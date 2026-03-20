@@ -1,0 +1,27 @@
+# Entorno virtual
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Variables de entorno
+.env
+*.env
+entornoLocal.env
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / temporales
+*.log
+*.tmp
+
+# archivos md 
+.md 
+*.md
+.DOCUMENTACION_TECNICA.md
