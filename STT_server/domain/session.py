@@ -44,6 +44,7 @@ class CallSession:
     pending_realtime_final: dict | None = None
     deferred_final_text: str = ""
     deferred_final_language: str | None = None
+    deferred_final_flush_task: asyncio.Task | None = None
     stt_failure_announced: bool = False
     closed: bool = False
 

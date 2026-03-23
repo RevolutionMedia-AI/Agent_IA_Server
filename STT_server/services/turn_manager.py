@@ -10,11 +10,13 @@ from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     DEEPGRAM_STT_LANGUAGE_HINT,
     FILLER_DELAY_MS,
+    FINAL_TRANSCRIPT_GRACE_MS,
     FINAL_RESTART_DELTA_CHARS,
     LLM_TIMEOUT_SEC,
     PARTIAL_PREFETCH_MAX_DELTA_CHARS,
     PARTIAL_TRANSCRIPT_DEBOUNCE_MS,
     PARTIAL_TRANSCRIPT_START_CHARS,
+    SHORT_FINAL_MAX_WORDS,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
     TTS_TIMEOUT_SEC,
 )
@@ -207,6 +209,84 @@ async def cancel_prefetch_task(session: CallSession) -> None:
 def clear_prefetched_reply(session: CallSession) -> None:
     session.prefetched_reply_source_text = ""
     session.prefetched_reply_text = ""
+
+
+async def cancel_deferred_final_flush(session: CallSession) -> None:
+    task = session.deferred_final_flush_task
+    session.deferred_final_flush_task = None
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def should_defer_final_transcript(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if looks_like_incomplete_utterance(stripped):
+        return True
+
+    if stripped[-1] in ".!?":
+        return False
+
+    word_count = len(stripped.split())
+    return word_count <= SHORT_FINAL_MAX_WORDS
+
+
+async def process_final_transcript(
+    session: CallSession,
+    text: str,
+    language: str,
+    speech_final: bool,
+) -> None:
+    pending_partial = session.partial_reply_task
+    if pending_partial and not pending_partial.done():
+        pending_partial.cancel()
+
+    prepared_reply = consume_prefetched_reply(session, text)
+    await cancel_prefetch_task(session)
+    clear_prefetched_reply(session)
+    session.pending_realtime_final = None
+
+    replace_current = bool(
+        session.reply_task
+        and not session.reply_task.done()
+        and text != session.reply_source_text
+        and len(text) >= len(session.reply_source_text) + FINAL_RESTART_DELTA_CHARS
+    )
+    await launch_reply_pipeline(
+        session,
+        text,
+        trigger="final",
+        replace_current=replace_current,
+        prepared_reply=prepared_reply,
+    )
+
+    if speech_final:
+        session.current_transcript = ""
+
+
+async def flush_deferred_final_after_grace(session: CallSession) -> None:
+    try:
+        await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 1000.0)
+    except asyncio.CancelledError:
+        return
+
+    text = session.deferred_final_text.strip()
+    if not text or session.closed:
+        return
+
+    if session.awaiting_local_final:
+        return
+
+    language = normalize_supported_language(session.deferred_final_language or session.preferred_language or DEFAULT_CALL_LANGUAGE)
+    session.deferred_final_text = ""
+    session.deferred_final_language = None
+    session.deferred_final_flush_task = None
+    log.info("Procesando final diferido en %s: %s", session.session_key, text)
+    await process_final_transcript(session, text, language, speech_final=True)
 
 
 async def prefetch_agent_reply(session: CallSession, user_text: str) -> None:
@@ -416,43 +496,28 @@ async def process_transcripts(session: CallSession) -> None:
                     }
                     continue
 
-                if session.deferred_final_text:
+                if source == "batch_final" and session.deferred_final_text:
+                    await cancel_deferred_final_flush(session)
+                    session.deferred_final_text = ""
+                    session.deferred_final_language = None
+                elif session.deferred_final_text:
+                    await cancel_deferred_final_flush(session)
                     text = f"{session.deferred_final_text} {text}".strip()
                     language = normalize_supported_language(session.deferred_final_language or language)
                     session.deferred_final_text = ""
                     session.deferred_final_language = None
 
-                if source in {"batch_final", "realtime_fallback"} and looks_like_incomplete_utterance(text):
+                if should_defer_final_transcript(text):
                     session.deferred_final_text = text
                     session.deferred_final_language = language
                     log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
+                    task = asyncio.create_task(flush_deferred_final_after_grace(session))
+                    session.deferred_final_flush_task = task
+                    session.tasks.add(task)
+                    task.add_done_callback(session.tasks.discard)
                     continue
 
-                pending_partial = session.partial_reply_task
-                if pending_partial and not pending_partial.done():
-                    pending_partial.cancel()
-
-                prepared_reply = consume_prefetched_reply(session, text)
-                await cancel_prefetch_task(session)
-                clear_prefetched_reply(session)
-                session.pending_realtime_final = None
-
-                replace_current = bool(
-                    session.reply_task
-                    and not session.reply_task.done()
-                    and text != session.reply_source_text
-                    and len(text) >= len(session.reply_source_text) + FINAL_RESTART_DELTA_CHARS
-                )
-                await launch_reply_pipeline(
-                    session,
-                    text,
-                    trigger="final",
-                    replace_current=replace_current,
-                    prepared_reply=prepared_reply,
-                )
-
-                if speech_final:
-                    session.current_transcript = ""
+                await process_final_transcript(session, text, language, speech_final=speech_final)
                 continue
 
             if len(text) < PARTIAL_TRANSCRIPT_START_CHARS:
