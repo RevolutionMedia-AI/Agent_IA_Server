@@ -12,10 +12,12 @@ from STT_server.config import (
     ENABLE_BARGE_IN,
     END_SILENCE_FRAMES,
     FRAME_DURATION_MS,
+    MIN_SPEECH_FRAMES,
     MIN_BARGE_IN_FRAMES,
     MIN_VOICE_RMS,
     PRE_SPEECH_FRAMES,
     SPEECH_START_FRAMES,
+    TRIM_TRAILING_SILENCE_FRAMES,
     TWILIO_SR,
 )
 from STT_server.domain.session import CallSession
@@ -98,6 +100,19 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
             session.silence_frames += 1
 
         if session.speech_frames and session.silence_frames >= END_SILENCE_FRAMES:
+            trimmed_frames = list(session.speech_frames)
+            if TRIM_TRAILING_SILENCE_FRAMES > 0 and len(trimmed_frames) > TRIM_TRAILING_SILENCE_FRAMES:
+                trimmed_frames = trimmed_frames[:-TRIM_TRAILING_SILENCE_FRAMES]
+
+            if session.speech_frame_count >= MIN_SPEECH_FRAMES and trimmed_frames:
+                session.awaiting_local_final = True
+                session.pending_realtime_final = None
+                await enqueue_with_drop(
+                    session.utterance_queue,
+                    (session.active_generation, b"".join(trimmed_frames)),
+                    "utterance_queue",
+                )
+
             session.speech_frames.clear()
             session.pre_speech_frames.clear()
             session.silence_frames = 0

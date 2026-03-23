@@ -192,6 +192,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                                             "language": language,
                                             "is_final": is_final or speech_final,
                                             "speech_final": speech_final,
+                                            "source": "realtime",
                                         }
                                     )
                                 continue
@@ -203,6 +204,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                                         "language": session.preferred_language,
                                         "is_final": True,
                                         "speech_final": True,
+                                        "source": "realtime",
                                     }
                                 )
                                 continue

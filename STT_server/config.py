@@ -41,11 +41,11 @@ TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 
 MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "180"))
 MIN_SPEECH_FRAMES = int(os.getenv("MIN_SPEECH_FRAMES", "5"))
-END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "4"))
+END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "18"))
 SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "2"))
 MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "6"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
-TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "4"))
+TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "6"))
 MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
 BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "700"))
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}

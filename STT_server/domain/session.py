@@ -40,6 +40,10 @@ class CallSession:
     prefetched_reply_source_text: str = ""
     prefetched_reply_text: str = ""
     prefetched_reply_task: asyncio.Task | None = None
+    awaiting_local_final: bool = False
+    pending_realtime_final: dict | None = None
+    deferred_final_text: str = ""
+    deferred_final_language: str | None = None
     stt_failure_announced: bool = False
     closed: bool = False
 

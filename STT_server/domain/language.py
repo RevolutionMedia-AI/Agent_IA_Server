@@ -60,6 +60,62 @@ ENGLISH_LANGUAGE_MARKERS = (
     "today",
 )
 
+INCOMPLETE_TRAILING_MARKERS = {
+    "a",
+    "about",
+    "an",
+    "and",
+    "because",
+    "but",
+    "como",
+    "con",
+    "de",
+    "del",
+    "el",
+    "for",
+    "i",
+    "if",
+    "just",
+    "la",
+    "like",
+    "los",
+    "my",
+    "o",
+    "or",
+    "para",
+    "pero",
+    "por",
+    "porque",
+    "que",
+    "si",
+    "so",
+    "sobre",
+    "that",
+    "the",
+    "to",
+    "with",
+    "y",
+    "yo",
+}
+
+INCOMPLETE_TRAILING_PHRASES = {
+    "and i",
+    "and my",
+    "because i",
+    "can you",
+    "could you",
+    "de mi",
+    "for my",
+    "i need",
+    "i want",
+    "me gustaria",
+    "para mi",
+    "por que",
+    "que me",
+    "y mi",
+    "y yo",
+}
+
 
 def normalize_supported_language(lang: str | None) -> str:
     if not lang:
@@ -133,6 +189,33 @@ def normalize_deepgram_language(lang: str | None) -> str | None:
     if lowered in {"es", "es-419", "es-es", "spanish"} or lowered.startswith("es-"):
         return "es"
     return None
+
+
+def looks_like_incomplete_utterance(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if stripped.endswith((",", ";", ":", "-", "(", "/")):
+        return True
+
+    if stripped[-1] in ".!?":
+        return False
+
+    tokens = stripped.lower().replace("?", "").replace("!", "").replace(".", "").split()
+    if not tokens:
+        return False
+
+    last_token = tokens[-1]
+    if last_token in INCOMPLETE_TRAILING_MARKERS:
+        return True
+
+    if len(tokens) >= 2:
+        last_phrase = " ".join(tokens[-2:])
+        if last_phrase in INCOMPLETE_TRAILING_PHRASES:
+            return True
+
+    return False
 
 
 def split_tts_segments(text: str, max_chars: int = 150) -> list[str]:

@@ -3,10 +3,12 @@ import contextlib
 import logging
 import time
 
+from STT_server.adapters.deepgram_stt_batch import transcribe_block
 from STT_server.adapters.deepgram_tts import stream_tts_segment
 from STT_server.adapters.openai_llm import build_messages, call_llm, stream_llm_reply_sync
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
+    DEEPGRAM_STT_LANGUAGE_HINT,
     FILLER_DELAY_MS,
     FINAL_RESTART_DELTA_CHARS,
     LLM_TIMEOUT_SEC,
@@ -16,7 +18,7 @@ from STT_server.config import (
     TEXT_SEGMENT_QUEUE_MAXSIZE,
     TTS_TIMEOUT_SEC,
 )
-from STT_server.domain.language import detect_language, get_filler_text, get_stt_failure_prompt, normalize_supported_language, split_tts_segments
+from STT_server.domain.language import detect_language, get_filler_text, get_stt_failure_prompt, looks_like_incomplete_utterance, normalize_supported_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
@@ -342,6 +344,52 @@ async def enqueue_transcript_event(session: CallSession, event: dict) -> None:
     await enqueue_with_drop(session.transcript_queue, event, "transcript_queue")
 
 
+async def process_local_utterances(session: CallSession) -> None:
+    try:
+        while True:
+            generation, utterance = await session.utterance_queue.get()
+            if generation != session.active_generation:
+                continue
+
+            try:
+                texts, language = await transcribe_block(
+                    utterance,
+                    language_hint=session.preferred_language or DEEPGRAM_STT_LANGUAGE_HINT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Batch STT error en %s", session.session_key)
+                texts = []
+                language = session.preferred_language or DEFAULT_CALL_LANGUAGE
+
+            final_text = " ".join(text.strip() for text in texts).strip()
+            session.awaiting_local_final = False
+
+            if final_text:
+                session.pending_realtime_final = None
+                await enqueue_transcript_event(
+                    session,
+                    {
+                        "text": final_text,
+                        "language": language,
+                        "is_final": True,
+                        "speech_final": True,
+                        "source": "batch_final",
+                    },
+                )
+                continue
+
+            pending_realtime = session.pending_realtime_final
+            session.pending_realtime_final = None
+            if pending_realtime:
+                await enqueue_transcript_event(session, pending_realtime)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Error en process_local_utterances")
+
+
 async def process_transcripts(session: CallSession) -> None:
     try:
         while True:
@@ -351,12 +399,35 @@ async def process_transcripts(session: CallSession) -> None:
                 continue
 
             language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
+            source = item.get("source") or "realtime"
             session.preferred_language = language
             session.current_transcript = text
             is_final = bool(item.get("is_final"))
             speech_final = bool(item.get("speech_final"))
 
             if is_final:
+                if source == "realtime" and session.awaiting_local_final:
+                    session.pending_realtime_final = {
+                        "text": text,
+                        "language": language,
+                        "is_final": True,
+                        "speech_final": speech_final,
+                        "source": "realtime_fallback",
+                    }
+                    continue
+
+                if session.deferred_final_text:
+                    text = f"{session.deferred_final_text} {text}".strip()
+                    language = normalize_supported_language(session.deferred_final_language or language)
+                    session.deferred_final_text = ""
+                    session.deferred_final_language = None
+
+                if source in {"batch_final", "realtime_fallback"} and looks_like_incomplete_utterance(text):
+                    session.deferred_final_text = text
+                    session.deferred_final_language = language
+                    log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
+                    continue
+
                 pending_partial = session.partial_reply_task
                 if pending_partial and not pending_partial.done():
                     pending_partial.cancel()
@@ -364,6 +435,7 @@ async def process_transcripts(session: CallSession) -> None:
                 prepared_reply = consume_prefetched_reply(session, text)
                 await cancel_prefetch_task(session)
                 clear_prefetched_reply(session)
+                session.pending_realtime_final = None
 
                 replace_current = bool(
                     session.reply_task
