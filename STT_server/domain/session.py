@@ -37,6 +37,9 @@ class CallSession:
     reply_source_text: str = ""
     reply_task: asyncio.Task | None = None
     partial_reply_task: asyncio.Task | None = None
+    prefetched_reply_source_text: str = ""
+    prefetched_reply_text: str = ""
+    prefetched_reply_task: asyncio.Task | None = None
     stt_failure_announced: bool = False
     closed: bool = False
 

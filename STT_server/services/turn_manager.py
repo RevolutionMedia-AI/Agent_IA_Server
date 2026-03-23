@@ -10,6 +10,7 @@ from STT_server.config import (
     FILLER_DELAY_MS,
     FINAL_RESTART_DELTA_CHARS,
     LLM_TIMEOUT_SEC,
+    PARTIAL_PREFETCH_MAX_DELTA_CHARS,
     PARTIAL_TRANSCRIPT_DEBOUNCE_MS,
     PARTIAL_TRANSCRIPT_START_CHARS,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
@@ -48,6 +49,33 @@ async def play_tts_from_text_queue(
         try:
             metric = await asyncio.wait_for(
                 stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item)),
+                timeout=TTS_TIMEOUT_SEC,
+            )
+            metrics.append(metric)
+        except asyncio.TimeoutError:
+            log.warning("TTS timeout en %s", session.session_key)
+            break
+        except Exception:
+            log.exception("TTS error en %s", session.session_key)
+            break
+
+    return metrics
+
+
+async def speak_precomputed_reply(
+    session: CallSession,
+    reply: str,
+    generation: int,
+) -> list[tuple[float | None, float]]:
+    metrics: list[tuple[float | None, float]] = []
+
+    for segment in split_tts_segments(reply):
+        if generation != session.active_generation:
+            break
+
+        try:
+            metric = await asyncio.wait_for(
+                stream_tts_segment(session, segment, generation, lambda item: emit_playback_item(session, item)),
                 timeout=TTS_TIMEOUT_SEC,
             )
             metrics.append(metric)
@@ -147,11 +175,96 @@ async def stream_llm_reply_with_tts(
     return reply.strip(), llm_ms, tts_metrics, llm_error
 
 
-async def handle_agent_reply(session: CallSession, user_text: str, generation: int, trigger: str) -> None:
+def consume_prefetched_reply(session: CallSession, final_text: str) -> str | None:
+    draft_text = session.prefetched_reply_source_text.strip()
+    draft_reply = session.prefetched_reply_text.strip()
+    if not draft_text or not draft_reply:
+        return None
+
+    normalized_final = final_text.strip()
+    if normalized_final == draft_text:
+        return draft_reply
+
+    if normalized_final.startswith(draft_text):
+        delta = len(normalized_final) - len(draft_text)
+        if delta <= PARTIAL_PREFETCH_MAX_DELTA_CHARS:
+            return draft_reply
+
+    return None
+
+
+async def cancel_prefetch_task(session: CallSession) -> None:
+    task = session.prefetched_reply_task
+    session.prefetched_reply_task = None
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def clear_prefetched_reply(session: CallSession) -> None:
+    session.prefetched_reply_source_text = ""
+    session.prefetched_reply_text = ""
+
+
+async def prefetch_agent_reply(session: CallSession, user_text: str) -> None:
+    normalized_text = user_text.strip()
+    if not normalized_text:
+        return
+
+    try:
+        if LLM_TIMEOUT_SEC > 0:
+            reply = await asyncio.wait_for(call_llm(session, normalized_text), timeout=LLM_TIMEOUT_SEC)
+        else:
+            reply = await call_llm(session, normalized_text)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Prefetch LLM error en %s", session.session_key)
+        return
+
+    if session.closed or session.prefetched_reply_source_text != normalized_text:
+        return
+
+    session.prefetched_reply_text = reply.strip()
+
+
+async def launch_reply_prefetch(session: CallSession, user_text: str) -> None:
+    normalized_text = user_text.strip()
+    if not normalized_text:
+        return
+
+    existing_task = session.prefetched_reply_task
+    if existing_task and not existing_task.done() and session.prefetched_reply_source_text == normalized_text:
+        return
+
+    await cancel_prefetch_task(session)
+    clear_prefetched_reply(session)
+    session.prefetched_reply_source_text = normalized_text
+    task = asyncio.create_task(prefetch_agent_reply(session, normalized_text))
+    session.prefetched_reply_task = task
+    session.tasks.add(task)
+    task.add_done_callback(session.tasks.discard)
+
+
+async def handle_agent_reply(
+    session: CallSession,
+    user_text: str,
+    generation: int,
+    trigger: str,
+    prepared_reply: str | None = None,
+) -> None:
     started_at = time.perf_counter()
     log.info("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
 
-    reply, llm_ms, tts_metrics, llm_error = await stream_llm_reply_with_tts(session, user_text, generation)
+    if prepared_reply:
+        reply = prepared_reply.strip()
+        llm_ms = 0.0
+        llm_error = None
+        tts_metrics = await speak_precomputed_reply(session, reply, generation)
+    else:
+        reply, llm_ms, tts_metrics, llm_error = await stream_llm_reply_with_tts(session, user_text, generation)
+
     if generation != session.active_generation or not reply:
         return
 
@@ -204,7 +317,7 @@ async def launch_reply_pipeline(
 
     session.reply_source_text = normalized_text
     generation = session.active_generation
-    task = asyncio.create_task(handle_agent_reply(session, normalized_text, generation, trigger))
+    task = asyncio.create_task(handle_agent_reply(session, normalized_text, generation, trigger, prepared_reply=prepared_reply))
     session.reply_task = task
     session.tasks.add(task)
     task.add_done_callback(session.tasks.discard)
@@ -221,7 +334,7 @@ async def schedule_partial_reply(session: CallSession, transcript: str) -> None:
     if session.reply_task and not session.reply_task.done():
         return
 
-    await launch_reply_pipeline(session, transcript, trigger="partial")
+    await launch_reply_prefetch(session, transcript)
 
 
 async def enqueue_transcript_event(session: CallSession, event: dict) -> None:
@@ -247,13 +360,23 @@ async def process_transcripts(session: CallSession) -> None:
                 if pending_partial and not pending_partial.done():
                     pending_partial.cancel()
 
+                prepared_reply = consume_prefetched_reply(session, text)
+                await cancel_prefetch_task(session)
+                clear_prefetched_reply(session)
+
                 replace_current = bool(
                     session.reply_task
                     and not session.reply_task.done()
                     and text != session.reply_source_text
                     and len(text) >= len(session.reply_source_text) + FINAL_RESTART_DELTA_CHARS
                 )
-                await launch_reply_pipeline(session, text, trigger="final", replace_current=replace_current)
+                await launch_reply_pipeline(
+                    session,
+                    text,
+                    trigger="final",
+                    replace_current=replace_current,
+                    prepared_reply=prepared_reply,
+                )
 
                 if speech_final:
                     session.current_transcript = ""
