@@ -1,6 +1,7 @@
 import asyncio
 import audioop
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -16,10 +17,12 @@ from pathlib import Path
 
 import uvicorn
 import webrtcvad
+import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from openai import OpenAI
+from websockets.exceptions import ConnectionClosed
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -72,17 +75,17 @@ TWILIO_CHANNELS = 1
 FRAME_DURATION_MS = 30
 FRAME_SAMPLES = int(TWILIO_SR * FRAME_DURATION_MS / 1000)
 FRAME_BYTES = FRAME_SAMPLES * 2
-MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "240"))
+MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "180"))
 MIN_UTTERANCE_BYTES = int(TWILIO_SR * (MIN_UTTERANCE_MS / 1000.0) * 2)
 MIN_SPEECH_FRAMES = int(os.getenv("MIN_SPEECH_FRAMES", "5"))
-END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "6"))
+END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "4"))
 SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "2"))
 MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "6"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
 TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "4"))
 MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
 BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "700"))
-ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
 ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "1200"))
 LOG_TWILIO_PLAYBACK = os.getenv("LOG_TWILIO_PLAYBACK", "true").strip().lower() in {"1", "true", "yes", "on"}
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
@@ -91,9 +94,18 @@ TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5.0"))
 TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "5.0"))
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
-MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "5"))
+MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "80"))
 DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "en").strip().lower()
+STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "120"))
+FILLER_TTS_ENABLED = os.getenv("FILLER_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+FILLER_TEXT_EN = os.getenv("FILLER_TEXT_EN", "Okay, one moment.").strip()
+FILLER_TEXT_ES = os.getenv("FILLER_TEXT_ES", "Claro, un momento.").strip()
+PARTIAL_TRANSCRIPT_START_CHARS = int(os.getenv("PARTIAL_TRANSCRIPT_START_CHARS", "18"))
+PARTIAL_TRANSCRIPT_DEBOUNCE_MS = int(os.getenv("PARTIAL_TRANSCRIPT_DEBOUNCE_MS", "350"))
+FINAL_RESTART_DELTA_CHARS = int(os.getenv("FINAL_RESTART_DELTA_CHARS", "12"))
+DEEPGRAM_STT_ENDPOINTING_MS = int(os.getenv("DEEPGRAM_STT_ENDPOINTING_MS", "300"))
+DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "700"))
 SUPPORTED_LANGUAGES = ("en", "es")
 SPANISH_LANGUAGE_MARKERS = (
     "hola",
@@ -155,11 +167,17 @@ class CallSession:
     history: list[dict[str, str]] = field(default_factory=list)
     utterance_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)
     playback_queue: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
+    stt_audio_queue: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
+    transcript_queue: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
     tasks: set[asyncio.Task] = field(default_factory=set)
     pending_marks: set[str] = field(default_factory=set)
     mark_counter: int = 0
     assistant_speaking: bool = False
     assistant_started_at: float | None = None
+    current_transcript: str = ""
+    reply_source_text: str = ""
+    reply_task: asyncio.Task | None = None
+    partial_reply_task: asyncio.Task | None = None
     closed: bool = False
 
 
@@ -210,6 +228,12 @@ def get_tts_model(lang: str) -> str:
     return "aura-2-estrella-es"
 
 
+def get_filler_text(lang: str) -> str:
+    if not FILLER_TTS_ENABLED:
+        return ""
+    return FILLER_TEXT_EN if lang == "en" else FILLER_TEXT_ES
+
+
 def normalize_deepgram_language(lang: str | None) -> str | None:
     if not lang:
         return None
@@ -238,7 +262,7 @@ def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]
     return messages
 
 
-def split_tts_segments(text: str, max_chars: int = 350) -> list[str]:
+def split_tts_segments(text: str, max_chars: int = 150) -> list[str]:
     stripped = text.strip()
     if not stripped:
         return []
@@ -271,6 +295,38 @@ def split_tts_segments(text: str, max_chars: int = 350) -> list[str]:
     return segments
 
 
+def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str], str]:
+    remainder = buffer
+    segments: list[str] = []
+
+    while remainder:
+        cut_index: int | None = None
+
+        for index, char in enumerate(remainder):
+            if char in ".!?\n":
+                cut_index = index + 1
+                break
+
+        if cut_index is None and len(remainder) >= STREAMING_SEGMENT_MAX_CHARS:
+            cut_index = remainder.rfind(" ", 0, STREAMING_SEGMENT_MAX_CHARS)
+            if cut_index <= 0:
+                cut_index = STREAMING_SEGMENT_MAX_CHARS
+
+        if cut_index is None:
+            break
+
+        segment = remainder[:cut_index].strip()
+        remainder = remainder[cut_index:].lstrip()
+        if segment:
+            segments.append(segment)
+
+    if force and remainder.strip():
+        segments.append(remainder.strip())
+        remainder = ""
+
+    return segments, remainder
+
+
 def extract_deepgram_transcript(payload: dict, fallback_language: str | None = None) -> tuple[list[str], str]:
     fallback = normalize_supported_language(fallback_language)
     results = payload.get("results") or {}
@@ -298,6 +354,61 @@ def extract_deepgram_transcript(payload: dict, fallback_language: str | None = N
         detected_language = infer_supported_language_from_text(transcript, fallback=fallback)
 
     return ([transcript] if transcript else []), detected_language or fallback
+
+
+def extract_deepgram_stream_result(
+    payload: dict,
+    fallback_language: str | None = None,
+) -> tuple[str, str, bool, bool]:
+    fallback = normalize_supported_language(fallback_language)
+    channel = payload.get("channel") or {}
+    alternatives = channel.get("alternatives") or []
+    if not alternatives:
+        return "", fallback, False, False
+
+    alternative = alternatives[0] or {}
+    transcript = (alternative.get("transcript") or "").strip()
+    detected_language = normalize_deepgram_language(
+        alternative.get("detected_language") or channel.get("detected_language")
+    )
+
+    if not detected_language:
+        languages = alternative.get("languages") or channel.get("languages") or []
+        if languages:
+            detected_language = normalize_deepgram_language(languages[0])
+
+    if not detected_language and transcript:
+        detected_language = infer_supported_language_from_text(transcript, fallback=fallback)
+
+    return (
+        transcript,
+        detected_language or fallback,
+        bool(payload.get("is_final")),
+        bool(payload.get("speech_final")),
+    )
+
+
+def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
+    hint = normalize_deepgram_language(language_hint)
+    params = {
+        "model": DEEPGRAM_STT_MODEL,
+        "encoding": "mulaw",
+        "sample_rate": str(TWILIO_SR),
+        "channels": str(TWILIO_CHANNELS),
+        "interim_results": "true",
+        "punctuate": str(DEEPGRAM_STT_PUNCTUATE).lower(),
+        "smart_format": str(DEEPGRAM_STT_SMART_FORMAT).lower(),
+        "endpointing": str(DEEPGRAM_STT_ENDPOINTING_MS),
+        "utterance_end_ms": str(DEEPGRAM_UTTERANCE_END_MS),
+        "vad_events": "true",
+    }
+
+    if hint:
+        params["language"] = hint
+    elif DEEPGRAM_STT_DETECT_LANGUAGE:
+        params["detect_language"] = "true"
+
+    return f"wss://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
 
 
 def get_frame_rms(frame: bytes) -> int:
@@ -388,6 +499,355 @@ async def call_llm(session: CallSession, user_text: str) -> str:
             return "Lo siento, tuve un problema momentaneo. Puedes repetirlo?"
 
     return await asyncio.to_thread(sync_call)
+
+
+def stream_llm_reply_sync(
+    messages: list[dict[str, str]],
+    output_queue: asyncio.Queue[str | None],
+    loop: asyncio.AbstractEventLoop,
+    should_stop,
+) -> tuple[str, str | None]:
+    if openai_client is None:
+        return "", "OpenAI no configurada. Define OPENAI_API_KEY."
+
+    full_reply = ""
+    pending = ""
+
+    try:
+        stream = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.4,
+            max_tokens=MAX_RESPONSE_TOKENS,
+            stream=True,
+        )
+
+        for chunk in stream:
+            if should_stop():
+                break
+            if not getattr(chunk, "choices", None):
+                continue
+
+            delta = chunk.choices[0].delta.content or ""
+            if not delta:
+                continue
+
+            full_reply += delta
+            pending += delta
+            ready_segments, pending = pop_streaming_segments(pending)
+            for segment in ready_segments:
+                loop.call_soon_threadsafe(output_queue.put_nowait, segment)
+
+        if not should_stop():
+            final_segments, _ = pop_streaming_segments(pending, force=True)
+            for segment in final_segments:
+                loop.call_soon_threadsafe(output_queue.put_nowait, segment)
+
+        return full_reply.strip(), None
+    except Exception as exc:
+        log.exception("LLM STREAM ERROR")
+        return full_reply.strip(), str(exc)
+    finally:
+        loop.call_soon_threadsafe(output_queue.put_nowait, None)
+
+
+async def play_tts_from_text_queue(
+    session: CallSession,
+    generation: int,
+    text_queue: asyncio.Queue[str | None],
+) -> list[tuple[float | None, float]]:
+    metrics: list[tuple[float | None, float]] = []
+
+    while True:
+        text = await text_queue.get()
+        if text is None:
+            break
+        if generation != session.active_generation:
+            break
+
+        try:
+            metric = await asyncio.wait_for(
+                stream_tts_segment(session, text, generation),
+                timeout=TTS_TIMEOUT_SEC,
+            )
+            metrics.append(metric)
+        except asyncio.TimeoutError:
+            log.warning("TTS timeout en %s", session.session_key)
+            break
+        except Exception:
+            log.exception("TTS error en %s", session.session_key)
+            break
+
+    return metrics
+
+
+async def stream_llm_reply_with_tts(
+    session: CallSession,
+    user_text: str,
+    generation: int,
+) -> tuple[str, float, list[tuple[float | None, float]], str | None]:
+    lang = session.preferred_language or detect_language(user_text)
+    filler_text = get_filler_text(lang)
+    loop = asyncio.get_running_loop()
+    text_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    playback_task = asyncio.create_task(play_tts_from_text_queue(session, generation, text_queue))
+
+    if filler_text and generation == session.active_generation:
+        await text_queue.put(filler_text)
+
+    llm_started = time.perf_counter()
+    producer_task = asyncio.create_task(
+        asyncio.to_thread(
+            stream_llm_reply_sync,
+            build_messages(session, user_text),
+            text_queue,
+            loop,
+            lambda: generation != session.active_generation or session.closed,
+        )
+    )
+
+    llm_error: str | None = None
+    reply = ""
+    try:
+        if LLM_TIMEOUT_SEC > 0:
+            reply, llm_error = await asyncio.wait_for(producer_task, timeout=LLM_TIMEOUT_SEC)
+        else:
+            reply, llm_error = await producer_task
+    except asyncio.TimeoutError:
+        llm_error = "timeout"
+        with contextlib.suppress(asyncio.QueueFull):
+            await text_queue.put(None)
+
+    llm_ms = (time.perf_counter() - llm_started) * 1000
+    tts_metrics = await playback_task
+
+    if llm_error and not reply and generation == session.active_generation:
+        reply = "Lo siento, estoy tardando mas de lo normal. Puedes repetirlo?"
+        try:
+            fallback_metric = await asyncio.wait_for(
+                stream_tts_segment(session, reply, generation),
+                timeout=TTS_TIMEOUT_SEC,
+            )
+            tts_metrics.append(fallback_metric)
+        except asyncio.TimeoutError:
+            log.warning("TTS timeout en fallback de %s", session.session_key)
+        except Exception:
+            log.exception("TTS error en fallback de %s", session.session_key)
+
+    return reply.strip(), llm_ms, tts_metrics, llm_error
+
+
+async def handle_agent_reply(session: CallSession, user_text: str, generation: int, trigger: str) -> None:
+    started_at = time.perf_counter()
+    log.info("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
+
+    reply, llm_ms, tts_metrics, llm_error = await stream_llm_reply_with_tts(session, user_text, generation)
+    if generation != session.active_generation or not reply:
+        return
+
+    session.history.extend(
+        [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": reply},
+        ]
+    )
+    trim_history(session)
+
+    log.info("Agente (%s): %s", session.session_key, reply)
+
+    total_ms = (time.perf_counter() - started_at) * 1000
+    first_tts_ms = next((metric[0] for metric in tts_metrics if metric[0] is not None), None)
+    log.info(
+        "Turno %s gen=%s trigger=%s llm_ms=%.1f tts_ttfb_ms=%s total_ms=%.1f llm_error=%s",
+        session.session_key,
+        generation,
+        trigger,
+        llm_ms,
+        f"{first_tts_ms:.1f}" if first_tts_ms is not None else "n/a",
+        total_ms,
+        llm_error or "none",
+    )
+
+
+async def launch_reply_pipeline(
+    session: CallSession,
+    user_text: str,
+    trigger: str,
+    replace_current: bool = False,
+) -> None:
+    normalized_text = user_text.strip()
+    if not normalized_text:
+        return
+
+    existing_task = session.reply_task
+    if existing_task and not existing_task.done():
+        if session.reply_source_text == normalized_text and not replace_current:
+            return
+        if not replace_current:
+            return
+        await interrupt_current_turn(session)
+        existing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await existing_task
+    else:
+        session.active_generation += 1
+
+    session.reply_source_text = normalized_text
+    generation = session.active_generation
+    task = asyncio.create_task(handle_agent_reply(session, normalized_text, generation, trigger))
+    session.reply_task = task
+    session.tasks.add(task)
+    task.add_done_callback(session.tasks.discard)
+
+
+async def schedule_partial_reply(session: CallSession, transcript: str) -> None:
+    try:
+        await asyncio.sleep(PARTIAL_TRANSCRIPT_DEBOUNCE_MS / 1000.0)
+    except asyncio.CancelledError:
+        return
+
+    if session.closed or transcript != session.current_transcript:
+        return
+    if session.reply_task and not session.reply_task.done():
+        return
+
+    await launch_reply_pipeline(session, transcript, trigger="partial")
+
+
+async def process_transcripts(session: CallSession) -> None:
+    try:
+        while True:
+            item = await session.transcript_queue.get()
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+
+            language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
+            session.preferred_language = language
+            session.current_transcript = text
+            is_final = bool(item.get("is_final"))
+            speech_final = bool(item.get("speech_final"))
+
+            if is_final:
+                pending_partial = session.partial_reply_task
+                if pending_partial and not pending_partial.done():
+                    pending_partial.cancel()
+
+                replace_current = bool(
+                    session.reply_task
+                    and not session.reply_task.done()
+                    and text != session.reply_source_text
+                    and len(text) >= len(session.reply_source_text) + FINAL_RESTART_DELTA_CHARS
+                )
+                await launch_reply_pipeline(session, text, trigger="final", replace_current=replace_current)
+
+                if speech_final:
+                    session.current_transcript = ""
+                continue
+
+            if len(text) < PARTIAL_TRANSCRIPT_START_CHARS:
+                continue
+            if session.reply_task and not session.reply_task.done():
+                continue
+
+            pending_partial = session.partial_reply_task
+            if pending_partial and not pending_partial.done():
+                pending_partial.cancel()
+
+            task = asyncio.create_task(schedule_partial_reply(session, text))
+            session.partial_reply_task = task
+            session.tasks.add(task)
+            task.add_done_callback(session.tasks.discard)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Error en process_transcripts")
+
+
+async def deepgram_audio_sender(dg_ws, session: CallSession) -> None:
+    while True:
+        chunk = await session.stt_audio_queue.get()
+        if chunk is None:
+            with contextlib.suppress(Exception):
+                await dg_ws.send(json.dumps({"type": "Finalize"}))
+            return
+        if chunk:
+            await dg_ws.send(chunk)
+
+
+async def run_realtime_stt(session: CallSession) -> None:
+    if not DEEPGRAM_API_KEY:
+        return
+
+    url = build_deepgram_realtime_url(session.preferred_language or DEEPGRAM_STT_LANGUAGE_HINT)
+    connect_kwargs = {
+        "ping_interval": 20,
+        "ping_timeout": 20,
+    }
+    try:
+        try:
+            realtime_connection = websockets.connect(
+                url,
+                additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                **connect_kwargs,
+            )
+        except TypeError:
+            realtime_connection = websockets.connect(
+                url,
+                extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                **connect_kwargs,
+            )
+
+        async with realtime_connection as dg_ws:
+            sender_task = asyncio.create_task(deepgram_audio_sender(dg_ws, session))
+            session.tasks.add(sender_task)
+            sender_task.add_done_callback(session.tasks.discard)
+
+            while True:
+                try:
+                    raw_message = await dg_ws.recv()
+                except ConnectionClosed:
+                    break
+
+                if isinstance(raw_message, bytes):
+                    continue
+
+                payload = json.loads(raw_message)
+                message_type = payload.get("type")
+
+                if message_type == "Results":
+                    transcript, language, is_final, speech_final = extract_deepgram_stream_result(
+                        payload,
+                        fallback_language=session.preferred_language or DEFAULT_CALL_LANGUAGE,
+                    )
+                    if transcript:
+                        await session.transcript_queue.put(
+                            {
+                                "text": transcript,
+                                "language": language,
+                                "is_final": is_final or speech_final,
+                                "speech_final": speech_final,
+                            }
+                        )
+                    continue
+
+                if message_type == "UtteranceEnd" and session.current_transcript:
+                    await session.transcript_queue.put(
+                        {
+                            "text": session.current_transcript,
+                            "language": session.preferred_language or DEFAULT_CALL_LANGUAGE,
+                            "is_final": True,
+                            "speech_final": True,
+                        }
+                    )
+                    continue
+
+                if message_type == "Error":
+                    log.error("Deepgram realtime error en %s: %s", session.session_key, payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Error en run_realtime_stt para %s", session.session_key)
 
 
 async def enqueue_playback_clear(session: CallSession) -> None:
@@ -597,6 +1057,8 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
     raw = base64.b64decode(media_payload)
+    if DEEPGRAM_API_KEY:
+        await session.stt_audio_queue.put(raw)
     pcm16 = audioop.ulaw2lin(raw, 2)
     session.vad_buffer.extend(pcm16)
 
@@ -653,25 +1115,10 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
             session.silence_frames += 1
 
         if session.speech_frames and session.silence_frames >= END_SILENCE_FRAMES:
-            trimmed_frames = session.speech_frames
-            if TRIM_TRAILING_SILENCE_FRAMES > 0 and session.silence_frames > 0:
-                trailing_trim = min(TRIM_TRAILING_SILENCE_FRAMES, session.silence_frames, len(session.speech_frames))
-                candidate_frames = session.speech_frames[:-trailing_trim]
-                if candidate_frames:
-                    trimmed_frames = candidate_frames
-
-            utterance = b"".join(trimmed_frames)
             session.speech_frames.clear()
             session.pre_speech_frames.clear()
             session.silence_frames = 0
-            speech_frame_count = session.speech_frame_count
             session.speech_frame_count = 0
-
-            if len(utterance) < MIN_UTTERANCE_BYTES or speech_frame_count < MIN_SPEECH_FRAMES:
-                continue
-
-            session.active_generation += 1
-            await session.utterance_queue.put((session.active_generation, utterance))
 
 
 async def process_utterances(session: CallSession) -> None:
@@ -779,6 +1226,9 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
 
     session.closed = True
 
+    with contextlib.suppress(Exception):
+        await session.stt_audio_queue.put(None)
+
     if session.speech_frames:
         session.speech_frames.clear()
 
@@ -826,8 +1276,12 @@ async def media_stream(ws: WebSocket) -> None:
     session = CallSession(session_key=f"ws-{id(ws)}")
 
     try:
-        session.tasks.add(asyncio.create_task(process_utterances(session)))
-        session.tasks.add(asyncio.create_task(playback_loop(ws, session)))
+        playback_task = asyncio.create_task(playback_loop(ws, session))
+        transcript_task = asyncio.create_task(process_transcripts(session))
+        session.tasks.add(playback_task)
+        session.tasks.add(transcript_task)
+        playback_task.add_done_callback(session.tasks.discard)
+        transcript_task.add_done_callback(session.tasks.discard)
 
         while True:
             message = await ws.receive_text()
@@ -845,6 +1299,9 @@ async def media_stream(ws: WebSocket) -> None:
                     session.session_key = session.call_sid
                 sessions[session.session_key] = session
                 log.info("callSid=%s streamSid=%s", session.call_sid, session.stream_sid)
+                realtime_stt_task = asyncio.create_task(run_realtime_stt(session))
+                session.tasks.add(realtime_stt_task)
+                realtime_stt_task.add_done_callback(session.tasks.discard)
                 session.tasks.add(asyncio.create_task(play_initial_greeting(session)))
                 continue
 
