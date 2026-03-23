@@ -1,6 +1,7 @@
 import asyncio
 import audioop
 import base64
+import io
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from openai import OpenAI
+
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
 print("ARCHIVO EN USO:", __file__)
 
@@ -85,9 +90,9 @@ TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 
 STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5.0"))
-TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "8.0"))
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "6"))
-MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "80"))
+TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "5.0"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
+MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
 DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "en").strip().lower()
 SUPPORTED_LANGUAGES = ("en", "es")
 SPANISH_LANGUAGE_MARKERS = (
@@ -128,8 +133,7 @@ vad = webrtcvad.Vad(2)
 SYSTEM_PROMPT = (
     "Eres un asistente de voz telefonico. "
     "Responde en el mismo idioma del usuario. "
-    "Da respuestas cortas, naturales y faciles de oir por telefono. "
-    "Usa una o dos frases como maximo. "
+    "Da respuestas concretas, naturales y faciles de oir por telefono. "
     "Evita listas, markdown, URLs, texto tecnico y respuestas largas. "
     "Si falta informacion, haz una sola pregunta concreta."
 )
@@ -305,9 +309,21 @@ def is_probable_voice(frame: bytes) -> tuple[bool, int]:
     return vad.is_speech(frame, TWILIO_SR) and rms >= MIN_VOICE_RMS, rms
 
 
+def pcm16_to_wav_bytes(pcm16_audio: bytes, sample_rate: int, channels: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm16_audio)
+    return buffer.getvalue()
+
+
 def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tuple[list[str], str]:
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("Deepgram no configurado. Define DEEPGRAM_API_KEY.")
+    if not pcm16_audio:
+        return [], normalize_supported_language(language_hint or DEFAULT_CALL_LANGUAGE)
 
     hint = normalize_deepgram_language(language_hint)
     params = {
@@ -321,14 +337,15 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
     elif DEEPGRAM_STT_DETECT_LANGUAGE:
         params["detect_language"] = "true"
 
+    wav_audio = pcm16_to_wav_bytes(pcm16_audio, sample_rate=TWILIO_SR, channels=TWILIO_CHANNELS)
     url = f"https://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": f"audio/l16;rate={TWILIO_SR};channels={TWILIO_CHANNELS}",
+        "Content-Type": "audio/wav",
         "Accept": "application/json",
     }
     timeout = STT_TIMEOUT_SEC if STT_TIMEOUT_SEC > 0 else 45
-    request = urllib.request.Request(url, data=pcm16_audio, headers=headers, method="POST")
+    request = urllib.request.Request(url, data=wav_audio, headers=headers, method="POST")
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
