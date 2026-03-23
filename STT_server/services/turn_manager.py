@@ -279,7 +279,13 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
         return
 
     if session.awaiting_local_final:
-        return
+        try:
+            await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 1000.0)
+        except asyncio.CancelledError:
+            return
+        text = session.deferred_final_text.strip()
+        if not text or session.closed:
+            return
 
     language = normalize_supported_language(session.deferred_final_language or session.preferred_language or DEFAULT_CALL_LANGUAGE)
     session.deferred_final_text = ""
@@ -429,6 +435,8 @@ async def process_local_utterances(session: CallSession) -> None:
         while True:
             generation, utterance = await session.utterance_queue.get()
             if generation != session.active_generation:
+                session.awaiting_local_final = False
+                session.pending_realtime_final = None
                 continue
 
             try:
@@ -480,7 +488,8 @@ async def process_transcripts(session: CallSession) -> None:
 
             language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
             source = item.get("source") or "realtime"
-            session.preferred_language = language
+            if source in {"batch_final", "realtime_fallback"} or (source == "realtime" and not session.awaiting_local_final and bool(item.get("is_final"))):
+                session.preferred_language = language
             session.current_transcript = text
             is_final = bool(item.get("is_final"))
             speech_final = bool(item.get("speech_final"))
