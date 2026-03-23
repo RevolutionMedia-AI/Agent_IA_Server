@@ -14,7 +14,6 @@ from STT_server.config import (
     DEEPGRAM_STT_MODEL,
     DEEPGRAM_STT_PUNCTUATE,
     DEEPGRAM_STT_SMART_FORMAT,
-    DEEPGRAM_UTTERANCE_END_MS,
     STT_RECONNECT_BASE_DELAY_MS,
     STT_RECONNECT_MAX_ATTEMPTS,
     STT_RECONNECT_MAX_DELAY_MS,
@@ -63,7 +62,6 @@ def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
         "punctuate": str(DEEPGRAM_STT_PUNCTUATE).lower(),
         "smart_format": str(DEEPGRAM_STT_SMART_FORMAT).lower(),
         "endpointing": str(DEEPGRAM_STT_ENDPOINTING_MS),
-        "utterance_end_ms": str(DEEPGRAM_UTTERANCE_END_MS),
         "vad_events": "true",
     }
 
