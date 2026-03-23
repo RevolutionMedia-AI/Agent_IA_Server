@@ -297,6 +297,7 @@ async def launch_reply_pipeline(
     user_text: str,
     trigger: str,
     replace_current: bool = False,
+    prepared_reply: str | None = None,
 ) -> None:
     normalized_text = user_text.strip()
     if not normalized_text:
