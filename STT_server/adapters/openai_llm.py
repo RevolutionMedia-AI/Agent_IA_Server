@@ -1,0 +1,117 @@
+import asyncio
+import logging
+
+from openai import OpenAI
+
+from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS, OPENAI_API_KEY, OPENAI_MODEL
+from STT_server.domain.language import SYSTEM_PROMPT, detect_language, get_language_instruction, pop_streaming_segments
+from STT_server.domain.session import CallSession
+
+
+log = logging.getLogger("stt_server")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]:
+    lang = session.preferred_language or detect_language(user_text)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": get_language_instruction(lang)},
+    ]
+    messages.extend(session.history[-MAX_HISTORY_MESSAGES:])
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+async def call_llm(session: CallSession, user_text: str) -> str:
+    if openai_client is None:
+        raise RuntimeError("OpenAI no configurada. Define OPENAI_API_KEY.")
+
+    messages = build_messages(session, user_text)
+
+    def sync_call() -> str:
+        try:
+            response = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=0.4,
+                max_tokens=MAX_RESPONSE_TOKENS,
+            )
+            content = response.choices[0].message.content
+            return (content or "").strip()
+        except Exception:
+            log.exception("LLM ERROR")
+            return "Lo siento, tuve un problema momentaneo. Puedes repetirlo?"
+
+    return await asyncio.to_thread(sync_call)
+
+
+def stream_llm_reply_sync(
+    messages: list[dict[str, str]],
+    should_stop,
+    emit_segment,
+    emit_done,
+    on_first_segment,
+) -> tuple[str, str | None]:
+    if openai_client is None:
+        return "", "OpenAI no configurada. Define OPENAI_API_KEY."
+
+    full_reply = ""
+    pending = ""
+
+    try:
+        stream = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.4,
+            max_tokens=MAX_RESPONSE_TOKENS,
+            stream=True,
+        )
+
+        for chunk in stream:
+            if should_stop():
+                break
+            if not getattr(chunk, "choices", None):
+                continue
+
+            delta = chunk.choices[0].delta.content or ""
+            if not delta:
+                continue
+
+            full_reply += delta
+            pending += delta
+            ready_segments, pending = pop_streaming_segments(pending)
+            for segment in ready_segments:
+                on_first_segment()
+                emit_segment(segment)
+
+        if not should_stop():
+            final_segments, _ = pop_streaming_segments(pending, force=True)
+            for segment in final_segments:
+                on_first_segment()
+                emit_segment(segment)
+
+        return full_reply.strip(), None
+    except Exception as exc:
+        log.exception("LLM STREAM ERROR")
+        return full_reply.strip(), str(exc)
+    finally:
+        emit_done()
+
+
+async def list_models() -> dict:
+    if openai_client is None:
+        return {"error": "OpenAI no configurada"}
+
+    def sync_list() -> dict:
+        try:
+            models_page = openai_client.models.list()
+            if hasattr(models_page, "data"):
+                models = [model.id for model in models_page.data]
+            else:
+                models = [model.id for model in models_page]
+            return {"models": models}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    return await asyncio.to_thread(sync_list)
