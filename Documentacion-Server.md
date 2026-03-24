@@ -12,6 +12,8 @@ Este proyecto implementa un servidor de voz conversacional en tiempo real orient
 
 El sistema esta disenado para operar como backend de un agente telefonico sin interfaz grafica ni persistencia en base de datos. El estado de cada llamada se mantiene en memoria mientras la sesion permanece activa.
 
+El backend emplea una arquitectura de STT dual: un canal en tiempo real mediante WebSocket de Deepgram para obtener transcripciones parciales y prefetch de respuestas, y un canal batch mediante HTTP para obtener transcripciones finales autoritativas con deteccion de idioma. Adicionalmente implementa un mecanismo de ventana de gracia para diferir transcripciones finales cortas o incompletas, evitando interrupciones prematuras durante el habla del usuario.
+
   
 
 ## Proposito del sistema
@@ -70,15 +72,27 @@ El alcance actual incluye:
 
 - manejo de sesiones activas por llamada en memoria;
 
-- VAD con `webrtcvad` para detectar inicio y fin de turno;
+- VAD local con `webrtcvad` para detectar inicio y fin de turno;
 
-- transcripcion STT mediante Deepgram;
+- transcripcion STT dual: realtime por WebSocket y batch por HTTP mediante Deepgram;
 
-- generacion de respuesta mediante OpenAI;
+- sistema de fallback con candidatos multiples para la conexion STT realtime;
 
-- sintesis TTS mediante Deepgram;
+- prefetch silencioso de respuestas LLM a partir de transcripciones parciales;
 
-- soporte bilingue limitado a ingles y espanol;
+- ventana de gracia configurable para diferir finals cortos o linguisticamente incompletos;
+
+- deteccion de utterances incompletas mediante marcadores linguisticos en ingles y espanol;
+
+- generacion de respuesta mediante OpenAI con streaming;
+
+- sintesis TTS mediante Deepgram con voces diferenciadas por idioma;
+
+- filler de espera configurable por idioma;
+
+- soporte bilingue en ingles y espanol con persistencia de idioma por sesion;
+
+- barge-in configurable para permitir interrupcion del asistente;
 
 - endpoints de prueba y diagnostico.
 
@@ -198,6 +212,10 @@ No se utiliza base de datos. Toda la informacion operacional se conserva tempora
 
 | webrtcvad | Deteccion de voz por frames |
 
+| websockets | Conexion WebSocket con Deepgram STT realtime |
+
+| httpx | Cliente HTTP asincrono (dependencia indirecta via OpenAI SDK) |
+
 | openai | Cliente del modelo conversacional |
 
 | twilio | Dependencia declarada para integracion con el ecosistema Twilio |
@@ -238,11 +256,15 @@ El sistema se compone de los siguientes bloques funcionales:
 
 | Endpoint `/media-stream` | Gestionar eventos WebSocket de Twilio |
 
-| VAD y endpointing | Detectar inicio y fin de una utterance |
+| VAD local | Detectar inicio y fin de una utterance mediante `webrtcvad` |
 
-| STT | Transcribir audio PCM con Deepgram |
+| STT realtime | Transcribir audio en tiempo real via WebSocket de Deepgram |
 
-| LLM | Generar respuesta textual breve |
+| STT batch | Transcribir utterances completas via HTTP de Deepgram con deteccion de idioma |
+
+| Turn manager | Coordinar transcripciones, prefetch, ventana de gracia y pipeline de respuesta |
+
+| LLM | Generar respuesta textual breve con streaming |
 
 | TTS | Sintetizar audio de salida con Deepgram |
 
@@ -266,19 +288,27 @@ El sistema se compone de los siguientes bloques funcionales:
 
 3. Twilio abre el WebSocket bidireccional y comienza a enviar eventos `connected`, `start` y `media`.
 
-4. El servidor acumula audio en frames PCM lineales y aplica VAD.
+4. El servidor acumula audio en frames PCM lineales y aplica VAD local con `webrtcvad`.
 
-5. Cuando detecta fin de turno, agrupa la utterance y la envia a Deepgram STT.
+5. En paralelo, el audio crudo se envia al canal STT realtime de Deepgram via WebSocket.
 
-6. El texto transcrito se pasa a OpenAI junto con prompt del sistema e historial reciente.
+6. Las transcripciones parciales del realtime disparan un prefetch silencioso de respuesta LLM.
 
-7. La respuesta textual se divide en segmentos aptos para TTS.
+7. Cuando el VAD local detecta fin de turno (silencio >= `END_SILENCE_FRAMES`), agrupa la utterance y la envia al STT batch de Deepgram via HTTP.
 
-8. Cada segmento se sintetiza con Deepgram TTS en `mulaw` a `8000 Hz`.
+8. El STT batch devuelve el transcript final autoritativo con deteccion de idioma.
 
-9. El backend envia el audio a Twilio mediante eventos `media` y sincroniza el fin de segmento con eventos `mark`.
+9. El turn manager evalua si el transcript final debe diferirse (ventana de gracia) o procesarse inmediatamente.
 
-10. Si el usuario interrumpe y el barge-in esta habilitado, el turno actual puede invalidarse y limpiarse.
+10. Si existe un prefetch de respuesta LLM compatible, se reutiliza directamente; de lo contrario se genera una nueva respuesta con streaming.
+
+11. La respuesta textual se divide en segmentos aptos para TTS.
+
+12. Cada segmento se sintetiza con Deepgram TTS en `mulaw` a `8000 Hz`, seleccionando la voz segun el idioma detectado.
+
+13. El backend envia el audio a Twilio mediante eventos `media` y sincroniza el fin de segmento con eventos `mark`.
+
+14. Si el usuario interrumpe y el barge-in esta habilitado, el turno actual puede invalidarse y limpiarse.
 
   
 
@@ -290,21 +320,29 @@ El sistema se compone de los siguientes bloques funcionales:
 
 | --- | --- | --- |
 
-| Entrada HTTP | `voice()` | Inicializa la llamada de voz |
+| Entrada HTTP | `STT_Server.voice()` | Inicializa la llamada de voz |
 
-| Entrada WebSocket | `media_stream()` | Orquesta el ciclo de vida del stream |
+| Entrada WebSocket | `STT_Server.media_stream()` | Orquesta el ciclo de vida del stream |
 
-| Audio/VAD | `handle_incoming_media()` | Convierte y segmenta el audio entrante |
+| Audio/VAD | `audio_ingest.handle_incoming_media()` | Convierte, segmenta y detecta utterances |
 
-| STT | `transcribe_sync()` y `transcribe_block()` | Envia audio a Deepgram y extrae transcript |
+| STT Realtime | `deepgram_stt_realtime.run_realtime_stt()` | Transcripcion en tiempo real via WebSocket |
 
-| LLM | `call_llm()` | Consulta el modelo conversacional |
+| STT Batch | `deepgram_stt_batch.transcribe_block()` | Transcripcion autoritativa via HTTP |
 
-| TTS | `stream_tts_segment()` | Solicita sintesis a Deepgram |
+| Turn Manager | `turn_manager.process_transcripts()` | Coordina prefetch, gracia y pipeline de respuesta |
 
-| Playback | `playback_loop()` | Emite audio y marcas a Twilio |
+| Batch Worker | `turn_manager.process_local_utterances()` | Procesa utterances del VAD local con STT batch |
 
-| Sesion | `CallSession` | Aisla el estado de una llamada |
+| LLM | `openai_llm.call_llm()` / `stream_llm_reply_sync()` | Genera respuesta con streaming |
+
+| TTS | `deepgram_tts.stream_tts_segment()` | Solicita sintesis a Deepgram |
+
+| Playback | `playback_service.playback_loop()` | Emite audio y marcas a Twilio |
+
+| Sesion | `session.CallSession` | Aisla el estado de una llamada |
+
+| Idioma | `language.detect_language()` / `looks_like_incomplete_utterance()` | Deteccion de idioma y analisis linguistico |
 
   
 
@@ -418,13 +456,17 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 
   
 
-- Las constantes globales se expresan en mayusculas.
+- Las constantes globales se expresan en mayusculas y se definen en `config.py`.
 
 - Las rutas HTTP y WebSocket usan nombres breves y semanticos.
 
-- La sesion por llamada se modela con la clase `CallSession`.
+- La sesion por llamada se modela con la clase `CallSession` en `domain/session.py`.
 
-- El archivo principal mantiene una estructura funcional centralizada; no hay separacion en paquetes por dominio.
+- Los adaptadores de servicios externos se agrupan en `adapters/`.
+
+- La logica de negocio se agrupa en `services/`.
+
+- El dominio (modelo de datos y reglas linguisticas) se agrupa en `domain/`.
 
   
 
@@ -472,9 +514,13 @@ El sistema no dispone de un modelo relacional ni de persistencia. El unico model
 
 | `history` | `list[dict[str, str]]` | Historial reciente de la conversacion |
 
-| `utterance_queue` | `asyncio.Queue` | Cola de utterances pendientes |
+| `utterance_queue` | `asyncio.Queue` | Cola de utterances completas para STT batch |
 
 | `playback_queue` | `asyncio.Queue` | Cola de audio/eventos de salida |
+
+| `stt_audio_queue` | `asyncio.Queue` | Cola de chunks de audio crudo para STT realtime |
+
+| `transcript_queue` | `asyncio.Queue` | Cola de eventos de transcripcion |
 
 | `tasks` | `set[asyncio.Task]` | Tareas asociadas a la sesion |
 
@@ -485,6 +531,32 @@ El sistema no dispone de un modelo relacional ni de persistencia. El unico model
 | `assistant_speaking` | `bool` | Indica si el asistente esta reproduciendo audio |
 
 | `assistant_started_at` | `float | None` | Timestamp del inicio de la reproduccion |
+
+| `current_transcript` | `str` | Transcripcion parcial o final en curso |
+
+| `reply_source_text` | `str` | Texto fuente del pipeline de respuesta activo |
+
+| `reply_task` | `asyncio.Task | None` | Tarea del pipeline de respuesta activo |
+
+| `partial_reply_task` | `asyncio.Task | None` | Tarea de debounce para prefetch desde parciales |
+
+| `prefetched_reply_source_text` | `str` | Texto fuente del prefetch LLM |
+
+| `prefetched_reply_text` | `str` | Respuesta prefetched lista para reutilizar |
+
+| `prefetched_reply_task` | `asyncio.Task | None` | Tarea del prefetch LLM en curso |
+
+| `awaiting_local_final` | `bool` | Indica que el VAD local detecto fin de utterance y espera resultado batch |
+
+| `pending_realtime_final` | `dict | None` | Final realtime almacenado como fallback mientras se espera batch |
+
+| `deferred_final_text` | `str` | Texto final diferido en ventana de gracia |
+
+| `deferred_final_language` | `str | None` | Idioma del final diferido |
+
+| `deferred_final_flush_task` | `asyncio.Task | None` | Timer de la ventana de gracia |
+
+| `stt_failure_announced` | `bool` | Indica si ya se anuncio fallo de STT al usuario |
 
 | `closed` | `bool` | Indica si la sesion fue cerrada |
 
@@ -604,11 +676,37 @@ El sistema usa `webrtcvad` y umbrales configurables para detectar:
 
   
 
-Cuando una utterance cierra, el backend envia el bloque de audio resultante a Deepgram STT y obtiene el transcript y el idioma detectado o inferido.
+El sistema emplea una arquitectura de STT dual:
 
   
 
-### 6.5 Generacion conversacional
+- **STT Realtime**: el audio crudo se envia continuamente a Deepgram via WebSocket. Se obtienen transcripciones parciales e intermedias que permiten al sistema anticipar la respuesta del asistente. La conexion utiliza un sistema de candidatos con fallback automatico ante rechazos HTTP 400.
+
+- **STT Batch**: cuando el VAD local detecta fin de utterance, el bloque de audio completo se envia a Deepgram via HTTP. Esta transcripcion es autoritativa y soporta deteccion de idioma, lo cual es esencial para el soporte bilingue.
+
+  
+
+El turn manager coordina ambas fuentes: si el batch STT tarda, el final del realtime se almacena como fallback.
+
+  
+
+### 6.5 Gestion de turnos y ventana de gracia
+
+  
+
+El turn manager implementa los siguientes mecanismos:
+
+  
+
+- **Prefetch silencioso**: las transcripciones parciales disparan una consulta LLM anticipada. Si la transcripcion final coincide con el parcial, se reutiliza la respuesta sin espera adicional.
+
+- **Ventana de gracia**: cuando una transcripcion final es corta (hasta `SHORT_FINAL_MAX_WORDS` palabras) o termina en un marcador linguistico incompleto (como "and", "because", "para"), el sistema difiere su procesamiento durante `FINAL_TRANSCRIPT_GRACE_MS` milisegundos. Si llega un nuevo final en ese periodo, ambos se combinan. Si no, se procesa el texto acumulado.
+
+- **Deteccion linguistica de incompletitud**: un conjunto de marcadores en ingles y espanol permite identificar utterances que probablemente no han terminado.
+
+  
+
+### 6.6 Generacion conversacional
 
   
 
@@ -628,11 +726,15 @@ Con ello se genera una respuesta breve mediante OpenAI.
 
   
 
-### 6.6 Sintesis TTS y playback
+### 6.7 Sintesis TTS y playback
 
   
 
-La respuesta textual se divide en segmentos y cada uno se sintetiza con Deepgram TTS. El audio resultante se fragmenta y se envia a Twilio con eventos `media`. Al final de cada segmento se emite un `mark` para sincronizar el estado del playback.
+La respuesta textual se divide en segmentos y cada uno se sintetiza con Deepgram TTS. El sistema selecciona automaticamente la voz segun el idioma detectado: `aura-2-thalia-en` para ingles y `aura-2-estrella-es` para espanol. El audio resultante se fragmenta y se envia a Twilio con eventos `media`. Al final de cada segmento se emite un `mark` para sincronizar el estado del playback.
+
+  
+
+Antes de la primera respuesta real, el sistema puede emitir un filler de espera configurable por idioma ("Okay, one moment." / "Claro, un momento.") si la generacion LLM tarda mas de `FILLER_DELAY_MS` milisegundos.
 
   
 
@@ -1014,11 +1116,11 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | --- | --- | --- |
 
-| `MIN_UTTERANCE_MS` | `240` | Duracion minima aceptada para una utterance |
+| `MIN_UTTERANCE_MS` | `180` | Duracion minima aceptada para una utterance |
 
 | `MIN_SPEECH_FRAMES` | `5` | Frames minimos de voz |
 
-| `END_SILENCE_FRAMES` | `6` | Frames de silencio para cierre de turno |
+| `END_SILENCE_FRAMES` | `18` | Frames de silencio para cierre de turno (540 ms) |
 
 | `SPEECH_START_FRAMES` | `2` | Frames requeridos para detectar inicio |
 
@@ -1026,17 +1128,17 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | `PRE_SPEECH_FRAMES` | `5` | Frames previos retenidos |
 
-| `TRIM_TRAILING_SILENCE_FRAMES` | `4` | Recorte final de silencio |
+| `TRIM_TRAILING_SILENCE_FRAMES` | `6` | Recorte final de silencio |
 
 | `MIN_VOICE_RMS` | `260` | Umbral RMS minimo de voz |
 
 | `BARGE_IN_MIN_RMS` | `700` | Umbral RMS minimo para barge-in |
 
-| `ENABLE_BARGE_IN` | `false` | Activa interrupcion del asistente |
+| `ENABLE_BARGE_IN` | `true` | Activa interrupcion del asistente |
 
 | `ASSISTANT_ECHO_IGNORE_MS` | `1200` | Ventana para ignorar eco inicial |
 
-| `LOG_TWILIO_PLAYBACK` | `true` | Activa logs de playback |
+| `LOG_TWILIO_PLAYBACK` | `false` | Activa logs de playback |
 
 | `TWILIO_OUTBOUND_PACING_MS` | `20` | Pausa entre frames salientes |
 
@@ -1046,9 +1148,21 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | `TTS_TIMEOUT_SEC` | `5.0` | Timeout maximo por segmento TTS |
 
-| `MAX_HISTORY_MESSAGES` | `10` | Longitud maxima del historial |
+| `MAX_HISTORY_MESSAGES` | `12` | Longitud maxima del historial |
 
-| `MAX_RESPONSE_TOKENS` | `150` | Limite de tokens de respuesta |
+| `MAX_RESPONSE_TOKENS` | `80` | Limite de tokens de respuesta |
+
+| `FILLER_DELAY_MS` | `1200` | Milisegundos antes de emitir el filler de espera |
+
+| `FINAL_TRANSCRIPT_GRACE_MS` | `1400` | Ventana de gracia para diferir finals cortos/incompletos |
+
+| `SHORT_FINAL_MAX_WORDS` | `6` | Umbral de palabras para considerar un final como corto |
+
+| `PARTIAL_TRANSCRIPT_START_CHARS` | `18` | Caracteres minimos para iniciar prefetch desde parciales |
+
+| `PARTIAL_TRANSCRIPT_DEBOUNCE_MS` | `350` | Debounce antes de lanzar prefetch |
+
+| `DEEPGRAM_STT_ENDPOINTING_MS` | `700` | Endpointing de Deepgram realtime en milisegundos |
 
   
 
@@ -1132,7 +1246,7 @@ WEB_CONCURRENCY=1
 
   
 
-- Python 3.11 o superior recomendado;
+- Python 3.13 o superior recomendado;
 
 - acceso a credenciales validas de OpenAI y Deepgram;
 
@@ -1228,6 +1342,28 @@ Pasos recomendados:
 
   
 
+## Despliegue en Azure (App Service con Git)
+
+  
+
+El proyecto soporta despliegue directo a Azure App Service mediante `git push`:
+
+  
+
+1. Crear una Azure Web App con runtime Python 3.13.
+
+2. Configurar el deployment center con Git local.
+
+3. Agregar el remote de Azure: `git remote add Azure <url>`.
+
+4. Configurar variables de entorno en la Web App.
+
+5. Desplegar con `git push Azure main`.
+
+6. Verificar el endpoint de health check `/`.
+
+  
+
 ## Consideraciones para produccion
 
   
@@ -1298,7 +1434,7 @@ Se recomiendan al menos las siguientes validaciones:
 
 - documentar cualquier cambio de modelo o parametros de audio;
 
-- controlar el crecimiento del archivo principal `STT_Server.py` para evitar complejidad excesiva;
+- controlar el crecimiento de los modulos para evitar complejidad excesiva;
 
 - eliminar dependencias heredadas cuando dejen de ser necesarias.
 
@@ -1330,19 +1466,33 @@ Se recomiendan al menos las siguientes validaciones:
 
 - recepcion de llamadas con Twilio Media Streams;
 
-- VAD con segmentacion por turnos;
+- VAD local con webrtcvad y segmentacion por turnos;
 
-- STT con Deepgram;
+- STT dual: realtime (WebSocket) para parciales y prefetch, batch (HTTP) para finals autoritativos con deteccion de idioma;
 
-- LLM con OpenAI;
+- sistema de candidatos con fallback automatico para conexiones STT;
 
-- TTS con Deepgram;
+- prefetch silencioso de respuesta LLM desde transcripciones parciales;
 
-- historial corto por sesion;
+- ventana de gracia para diferir finals cortos o linguisticamente incompletos;
+
+- deteccion linguistica de utterances incompletas (marcadores en ingles y espanol);
+
+- LLM con OpenAI GPT-4o-mini con streaming;
+
+- TTS con Deepgram, seleccion automatica de voz por idioma;
+
+- filler de espera configurable por idioma;
+
+- barge-in (interrupcion del asistente por el usuario);
+
+- historial corto por sesion (hasta 12 mensajes);
 
 - saludo inicial configurable;
 
-- endpoints de diagnostico y health check.
+- endpoints de diagnostico y health check;
+
+- arquitectura modular: adapters, domain, services.
 
   
 
@@ -1366,17 +1516,17 @@ Se recomiendan al menos las siguientes validaciones:
 
   
 
-1. separar el archivo principal en modulos por dominio;
+1. implementar pruebas unitarias e integracion;
 
-2. implementar pruebas unitarias e integracion;
+2. agregar validacion de origen o firma para Twilio;
 
-3. agregar validacion de origen o firma para Twilio;
+3. incorporar observabilidad estructurada;
 
-4. incorporar observabilidad estructurada;
+4. persistir metricas y eventos de llamada;
 
-5. persistir metricas y eventos de llamada;
+5. limpiar scripts y dependencias heredadas de STT local si ya no forman parte del roadmap;
 
-6. limpiar scripts y dependencias heredadas de STT local si ya no forman parte del roadmap.
+6. agregar persistencia de conversaciones en base de datos.
 
   
 
