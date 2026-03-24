@@ -42,6 +42,7 @@ async def play_tts_from_text_queue(
     text_queue: asyncio.Queue[str | None],
 ) -> list[tuple[float | None, float]]:
     metrics: list[tuple[float | None, float]] = []
+    first_emitted = False
 
     while True:
         text = await text_queue.get()
@@ -49,6 +50,22 @@ async def play_tts_from_text_queue(
             break
         if generation != session.active_generation:
             break
+
+        # After the first segment is spoken, merge any already-queued
+        # segments into a single TTS call to reduce inter-segment gaps.
+        end_of_stream = False
+        if first_emitted:
+            while not text_queue.empty():
+                try:
+                    peek = text_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if peek is None:
+                    end_of_stream = True
+                    break
+                text += " " + peek
+
+        first_emitted = True
 
         try:
             metric = await asyncio.wait_for(
@@ -61,6 +78,9 @@ async def play_tts_from_text_queue(
             break
         except Exception:
             log.exception("TTS error en %s", session.session_key)
+            break
+
+        if end_of_stream:
             break
 
     return metrics

@@ -21,7 +21,7 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
     loop = asyncio.get_running_loop()
     ttfb_ms: float | None = None
     started_at = time.perf_counter()
-    tts_language = infer_supported_language_from_text(text, fallback=session.preferred_language)
+    tts_language = session.preferred_language if session.preferred_language else infer_supported_language_from_text(text, fallback="en")
     model = get_tts_model(tts_language)
     params = urllib.parse.urlencode(
         {

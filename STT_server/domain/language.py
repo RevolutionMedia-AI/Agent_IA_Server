@@ -225,7 +225,7 @@ def looks_like_incomplete_utterance(text: str) -> bool:
     return False
 
 
-def split_tts_segments(text: str, max_chars: int = 150) -> list[str]:
+def split_tts_segments(text: str, max_chars: int = 300) -> list[str]:
     stripped = text.strip()
     if not stripped:
         return []
@@ -237,7 +237,7 @@ def split_tts_segments(text: str, max_chars: int = 150) -> list[str]:
     for char in stripped:
         current.append(char)
         count += 1
-        if char in ".!?" and count >= 40:
+        if char in ".!?" and count >= 80:
             segment = "".join(current).strip()
             if segment:
                 segments.append(segment)
@@ -266,7 +266,7 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
         cut_index: int | None = None
 
         for index, char in enumerate(remainder):
-            if char in ".!?\n":
+            if char in ".!?\n" and index >= 15:
                 cut_index = index + 1
                 break
 
