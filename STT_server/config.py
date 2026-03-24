@@ -91,4 +91,5 @@ INITIAL_GREETING_TEXT = os.getenv(
 	"INITIAL_GREETING_TEXT",
 	"Thank you for calling Cialix Customer Support. My name is Tessa. How can I help you today?",
 ).strip()
+IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 

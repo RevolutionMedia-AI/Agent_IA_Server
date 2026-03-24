@@ -90,6 +90,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
 
                 if not session.assistant_speaking:
                     session.assistant_started_at = time.perf_counter()
+                    session.last_activity_at = time.monotonic()
                 session.assistant_speaking = True
                 chunk = item["data"]
                 sent_frames = 0

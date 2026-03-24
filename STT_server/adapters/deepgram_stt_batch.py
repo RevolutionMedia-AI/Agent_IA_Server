@@ -9,7 +9,6 @@ import wave
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     DEEPGRAM_API_KEY,
-    DEEPGRAM_STT_DETECT_LANGUAGE,
     DEEPGRAM_STT_MODEL,
     DEEPGRAM_STT_PUNCTUATE,
     DEEPGRAM_STT_SMART_FORMAT,
@@ -80,8 +79,8 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
     hint = normalize_deepgram_language(language_hint)
     if hint:
         params["language"] = hint
-    elif DEEPGRAM_STT_DETECT_LANGUAGE:
-        params["detect_language"] = "true"
+    else:
+        params["language"] = "multi"
 
     url = f"https://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
     wav_audio = pcm16_to_wav_bytes(pcm16_audio)

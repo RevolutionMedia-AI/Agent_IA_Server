@@ -1,6 +1,7 @@
 from collections import deque
 from dataclasses import dataclass, field
 import asyncio
+import time
 
 from STT_server.config import (
     PLAYBACK_QUEUE_MAXSIZE,
@@ -47,6 +48,7 @@ class CallSession:
     deferred_final_flush_task: asyncio.Task | None = None
     stt_failure_announced: bool = False
     closed: bool = False
+    last_activity_at: float = field(default_factory=time.monotonic)
 
 
 

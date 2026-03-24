@@ -15,7 +15,7 @@ from STT_server.domain.session import CallSession
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import play_initial_greeting, playback_loop
-from STT_server.services.session_runtime import cleanup_session, register_session, track_task
+from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, register_session, track_task
 from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_local_utterances, process_transcripts
 
 
@@ -96,6 +96,7 @@ async def media_stream(ws: WebSocket) -> None:
                     ),
                 )
                 track_task(session, asyncio.create_task(play_initial_greeting(session)))
+                track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 continue
 
             if event == "media":

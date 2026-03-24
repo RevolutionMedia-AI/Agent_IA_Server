@@ -82,6 +82,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                         await interrupt_current_turn(session)
 
                 if not session.assistant_speaking and session.voice_streak >= SPEECH_START_FRAMES:
+                    session.last_activity_at = time.monotonic()
                     session.speech_frames.extend(session.pre_speech_frames)
                     session.speech_frame_count = session.voice_streak
                     session.silence_frames = 0

@@ -307,6 +307,11 @@ NON_ACTIONABLE_PHRASES = {
     "espera", "oh", "oh well", "um", "uh", "hmm", "ah", "right",
     "got it", "i see", "oh ok", "oh okay", "thanks", "thank you",
     "gracias",
+    # Lone pronouns / fragments that Deepgram emits as isolated finals
+    "i", "he", "she", "we", "they", "it", "you", "me", "us", "them",
+    "yo", "el", "ella", "ellos", "nosotros",
+    "ah bueno", "oh bueno", "bueno", "bien", "pues", "este",
+    "so", "well", "like", "actually", "anyway",
 }
 
 
