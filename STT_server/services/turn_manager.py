@@ -307,6 +307,18 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
         if not text or session.closed:
             return
 
+    # If still incomplete after grace, give one more grace period for
+    # the continuation to arrive before processing a partial sentence.
+    if looks_like_incomplete_utterance(text):
+        log.info("Texto aún incompleto tras grace en %s, esperando más: %s", session.session_key, text)
+        try:
+            await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 1000.0)
+        except asyncio.CancelledError:
+            return
+        text = session.deferred_final_text.strip()
+        if not text or session.closed:
+            return
+
     # If the assistant is still speaking, wait until playback finishes
     # before flushing so we don't interrupt the current response.
     if session.assistant_speaking:
