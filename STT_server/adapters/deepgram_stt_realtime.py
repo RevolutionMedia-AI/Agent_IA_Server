@@ -142,6 +142,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
     while not session.closed:
         sender_task: asyncio.Task | None = None
         last_invalid_status: InvalidStatus | None = None
+        received_any_result = False
         try:
             for params in build_deepgram_realtime_candidates(session.preferred_language):
                 url = build_deepgram_realtime_url_from_params(params)
@@ -160,7 +161,6 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                         )
 
                     async with realtime_connection as dg_ws:
-                        attempt = 0
                         sender_task = asyncio.create_task(deepgram_audio_sender(dg_ws, session))
                         log.info(
                             "Deepgram realtime conectado en %s con params=%s",
@@ -172,6 +172,11 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                             try:
                                 raw_message = await dg_ws.recv()
                             except ConnectionClosed:
+                                if not received_any_result:
+                                    log.warning(
+                                        "Deepgram cerro conexion sin enviar resultados en %s",
+                                        session.session_key,
+                                    )
                                 break
 
                             if isinstance(raw_message, bytes):
@@ -181,6 +186,8 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                             message_type = payload.get("type")
 
                             if message_type == "Results":
+                                received_any_result = True
+                                attempt = 0
                                 transcript, language, is_final, speech_final = extract_deepgram_stream_result(
                                     payload,
                                     fallback_language=session.preferred_language,
@@ -198,6 +205,8 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                                 continue
 
                             if message_type == "UtteranceEnd" and session.current_transcript:
+                                received_any_result = True
+                                attempt = 0
                                 await on_transcript(
                                     {
                                         "text": session.current_transcript,
