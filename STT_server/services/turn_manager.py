@@ -20,7 +20,7 @@ from STT_server.config import (
     TEXT_SEGMENT_QUEUE_MAXSIZE,
     TTS_TIMEOUT_SEC,
 )
-from STT_server.domain.language import detect_language, get_filler_text, get_stt_failure_prompt, looks_like_incomplete_utterance, normalize_supported_language, split_tts_segments
+from STT_server.domain.language import detect_language, get_filler_text, get_stt_failure_prompt, is_non_actionable_utterance, looks_like_incomplete_utterance, normalize_supported_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
@@ -240,6 +240,11 @@ async def cancel_deferred_final_flush(session: CallSession) -> None:
             await task
 
 
+# Very short utterances (≤ this many words) are always deferred even with
+# punctuation so the user has time to continue speaking.
+VERY_SHORT_WORD_LIMIT = 3
+
+
 def should_defer_final_transcript(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -248,10 +253,16 @@ def should_defer_final_transcript(text: str) -> bool:
     if looks_like_incomplete_utterance(stripped):
         return True
 
+    word_count = len(stripped.split())
+
+    # Very short phrases like "Hi.", "Wait.", "Oh, well." are almost
+    # never a complete turn — always defer them to accumulate more text.
+    if word_count <= VERY_SHORT_WORD_LIMIT:
+        return True
+
     if stripped[-1] in ".!?":
         return False
 
-    word_count = len(stripped.split())
     return word_count <= SHORT_FINAL_MAX_WORDS
 
 
@@ -571,6 +582,20 @@ async def process_transcripts(session: CallSession) -> None:
                         log.info("Defiriendo final (asistente hablando) en %s: %s", session.session_key, text)
                     else:
                         log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
+                    await cancel_deferred_final_flush(session)
+                    task = asyncio.create_task(flush_deferred_final_after_grace(session))
+                    session.deferred_final_flush_task = task
+                    session.tasks.add(task)
+                    task.add_done_callback(session.tasks.discard)
+                    continue
+
+                # If the text is purely non-actionable (greeting, filler,
+                # name mention) don't trigger a turn — just defer it so it
+                # can be merged with the real request when it arrives.
+                if is_non_actionable_utterance(text):
+                    session.deferred_final_text = text
+                    session.deferred_final_language = language
+                    log.info("Defiriendo final no-accionable en %s: %s", session.session_key, text)
                     await cancel_deferred_final_flush(session)
                     task = asyncio.create_task(flush_deferred_final_after_grace(session))
                     session.deferred_final_flush_task = task

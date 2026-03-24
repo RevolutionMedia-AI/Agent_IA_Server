@@ -289,6 +289,38 @@ def normalize_deepgram_language(lang: str | None) -> str | None:
     return None
 
 
+# Greetings, fillers, name-mentions and acknowledgments that should not
+# trigger an LLM response on their own.  They get deferred and merged
+# with the real user request when it arrives.
+NON_ACTIONABLE_PHRASES = {
+    # English greetings / fillers
+    "hi", "hello", "hey", "yo", "good morning", "good afternoon",
+    "good evening", "good day", "how are you", "howdy",
+    # Spanish greetings / fillers
+    "hola", "buenos dias", "buenas tardes", "buenas noches", "buenas",
+    "buenos", "que tal",
+    # Agent name variations
+    "tessa", "hi tessa", "hello tessa", "hey tessa", "hola tessa",
+    # Acknowledgments / stalls
+    "ok", "okay", "sure", "yes", "yeah", "yep", "no", "nah", "nope",
+    "si", "vale", "wait", "hold on", "one moment", "un momento",
+    "espera", "oh", "oh well", "um", "uh", "hmm", "ah", "right",
+    "got it", "i see", "oh ok", "oh okay", "thanks", "thank you",
+    "gracias",
+}
+
+
+def is_non_actionable_utterance(text: str) -> bool:
+    """Return True if the text is purely a greeting / filler / acknowledgment."""
+    cleaned = text.strip().lower()
+    # Strip trailing punctuation for matching
+    cleaned = cleaned.rstrip(".,!?;:")
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return False
+    return cleaned in NON_ACTIONABLE_PHRASES
+
+
 def looks_like_incomplete_utterance(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
