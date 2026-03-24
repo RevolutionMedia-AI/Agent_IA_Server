@@ -68,7 +68,7 @@ def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
     if hint:
         params["language"] = hint
     elif DEEPGRAM_STT_DETECT_LANGUAGE:
-        params["detect_language"] = "true"
+        params["language"] = "multi"
 
     return f"wss://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
 
@@ -97,13 +97,13 @@ def build_deepgram_realtime_candidates(language_hint: str | None = None) -> list
         if hint:
             params["language"] = hint
         elif DEEPGRAM_STT_DETECT_LANGUAGE:
-            params["detect_language"] = "true"
+            params["language"] = "multi"
         candidates.append(params)
 
         no_vad_params = {key: value for key, value in params.items() if key != "vad_events"}
         candidates.append(no_vad_params)
 
-        neutral_params = {key: value for key, value in no_vad_params.items() if key not in {"language", "detect_language"}}
+        neutral_params = {key: value for key, value in no_vad_params.items() if key not in {"language"}}
         candidates.append(neutral_params)
 
     unique_candidates: list[dict[str, str]] = []
