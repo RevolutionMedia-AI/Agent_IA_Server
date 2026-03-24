@@ -307,6 +307,20 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
         if not text or session.closed:
             return
 
+    # If the assistant is still speaking, wait until playback finishes
+    # before flushing so we don't interrupt the current response.
+    if session.assistant_speaking:
+        for _ in range(20):  # up to ~10s extra wait
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                return
+            if not session.assistant_speaking or session.closed:
+                break
+        text = session.deferred_final_text.strip()
+        if not text or session.closed:
+            return
+
     language = normalize_supported_language(session.deferred_final_language or session.preferred_language or DEFAULT_CALL_LANGUAGE)
     session.deferred_final_text = ""
     session.deferred_final_language = None
@@ -536,10 +550,16 @@ async def process_transcripts(session: CallSession) -> None:
                     session.deferred_final_text = ""
                     session.deferred_final_language = None
 
-                if should_defer_final_transcript(text):
+                # While the assistant is speaking, always defer the final
+                # so we don't cut off the current response with a new turn.
+                if session.assistant_speaking or should_defer_final_transcript(text):
                     session.deferred_final_text = text
                     session.deferred_final_language = language
-                    log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
+                    if session.assistant_speaking:
+                        log.info("Defiriendo final (asistente hablando) en %s: %s", session.session_key, text)
+                    else:
+                        log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
+                    await cancel_deferred_final_flush(session)
                     task = asyncio.create_task(flush_deferred_final_after_grace(session))
                     session.deferred_final_flush_task = task
                     session.tasks.add(task)

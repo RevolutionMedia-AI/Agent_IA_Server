@@ -56,7 +56,7 @@ STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5.0"))
 TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "5.0"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
-MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "80"))
+MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
 DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "en").strip().lower()
 
 
@@ -89,6 +89,6 @@ STT_FAILURE_PROMPT_ES = os.getenv("STT_FAILURE_PROMPT_ES", "Estoy teniendo probl
 INITIAL_GREETING_ENABLED = os.getenv("INITIAL_GREETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 INITIAL_GREETING_TEXT = os.getenv(
 	"INITIAL_GREETING_TEXT",
-	"Good day. My name is Athenas. Please tell me how I can help you today.",
+	"Thank you for calling Cialix Customer Support. My name is Tessa. How can I help you today?",
 ).strip()
 
