@@ -103,33 +103,35 @@ async def stream_tts_segment(
     # Request 8 kHz directly so we avoid downsampling most of the time.
     sample_rate = RIME_TTS_SAMPLE_RATE
 
-    ws_request = {
-        "text": text,
-        "speaker": speaker,
-        "modelId": RIME_TTS_MODEL_ID,
-        "lang": lang_code,
-        "audioFormat": "pcm",
-        "samplingRate": sample_rate,
-    }
-
     log.info(
         "Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d",
         speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text),
     )
 
+    # Rime WS expects config as query params during handshake, text via message.
+    from urllib.parse import urlencode
+    qs = urlencode({
+        "speaker": speaker,
+        "modelId": RIME_TTS_MODEL_ID,
+        "lang": lang_code,
+        "audioFormat": "pcm",
+        "samplingRate": sample_rate,
+    })
+    ws_url = f"{RIME_WS_URL}?{qs}"
+
     extra_headers = {
         "Authorization": f"Bearer {RIME_API_KEY}",
-        "Content-Type": "application/json",
     }
 
     try:
         async with websockets.connect(
-            RIME_WS_URL,
+            ws_url,
             additional_headers=extra_headers,
             close_timeout=5,
             open_timeout=10,
         ) as ws:
-            await ws.send(json.dumps(ws_request))
+            # Send just the text after connection is established.
+            await ws.send(json.dumps({"text": text}))
 
             async for raw_msg in ws:
                 msg = json.loads(raw_msg)
