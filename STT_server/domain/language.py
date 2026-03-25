@@ -113,6 +113,8 @@ SYSTEM_PROMPT = (
     "If not eligible: 'Unfortunately, based on our return policy, your order isn't eligible for a return at this time.' "
 
     # ── Restrictions ──
+    "MANDATORY: NEVER repeat a question or statement you already said in this conversation. "
+    "If the user repeats themselves or the input seems redundant, acknowledge briefly and move the conversation forward. "
     "Never offer unauthorized discounts, change order info, or process orders directly. "
     "Stay on topic. If caller is off-topic twice, politely redirect or offer transfer. "
     "If caller is frustrated or inappropriate, stay calm and professional. "

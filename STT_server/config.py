@@ -30,6 +30,7 @@ RIME_API_KEY = os.getenv("RIME_API_KEY")
 RIME_TTS_MODEL_ID = os.getenv("RIME_TTS_MODEL_ID", "arcana")
 RIME_TTS_SPEAKER_EN = os.getenv("RIME_TTS_SPEAKER_EN", "lyra")
 RIME_TTS_SPEAKER_ES = os.getenv("RIME_TTS_SPEAKER_ES", "celestino")
+RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
 
 
 TWILIO_SR = 8000

@@ -393,10 +393,45 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
         if not text or session.closed:
             return
 
+    # ── Discard fragment echoes ──
+    # If the deferred text is a substring of the last processed user text
+    # it is just an echo/suffix Deepgram re-sent — not a new utterance.
+    last = session.last_processed_user_text.strip().lower()
+    if last and text.strip().lower() in last:
+        log.info(
+            "Descartando final diferido (fragmento duplicado) en %s: %s",
+            session.session_key, text,
+        )
+        session.deferred_final_text = ""
+        session.deferred_final_language = None
+        session.deferred_final_flush_task = None
+        return
+
+    # Also discard if it duplicates the last user entry in history.
+    if session.history:
+        for entry in reversed(session.history):
+            if entry["role"] == "user":
+                if text.strip().lower() == entry["content"].strip().lower():
+                    log.info(
+                        "Descartando final diferido (duplica historial) en %s: %s",
+                        session.session_key, text,
+                    )
+                    session.deferred_final_text = ""
+                    session.deferred_final_language = None
+                    session.deferred_final_flush_task = None
+                    return
+                break  # only check the most recent user message
+
     language = normalize_supported_language(session.deferred_final_language or session.preferred_language or DEFAULT_CALL_LANGUAGE)
     session.deferred_final_text = ""
     session.deferred_final_language = None
     session.deferred_final_flush_task = None
+
+    # Clear stale prefetched replies so the deferred final always uses
+    # a fresh LLM call — the prefetch was computed for a different partial.
+    await cancel_prefetch_task(session)
+    clear_prefetched_reply(session)
+
     log.info("Procesando final diferido en %s: %s", session.session_key, text)
     await process_final_transcript(session, text, language, speech_final=True)
 
@@ -462,6 +497,7 @@ async def handle_agent_reply(
     if generation != session.active_generation or not reply:
         return
 
+    session.last_processed_user_text = user_text
     session.history.extend(
         [
             {"role": "user", "content": user_text},
@@ -577,6 +613,16 @@ async def process_local_utterances(session: CallSession) -> None:
             pending_realtime = session.pending_realtime_final
             session.pending_realtime_final = None
             if pending_realtime:
+                # If a deferred final is already being flushed for this text,
+                # skip the fallback to avoid processing the same turn twice.
+                deferred = session.deferred_final_text.strip().lower()
+                fallback_text = (pending_realtime.get("text") or "").strip().lower()
+                if deferred and (fallback_text in deferred or deferred in fallback_text):
+                    log.info(
+                        "Batch STT fallback omitido (deferred final ya en curso) en %s: %s",
+                        session.session_key, fallback_text,
+                    )
+                    continue
                 await enqueue_transcript_event(session, pending_realtime)
     except asyncio.CancelledError:
         raise
