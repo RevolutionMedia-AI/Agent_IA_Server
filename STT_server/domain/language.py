@@ -17,9 +17,10 @@ SYSTEM_PROMPT = (
     # ── Voice behavior (top priority) ──
     "You are Tessa, Cialix Customer Service AI Assistant on a live phone call. "
     "Cialix is pronounced sigh-ah-licks. "
-    "Speak in 1-2 short sentences max. Be polite, professional, empathetic, calm, and clear. "
+    "Be polite, professional, empathetic, calm, and clear. "
     "Never use lists, markdown, URLs, or technical language. Everything you say is spoken aloud. "
     "Ask only one question at a time. Guide the caller step by step. "
+    "Provide as much detail as needed to fully answer the customer's question. "
     "If you don't understand, ask them to repeat briefly. Never invent information. "
     "Introduce yourself only once at the start. Never repeat greetings. "
     "Always identify as an AI assistant. Never give medical advice or make health claims. "
@@ -112,6 +113,14 @@ SYSTEM_PROMPT = (
     "Ask: 'Would you like me to repeat it?' "
     "If not eligible: 'Unfortunately, based on our return policy, your order isn't eligible for a return at this time.' "
 
+    # ── Order number simulation (demo mode) ──
+    "MANDATORY: When the customer provides a number that is 5 or 6 digits long, treat it as a valid order number. "
+    "Simulate realistic order details as if you looked it up: generate a plausible order date within the last 30 days, "
+    "a shipping status (e.g. 'Processing', 'Shipped', 'Delivered'), a random USPS-style tracking number, "
+    "and 1-3 Cialix products with quantities and prices that add up to a reasonable total. "
+    "Present this information naturally and confidently as if it came from a real database. "
+    "If the customer asks follow-up questions about the simulated order, stay consistent with the details you already gave. "
+
     # ── Conversation style ──
     "MANDATORY: Sound natural and conversational, like a real person on the phone. "
     "NEVER use filler phrases such as 'One moment', 'One moment please', 'Let me check', 'Wait let me check the answer', "
@@ -132,20 +141,22 @@ SYSTEM_PROMPT = (
     "After confirming no further help needed: 'Thank you for contacting Cialix Customer Support. If you need further help, don't hesitate to reach out. Have a great day!'"
 )
 
-SPANISH_LANGUAGE_MARKERS = (
-    "hola",
-    "gracias",
-    "por favor",
-    "buenos",
-    "buenas",
-    "necesito",
-    "quiero",
-    "puedo",
-    "ayuda",
-    "como",
-    "donde",
-    "cuanto",
-)
+# ── Spanish language markers (disabled — full English mode) ──
+# SPANISH_LANGUAGE_MARKERS = (
+#     "hola",
+#     "gracias",
+#     "por favor",
+#     "buenos",
+#     "buenas",
+#     "necesito",
+#     "quiero",
+#     "puedo",
+#     "ayuda",
+#     "como",
+#     "donde",
+#     "cuanto",
+# )
+SPANISH_LANGUAGE_MARKERS: tuple[str, ...] = ()  # empty — Spanish detection disabled
 
 ENGLISH_LANGUAGE_MARKERS = (
     "hello",
@@ -240,35 +251,47 @@ def normalize_supported_language(lang: str | None) -> str:
 
 
 def infer_supported_language_from_text(text: str, fallback: str = "en") -> str:
-    lowered = text.lower().strip()
-    if not lowered:
-        return normalize_supported_language(fallback)
-
-    english_hits = sum(marker in lowered for marker in ENGLISH_LANGUAGE_MARKERS)
-    spanish_hits = sum(marker in lowered for marker in SPANISH_LANGUAGE_MARKERS)
-    has_spanish_chars = any(char in lowered for char in "áéíóúñ¿¡")
-
-    if has_spanish_chars or spanish_hits > english_hits:
-        return "es"
-    if english_hits > spanish_hits:
-        return "en"
-    return normalize_supported_language(fallback)
+    # ── Spanish detection disabled — full English mode ──
+    # To re-enable, uncomment the block below and SPANISH_LANGUAGE_MARKERS.
+    return "en"
+    # lowered = text.lower().strip()
+    # if not lowered:
+    #     return normalize_supported_language(fallback)
+    #
+    # english_hits = sum(marker in lowered for marker in ENGLISH_LANGUAGE_MARKERS)
+    # spanish_hits = sum(marker in lowered for marker in SPANISH_LANGUAGE_MARKERS)
+    # has_spanish_chars = any(char in lowered for char in "áéíóúñ¿¡")
+    #
+    # if has_spanish_chars or spanish_hits > english_hits:
+    #     return "es"
+    # if english_hits > spanish_hits:
+    #     return "en"
+    # return normalize_supported_language(fallback)
 
 
 def detect_language(text: str) -> str:
-    return infer_supported_language_from_text(text, fallback=DEFAULT_CALL_LANGUAGE)
+    # Full English mode — always returns "en".
+    # To re-enable detection, uncomment the original line.
+    return "en"
+    # return infer_supported_language_from_text(text, fallback=DEFAULT_CALL_LANGUAGE)
 
 
 def get_language_instruction(lang: str) -> str:
-    if normalize_supported_language(lang) == "en":
-        return (
-            "Reply only in English. Keep responses to 1-2 short sentences. "
-            "Do not switch language unless the user explicitly does."
-        )
+    # Full English mode — always returns English instruction.
+    # To re-enable Spanish, uncomment the block below.
     return (
-        "Responde solo en espanol. Maximo 1-2 frases cortas. "
-        "No cambies de idioma salvo que el usuario lo haga explicitamente."
+        "Reply only in English. "
+        "Do not switch language unless the user explicitly does."
     )
+    # if normalize_supported_language(lang) == "en":
+    #     return (
+    #         "Reply only in English. Keep responses to 1-2 short sentences. "
+    #         "Do not switch language unless the user explicitly does."
+    #     )
+    # return (
+    #     "Responde solo en espanol. Maximo 1-2 frases cortas. "
+    #     "No cambies de idioma salvo que el usuario lo haga explicitamente."
+    # )
 
 
 def extract_structured_data(text: str) -> dict[str, str]:
@@ -315,19 +338,25 @@ def is_duplicate_collected_data(session, structured_data: dict[str, str]) -> boo
 
 
 def get_tts_model(lang: str) -> str:
-    if normalize_supported_language(lang) == "en":
-        return RIME_TTS_SPEAKER_EN
-    return RIME_TTS_SPEAKER_ES
+    # Full English mode — always returns English speaker.
+    return RIME_TTS_SPEAKER_EN
+    # if normalize_supported_language(lang) == "en":
+    #     return RIME_TTS_SPEAKER_EN
+    # return RIME_TTS_SPEAKER_ES
 
 
 def get_filler_text(lang: str) -> str:
     if not FILLER_TTS_ENABLED:
         return ""
-    return FILLER_TEXT_EN if normalize_supported_language(lang) == "en" else FILLER_TEXT_ES
+    # Full English mode — always returns English filler.
+    return FILLER_TEXT_EN
+    # return FILLER_TEXT_EN if normalize_supported_language(lang) == "en" else FILLER_TEXT_ES
 
 
 def get_stt_failure_prompt(lang: str) -> str:
-    return STT_FAILURE_PROMPT_EN if normalize_supported_language(lang) == "en" else STT_FAILURE_PROMPT_ES
+    # Full English mode — always returns English prompt.
+    return STT_FAILURE_PROMPT_EN
+    # return STT_FAILURE_PROMPT_EN if normalize_supported_language(lang) == "en" else STT_FAILURE_PROMPT_ES
 
 
 def normalize_deepgram_language(lang: str | None) -> str | None:
