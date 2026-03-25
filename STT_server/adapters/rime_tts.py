@@ -35,7 +35,7 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
         "lang": lang_code,
         "audioFormat": "mulaw",
         "samplingRate": 8000,
-        "phoneFilter": True,
+        "reduceLatency": True,
     }).encode("utf-8")
 
     headers = {
