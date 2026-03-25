@@ -28,15 +28,16 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
 
     lang_code = "eng" if normalize_supported_language(tts_language) == "en" else "spa"
 
-    payload = json.dumps({
+    payload_dict = {
         "speaker": speaker,
         "text": text,
         "modelId": RIME_TTS_MODEL_ID,
         "lang": lang_code,
         "audioFormat": "mulaw",
         "samplingRate": 8000,
-        "reduceLatency": True,
-    }).encode("utf-8")
+    }
+    log.info("Rime TTS request: speaker=%s model=%s lang=%s text_len=%d", speaker, RIME_TTS_MODEL_ID, lang_code, len(text))
+    payload = json.dumps(payload_dict).encode("utf-8")
 
     headers = {
         "Authorization": f"Bearer {RIME_API_KEY}",
@@ -71,6 +72,7 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
                 body = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
+            log.error("Rime TTS HTTP %d — headers: %s — body: %s", exc.code, dict(exc.headers), body)
             loop.call_soon_threadsafe(
                 emit_item,
                 {
