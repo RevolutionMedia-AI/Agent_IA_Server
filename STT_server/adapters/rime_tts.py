@@ -68,7 +68,7 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
         "text": text,
         "modelId": RIME_TTS_MODEL_ID,
         "lang": lang_code,
-        "audioFormat": "pcm",
+        "audioFormat": "wav",
         "samplingRate": 8000,
     }
     log.info("Rime TTS request: speaker=%s model=%s lang=%s text_len=%d", speaker, RIME_TTS_MODEL_ID, lang_code, len(text))
@@ -93,7 +93,9 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
 
                 data = json.loads(raw)
                 audio_b64 = data.get("audioContent", "")
-                pcm_bytes = base64.b64decode(audio_b64)
+                wav_bytes = base64.b64decode(audio_b64)
+                # Strip WAV header (44 bytes standard) to get raw PCM16
+                pcm_bytes = wav_bytes[44:] if len(wav_bytes) > 44 else wav_bytes
                 mulaw_bytes = _pcm16_to_mulaw(pcm_bytes)
 
                 for i in range(0, len(mulaw_bytes), 4096):
