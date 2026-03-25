@@ -117,12 +117,12 @@ async def stream_tts_segment(
         speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text),
     )
 
-    extra_headers = {"Authorization": f"Bearer {RIME_API_KEY}"}
+    # Rime WS authenticates via query parameter, not HTTP header.
+    ws_url = f"{RIME_WS_URL}?authToken={RIME_API_KEY}"
 
     try:
         async with websockets.connect(
-            RIME_WS_URL,
-            additional_headers=extra_headers,
+            ws_url,
             close_timeout=5,
             open_timeout=10,
         ) as ws:
@@ -164,6 +164,19 @@ async def stream_tts_segment(
                 if msg.get("is_final"):
                     break
 
+    except websockets.exceptions.InvalidStatus as exc:
+        body = ""
+        if hasattr(exc, "response") and exc.response:
+            try:
+                body = exc.response.body.decode("utf-8", errors="replace") if exc.response.body else ""
+            except Exception:
+                pass
+        log.error("Rime WS handshake rejected HTTP %s — body: %s", exc.response.status_code if hasattr(exc, "response") and exc.response else "?", body)
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": f"Rime WS handshake error: {exc}",
+        })
     except websockets.exceptions.ConnectionClosed as exc:
         log.error("Rime WS connection closed unexpectedly: %s", exc)
         emit_item({
