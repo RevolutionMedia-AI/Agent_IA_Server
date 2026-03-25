@@ -67,17 +67,13 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
         "speaker": speaker,
         "text": text,
         "modelId": RIME_TTS_MODEL_ID,
-        "lang": lang_code,
-        "audioFormat": "wav",
-        "samplingRate": 8000,
     }
-    log.info("Rime TTS request: speaker=%s model=%s lang=%s text_len=%d", speaker, RIME_TTS_MODEL_ID, lang_code, len(text))
+    log.info("Rime TTS payload: %s", json.dumps(payload_dict))
     payload = json.dumps(payload_dict).encode("utf-8")
 
     headers = {
         "Authorization": f"Bearer {RIME_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
 
     def producer() -> None:
