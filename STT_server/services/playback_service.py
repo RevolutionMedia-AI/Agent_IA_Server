@@ -128,6 +128,12 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
 
             if item_type == "audio":
                 if not session.stream_sid:
+                    # Wait briefly for Twilio to send the stream SID.
+                    for _ in range(50):  # up to 2.5 s
+                        await asyncio.sleep(0.05)
+                        if session.stream_sid:
+                            break
+                if not session.stream_sid:
                     continue
 
                 if not session.assistant_speaking:

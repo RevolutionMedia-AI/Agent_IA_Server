@@ -3,6 +3,7 @@ Quick local test: Rime WebSocket TTS protocol debugging.
 Tries multiple message formats to find what actually returns audio.
 """
 import asyncio
+import base64
 import json
 import sys
 from urllib.parse import urlencode
@@ -172,23 +173,28 @@ async def drain_all(label, endpoint, qs_params, message):
                     if isinstance(raw, bytes):
                         total_audio_bytes += len(raw)
                         print(f"    frame {frame_num}: BINARY {len(raw)} bytes (total audio: {total_audio_bytes})")
+                        if frame_num <= 2:
+                            print(f"      First 20 bytes hex: {raw[:20].hex()}")
                     else:
                         obj = json.loads(raw)
                         ftype = obj.get("type", "?")
                         if ftype == "chunk":
-                            audio_data = obj.get("data", "")
-                            decoded = base64.b64decode(audio_data)
+                            audio_b64 = obj.get("data", "")
+                            decoded = base64.b64decode(audio_b64)
                             total_audio_bytes += len(decoded)
-                            print(f"    frame {frame_num}: chunk — {len(decoded)} PCM bytes (total: {total_audio_bytes})")
+                            print(f"    frame {frame_num}: chunk — b64 len={len(audio_b64)} → decoded={len(decoded)} PCM bytes (total: {total_audio_bytes})")
+                            if frame_num <= 2:
+                                print(f"      First 20 bytes hex: {decoded[:20].hex()}")
                         elif ftype == "timestamps":
                             print(f"    frame {frame_num}: timestamps — words: {obj.get('word_timestamps',{}).get('words',[])}") 
                         else:
-                            print(f"    frame {frame_num}: TEXT {raw[:200]}")
+                            print(f"    frame {frame_num}: TEXT type={ftype} keys={list(obj.keys())}")
             except asyncio.TimeoutError:
                 print(f"  ✗ Timeout after {frame_num} frames, {total_audio_bytes} total audio bytes")
             except websockets.exceptions.ConnectionClosed as exc:
                 print(f"  Connection closed after {frame_num} frames: {exc}")
-            print(f"  Summary: {frame_num} frames, {total_audio_bytes} audio bytes")
+            duration_sec = total_audio_bytes / 2 / 8000 if total_audio_bytes > 0 else 0
+            print(f"  Summary: {frame_num} frames, {total_audio_bytes} audio bytes = {duration_sec:.2f}s @ 8kHz PCM16")
     except Exception as exc:
         print(f"  ✗ {type(exc).__name__}: {exc}")
 

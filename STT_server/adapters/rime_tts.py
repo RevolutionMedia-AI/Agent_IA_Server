@@ -159,10 +159,13 @@ async def stream_tts_segment(
                     })
                     break
 
-                if msg_type == "timestamps":
-                    # Final frame — stream is complete.
-                    log.info("Rime WS TTS complete (timestamps received)")
+                if msg_type == "done":
+                    log.info("Rime WS TTS complete (done frame)")
                     break
+
+                if msg_type == "timestamps":
+                    # Metadata frame — not end-of-stream; continue reading audio.
+                    continue
 
                 if msg_type == "chunk":
                     audio_b64 = msg.get("data", "")
