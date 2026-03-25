@@ -1,10 +1,11 @@
 import asyncio
+import contextlib
 import logging
 import time
 
 from fastapi import WebSocket
 
-from STT_server.adapters.deepgram_tts import stream_tts_segment
+from STT_server.adapters.rime_tts import stream_tts_segment
 from STT_server.adapters.twilio_media import send_twilio_clear, send_twilio_mark, send_twilio_media
 from STT_server.config import (
     DEEPGRAM_API_KEY,
@@ -37,6 +38,47 @@ async def enqueue_playback_clear(session: CallSession) -> None:
 
 async def interrupt_current_turn(session: CallSession) -> None:
     session.active_generation += 1
+
+    # Stop any pending response generation and prefetch.
+    if session.reply_task and not session.reply_task.done():
+        session.reply_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await session.reply_task
+        session.reply_task = None
+
+    if session.prefetched_reply_task and not session.prefetched_reply_task.done():
+        session.prefetched_reply_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await session.prefetched_reply_task
+        session.prefetched_reply_task = None
+
+    session.reply_source_text = ""
+    session.partial_reply_task = None
+    session.prefetched_reply_source_text = ""
+    session.prefetched_reply_text = ""
+
+    session.assistant_speaking = False
+    session.assistant_started_at = None
+    session.pending_marks.clear()
+    drain_queue_nowait(session.playback_queue)
+    await enqueue_playback_clear(session)
+
+
+async def handle_barge_in(session: CallSession) -> None:
+    """Alias claro para la logica de barge-in esperada por QA."""
+    await interrupt_current_turn(session)
+
+    if session.prefetched_reply_task and not session.prefetched_reply_task.done():
+        session.prefetched_reply_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await session.prefetched_reply_task
+        session.prefetched_reply_task = None
+
+    session.reply_source_text = ""
+    session.partial_reply_task = None
+    session.prefetched_reply_source_text = ""
+    session.prefetched_reply_text = ""
+
     session.assistant_speaking = False
     session.assistant_started_at = None
     session.pending_marks.clear()

@@ -1,9 +1,10 @@
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
-    DEEPGRAM_TTS_MODEL,
     FILLER_TEXT_EN,
     FILLER_TEXT_ES,
     FILLER_TTS_ENABLED,
+    RIME_TTS_SPEAKER_EN,
+    RIME_TTS_SPEAKER_ES,
     STREAMING_SEGMENT_MAX_CHARS,
     STT_FAILURE_PROMPT_EN,
     STT_FAILURE_PROMPT_ES,
@@ -261,10 +262,53 @@ def get_language_instruction(lang: str) -> str:
     )
 
 
+def extract_structured_data(text: str) -> dict[str, str]:
+    import re
+
+    results: dict[str, str] = {}
+    lowered = text.lower()
+
+    # Order number pattern (5-6 digits)
+    match = re.search(r"\b(\d{5,6})\b", text)
+    if match:
+        results["order_number"] = match.group(1)
+
+    # Email pattern
+    match = re.search(r"\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b", text)
+    if match:
+        results["email"] = match.group(1)
+
+    # Phone number pattern
+    match = re.search(r"\b(\+?\d{7,15})\b", re.sub(r"[\s().-]", "", text))
+    if match:
+        results["phone"] = match.group(1)
+
+    # Name pattern (simple)
+    if "my name is" in lowered or "mi nombre es" in lowered:
+        name_candidate = None
+        if "my name is" in lowered:
+            name_candidate = text.split("my name is", 1)[1].strip().split(" ")[0:3]
+        elif "mi nombre es" in lowered:
+            name_candidate = text.split("mi nombre es", 1)[1].strip().split(" ")[0:3]
+        if name_candidate:
+            results["name"] = " ".join(name_candidate).strip().strip(".?,!")
+
+    # Address or city request is more complex; skip for now.
+    return results
+
+
+def is_duplicate_collected_data(session, structured_data: dict[str, str]) -> bool:
+    for key, value in structured_data.items():
+        existing = session.collected_data.get(key)
+        if existing and existing.lower() == value.lower():
+            return True
+    return False
+
+
 def get_tts_model(lang: str) -> str:
     if normalize_supported_language(lang) == "en":
-        return DEEPGRAM_TTS_MODEL
-    return "aura-2-estrella-es"
+        return RIME_TTS_SPEAKER_EN
+    return RIME_TTS_SPEAKER_ES
 
 
 def get_filler_text(lang: str) -> str:

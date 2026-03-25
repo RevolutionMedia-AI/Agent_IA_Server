@@ -13,11 +13,26 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]:
+    # Include structured user state, not as a memory, but as a guide for LLM
     lang = session.preferred_language or detect_language(user_text)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": get_language_instruction(lang)},
     ]
+
+    if session.collected_data:
+        collected_items = ", ".join(f"{k}: {v}" for k, v in session.collected_data.items())
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "User state already collected in this session: "
+                    + collected_items
+                    + ". Do not ask for these details again."
+                ),
+            }
+        )
+
     messages.extend(session.history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_text})
     return messages

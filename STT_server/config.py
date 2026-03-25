@@ -22,14 +22,14 @@ DEEPGRAM_STT_PUNCTUATE = os.getenv("DEEPGRAM_STT_PUNCTUATE", "true").strip().low
 DEEPGRAM_STT_SMART_FORMAT = os.getenv("DEEPGRAM_STT_SMART_FORMAT", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEEPGRAM_STT_DETECT_LANGUAGE = os.getenv("DEEPGRAM_STT_DETECT_LANGUAGE", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEEPGRAM_STT_LANGUAGE_HINT = os.getenv("DEEPGRAM_STT_LANGUAGE_HINT", os.getenv("WHISPER_LANGUAGE_HINT", "")).strip().lower() or None
-DEEPGRAM_TTS_MODEL = os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en")
-DEEPGRAM_TTS_ENCODING = os.getenv("DEEPGRAM_TTS_ENCODING", "mulaw").lower()
-DEEPGRAM_TTS_SAMPLE_RATE = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", "8000"))
 DEEPGRAM_STT_ENDPOINTING_MS = int(os.getenv("DEEPGRAM_STT_ENDPOINTING_MS", "700"))
 DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "700"))
 
-if DEEPGRAM_TTS_ENCODING != "mulaw":
-	DEEPGRAM_TTS_ENCODING = "mulaw"
+
+RIME_API_KEY = os.getenv("RIME_API_KEY")
+RIME_TTS_MODEL_ID = os.getenv("RIME_TTS_MODEL_ID", "arcana")
+RIME_TTS_SPEAKER_EN = os.getenv("RIME_TTS_SPEAKER_EN", "lyra")
+RIME_TTS_SPEAKER_ES = os.getenv("RIME_TTS_SPEAKER_ES", "celestino")
 
 
 TWILIO_SR = 8000
@@ -72,8 +72,8 @@ TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "16"))
 
 
 STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "120"))
-FILLER_TEXT_EN = os.getenv("FILLER_TEXT_EN", "Okay, one moment.").strip()
-FILLER_TEXT_ES = os.getenv("FILLER_TEXT_ES", "Claro, un momento.").strip()
+FILLER_TEXT_EN = os.getenv("FILLER_TEXT_EN", "Please hold briefly while I prepare your answer.").strip()
+FILLER_TEXT_ES = os.getenv("FILLER_TEXT_ES", "Por favor, espere un instante mientras preparo su respuesta.").strip()
 FILLER_DELAY_MS = int(os.getenv("FILLER_DELAY_MS", "1200"))
 PARTIAL_TRANSCRIPT_START_CHARS = int(os.getenv("PARTIAL_TRANSCRIPT_START_CHARS", "40"))
 PARTIAL_TRANSCRIPT_DEBOUNCE_MS = int(os.getenv("PARTIAL_TRANSCRIPT_DEBOUNCE_MS", "600"))

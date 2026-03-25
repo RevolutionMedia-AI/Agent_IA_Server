@@ -46,6 +46,7 @@ class CallSession:
     deferred_final_text: str = ""
     deferred_final_language: str | None = None
     deferred_final_flush_task: asyncio.Task | None = None
+    collected_data: dict[str, str] = field(default_factory=dict)
     stt_failure_announced: bool = False
     closed: bool = False
     last_activity_at: float = field(default_factory=time.monotonic)

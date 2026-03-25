@@ -9,7 +9,7 @@ from fastapi.responses import Response
 from STT_server.adapters.deepgram_stt_batch import transcribe_block
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
-from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_STT_LANGUAGE_HINT, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_ENCODING, OPENAI_API_KEY, PORT, PUBLIC_URL, TWILIO_SR
+from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_STT_LANGUAGE_HINT, DEEPGRAM_STT_MODEL, OPENAI_API_KEY, PORT, PUBLIC_URL, RIME_API_KEY, TWILIO_SR
 from STT_server.domain.language import detect_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_ingest import handle_incoming_media
@@ -29,10 +29,10 @@ if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY no configurada.")
 
 if not DEEPGRAM_API_KEY:
-    log.warning("DEEPGRAM_API_KEY no configurada. El STT y el TTS no estaran disponibles.")
+    log.warning("DEEPGRAM_API_KEY no configurada. El STT no estara disponible.")
 
-if DEEPGRAM_TTS_ENCODING != "mulaw":
-    log.warning("La configuracion TTS debe mantenerse en mulaw para Twilio Media Streams.")
+if not RIME_API_KEY:
+    log.warning("RIME_API_KEY no configurada. El TTS no estara disponible.")
 
 
 app = FastAPI()

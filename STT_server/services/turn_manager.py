@@ -4,7 +4,7 @@ import logging
 import time
 
 from STT_server.adapters.deepgram_stt_batch import transcribe_block
-from STT_server.adapters.deepgram_tts import stream_tts_segment
+from STT_server.adapters.rime_tts import stream_tts_segment
 from STT_server.adapters.openai_llm import build_messages, call_llm, stream_llm_reply_sync
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
@@ -35,6 +35,33 @@ def trim_history(session: CallSession) -> None:
     if len(session.history) > MAX_HISTORY_MESSAGES:
         session.history[:] = session.history[-MAX_HISTORY_MESSAGES:]
 
+
+def update_memory(session: CallSession, transcript: str) -> None:
+    from STT_server.domain.language import extract_structured_data
+
+    structured = extract_structured_data(transcript)
+    for k, v in structured.items():
+        session.collected_data[k] = v
+
+
+def should_generate_response(session: CallSession, transcript: str) -> bool:
+    # Only generate when the final transcript is not a repeat of collected data
+    from STT_server.domain.language import extract_structured_data, is_duplicate_collected_data
+
+    structured = extract_structured_data(transcript)
+    if not structured:
+        return True
+    if is_duplicate_collected_data(session, structured):
+        log.info("Texto ya registrado en collected_data, ignora respuesta: %s", transcript)
+        return False
+
+    return True
+
+async def generate_reply(session: CallSession, generation_id: int, user_text: str) -> None:
+    if generation_id != session.active_generation:
+        log.info("Ignorando generate_reply para gen desfasado %s (activa %s)", generation_id, session.active_generation)
+        return
+    await launch_reply_pipeline(session, user_text, trigger="final")
 
 async def play_tts_from_text_queue(
     session: CallSession,
@@ -245,6 +272,20 @@ async def cancel_deferred_final_flush(session: CallSession) -> None:
 VERY_SHORT_WORD_LIMIT = 3
 
 
+def user_is_speaking(session: CallSession) -> bool:
+    return bool(session.speech_frames or session.voice_streak > 0)
+
+
+def final_transcript_ready(session: CallSession, source: str, is_final: bool) -> bool:
+    if not is_final:
+        return False
+    if source in {"batch_final", "realtime_fallback"}:
+        return not user_is_speaking(session)
+    if source == "realtime" and not session.awaiting_local_final:
+        return not user_is_speaking(session)
+    return False
+
+
 def should_defer_final_transcript(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -280,6 +321,14 @@ async def process_final_transcript(
     await cancel_prefetch_task(session)
     clear_prefetched_reply(session)
     session.pending_realtime_final = None
+
+    # Collect structured data from final transcript and check duplication.
+    update_memory(session, text)
+    if not should_generate_response(session, text):
+        log.info("No se genera respuesta para final duplicado en %s: %s", session.session_key, text)
+        if speech_final:
+            session.current_transcript = ""
+        return
 
     replace_current = bool(
         session.reply_task
@@ -550,6 +599,17 @@ async def process_transcripts(session: CallSession) -> None:
             session.current_transcript = text
             is_final = bool(item.get("is_final"))
             speech_final = bool(item.get("speech_final"))
+
+            if is_final and not final_transcript_ready(session, source, is_final):
+                log.info("Final recibido pero usuario sigue hablando, pausar procesamiento: %s", session.session_key)
+                session.deferred_final_text = text
+                session.deferred_final_language = language
+                await cancel_deferred_final_flush(session)
+                task = asyncio.create_task(flush_deferred_final_after_grace(session))
+                session.deferred_final_flush_task = task
+                session.tasks.add(task)
+                task.add_done_callback(session.tasks.discard)
+                continue
 
             if is_final:
                 if source == "realtime" and session.awaiting_local_final:

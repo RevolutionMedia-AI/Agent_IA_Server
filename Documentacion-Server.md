@@ -92,7 +92,17 @@ El alcance actual incluye:
 
 - soporte bilingue en ingles y espanol con persistencia de idioma por sesion;
 
-- barge-in configurable para permitir interrupcion del asistente;
+- barge-in configurable para permitir interrupcion del asistente (cancelacion de turnos, tareas y cola de reproducción);
+
+- filtrado de utterances no accionables (saludos, fillers, confirmaciones);
+
+- memoria estructurada en `session.collected_data` para evitar repetir solicitudes de datos ya capturados;
+
+- monitoreo de inactividad con cierre automatico de llamada;
+
+- reconexion automatica de STT realtime con backoff exponencial;
+
+- proteccion de endpoints de diagnostico mediante flag configurable;
 
 - endpoints de prueba y diagnostico.
 
@@ -176,7 +186,9 @@ No se utiliza base de datos. Toda la informacion operacional se conserva tempora
 
 | OpenAI | Generacion de respuesta del asistente |
 
-| Railway | Plataforma de despliegue |
+| Railway | Plataforma de despliegue (configuracion heredada) |
+
+| Azure App Service | Plataforma de despliegue principal mediante `git push` |
 
   
 
@@ -192,7 +204,9 @@ No se utiliza base de datos. Toda la informacion operacional se conserva tempora
 
 | venv | Entorno virtual Python local |
 
-| Railway CLI o panel web | Despliegue y configuracion del servicio |
+| Railway CLI o panel web | Despliegue y configuracion del servicio (heredado) |
+
+| Azure App Service + Git | Despliegue principal mediante `git push Azure main` |
 
   
 
@@ -224,7 +238,7 @@ No se utiliza base de datos. Toda la informacion operacional se conserva tempora
 
   
 
-Dependencias declaradas en el repositorio como `faster-whisper`, `numpy`, `librosa` y `soundfile` aparecen asociadas a scripts auxiliares o a configuracion heredada y no forman parte del flujo principal actual del servidor telefonico.
+Dependencias declaradas en el repositorio como `faster-whisper`, `numpy`, `librosa` y `soundfile` aparecen asociadas a scripts auxiliares o a configuracion heredada y no forman parte del flujo principal actual del servidor telefonico. Nota: `websockets` no esta declarado en `requirements.txt` pero es requerido por `deepgram_stt_realtime.py`; se instala como dependencia transitiva de `uvicorn[standard]`.
 
   
 
@@ -271,6 +285,10 @@ El sistema se compone de los siguientes bloques funcionales:
 | Playback | Reenviar audio, marcas y comandos de limpieza a Twilio |
 
 | Gestion de sesion | Mantener estado por llamada |
+
+| Monitoreo de inactividad | Cerrar llamadas sin actividad tras timeout configurable |
+
+| Filtrado de utterances | Descartar utterances no accionables (saludos, fillers) |
 
   
 
@@ -342,7 +360,11 @@ El sistema se compone de los siguientes bloques funcionales:
 
 | Sesion | `session.CallSession` | Aisla el estado de una llamada |
 
-| Idioma | `language.detect_language()` / `looks_like_incomplete_utterance()` | Deteccion de idioma y analisis linguistico |
+| Idioma | `language.detect_language()` / `looks_like_incomplete_utterance()` / `is_non_actionable_utterance()` | Deteccion de idioma, analisis linguistico y filtrado de utterances |
+
+| Runtime de sesion | `session_runtime.register_session()` / `cleanup_session()` | Registro, limpieza y monitoreo de inactividad |
+
+| Utilidades | `common.require_debug_endpoints()` | Proteccion de endpoints y operaciones de cola |
 
   
 
@@ -360,7 +382,7 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 
 - OpenAI responde al contexto conversacional;
 
-- Railway hospeda la aplicacion.
+- Railway o Azure App Service hospeda la aplicacion.
 
   
 
@@ -382,7 +404,9 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 
 ├── requirements.txt
 
-├── DOCUMENTACION_TECNICA.md
+├── CAMBIOS_2026-03-23.md
+
+├── Documentacion-Server.md
 
 ├── ConvertLocalSTT/
 
@@ -398,11 +422,41 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 
     ├── __init__.py
 
+    ├── config.py
+
     ├── STT_Server.py
 
     ├── entornoLocal.env
 
-    └── static/
+    ├── adapters/
+
+    │   ├── deepgram_stt_batch.py
+
+    │   ├── deepgram_stt_realtime.py
+
+    │   ├── deepgram_tts.py
+
+    │   ├── openai_llm.py
+
+    │   └── twilio_media.py
+
+    ├── domain/
+
+    │   ├── language.py
+
+    │   └── session.py
+
+    └── services/
+
+        ├── audio_ingest.py
+
+        ├── common.py
+
+        ├── playback_service.py
+
+        ├── session_runtime.py
+
+        └── turn_manager.py
 
 ```
 
@@ -416,17 +470,23 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 
 | --- | --- |
 
-| `main.py` | Punto de entrada ASGI para Uvicorn y Railway |
+| `main.py` | Punto de entrada ASGI para Uvicorn y Railway/Azure |
 
 | `railway.toml` | Configuracion de build y arranque en Railway |
 
 | `requirements.txt` | Dependencias del proyecto |
 
-| `STT_server/STT_Server.py` | Implementacion principal del servidor |
+| `STT_server/config.py` | Constantes y parametros configurables del sistema |
+
+| `STT_server/STT_Server.py` | Punto de entrada FastAPI con definicion de endpoints |
 
 | `STT_server/entornoLocal.env` | Configuracion local de desarrollo |
 
-| `STT_server/static/` | Carpeta reservada; uso no especificado en el flujo actual |
+| `STT_server/adapters/` | Integraciones con servicios externos (Deepgram, OpenAI, Twilio) |
+
+| `STT_server/domain/` | Modelo de datos (`CallSession`) y logica de idioma |
+
+| `STT_server/services/` | Orquestacion de audio, reproduccion, turnos y sesiones |
 
 | `ConvertLocalSTT/` | Scripts auxiliares o heredados de transcripcion local |
 
@@ -440,15 +500,27 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 
 | --- | --- |
 
-| `main.py` | Importa y expone la instancia `app` |
+| `main.py` | Importa y expone la instancia `app` de FastAPI |
 
-| `STT_server/STT_Server.py` | Nucleo funcional del sistema |
+| `STT_server/config.py` | Centraliza todas las constantes y parametros configurables |
+
+| `STT_server/STT_Server.py` | Define los endpoints HTTP y WebSocket del servidor |
+
+| `STT_server/domain/session.py` | Define la clase `CallSession` con todo el estado por llamada |
+
+| `STT_server/domain/language.py` | Deteccion de idioma, marcadores linguisticos y segmentacion TTS |
+
+| `STT_server/services/turn_manager.py` | Orquesta transcripciones, prefetch, ventana de gracia y pipeline de respuesta |
+
+| `STT_server/services/session_runtime.py` | Registro de sesiones, limpieza y monitoreo de inactividad |
 
 | `railway.toml` | Define el comando de arranque para despliegue |
 
 | `requirements.txt` | Lista dependencias Python |
 
-| `DOCUMENTACION_TECNICA.md` | Documentacion tecnica del repositorio |
+| `Documentacion-Server.md` | Documentacion tecnica del repositorio |
+
+| `CAMBIOS_2026-03-23.md` | Registro de cambios del 23 de marzo de 2026 |
 
   
 
@@ -560,6 +632,8 @@ El sistema no dispone de un modelo relacional ni de persistencia. El unico model
 
 | `closed` | `bool` | Indica si la sesion fue cerrada |
 
+| `last_activity_at` | `float` | Timestamp monotonic de la ultima actividad; usado para monitoreo de inactividad |
+
   
 
 ## Relaciones
@@ -627,6 +701,8 @@ El sistema no dispone de un modelo relacional ni de persistencia. El unico model
 | Eventos de Twilio procesados | `connected`, `start`, `media`, `mark`, `dtmf`, `stop` |
 
 | Eventos internos de playback | `audio`, `mark`, `clear`, `segment_end`, `error` |
+
+| `NON_ACTIONABLE_PHRASES` | Conjunto de ~60 frases (saludos, fillers, confirmaciones) que se filtran silenciosamente |
 
   
 
@@ -704,6 +780,8 @@ El turn manager implementa los siguientes mecanismos:
 
 - **Deteccion linguistica de incompletitud**: un conjunto de marcadores en ingles y espanol permite identificar utterances que probablemente no han terminado.
 
+- **Filtrado de utterances no accionables**: un conjunto de mas de 60 frases (`NON_ACTIONABLE_PHRASES`) permite identificar y descartar saludos, fillers, confirmaciones y pronombres aislados que no requieren respuesta del asistente.
+
   
 
 ### 6.6 Generacion conversacional
@@ -735,6 +813,18 @@ La respuesta textual se divide en segmentos y cada uno se sintetiza con Deepgram
   
 
 Antes de la primera respuesta real, el sistema puede emitir un filler de espera configurable por idioma ("Okay, one moment." / "Claro, un momento.") si la generacion LLM tarda mas de `FILLER_DELAY_MS` milisegundos.
+
+### 6.8 Monitoreo de inactividad
+
+El modulo `session_runtime` implementa un monitor de silencio por sesion (`monitor_idle_silence`). Si no se detecta actividad durante `IDLE_SILENCE_TIMEOUT_SEC` segundos (por defecto 45), la llamada se cierra automaticamente para liberar recursos.
+
+### 6.9 Proteccion de endpoints de diagnostico
+
+Los endpoints `/test-llm-tts`, `/test-stt` y `/list-models` estan protegidos por la variable `ENABLE_DEBUG_ENDPOINTS`. Si esta en `false` (valor por defecto), devuelven HTTP 404. Esto evita la exposicion de funcionalidad de diagnostico en produccion.
+
+### 6.10 Reconexion automatica de STT realtime
+
+El adaptador de STT realtime implementa un mecanismo de reconexion exponencial con hasta `STT_RECONNECT_MAX_ATTEMPTS` intentos. Si la reconexion falla definitivamente, el sistema anuncia al usuario un mensaje de fallo de STT configurable por idioma.
 
   
 
@@ -780,6 +870,8 @@ Antes de la primera respuesta real, el sistema puede emitir un filler de espera 
 
 - se ignoran utterances demasiado cortas;
 
+- se filtran utterances no accionables (saludos, fillers, pronombres aislados);
+
 - se descartan resultados de turnos cuya `generation` ya no sea la activa;
 
 - el servidor no arranca sin `PUBLIC_URL`;
@@ -816,11 +908,11 @@ Antes de la primera respuesta real, el sistema puede emitir un filler de espera 
 
 | `WS` | `/media-stream` | Gestiona audio y eventos de Twilio |
 
-| `GET` | `/test-llm-tts` | Prueba la generacion textual y segmentacion TTS |
+| `GET` | `/test-llm-tts` | Prueba la generacion textual y segmentacion TTS (requiere `ENABLE_DEBUG_ENDPOINTS=true`) |
 
-| `POST` | `/test-stt` | Prueba la transcripcion STT |
+| `POST` | `/test-stt` | Prueba la transcripcion STT (requiere `ENABLE_DEBUG_ENDPOINTS=true`) |
 
-| `GET` | `/list-models` | Lista modelos accesibles desde OpenAI |
+| `GET` | `/list-models` | Lista modelos accesibles desde OpenAI (requiere `ENABLE_DEBUG_ENDPOINTS=true`) |
 
 | `GET` | `/` | Health check basico |
 
@@ -1124,7 +1216,7 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | `SPEECH_START_FRAMES` | `2` | Frames requeridos para detectar inicio |
 
-| `MIN_BARGE_IN_FRAMES` | `6` | Frames minimos para interrupcion |
+| `MIN_BARGE_IN_FRAMES` | `12` | Frames minimos para interrupcion |
 
 | `PRE_SPEECH_FRAMES` | `5` | Frames previos retenidos |
 
@@ -1132,7 +1224,7 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | `MIN_VOICE_RMS` | `260` | Umbral RMS minimo de voz |
 
-| `BARGE_IN_MIN_RMS` | `700` | Umbral RMS minimo para barge-in |
+| `BARGE_IN_MIN_RMS` | `900` | Umbral RMS minimo para barge-in |
 
 | `ENABLE_BARGE_IN` | `true` | Activa interrupcion del asistente |
 
@@ -1150,19 +1242,51 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | `MAX_HISTORY_MESSAGES` | `12` | Longitud maxima del historial |
 
-| `MAX_RESPONSE_TOKENS` | `80` | Limite de tokens de respuesta |
+| `MAX_RESPONSE_TOKENS` | `150` | Limite de tokens de respuesta |
 
 | `FILLER_DELAY_MS` | `1200` | Milisegundos antes de emitir el filler de espera |
 
-| `FINAL_TRANSCRIPT_GRACE_MS` | `1400` | Ventana de gracia para diferir finals cortos/incompletos |
+| `FINAL_TRANSCRIPT_GRACE_MS` | `2000` | Ventana de gracia para diferir finals cortos/incompletos |
 
-| `SHORT_FINAL_MAX_WORDS` | `6` | Umbral de palabras para considerar un final como corto |
+| `SHORT_FINAL_MAX_WORDS` | `12` | Umbral de palabras para considerar un final como corto |
 
-| `PARTIAL_TRANSCRIPT_START_CHARS` | `18` | Caracteres minimos para iniciar prefetch desde parciales |
+| `PARTIAL_TRANSCRIPT_START_CHARS` | `40` | Caracteres minimos para iniciar prefetch desde parciales |
 
-| `PARTIAL_TRANSCRIPT_DEBOUNCE_MS` | `350` | Debounce antes de lanzar prefetch |
+| `PARTIAL_TRANSCRIPT_DEBOUNCE_MS` | `600` | Debounce antes de lanzar prefetch |
 
 | `DEEPGRAM_STT_ENDPOINTING_MS` | `700` | Endpointing de Deepgram realtime en milisegundos |
+
+| `DEEPGRAM_UTTERANCE_END_MS` | `700` | Utterance end timeout de Deepgram |
+
+| `FILLER_TTS_ENABLED` | `true` | Habilita la emision de filler de espera TTS |
+
+| `ENABLE_DEBUG_ENDPOINTS` | `false` | Habilita los endpoints de diagnostico (`/test-llm-tts`, `/test-stt`, `/list-models`) |
+
+| `STT_AUDIO_QUEUE_MAXSIZE` | `100` | Tamano maximo de la cola de audio para STT realtime |
+
+| `TRANSCRIPT_QUEUE_MAXSIZE` | `32` | Tamano maximo de la cola de transcripciones |
+
+| `PLAYBACK_QUEUE_MAXSIZE` | `256` | Tamano maximo de la cola de playback |
+
+| `TEXT_SEGMENT_QUEUE_MAXSIZE` | `16` | Tamano maximo de la cola de segmentos de texto |
+
+| `STREAMING_SEGMENT_MAX_CHARS` | `120` | Caracteres maximos por segmento de streaming TTS |
+
+| `FINAL_RESTART_DELTA_CHARS` | `12` | Delta de caracteres para reiniciar pipeline desde un final nuevo |
+
+| `PARTIAL_PREFETCH_MAX_DELTA_CHARS` | `20` | Delta maximo de caracteres para reutilizar prefetch parcial |
+
+| `STT_RECONNECT_MAX_ATTEMPTS` | `3` | Intentos maximos de reconexion STT realtime |
+
+| `STT_RECONNECT_BASE_DELAY_MS` | `250` | Retardo base para reconexion exponencial STT |
+
+| `STT_RECONNECT_MAX_DELAY_MS` | `2000` | Retardo maximo para reconexion exponencial STT |
+
+| `STT_FAILURE_PROMPT_EN` | `"I'm having trouble hearing you right now."` | Mensaje al usuario cuando falla STT (ingles) |
+
+| `STT_FAILURE_PROMPT_ES` | `"Estoy teniendo problemas para escucharte en este momento."` | Mensaje al usuario cuando falla STT (espanol) |
+
+| `IDLE_SILENCE_TIMEOUT_SEC` | `45` | Segundos de inactividad antes de cerrar la llamada |
 
   
 
@@ -1226,7 +1350,7 @@ DEFAULT_CALL_LANGUAGE=en
 
 INITIAL_GREETING_ENABLED=true
 
-INITIAL_GREETING_TEXT=Good day. My name is Athenas. Please tell me how I can help you today.
+INITIAL_GREETING_TEXT=Thank you for calling Cialix Customer Support. My name is Tessa. How can I help you today?
 
 LLM_TIMEOUT_SEC=5.0
 
@@ -1316,6 +1440,10 @@ El archivo `railway.toml` define el arranque del servicio con:
 
 ```toml
 
+[build]
+
+builder = "RAILPACK"
+
 [deploy]
 
 startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT --workers ${WEB_CONCURRENCY:-1}"
@@ -1342,11 +1470,11 @@ Pasos recomendados:
 
   
 
-## Despliegue en Azure (App Service con Git)
+## Despliegue en Azure (App Service con Git) — metodo principal
 
   
 
-El proyecto soporta despliegue directo a Azure App Service mediante `git push`:
+El proyecto se despliega a Azure App Service mediante `git push`:
 
   
 
@@ -1491,6 +1619,16 @@ Se recomiendan al menos las siguientes validaciones:
 - saludo inicial configurable;
 
 - endpoints de diagnostico y health check;
+
+- proteccion de endpoints de diagnostico mediante `ENABLE_DEBUG_ENDPOINTS`;
+
+- filtrado de utterances no accionables (saludos, fillers, pronombres aislados);
+
+- monitoreo de inactividad con cierre automatico de llamada tras `IDLE_SILENCE_TIMEOUT_SEC`;
+
+- reconexion automatica de STT realtime con backoff exponencial;
+
+- anuncio de fallo de STT al usuario en su idioma;
 
 - arquitectura modular: adapters, domain, services.
 
