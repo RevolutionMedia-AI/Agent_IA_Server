@@ -108,16 +108,18 @@ async def stream_tts_segment(
         speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text),
     )
 
-    # Rime WS expects config as query params during handshake, text via message.
+    # Rime WS3 requires ALL config as query params; message body is text-only.
     from urllib.parse import urlencode
     qs = urlencode({
         "speaker": speaker,
         "modelId": RIME_TTS_MODEL_ID,
         "lang": lang_code,
         "audioFormat": "pcm",
-        "samplingRate": sample_rate,
+        "samplingRate": str(sample_rate),
     })
     ws_url = f"{RIME_WS_URL}?{qs}"
+
+    ws_message = json.dumps({"text": text})
 
     extra_headers = {
         "Authorization": f"Bearer {RIME_API_KEY}",
@@ -130,44 +132,55 @@ async def stream_tts_segment(
             close_timeout=5,
             open_timeout=10,
         ) as ws:
-            # Send just the text after connection is established.
-            await ws.send(json.dumps({"text": text}))
+            await ws.send(ws_message)
+            log.info("Rime WS message sent, waiting for audio...")
 
             async for raw_msg in ws:
-                msg = json.loads(raw_msg)
+                # Binary frame = raw audio data (shouldn't happen on /ws3, but handle it)
+                if isinstance(raw_msg, bytes):
+                    if ttfb_ms is None:
+                        ttfb_ms = (time.perf_counter() - started_at) * 1000
+                        log.info("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
+                    mulaw_bytes = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate)
+                    for i in range(0, len(mulaw_bytes), 4096):
+                        emit_item({"type": "audio", "generation": generation, "data": mulaw_bytes[i : i + 4096]})
+                    continue
 
-                # Error frame from Rime
-                if "error" in msg:
-                    log.error("Rime WS TTS error: %s", msg["error"])
+                # Text frame — JSON
+                msg = json.loads(raw_msg)
+                msg_type = msg.get("type", "")
+
+                if msg_type == "error" or "error" in msg:
+                    log.error("Rime WS TTS error: %s", msg.get("error", msg))
                     emit_item({
                         "type": "error",
                         "generation": generation,
-                        "message": f"Rime WS error: {msg['error']}",
+                        "message": f"Rime WS error: {msg.get('error', msg)}",
                     })
                     break
 
-                audio_b64 = msg.get("audio")
-                if not audio_b64:
-                    # Could be a status/metadata frame — skip.
-                    if msg.get("is_final"):
-                        break
+                if msg_type == "timestamps":
+                    # Final frame — stream is complete.
+                    log.info("Rime WS TTS complete (timestamps received)")
+                    break
+
+                if msg_type == "chunk":
+                    audio_b64 = msg.get("data", "")
+                    if not audio_b64:
+                        continue
+                    pcm_bytes = base64.b64decode(audio_b64)
+
+                    if ttfb_ms is None:
+                        ttfb_ms = (time.perf_counter() - started_at) * 1000
+                        log.info("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
+
+                    mulaw_bytes = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate)
+                    for i in range(0, len(mulaw_bytes), 4096):
+                        emit_item({"type": "audio", "generation": generation, "data": mulaw_bytes[i : i + 4096]})
                     continue
 
-                pcm_bytes = base64.b64decode(audio_b64)
-
-                if ttfb_ms is None:
-                    ttfb_ms = (time.perf_counter() - started_at) * 1000
-                    log.info("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
-
-                mulaw_bytes = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate)
-
-                # Emit in Twilio-friendly 4096-byte chunks
-                for i in range(0, len(mulaw_bytes), 4096):
-                    chunk = mulaw_bytes[i : i + 4096]
-                    emit_item({"type": "audio", "generation": generation, "data": chunk})
-
-                if msg.get("is_final"):
-                    break
+                # Unknown frame type — log and skip
+                log.warning("Rime WS unknown frame type=%s keys=%s", msg_type, list(msg.keys()))
 
     except websockets.exceptions.InvalidStatus as exc:
         body = ""
