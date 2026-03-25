@@ -67,18 +67,24 @@ def _downsample_linear(samples: list[int], src_rate: int, dst_rate: int) -> list
     return out
 
 
-def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int) -> bytes:
-    """Convert raw PCM16-LE bytes at *src_rate* to mu-law 8 kHz."""
-    # Ensure even byte count — Rime sometimes sends odd-length chunks.
-    usable = len(pcm_bytes) & ~1
+def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes = b"") -> tuple[bytes, bytes]:
+    """Convert raw PCM16-LE bytes at *src_rate* to mu-law 8 kHz.
+
+    Returns ``(mulaw_bytes, leftover)`` where *leftover* is a 0-or-1 byte
+    remainder that should be prepended to the next chunk so sample
+    boundaries stay aligned across WebSocket messages.
+    """
+    data = remainder + pcm_bytes
+    usable = len(data) & ~1
+    leftover = data[usable:]  # 0 or 1 byte carried to next chunk
     if usable == 0:
-        return b""
+        return b"", leftover
     n_samples = usable // 2
-    samples = list(struct.unpack(f"<{n_samples}h", pcm_bytes[:usable]))
+    samples = list(struct.unpack(f"<{n_samples}h", data[:usable]))
     if src_rate != TWILIO_SAMPLE_RATE:
         samples = _downsample_linear(samples, src_rate, TWILIO_SAMPLE_RATE)
     pcm = struct.pack(f"<{len(samples)}h", *samples)
-    return _pcm16_to_mulaw(pcm)
+    return _pcm16_to_mulaw(pcm), leftover
 
 
 async def stream_tts_segment(
@@ -137,13 +143,15 @@ async def stream_tts_segment(
             await ws.send(ws_message)
             log.info("Rime WS message sent, waiting for audio...")
 
+            pcm_remainder = b""  # carry odd trailing byte across chunks
+
             async for raw_msg in ws:
                 # Binary frame = raw audio data (shouldn't happen on /ws3, but handle it)
                 if isinstance(raw_msg, bytes):
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.info("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
-                    mulaw_bytes = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate)
+                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
                     for i in range(0, len(mulaw_bytes), 4096):
                         emit_item({"type": "audio", "generation": generation, "data": mulaw_bytes[i : i + 4096]})
                     continue
@@ -179,7 +187,7 @@ async def stream_tts_segment(
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.info("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
 
-                    mulaw_bytes = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate)
+                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
                     for i in range(0, len(mulaw_bytes), 4096):
                         emit_item({"type": "audio", "generation": generation, "data": mulaw_bytes[i : i + 4096]})
                     continue
