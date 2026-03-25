@@ -117,12 +117,15 @@ async def stream_tts_segment(
         speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text),
     )
 
-    # Rime WS authenticates via query parameter, not HTTP header.
-    ws_url = f"{RIME_WS_URL}?authToken={RIME_API_KEY}"
+    extra_headers = {
+        "Authorization": f"Bearer {RIME_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
     try:
         async with websockets.connect(
-            ws_url,
+            RIME_WS_URL,
+            additional_headers=extra_headers,
             close_timeout=5,
             open_timeout=10,
         ) as ws:
