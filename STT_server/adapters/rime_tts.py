@@ -69,10 +69,12 @@ def _downsample_linear(samples: list[int], src_rate: int, dst_rate: int) -> list
 
 def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int) -> bytes:
     """Convert raw PCM16-LE bytes at *src_rate* to mu-law 8 kHz."""
-    n_samples = len(pcm_bytes) // 2
-    if n_samples == 0:
+    # Ensure even byte count — Rime sometimes sends odd-length chunks.
+    usable = len(pcm_bytes) & ~1
+    if usable == 0:
         return b""
-    samples = list(struct.unpack(f"<{n_samples}h", pcm_bytes))
+    n_samples = usable // 2
+    samples = list(struct.unpack(f"<{n_samples}h", pcm_bytes[:usable]))
     if src_rate != TWILIO_SAMPLE_RATE:
         samples = _downsample_linear(samples, src_rate, TWILIO_SAMPLE_RATE)
     pcm = struct.pack(f"<{len(samples)}h", *samples)

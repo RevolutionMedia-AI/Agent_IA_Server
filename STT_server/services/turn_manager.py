@@ -236,8 +236,15 @@ def consume_prefetched_reply(session: CallSession, final_text: str) -> str | Non
     if normalized_final == draft_text:
         return draft_reply
 
+    # Final starts with the draft partial → small continuation appended
     if normalized_final.startswith(draft_text):
         delta = len(normalized_final) - len(draft_text)
+        if delta <= PARTIAL_PREFETCH_MAX_DELTA_CHARS:
+            return draft_reply
+
+    # Draft starts with the final → user said less than predicted
+    if draft_text.startswith(normalized_final):
+        delta = len(draft_text) - len(normalized_final)
         if delta <= PARTIAL_PREFETCH_MAX_DELTA_CHARS:
             return draft_reply
 
@@ -269,7 +276,9 @@ async def cancel_deferred_final_flush(session: CallSession) -> None:
 
 # Very short utterances (≤ this many words) are always deferred even with
 # punctuation so the user has time to continue speaking.
-VERY_SHORT_WORD_LIMIT = 3
+# Only single-word fragments like "Um" or "Okay" are deferred —
+# anything 2+ words with terminal punctuation is a valid turn.
+VERY_SHORT_WORD_LIMIT = 1
 
 
 def user_is_speaking(session: CallSession) -> bool:
@@ -291,19 +300,21 @@ def should_defer_final_transcript(text: str) -> bool:
     if not stripped:
         return False
 
-    if looks_like_incomplete_utterance(stripped):
-        return True
-
     word_count = len(stripped.split())
 
-    # Very short phrases like "Hi.", "Wait.", "Oh, well." are almost
-    # never a complete turn — always defer them to accumulate more text.
-    if word_count <= VERY_SHORT_WORD_LIMIT:
+    # Single-word fragments without punctuation ("Um", "Okay") → defer.
+    if word_count <= VERY_SHORT_WORD_LIMIT and stripped[-1] not in ".!?":
         return True
 
+    # Anything with terminal punctuation (.!?) is a complete turn — process now.
     if stripped[-1] in ".!?":
         return False
 
+    # Structurally incomplete sentences (trailing comma, "because", etc.)
+    if looks_like_incomplete_utterance(stripped):
+        return True
+
+    # Unpunctuated but longer than SHORT_FINAL_MAX_WORDS → treat as complete.
     return word_count <= SHORT_FINAL_MAX_WORDS
 
 
@@ -358,21 +369,12 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
     if not text or session.closed:
         return
 
-    if session.awaiting_local_final:
+    # If we're awaiting a batch STT result OR the text still looks
+    # incomplete, allow ONE extra short wait (half grace) to accumulate
+    # more text — but never the triple-grace cascade we had before.
+    if session.awaiting_local_final or looks_like_incomplete_utterance(text):
         try:
-            await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 1000.0)
-        except asyncio.CancelledError:
-            return
-        text = session.deferred_final_text.strip()
-        if not text or session.closed:
-            return
-
-    # If still incomplete after grace, give one more grace period for
-    # the continuation to arrive before processing a partial sentence.
-    if looks_like_incomplete_utterance(text):
-        log.info("Texto aún incompleto tras grace en %s, esperando más: %s", session.session_key, text)
-        try:
-            await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 1000.0)
+            await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 2000.0)
         except asyncio.CancelledError:
             return
         text = session.deferred_final_text.strip()
