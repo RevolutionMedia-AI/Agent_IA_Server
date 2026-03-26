@@ -1,10 +1,17 @@
 import asyncio
 import io
 import json
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+
+log = logging.getLogger("stt_server")
+
+# Batch STT retry settings.
+_BATCH_MAX_RETRIES = 2
+_BATCH_RETRY_BASE_DELAY = 1.0  # seconds
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
@@ -89,23 +96,34 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
         "Content-Type": "audio/wav",
         "Accept": "application/json",
     }
-    timeout = STT_TIMEOUT_SEC if STT_TIMEOUT_SEC > 0 else 45
+    timeout = STT_TIMEOUT_SEC if STT_TIMEOUT_SEC > 0 else 30
     request = urllib.request.Request(url, data=wav_audio, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = ""
+    last_exc: Exception | None = None
+    for attempt in range(_BATCH_MAX_RETRIES + 1):
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(f"Deepgram STT error {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Deepgram STT connection error: {exc}") from exc
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return extract_deepgram_transcript(payload, fallback_language=fallback_language)
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(f"Deepgram STT error {exc.code}: {body}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt < _BATCH_MAX_RETRIES:
+                import time
+                delay = _BATCH_RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning("Batch STT timeout/error (intento %d/%d), reintentando en %.1fs: %s",
+                            attempt + 1, _BATCH_MAX_RETRIES + 1, delay, exc)
+                time.sleep(delay)
+            # Rebuild the request object for retry (data stream may be consumed).
+            request = urllib.request.Request(url, data=wav_audio, headers=headers, method="POST")
 
-    return extract_deepgram_transcript(payload, fallback_language=fallback_language)
+    raise RuntimeError(f"Deepgram STT connection error after {_BATCH_MAX_RETRIES + 1} attempts: {last_exc}") from last_exc
 
 
 async def transcribe_block(pcm16_audio: bytes, language_hint: str | None = None) -> tuple[list[str], str]:

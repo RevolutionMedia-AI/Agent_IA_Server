@@ -48,8 +48,23 @@ def should_generate_response(session: CallSession, transcript: str) -> bool:
     if not structured:
         return True
     if is_duplicate_collected_data(session, structured):
-        log.info("Texto ya registrado en collected_data, ignora respuesta: %s", transcript)
-        return False
+        # Only suppress when the transcript is *purely* a data repeat
+        # (e.g. the bare order number).  If the user wrapped it in
+        # conversational text ("Oh yeah sure, 123451") we must still
+        # process so the assistant can acknowledge and continue.
+        stripped = transcript.strip().rstrip(".,!?;:")
+        data_values = {v.lower() for v in structured.values()}
+        normalized = normalize_digits_in_text(stripped)
+        stripped_norm = normalized.strip().rstrip(".,!?;:").lower()
+        # Pure repeat: every non-whitespace token is a known data value.
+        words = stripped_norm.split()
+        if words and all(
+            w.rstrip(".,!?;:") in data_values for w in words
+        ):
+            log.info("Texto puramente duplicado en collected_data, ignora: %s", transcript)
+            return False
+        # Conversational confirmation — process normally.
+        log.info("Datos duplicados pero con contexto conversacional, procesa: %s", transcript)
 
     return True
 
