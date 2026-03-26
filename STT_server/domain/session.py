@@ -6,6 +6,7 @@ import time
 from STT_server.config import (
     PLAYBACK_QUEUE_MAXSIZE,
     PRE_SPEECH_FRAMES,
+    REALTIME_AUDIO_QUEUE_MAXSIZE,
     STT_AUDIO_QUEUE_MAXSIZE,
     STT_MUTE_BUFFER_CHUNKS,
     TRANSCRIPT_QUEUE_MAXSIZE,
@@ -48,6 +49,9 @@ class CallSession:
     deferred_final_language: str | None = None
     deferred_final_flush_task: asyncio.Task | None = None
     collected_data: dict[str, str] = field(default_factory=dict)
+    realtime_audio_queue: asyncio.Queue[bytes | None] = field(default_factory=lambda: asyncio.Queue(maxsize=REALTIME_AUDIO_QUEUE_MAXSIZE))
+    realtime_text_queue: asyncio.Queue | None = None
+    generation_changed: asyncio.Event = field(default_factory=asyncio.Event)
     stt_failure_announced: bool = False
     last_processed_user_text: str = ""
     closed: bool = False

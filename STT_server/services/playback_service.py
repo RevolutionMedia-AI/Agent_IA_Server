@@ -8,10 +8,11 @@ from fastapi import WebSocket
 from STT_server.adapters.rime_tts import stream_tts_segment
 from STT_server.adapters.twilio_media import send_twilio_clear, send_twilio_mark, send_twilio_media
 from STT_server.config import (
-    DEEPGRAM_API_KEY,
     INITIAL_GREETING_ENABLED,
     INITIAL_GREETING_TEXT,
     LOG_TWILIO_PLAYBACK,
+    OPENAI_API_KEY,
+    RIME_API_KEY,
     TTS_TIMEOUT_SEC,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
@@ -62,10 +63,11 @@ async def interrupt_current_turn(session: CallSession) -> None:
     session.pending_marks.clear()
     drain_queue_nowait(session.playback_queue)
     await enqueue_playback_clear(session)
+    session.generation_changed.set()
 
 
 async def play_initial_greeting(session: CallSession) -> None:
-    if not INITIAL_GREETING_ENABLED or not INITIAL_GREETING_TEXT or not DEEPGRAM_API_KEY:
+    if not INITIAL_GREETING_ENABLED or not INITIAL_GREETING_TEXT or not (OPENAI_API_KEY or RIME_API_KEY):
         return
 
     session.active_generation += 1

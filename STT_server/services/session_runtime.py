@@ -34,6 +34,11 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
     with contextlib.suppress(Exception):
         await enqueue_with_drop(session.stt_audio_queue, None, "stt_audio_queue")
 
+    with contextlib.suppress(Exception):
+        await enqueue_with_drop(session.realtime_audio_queue, None, "realtime_audio_queue")
+
+    session.generation_changed.set()
+
     if session.speech_frames:
         session.speech_frames.clear()
 

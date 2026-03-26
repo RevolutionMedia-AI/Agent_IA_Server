@@ -14,6 +14,8 @@ PUBLIC_URL = os.getenv("PUBLIC_URL")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
+USE_OPENAI_REALTIME = os.getenv("USE_OPENAI_REALTIME", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
@@ -79,6 +81,7 @@ ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lo
 
 
 STT_AUDIO_QUEUE_MAXSIZE = int(os.getenv("STT_AUDIO_QUEUE_MAXSIZE", "300"))
+REALTIME_AUDIO_QUEUE_MAXSIZE = int(os.getenv("REALTIME_AUDIO_QUEUE_MAXSIZE", "300"))
 # How many Twilio audio chunks (20ms each) to keep during mute.
 # 25 chunks = 500ms of audio to replay when assistant stops speaking.
 STT_MUTE_BUFFER_CHUNKS = int(os.getenv("STT_MUTE_BUFFER_CHUNKS", "25"))

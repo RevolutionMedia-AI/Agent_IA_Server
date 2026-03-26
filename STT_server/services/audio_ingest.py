@@ -17,6 +17,7 @@ from STT_server.config import (
     PRE_SPEECH_FRAMES,
     SPEECH_START_FRAMES,
     TWILIO_SR,
+    USE_OPENAI_REALTIME,
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_with_drop
@@ -40,18 +41,27 @@ def is_probable_voice(frame: bytes) -> tuple[bool, int]:
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
     raw = base64.b64decode(media_payload)
-    if DEEPGRAM_API_KEY:
+
+    # Route audio to the active STT backend
+    if USE_OPENAI_REALTIME:
+        target_queue = session.realtime_audio_queue
+        queue_name = "realtime_audio_queue"
+    elif DEEPGRAM_API_KEY:
+        target_queue = session.stt_audio_queue
+        queue_name = "stt_audio_queue"
+    else:
+        target_queue = None
+        queue_name = ""
+
+    if target_queue is not None:
         if session.assistant_speaking:
-            # Buffer audio during mute so we can replay the tail when
-            # the assistant stops — prevents losing the start of user speech.
             session.stt_mute_buffer.append(raw)
         else:
-            # Flush buffered tail from mute period first.
             if session.stt_mute_buffer:
                 for buffered_chunk in session.stt_mute_buffer:
-                    await enqueue_with_drop(session.stt_audio_queue, buffered_chunk, "stt_audio_queue")
+                    await enqueue_with_drop(target_queue, buffered_chunk, queue_name)
                 session.stt_mute_buffer.clear()
-            await enqueue_with_drop(session.stt_audio_queue, raw, "stt_audio_queue")
+            await enqueue_with_drop(target_queue, raw, queue_name)
     pcm16 = audioop.ulaw2lin(raw, 2)
     session.vad_buffer.extend(pcm16)
 

@@ -8,7 +8,8 @@ from fastapi.responses import Response
 
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
-from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_STT_LANGUAGE_HINT, DEEPGRAM_STT_MODEL, OPENAI_API_KEY, PORT, PUBLIC_URL, RIME_API_KEY, TWILIO_SR
+from STT_server.adapters.openai_realtime import run_realtime_session
+from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_STT_LANGUAGE_HINT, DEEPGRAM_STT_MODEL, OPENAI_API_KEY, PORT, PUBLIC_URL, RIME_API_KEY, TWILIO_SR, USE_OPENAI_REALTIME
 from STT_server.domain.language import detect_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_ingest import handle_incoming_media
@@ -83,16 +84,23 @@ async def media_stream(ws: WebSocket) -> None:
                     session.session_key = session.call_sid
                 register_session(session)
                 log.info("callSid=%s streamSid=%s", session.call_sid, session.stream_sid)
-                track_task(
-                    session,
-                    asyncio.create_task(
-                        run_realtime_stt(
-                            session,
-                            lambda item: enqueue_transcript_event(session, item),
-                            announce_stt_failure_once,
-                        )
-                    ),
-                )
+                if USE_OPENAI_REALTIME:
+                    track_task(
+                        session,
+                        asyncio.create_task(run_realtime_session(session)),
+                    )
+                else:
+                    track_task(
+                        session,
+                        asyncio.create_task(
+                            run_realtime_stt(
+                                session,
+                                lambda item: enqueue_transcript_event(session, item),
+                                announce_stt_failure_once,
+                            )
+                        ),
+                    )
+                    track_task(session, asyncio.create_task(process_transcripts(session)))
                 track_task(session, asyncio.create_task(play_initial_greeting(session)))
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 continue
