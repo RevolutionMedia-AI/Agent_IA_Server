@@ -12,9 +12,11 @@ PORT = int(os.environ.get("PORT", 8080))
 PUBLIC_URL = os.getenv("PUBLIC_URL")
 
 
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
+OPENAI_REALTIME_TEMPERATURE = float(os.getenv("OPENAI_REALTIME_TEMPERATURE", "0.7"))  # API minimum is 0.6
 USE_OPENAI_REALTIME = os.getenv("USE_OPENAI_REALTIME", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 

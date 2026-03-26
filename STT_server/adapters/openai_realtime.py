@@ -110,6 +110,7 @@ async def run_realtime_session(session: CallSession) -> None:
             )
 
             # ── Configure session ──
+            from STT_server.config import OPENAI_REALTIME_TEMPERATURE
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -123,7 +124,7 @@ async def run_realtime_session(session: CallSession) -> None:
                         "prefix_padding_ms": 300,
                         "silence_duration_ms": 500,
                     },
-                    "temperature": 0.2,
+                    "temperature": OPENAI_REALTIME_TEMPERATURE,
                     "max_response_output_tokens": MAX_RESPONSE_TOKENS,
                 },
             }))
