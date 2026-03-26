@@ -657,11 +657,11 @@ async def process_transcripts(session: CallSession) -> None:
 
             language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
             source = item.get("source") or "realtime"
+            is_final = bool(item.get("is_final"))
+            speech_final = bool(item.get("speech_final"))
             if is_final:
                 session.preferred_language = language
             session.current_transcript = text
-            is_final = bool(item.get("is_final"))
-            speech_final = bool(item.get("speech_final"))
 
             if is_final and not final_transcript_ready(session, is_final):
                 log.info("Final recibido pero usuario sigue hablando, pausar procesamiento: %s", session.session_key)
