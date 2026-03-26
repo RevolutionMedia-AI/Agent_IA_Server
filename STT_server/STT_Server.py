@@ -69,7 +69,18 @@ async def media_stream(ws: WebSocket) -> None:
         track_task(session, asyncio.create_task(process_transcripts(session)))
 
         while True:
-            message = await ws.receive_text()
+            try:
+                message = await ws.receive_text()
+            except RuntimeError as e:
+                if "WebSocket is not connected" in str(e):
+                    log.warning("WebSocket ya no está conectado (probablemente cerrado por timeout o cliente). Saliendo del bucle de media_stream para %s.", session.session_key)
+                    break
+                else:
+                    raise
+            except WebSocketDisconnect:
+                log.info("WebSocket desconectado para %s", session.session_key)
+                break
+
             msg = json.loads(message)
             event = msg.get("event")
 
@@ -125,10 +136,8 @@ async def media_stream(ws: WebSocket) -> None:
                 log.info("Stream stop para %s", session.session_key)
                 break
 
-    except WebSocketDisconnect:
-        log.info("WebSocket desconectado para %s", session.session_key)
     except Exception:
-        log.exception("Error en media_stream")
+        log.exception("Error en media_stream (excepción no controlada)")
     finally:
         await cleanup_session(session, ws)
 
