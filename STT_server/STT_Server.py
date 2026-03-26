@@ -6,7 +6,6 @@ import uvicorn
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from STT_server.adapters.deepgram_stt_batch import transcribe_block
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
 from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_STT_LANGUAGE_HINT, DEEPGRAM_STT_MODEL, OPENAI_API_KEY, PORT, PUBLIC_URL, RIME_API_KEY, TWILIO_SR
@@ -16,7 +15,7 @@ from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import play_initial_greeting, playback_loop
 from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, register_session, track_task
-from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_local_utterances, process_transcripts
+from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_transcripts
 
 
 logging.basicConfig(level=logging.INFO)
@@ -67,7 +66,6 @@ async def media_stream(ws: WebSocket) -> None:
     try:
         track_task(session, asyncio.create_task(playback_loop(ws, session)))
         track_task(session, asyncio.create_task(process_transcripts(session)))
-        track_task(session, asyncio.create_task(process_local_utterances(session)))
 
         while True:
             message = await ws.receive_text()
@@ -145,6 +143,7 @@ async def test_llm_tts(q: str = Query(...)) -> dict:
 @app.post("/test-stt")
 async def test_stt() -> dict:
     require_debug_endpoints()
+    from STT_server.adapters.deepgram_stt_batch import transcribe_block
     dummy_audio = b"\x00\x00" * TWILIO_SR
     texts, language = await transcribe_block(dummy_audio, language_hint=DEEPGRAM_STT_LANGUAGE_HINT)
     return {

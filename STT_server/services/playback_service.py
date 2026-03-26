@@ -128,7 +128,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         if len(frame) == TWILIO_OUTBOUND_CHUNK_BYTES:
                             await asyncio.sleep(TWILIO_OUTBOUND_PACING_MS / 1000.0)
                 if LOG_TWILIO_PLAYBACK and sent_frames:
-                    log.info(
+                    log.debug(
                         "Playback audio %s gen=%s bytes=%s frames=%s",
                         session.session_key,
                         generation,

@@ -4,12 +4,10 @@ import logging
 import re
 import time
 
-from STT_server.adapters.deepgram_stt_batch import transcribe_block
 from STT_server.adapters.rime_tts import stream_tts_segment
 from STT_server.adapters.openai_llm import build_messages, call_llm, stream_llm_reply_sync
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
-    DEEPGRAM_STT_LANGUAGE_HINT,
     DIGIT_DICTATION_GRACE_MS,
     FILLER_DELAY_MS,
     FINAL_TRANSCRIPT_GRACE_MS,
@@ -327,14 +325,10 @@ def user_is_speaking(session: CallSession) -> bool:
     return bool(session.speech_frames or session.voice_streak > 0)
 
 
-def final_transcript_ready(session: CallSession, source: str, is_final: bool) -> bool:
+def final_transcript_ready(session: CallSession, is_final: bool) -> bool:
     if not is_final:
         return False
-    if source in {"batch_final", "realtime_fallback"}:
-        return not user_is_speaking(session)
-    if source == "realtime" and not session.awaiting_local_final:
-        return not user_is_speaking(session)
-    return False
+    return not user_is_speaking(session)
 
 
 def should_defer_final_transcript(text: str) -> bool:
@@ -384,7 +378,6 @@ async def process_final_transcript(
     prepared_reply = consume_prefetched_reply(session, text)
     await cancel_prefetch_task(session)
     clear_prefetched_reply(session)
-    session.pending_realtime_final = None
 
     # Collect structured data from final transcript and check duplication.
     update_memory(session, text)
@@ -430,11 +423,9 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
     if not text or session.closed:
         return
 
-    # If we're awaiting a batch STT result OR the text still looks
-    # incomplete, allow ONE extra short wait (half grace) to accumulate
-    # more text — but never the triple-grace cascade we had before.
-    # For digit dictation, use half of the digit grace for extension.
-    if session.awaiting_local_final or looks_like_incomplete_utterance(text):
+    # If the text still looks incomplete, allow ONE extra short wait
+    # (half grace) to accumulate more text.
+    if looks_like_incomplete_utterance(text):
         ext_ms = (
             DIGIT_DICTATION_GRACE_MS / 2
             if looks_like_digit_dictation(text)
@@ -656,64 +647,6 @@ async def enqueue_transcript_event(session: CallSession, event: dict) -> None:
     await enqueue_with_drop(session.transcript_queue, event, "transcript_queue")
 
 
-async def process_local_utterances(session: CallSession) -> None:
-    try:
-        while True:
-            generation, utterance = await session.utterance_queue.get()
-            if generation != session.active_generation:
-                session.awaiting_local_final = False
-                session.pending_realtime_final = None
-                continue
-
-            try:
-                texts, language = await transcribe_block(
-                    utterance,
-                    language_hint=session.preferred_language or DEEPGRAM_STT_LANGUAGE_HINT,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Batch STT error en %s", session.session_key)
-                texts = []
-                language = session.preferred_language or DEFAULT_CALL_LANGUAGE
-
-            final_text = " ".join(text.strip() for text in texts).strip()
-            session.awaiting_local_final = False
-
-            if final_text:
-                session.pending_realtime_final = None
-                await enqueue_transcript_event(
-                    session,
-                    {
-                        "text": final_text,
-                        "language": language,
-                        "is_final": True,
-                        "speech_final": True,
-                        "source": "batch_final",
-                    },
-                )
-                continue
-
-            pending_realtime = session.pending_realtime_final
-            session.pending_realtime_final = None
-            if pending_realtime:
-                # If a deferred final is already being flushed for this text,
-                # skip the fallback to avoid processing the same turn twice.
-                deferred = session.deferred_final_text.strip().lower()
-                fallback_text = (pending_realtime.get("text") or "").strip().lower()
-                if deferred and fallback_text and deferred == fallback_text:
-                    log.info(
-                        "Batch STT fallback omitido (deferred final ya en curso) en %s: %s",
-                        session.session_key, fallback_text,
-                    )
-                    continue
-                await enqueue_transcript_event(session, pending_realtime)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Error en process_local_utterances")
-
-
 async def process_transcripts(session: CallSession) -> None:
     try:
         while True:
@@ -724,13 +657,13 @@ async def process_transcripts(session: CallSession) -> None:
 
             language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
             source = item.get("source") or "realtime"
-            if source in {"batch_final", "realtime_fallback"} or (source == "realtime" and not session.awaiting_local_final and bool(item.get("is_final"))):
+            if is_final:
                 session.preferred_language = language
             session.current_transcript = text
             is_final = bool(item.get("is_final"))
             speech_final = bool(item.get("speech_final"))
 
-            if is_final and not final_transcript_ready(session, source, is_final):
+            if is_final and not final_transcript_ready(session, is_final):
                 log.info("Final recibido pero usuario sigue hablando, pausar procesamiento: %s", session.session_key)
                 session.deferred_final_text = text
                 session.deferred_final_language = language
@@ -742,21 +675,8 @@ async def process_transcripts(session: CallSession) -> None:
                 continue
 
             if is_final:
-                if source == "realtime" and session.awaiting_local_final:
-                    session.pending_realtime_final = {
-                        "text": text,
-                        "language": language,
-                        "is_final": True,
-                        "speech_final": speech_final,
-                        "source": "realtime_fallback",
-                    }
-                    continue
-
-                if source == "batch_final" and session.deferred_final_text:
-                    await cancel_deferred_final_flush(session)
-                    session.deferred_final_text = ""
-                    session.deferred_final_language = None
-                elif session.deferred_final_text:
+                # Merge with any pending deferred text.
+                if session.deferred_final_text:
                     await cancel_deferred_final_flush(session)
                     text = f"{session.deferred_final_text} {text}".strip()
                     language = normalize_supported_language(session.deferred_final_language or language)
@@ -796,19 +716,8 @@ async def process_transcripts(session: CallSession) -> None:
                 await process_final_transcript(session, text, language, speech_final=speech_final)
                 continue
 
-            if len(text) < PARTIAL_TRANSCRIPT_START_CHARS:
-                continue
-            if session.reply_task and not session.reply_task.done():
-                continue
-
-            pending_partial = session.partial_reply_task
-            if pending_partial and not pending_partial.done():
-                pending_partial.cancel()
-
-            task = asyncio.create_task(schedule_partial_reply(session, text))
-            session.partial_reply_task = task
-            session.tasks.add(task)
-            task.add_done_callback(session.tasks.discard)
+            # Partial transcripts: no action — wait for the final.
+            continue
     except asyncio.CancelledError:
         raise
     except Exception:

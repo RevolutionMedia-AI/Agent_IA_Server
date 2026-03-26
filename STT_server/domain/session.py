@@ -7,6 +7,7 @@ from STT_server.config import (
     PLAYBACK_QUEUE_MAXSIZE,
     PRE_SPEECH_FRAMES,
     STT_AUDIO_QUEUE_MAXSIZE,
+    STT_MUTE_BUFFER_CHUNKS,
     TRANSCRIPT_QUEUE_MAXSIZE,
 )
 
@@ -28,6 +29,7 @@ class CallSession:
     utterance_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)
     playback_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE))
     stt_audio_queue: asyncio.Queue[bytes | None] = field(default_factory=lambda: asyncio.Queue(maxsize=STT_AUDIO_QUEUE_MAXSIZE))
+    stt_mute_buffer: deque[bytes] = field(default_factory=lambda: deque(maxlen=STT_MUTE_BUFFER_CHUNKS))
     transcript_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=TRANSCRIPT_QUEUE_MAXSIZE))
     tasks: set[asyncio.Task] = field(default_factory=set)
     pending_marks: set[str] = field(default_factory=set)
@@ -41,8 +43,7 @@ class CallSession:
     prefetched_reply_source_text: str = ""
     prefetched_reply_text: str = ""
     prefetched_reply_task: asyncio.Task | None = None
-    awaiting_local_final: bool = False
-    pending_realtime_final: dict | None = None
+
     deferred_final_text: str = ""
     deferred_final_language: str | None = None
     deferred_final_flush_task: asyncio.Task | None = None

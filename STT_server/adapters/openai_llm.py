@@ -70,7 +70,7 @@ async def call_llm(session: CallSession, user_text: str) -> str:
             response = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=messages,
-                temperature=0.4,
+                temperature=0.2,
                 max_tokens=MAX_RESPONSE_TOKENS,
             )
             content = response.choices[0].message.content
@@ -99,7 +99,7 @@ def stream_llm_reply_sync(
         stream = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.4,
+            temperature=0.2,
             max_tokens=MAX_RESPONSE_TOKENS,
             stream=True,
         )
