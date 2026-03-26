@@ -7,6 +7,7 @@ from STT_server.config import (
     FILLER_TTS_ENABLED,
     RIME_TTS_SPEAKER_EN,
     RIME_TTS_SPEAKER_ES,
+    STREAMING_FIRST_SEGMENT_CHARS,
     STREAMING_SEGMENT_MAX_CHARS,
     STT_FAILURE_PROMPT_EN,
     STT_FAILURE_PROMPT_ES,
@@ -567,16 +568,20 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
 
     while remainder:
         cut_index: int | None = None
+        # First segment uses a lower threshold for faster TTFT
+        is_first = len(segments) == 0
+        min_punct = 5 if is_first else 15
+        max_chars = STREAMING_FIRST_SEGMENT_CHARS if is_first else STREAMING_SEGMENT_MAX_CHARS
 
         for index, char in enumerate(remainder):
-            if char in ".!?\n" and index >= 15:
+            if char in ".!?\n" and index >= min_punct:
                 cut_index = index + 1
                 break
 
-        if cut_index is None and len(remainder) >= STREAMING_SEGMENT_MAX_CHARS:
-            cut_index = remainder.rfind(" ", 0, STREAMING_SEGMENT_MAX_CHARS)
+        if cut_index is None and len(remainder) >= max_chars:
+            cut_index = remainder.rfind(" ", 0, max_chars)
             if cut_index <= 0:
-                cut_index = STREAMING_SEGMENT_MAX_CHARS
+                cut_index = max_chars
 
         if cut_index is None:
             break
