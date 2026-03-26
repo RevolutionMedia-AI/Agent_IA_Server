@@ -95,7 +95,7 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
     qs = urllib.parse.urlencode(params)
     if DEEPGRAM_STT_KEYWORDS:
         kw_qs = "&".join(
-            f"keywords={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
+            f"keyterm={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
         )
         qs = f"{qs}&{kw_qs}"
     url = f"https://api.deepgram.com/v1/listen?{qs}"

@@ -78,7 +78,7 @@ def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
     qs = urllib.parse.urlencode(params)
     if DEEPGRAM_STT_KEYWORDS:
         kw_qs = "&".join(
-            f"keywords={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
+            f"keyterm={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
         )
         qs = f"{qs}&{kw_qs}"
 
@@ -145,7 +145,7 @@ def build_deepgram_realtime_url_from_params(params: dict[str, str]) -> str:
     qs = urllib.parse.urlencode(params)
     if DEEPGRAM_STT_KEYWORDS:
         kw_qs = "&".join(
-            f"keywords={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
+            f"keyterm={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
         )
         qs = f"{qs}&{kw_qs}"
     return f"wss://api.deepgram.com/v1/listen?{qs}"
