@@ -32,6 +32,43 @@ from STT_server.services.playback_service import emit_playback_item, interrupt_c
 log = logging.getLogger("stt_server")
 
 
+# ── Echo / hallucination detection ──────────────────────────────────
+
+def _has_excessive_repetition(text: str) -> bool:
+    """True when any single word repeats 3+ times consecutively."""
+    words = text.lower().split()
+    streak = 1
+    for i in range(1, len(words)):
+        prev = words[i - 1].rstrip(".,!?;:")
+        curr = words[i].rstrip(".,!?;:")
+        if curr and curr == prev:
+            streak += 1
+            if streak >= 3:
+                return True
+        else:
+            streak = 1
+    return False
+
+
+def _echoes_agent_speech(text: str, session: CallSession) -> bool:
+    """True when >60 % of words overlap with the agent's last utterance."""
+    words = text.lower().split()
+    if len(words) < 4:
+        return False
+    for entry in reversed(session.history[-6:]):
+        if entry["role"] == "assistant":
+            agent_words = set(entry["content"].lower().split())
+            overlap = sum(1 for w in words if w.rstrip(".,!?;:") in agent_words)
+            return overlap > len(words) * 0.6
+    return False
+
+
+def is_echo_hallucination(text: str, session: CallSession) -> bool:
+    """Detects likely Deepgram hallucinations — repetitive garbage or
+    text that mirrors the agent's own speech (TTS echo)."""
+    return _has_excessive_repetition(text) or _echoes_agent_speech(text, session)
+
+
 def trim_history(session: CallSession) -> None:
     if len(session.history) > MAX_HISTORY_MESSAGES:
         session.history[:] = session.history[-MAX_HISTORY_MESSAGES:]
@@ -425,6 +462,17 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
         text = session.deferred_final_text.strip()
         if not text or session.closed:
             return
+
+    # ── Discard Deepgram hallucinations / TTS echo ──
+    if is_echo_hallucination(text, session):
+        log.info(
+            "Descartando hallucination/eco en %s: %s",
+            session.session_key, text,
+        )
+        session.deferred_final_text = ""
+        session.deferred_final_language = None
+        session.deferred_final_flush_task = None
+        return
 
     # ── Discard fragment echoes ──
     # Only discard if the deferred text is an exact duplicate of the last

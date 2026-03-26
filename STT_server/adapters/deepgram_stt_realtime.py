@@ -153,7 +153,17 @@ def build_deepgram_realtime_url_from_params(params: dict[str, str]) -> str:
 
 async def deepgram_audio_sender(dg_ws, session: CallSession) -> None:
     while True:
-        chunk = await session.stt_audio_queue.get()
+        try:
+            chunk = await asyncio.wait_for(session.stt_audio_queue.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            # No audio for 5 s (likely during TTS playback muting).
+            # Send KeepAlive so Deepgram doesn't close the connection.
+            if not session.closed:
+                try:
+                    await dg_ws.send(json.dumps({"type": "KeepAlive"}))
+                except Exception:
+                    return
+            continue
         if chunk is None:
             await dg_ws.send(json.dumps({"type": "Finalize"}))
             return

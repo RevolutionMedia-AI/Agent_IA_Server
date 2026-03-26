@@ -42,7 +42,9 @@ def is_probable_voice(frame: bytes) -> tuple[bool, int]:
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
     raw = base64.b64decode(media_payload)
-    if DEEPGRAM_API_KEY:
+    # Don't feed audio to STT while the agent is speaking — prevents
+    # Deepgram from hallucinating on TTS echo / background noise.
+    if DEEPGRAM_API_KEY and not session.assistant_speaking:
         await enqueue_with_drop(session.stt_audio_queue, raw, "stt_audio_queue")
     pcm16 = audioop.ulaw2lin(raw, 2)
     session.vad_buffer.extend(pcm16)
