@@ -59,17 +59,14 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
         return
     try:
         while not session.closed:
-            await asyncio.sleep(5)
-            if session.closed:
-                break
-            # Don't count idle while the assistant is speaking
             if session.assistant_speaking:
+                await asyncio.sleep(5)
                 continue
-            elapsed = time.monotonic() - session.last_activity_at
-            if elapsed >= IDLE_SILENCE_TIMEOUT_SEC:
+            remaining = IDLE_SILENCE_TIMEOUT_SEC - (time.monotonic() - session.last_activity_at)
+            if remaining <= 0:
                 log.info(
                     "Idle silence timeout (%.0fs) en %s, cerrando llamada",
-                    elapsed,
+                    IDLE_SILENCE_TIMEOUT_SEC,
                     session.session_key,
                 )
                 try:
@@ -77,6 +74,7 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                 except Exception:
                     pass
                 break
+            await asyncio.sleep(min(remaining, 5))
     except asyncio.CancelledError:
         return
     except Exception:

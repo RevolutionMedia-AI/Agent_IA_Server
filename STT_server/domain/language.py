@@ -1,3 +1,5 @@
+import re
+
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     FILLER_TEXT_EN,
@@ -9,6 +11,79 @@ from STT_server.config import (
     STT_FAILURE_PROMPT_EN,
     STT_FAILURE_PROMPT_ES,
 )
+
+
+# ── Digit dictation support ──
+# Maps spoken English number words to single digit characters.
+WORD_TO_DIGIT: dict[str, str] = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
+# Regex: each token is either digits (one or more) or a number word.
+_DIGIT_TOKEN_RE = re.compile(
+    r"^(?:" + "|".join([r"\d+"] + list(WORD_TO_DIGIT.keys())) + r")$",
+    re.IGNORECASE,
+)
+
+
+def normalize_digits_in_text(text: str) -> str:
+    """Convert spoken digit words and space-separated digits into a contiguous digit string.
+
+    Examples:
+        "4 5 1 0 8 6"          -> "451086"
+        "four five one zero"   -> "451086" (if those 4 words)
+        "my order is 4 5 1"    -> "my order is 451"
+    Only collapses consecutive digit-like tokens; non-digit words pass through.
+    """
+    tokens = text.strip().split()
+    result: list[str] = []
+    digit_run: list[str] = []
+
+    def flush_run() -> None:
+        if digit_run:
+            result.append("".join(digit_run))
+            digit_run.clear()
+
+    for tok in tokens:
+        clean = tok.strip(".,!?;:")
+        lowered = clean.lower()
+        if _DIGIT_TOKEN_RE.match(lowered):
+            digit_run.append(WORD_TO_DIGIT.get(lowered, clean))
+        else:
+            flush_run()
+            result.append(tok)
+
+    flush_run()
+    return " ".join(result)
+
+
+def looks_like_digit_dictation(text: str) -> bool:
+    """Return True if the text looks like the user is dictating digits/numbers.
+
+    Matches patterns like: "4 5 1", "four five one", "4 5 1 0 8 6",
+    single digit words, or mixed digit/word sequences with at least 2 tokens.
+    """
+    tokens = text.strip().split()
+    if not tokens:
+        return False
+
+    # Count how many tokens are digit-like.
+    digit_count = sum(
+        1 for t in tokens
+        if _DIGIT_TOKEN_RE.match(t.strip(".,!?;:").lower())
+    )
+
+    # If it's a single digit token, it might be start of dictation.
+    if len(tokens) == 1 and digit_count == 1:
+        return True
+
+    # If majority of tokens are digits (>=50%) and at least 2 digit tokens.
+    if digit_count >= 2 and digit_count >= len(tokens) * 0.5:
+        return True
+
+    return False
 
 
 SUPPORTED_LANGUAGES = ("en", "es")
@@ -114,7 +189,7 @@ SYSTEM_PROMPT = (
     "If not eligible: 'Unfortunately, based on our return policy, your order isn't eligible for a return at this time.' "
 
     # ── Order number simulation (demo mode) ──
-    "MANDATORY: When the customer provides a number that is 5 or 6 digits long, treat it as a valid order number. "
+    "MANDATORY: When the customer provides a number that is 4 or 10 digits long, treat it as a valid order number. "
     "Simulate realistic order details as if you looked it up: generate a plausible order date within the last 30 days, "
     "a shipping status (e.g. 'Processing', 'Shipped', 'Delivered'), a random USPS-style tracking number, "
     "and 1-3 Cialix products with quantities and prices that add up to a reasonable total. "
@@ -295,15 +370,21 @@ def get_language_instruction(lang: str) -> str:
 
 
 def extract_structured_data(text: str) -> dict[str, str]:
-    import re
-
     results: dict[str, str] = {}
     lowered = text.lower()
 
-    # Order number pattern (5-6 digits)
-    match = re.search(r"\b(\d{5,6})\b", text)
+    # Normalize spoken digits before looking for order numbers.
+    normalized = normalize_digits_in_text(text)
+
+    # Order number pattern (5-6 contiguous digits) — works on normalized text.
+    match = re.search(r"\b(\d{5,6})\b", normalized)
     if match:
         results["order_number"] = match.group(1)
+    else:
+        # Fallback: also try on original text in case normalization missed it.
+        match = re.search(r"\b(\d{5,6})\b", text)
+        if match:
+            results["order_number"] = match.group(1)
 
     # Email pattern
     match = re.search(r"\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b", text)
@@ -422,6 +503,15 @@ def looks_like_incomplete_utterance(text: str) -> bool:
     tokens = stripped.lower().replace("?", "").replace("!", "").replace(".", "").split()
     if not tokens:
         return False
+
+    # Digit dictation in progress — user may still be speaking digits.
+    # Only treat as incomplete if fewer than 5 digits accumulated so far.
+    if looks_like_digit_dictation(stripped):
+        normalized = normalize_digits_in_text(stripped)
+        digit_runs = re.findall(r"\d+", normalized)
+        max_digits = max((len(r) for r in digit_runs), default=0)
+        if max_digits < 5:
+            return True
 
     last_token = tokens[-1]
     if last_token in INCOMPLETE_TRAILING_MARKERS:

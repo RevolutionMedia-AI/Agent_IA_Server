@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import re
 import time
 
 from STT_server.adapters.deepgram_stt_batch import transcribe_block
@@ -9,10 +10,12 @@ from STT_server.adapters.openai_llm import build_messages, call_llm, stream_llm_
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     DEEPGRAM_STT_LANGUAGE_HINT,
+    DIGIT_DICTATION_GRACE_MS,
     FILLER_DELAY_MS,
     FINAL_TRANSCRIPT_GRACE_MS,
     FINAL_RESTART_DELTA_CHARS,
     LLM_TIMEOUT_SEC,
+    MAX_HISTORY_MESSAGES,
     PARTIAL_PREFETCH_MAX_DELTA_CHARS,
     PARTIAL_TRANSCRIPT_DEBOUNCE_MS,
     PARTIAL_TRANSCRIPT_START_CHARS,
@@ -20,7 +23,7 @@ from STT_server.config import (
     TEXT_SEGMENT_QUEUE_MAXSIZE,
     TTS_TIMEOUT_SEC,
 )
-from STT_server.domain.language import detect_language, get_filler_text, get_stt_failure_prompt, is_non_actionable_utterance, looks_like_incomplete_utterance, normalize_supported_language, split_tts_segments
+from STT_server.domain.language import detect_language, extract_structured_data, get_filler_text, get_stt_failure_prompt, is_duplicate_collected_data, is_non_actionable_utterance, looks_like_digit_dictation, looks_like_incomplete_utterance, normalize_digits_in_text, normalize_supported_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
@@ -30,24 +33,17 @@ log = logging.getLogger("stt_server")
 
 
 def trim_history(session: CallSession) -> None:
-    from STT_server.config import MAX_HISTORY_MESSAGES
-
     if len(session.history) > MAX_HISTORY_MESSAGES:
         session.history[:] = session.history[-MAX_HISTORY_MESSAGES:]
 
 
 def update_memory(session: CallSession, transcript: str) -> None:
-    from STT_server.domain.language import extract_structured_data
-
     structured = extract_structured_data(transcript)
     for k, v in structured.items():
         session.collected_data[k] = v
 
 
 def should_generate_response(session: CallSession, transcript: str) -> bool:
-    # Only generate when the final transcript is not a repeat of collected data
-    from STT_server.domain.language import extract_structured_data, is_duplicate_collected_data
-
     structured = extract_structured_data(transcript)
     if not structured:
         return True
@@ -56,12 +52,6 @@ def should_generate_response(session: CallSession, transcript: str) -> bool:
         return False
 
     return True
-
-async def generate_reply(session: CallSession, generation_id: int, user_text: str) -> None:
-    if generation_id != session.active_generation:
-        log.info("Ignorando generate_reply para gen desfasado %s (activa %s)", generation_id, session.active_generation)
-        return
-    await launch_reply_pipeline(session, user_text, trigger="final")
 
 async def play_tts_from_text_queue(
     session: CallSession,
@@ -306,6 +296,17 @@ def should_defer_final_transcript(text: str) -> bool:
     if word_count <= VERY_SHORT_WORD_LIMIT and stripped[-1] not in ".!?":
         return True
 
+    # Digit dictation: if the user seems to be spelling out an order
+    # number but hasn't yet reached 5 digits, keep deferring even if
+    # Deepgram added terminal punctuation — the user is likely still
+    # going.
+    if looks_like_digit_dictation(stripped):
+        normalized = normalize_digits_in_text(stripped)
+        digit_runs = re.findall(r"\d+", normalized)
+        max_digits = max((len(r) for r in digit_runs), default=0)
+        if max_digits < 5:
+            return True
+
     # Anything with terminal punctuation (.!?) is a complete turn — process now.
     if stripped[-1] in ".!?":
         return False
@@ -360,8 +361,16 @@ async def process_final_transcript(
 
 
 async def flush_deferred_final_after_grace(session: CallSession) -> None:
+    # Use a longer initial grace period when the user is dictating digits
+    # (e.g. spelling out an order number one digit at a time).
+    text_peek = session.deferred_final_text.strip()
+    grace_ms = (
+        DIGIT_DICTATION_GRACE_MS
+        if text_peek and looks_like_digit_dictation(text_peek)
+        else FINAL_TRANSCRIPT_GRACE_MS
+    )
     try:
-        await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 1000.0)
+        await asyncio.sleep(grace_ms / 1000.0)
     except asyncio.CancelledError:
         return
 
@@ -372,9 +381,15 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
     # If we're awaiting a batch STT result OR the text still looks
     # incomplete, allow ONE extra short wait (half grace) to accumulate
     # more text — but never the triple-grace cascade we had before.
+    # For digit dictation, use half of the digit grace for extension.
     if session.awaiting_local_final or looks_like_incomplete_utterance(text):
+        ext_ms = (
+            DIGIT_DICTATION_GRACE_MS / 2
+            if looks_like_digit_dictation(text)
+            else FINAL_TRANSCRIPT_GRACE_MS / 2
+        )
         try:
-            await asyncio.sleep(FINAL_TRANSCRIPT_GRACE_MS / 2000.0)
+            await asyncio.sleep(ext_ms / 1000.0)
         except asyncio.CancelledError:
             return
         text = session.deferred_final_text.strip()
@@ -401,8 +416,9 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
     # processed user text — substring matching was too aggressive and
     # discarded valid short answers like "Five" that happened to appear
     # inside a previous longer utterance.
+    text_norm = text.strip().lower()
     last = session.last_processed_user_text.strip().lower()
-    if last and text.strip().lower() == last:
+    if last and text_norm == last:
         log.info(
             "Descartando final diferido (duplicado exacto) en %s: %s",
             session.session_key, text,
@@ -414,9 +430,9 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
 
     # Also discard if it duplicates the last user entry in history.
     if session.history:
-        for entry in reversed(session.history):
+        for entry in reversed(session.history[-6:]):
             if entry["role"] == "user":
-                if text.strip().lower() == entry["content"].strip().lower():
+                if text_norm == entry["content"].strip().lower():
                     log.info(
                         "Descartando final diferido (duplica historial) en %s: %s",
                         session.session_key, text,
@@ -622,7 +638,7 @@ async def process_local_utterances(session: CallSession) -> None:
                 # skip the fallback to avoid processing the same turn twice.
                 deferred = session.deferred_final_text.strip().lower()
                 fallback_text = (pending_realtime.get("text") or "").strip().lower()
-                if deferred and (fallback_text in deferred or deferred in fallback_text):
+                if deferred and fallback_text and deferred == fallback_text:
                     log.info(
                         "Batch STT fallback omitido (deferred final ya en curso) en %s: %s",
                         session.session_key, fallback_text,

@@ -64,28 +64,6 @@ async def interrupt_current_turn(session: CallSession) -> None:
     await enqueue_playback_clear(session)
 
 
-async def handle_barge_in(session: CallSession) -> None:
-    """Alias claro para la logica de barge-in esperada por QA."""
-    await interrupt_current_turn(session)
-
-    if session.prefetched_reply_task and not session.prefetched_reply_task.done():
-        session.prefetched_reply_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await session.prefetched_reply_task
-        session.prefetched_reply_task = None
-
-    session.reply_source_text = ""
-    session.partial_reply_task = None
-    session.prefetched_reply_source_text = ""
-    session.prefetched_reply_text = ""
-
-    session.assistant_speaking = False
-    session.assistant_started_at = None
-    session.pending_marks.clear()
-    drain_queue_nowait(session.playback_queue)
-    await enqueue_playback_clear(session)
-
-
 async def play_initial_greeting(session: CallSession) -> None:
     if not INITIAL_GREETING_ENABLED or not INITIAL_GREETING_TEXT or not DEEPGRAM_API_KEY:
         return

@@ -47,9 +47,13 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
     pcm16 = audioop.ulaw2lin(raw, 2)
     session.vad_buffer.extend(pcm16)
 
-    while len(session.vad_buffer) >= FRAME_BYTES:
-        frame = bytes(session.vad_buffer[:FRAME_BYTES])
-        del session.vad_buffer[:FRAME_BYTES]
+    buf = session.vad_buffer
+    offset = 0
+    buf_len = len(buf)
+
+    while buf_len - offset >= FRAME_BYTES:
+        frame = bytes(buf[offset:offset + FRAME_BYTES])
+        offset += FRAME_BYTES
 
         is_voice, rms = is_probable_voice(frame)
         session.pre_speech_frames.append(frame)
@@ -118,3 +122,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
             session.pre_speech_frames.clear()
             session.silence_frames = 0
             session.speech_frame_count = 0
+
+    # Compact: remove consumed bytes in one operation instead of per-frame
+    if offset > 0:
+        del buf[:offset]
