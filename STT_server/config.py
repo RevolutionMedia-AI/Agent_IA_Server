@@ -27,6 +27,15 @@ DEEPGRAM_STT_DETECT_LANGUAGE = os.getenv("DEEPGRAM_STT_DETECT_LANGUAGE", "false"
 DEEPGRAM_STT_LANGUAGE_HINT = os.getenv("DEEPGRAM_STT_LANGUAGE_HINT", "en").strip().lower() or None
 DEEPGRAM_STT_ENDPOINTING_MS = int(os.getenv("DEEPGRAM_STT_ENDPOINTING_MS", "500"))
 DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000"))
+DEEPGRAM_STT_NUMERALS = os.getenv("DEEPGRAM_STT_NUMERALS", "true").strip().lower() in {"1", "true", "yes", "on"}
+DEEPGRAM_STT_KEYWORDS: list[str] = [
+    kw.strip()
+    for kw in os.getenv(
+        "DEEPGRAM_STT_KEYWORDS",
+        "zero:2,one:2,two:2,three:2,four:2,five:2,six:2,seven:2,eight:2,nine:2,oh:1,order number:2"
+    ).split(",")
+    if kw.strip()
+]
 
 
 RIME_API_KEY = os.getenv("RIME_API_KEY")

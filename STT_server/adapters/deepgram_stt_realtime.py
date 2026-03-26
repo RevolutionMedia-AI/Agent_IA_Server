@@ -11,8 +11,10 @@ from STT_server.config import (
     DEEPGRAM_API_KEY,
     DEEPGRAM_STT_DETECT_LANGUAGE,
     DEEPGRAM_STT_ENDPOINTING_MS,
+    DEEPGRAM_STT_KEYWORDS,
     DEEPGRAM_STT_LANGUAGE_HINT,
     DEEPGRAM_STT_MODEL,
+    DEEPGRAM_STT_NUMERALS,
     DEEPGRAM_STT_PUNCTUATE,
     DEEPGRAM_STT_SMART_FORMAT,
     STT_RECONNECT_BASE_DELAY_MS,
@@ -63,6 +65,7 @@ def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
         "punctuate": str(DEEPGRAM_STT_PUNCTUATE).lower(),
         "smart_format": str(DEEPGRAM_STT_SMART_FORMAT).lower(),
         "endpointing": str(DEEPGRAM_STT_ENDPOINTING_MS),
+        "numerals": str(DEEPGRAM_STT_NUMERALS).lower(),
         "vad_events": "true",
     }
 
@@ -71,7 +74,15 @@ def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
     elif DEEPGRAM_STT_DETECT_LANGUAGE:
         params["language"] = "multi"
 
-    return f"wss://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
+    # Deepgram keywords param accepts multiple values via repeated key.
+    qs = urllib.parse.urlencode(params)
+    if DEEPGRAM_STT_KEYWORDS:
+        kw_qs = "&".join(
+            f"keywords={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
+        )
+        qs = f"{qs}&{kw_qs}"
+
+    return f"wss://api.deepgram.com/v1/listen?{qs}"
 
 
 def build_deepgram_realtime_candidates(language_hint: str | None = None) -> list[dict[str, str]]:
@@ -94,6 +105,7 @@ def build_deepgram_realtime_candidates(language_hint: str | None = None) -> list
         "punctuate": str(DEEPGRAM_STT_PUNCTUATE).lower(),
         "smart_format": str(DEEPGRAM_STT_SMART_FORMAT).lower(),
         "endpointing": str(DEEPGRAM_STT_ENDPOINTING_MS),
+        "numerals": str(DEEPGRAM_STT_NUMERALS).lower(),
     }
 
     candidates: list[dict[str, str]] = []
@@ -130,7 +142,13 @@ def build_deepgram_realtime_candidates(language_hint: str | None = None) -> list
 
 
 def build_deepgram_realtime_url_from_params(params: dict[str, str]) -> str:
-    return f"wss://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
+    qs = urllib.parse.urlencode(params)
+    if DEEPGRAM_STT_KEYWORDS:
+        kw_qs = "&".join(
+            f"keywords={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
+        )
+        qs = f"{qs}&{kw_qs}"
+    return f"wss://api.deepgram.com/v1/listen?{qs}"
 
 
 async def deepgram_audio_sender(dg_ws, session: CallSession) -> None:

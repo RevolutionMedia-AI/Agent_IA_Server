@@ -33,6 +33,27 @@ def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]
             }
         )
 
+    # Count how many times the assistant has already asked for the order
+    # number so the LLM can decide to escalate rather than loop.
+    _ORDER_PHRASES = ("order number", "order #", "número de orden", "numero de pedido")
+    ask_count = 0
+    for entry in session.history:
+        if entry["role"] == "assistant":
+            lowered = entry["content"].lower()
+            if any(phrase in lowered for phrase in _ORDER_PHRASES):
+                ask_count += 1
+    if ask_count >= 2:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"WARNING: You have already asked for the order number {ask_count} times in this call. "
+                    "The speech recognition system is having difficulty capturing the digits. "
+                    "Do NOT ask again. Transfer the caller to a live agent immediately using TRANSFER_AGENT."
+                ),
+            }
+        )
+
     messages.extend(session.history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_text})
     return messages

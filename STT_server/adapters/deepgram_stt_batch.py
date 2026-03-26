@@ -16,7 +16,9 @@ _BATCH_RETRY_BASE_DELAY = 1.0  # seconds
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     DEEPGRAM_API_KEY,
+    DEEPGRAM_STT_KEYWORDS,
     DEEPGRAM_STT_MODEL,
+    DEEPGRAM_STT_NUMERALS,
     DEEPGRAM_STT_PUNCTUATE,
     DEEPGRAM_STT_SMART_FORMAT,
     STT_TIMEOUT_SEC,
@@ -81,6 +83,7 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
         "model": DEEPGRAM_STT_MODEL,
         "punctuate": str(DEEPGRAM_STT_PUNCTUATE).lower(),
         "smart_format": str(DEEPGRAM_STT_SMART_FORMAT).lower(),
+        "numerals": str(DEEPGRAM_STT_NUMERALS).lower(),
     }
 
     hint = normalize_deepgram_language(language_hint)
@@ -89,7 +92,13 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
     else:
         params["language"] = "multi"
 
-    url = f"https://api.deepgram.com/v1/listen?{urllib.parse.urlencode(params)}"
+    qs = urllib.parse.urlencode(params)
+    if DEEPGRAM_STT_KEYWORDS:
+        kw_qs = "&".join(
+            f"keywords={urllib.parse.quote(kw)}" for kw in DEEPGRAM_STT_KEYWORDS
+        )
+        qs = f"{qs}&{kw_qs}"
+    url = f"https://api.deepgram.com/v1/listen?{qs}"
     wav_audio = pcm16_to_wav_bytes(pcm16_audio)
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
