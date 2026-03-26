@@ -7,6 +7,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from STT_server.config import (
+    DEFAULT_CALL_LANGUAGE,
     DEEPGRAM_API_KEY,
     DEEPGRAM_STT_DETECT_LANGUAGE,
     DEEPGRAM_STT_ENDPOINTING_MS,
@@ -75,6 +76,11 @@ def build_deepgram_realtime_url(language_hint: str | None = None) -> str:
 
 def build_deepgram_realtime_candidates(language_hint: str | None = None) -> list[dict[str, str]]:
     hint = normalize_deepgram_language(language_hint or DEEPGRAM_STT_LANGUAGE_HINT)
+    # When no explicit hint, use the default call language for the primary
+    # candidates — a specific language ("en") is far more stable than
+    # "multi" and avoids intermittent early connection drops.
+    effective_hint = hint or normalize_deepgram_language(DEFAULT_CALL_LANGUAGE)
+
     candidate_models: list[str] = []
     for model in (DEEPGRAM_STT_MODEL, "nova-3", "nova-2", "phonecall"):
         if model and model not in candidate_models:
@@ -93,12 +99,17 @@ def build_deepgram_realtime_candidates(language_hint: str | None = None) -> list
     candidates: list[dict[str, str]] = []
 
     for model in candidate_models:
+        # Primary: specific language + vad (most stable)
         params = {**base_params, "model": model, "vad_events": "true"}
-        if hint:
-            params["language"] = hint
-        elif DEEPGRAM_STT_DETECT_LANGUAGE:
-            params["language"] = "multi"
+        if effective_hint:
+            params["language"] = effective_hint
         candidates.append(params)
+
+        # Multilingual fallback with vad (if detection enabled and
+        # the primary hint is not already "multi")
+        if DEEPGRAM_STT_DETECT_LANGUAGE and effective_hint != "multi":
+            multi_params = {**base_params, "model": model, "vad_events": "true", "language": "multi"}
+            candidates.append(multi_params)
 
         no_vad_params = {key: value for key, value in params.items() if key != "vad_events"}
         candidates.append(no_vad_params)
@@ -140,6 +151,22 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
     attempt = 0
 
     while not session.closed:
+        # On reconnect, flush stale buffered audio so Deepgram
+        # processes current speech instead of old backlog.
+        if attempt > 0:
+            drained = 0
+            while not session.stt_audio_queue.empty():
+                try:
+                    session.stt_audio_queue.get_nowait()
+                    drained += 1
+                except asyncio.QueueEmpty:
+                    break
+            if drained:
+                log.info(
+                    "Drenado %d chunks de audio stale en reconexion para %s",
+                    drained, session.session_key,
+                )
+
         sender_task: asyncio.Task | None = None
         last_invalid_status: InvalidStatus | None = None
         received_any_result = False
@@ -224,6 +251,23 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
 
                         if session.closed:
                             return
+
+                        if not received_any_result:
+                            # Connection opened but dropped without sending
+                            # any results — try next candidate params instead
+                            # of wasting the entire reconnect attempt.
+                            if sender_task is not None:
+                                sender_task.cancel()
+                                try:
+                                    await sender_task
+                                except asyncio.CancelledError:
+                                    pass
+                                sender_task = None
+                            log.info(
+                                "Deepgram dropped sin resultados, probando siguiente candidato para %s",
+                                session.session_key,
+                            )
+                            continue
 
                         break
                 except InvalidStatus as exc:
