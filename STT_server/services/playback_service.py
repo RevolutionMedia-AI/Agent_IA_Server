@@ -13,6 +13,8 @@ from STT_server.config import (
     LOG_TWILIO_PLAYBACK,
     OPENAI_API_KEY,
     RIME_API_KEY,
+    TTS_MAX_RETRIES,
+    TTS_RETRY_BACKOFF_MS,
     TTS_TIMEOUT_SEC,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
@@ -23,6 +25,35 @@ from STT_server.services.common import drain_queue_nowait, enqueue_nowait_with_d
 
 
 log = logging.getLogger("stt_server")
+
+
+async def run_tts_with_retries(session: CallSession, text: str, generation: int) -> tuple[float | None, float]:
+    attempts = max(0, TTS_MAX_RETRIES) + 1
+    last_timeout = False
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(
+                stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item)),
+                timeout=TTS_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            last_timeout = True
+            log.warning(
+                "TTS timeout en saludo %s (attempt %s/%s, text_len=%s)",
+                session.session_key,
+                attempt,
+                attempts,
+                len(text),
+            )
+            if attempt < attempts:
+                await asyncio.sleep(max(0, TTS_RETRY_BACKOFF_MS) / 1000.0)
+        except Exception:
+            log.exception("TTS error en saludo %s (attempt %s/%s)", session.session_key, attempt, attempts)
+            raise
+
+    if last_timeout:
+        raise asyncio.TimeoutError()
+    raise RuntimeError("TTS greeting failed without timeout detail")
 
 
 def emit_playback_item(session: CallSession, item: dict) -> bool:
@@ -79,10 +110,7 @@ async def play_initial_greeting(session: CallSession) -> None:
         for segment in split_tts_segments(INITIAL_GREETING_TEXT):
             if generation != session.active_generation:
                 return
-            await asyncio.wait_for(
-                stream_tts_segment(session, segment, generation, lambda item: emit_playback_item(session, item)),
-                timeout=TTS_TIMEOUT_SEC,
-            )
+            await run_tts_with_retries(session, segment, generation)
     except asyncio.TimeoutError:
         log.warning("TTS timeout en saludo inicial para %s", session.session_key)
     except Exception:

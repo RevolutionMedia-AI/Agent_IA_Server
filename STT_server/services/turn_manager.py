@@ -19,6 +19,8 @@ from STT_server.config import (
     PARTIAL_TRANSCRIPT_START_CHARS,
     SHORT_FINAL_MAX_WORDS,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
+    TTS_MAX_RETRIES,
+    TTS_RETRY_BACKOFF_MS,
     TTS_TIMEOUT_SEC,
 )
 from STT_server.domain.language import detect_language, extract_structured_data, get_filler_text, get_stt_failure_prompt, is_duplicate_collected_data, is_non_actionable_utterance, looks_like_digit_dictation, looks_like_incomplete_utterance, normalize_digits_in_text, normalize_supported_language, split_tts_segments
@@ -28,6 +30,41 @@ from STT_server.services.playback_service import emit_playback_item, interrupt_c
 
 
 log = logging.getLogger("stt_server")
+
+
+async def run_tts_with_retries(session: CallSession, text: str, generation: int) -> tuple[float | None, float]:
+    """Run one TTS segment with timeout + bounded retries."""
+    attempts = max(0, TTS_MAX_RETRIES) + 1
+    last_timeout = False
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(
+                stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item)),
+                timeout=TTS_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            last_timeout = True
+            log.warning(
+                "TTS timeout en %s (attempt %s/%s, text_len=%s)",
+                session.session_key,
+                attempt,
+                attempts,
+                len(text),
+            )
+            if attempt < attempts:
+                await asyncio.sleep(max(0, TTS_RETRY_BACKOFF_MS) / 1000.0)
+        except Exception:
+            log.exception(
+                "TTS error en %s (attempt %s/%s)",
+                session.session_key,
+                attempt,
+                attempts,
+            )
+            raise
+
+    if last_timeout:
+        raise asyncio.TimeoutError()
+    raise RuntimeError("TTS failed without timeout detail")
 
 
 # ── Echo / hallucination detection ──────────────────────────────────
@@ -135,16 +172,11 @@ async def play_tts_from_text_queue(
         first_emitted = True
 
         try:
-            metric = await asyncio.wait_for(
-                stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item)),
-                timeout=TTS_TIMEOUT_SEC,
-            )
+            metric = await run_tts_with_retries(session, text, generation)
             metrics.append(metric)
         except asyncio.TimeoutError:
-            log.warning("TTS timeout en %s", session.session_key)
             break
         except Exception:
-            log.exception("TTS error en %s", session.session_key)
             break
 
         if end_of_stream:
@@ -165,16 +197,11 @@ async def speak_precomputed_reply(
             break
 
         try:
-            metric = await asyncio.wait_for(
-                stream_tts_segment(session, segment, generation, lambda item: emit_playback_item(session, item)),
-                timeout=TTS_TIMEOUT_SEC,
-            )
+            metric = await run_tts_with_retries(session, segment, generation)
             metrics.append(metric)
         except asyncio.TimeoutError:
-            log.warning("TTS timeout en %s", session.session_key)
             break
         except Exception:
-            log.exception("TTS error en %s", session.session_key)
             break
 
     return metrics
@@ -253,10 +280,7 @@ async def stream_llm_reply_with_tts(
     if llm_error and not reply and generation == session.active_generation:
         reply = "Lo siento, estoy tardando mas de lo normal. Puedes repetirlo?"
         try:
-            fallback_metric = await asyncio.wait_for(
-                stream_tts_segment(session, reply, generation, lambda item: emit_playback_item(session, item)),
-                timeout=TTS_TIMEOUT_SEC,
-            )
+            fallback_metric = await run_tts_with_retries(session, reply, generation)
             tts_metrics.append(fallback_metric)
         except asyncio.TimeoutError:
             log.warning("TTS timeout en fallback de %s", session.session_key)
@@ -734,10 +758,7 @@ async def announce_stt_failure_once(session: CallSession) -> None:
     prompt = get_stt_failure_prompt(session.preferred_language or DEFAULT_CALL_LANGUAGE)
 
     try:
-        await asyncio.wait_for(
-            stream_tts_segment(session, prompt, generation, lambda item: emit_playback_item(session, item)),
-            timeout=TTS_TIMEOUT_SEC,
-        )
+        await run_tts_with_retries(session, prompt, generation)
     except asyncio.TimeoutError:
         log.warning("TTS timeout en fallback STT para %s", session.session_key)
     except Exception:
