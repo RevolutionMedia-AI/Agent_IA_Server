@@ -381,10 +381,11 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
         if not text or session.closed:
             return
 
-    # If the assistant is still speaking, wait until playback finishes
-    # before flushing so we don't interrupt the current response.
+    # If the assistant is still speaking, wait briefly for playback to
+    # finish — but cap at ~3 s to avoid the "amnesia" effect where user
+    # input is recognised too late.
     if session.assistant_speaking:
-        for _ in range(20):  # up to ~10s extra wait
+        for _ in range(6):  # up to ~3s extra wait
             try:
                 await asyncio.sleep(0.5)
             except asyncio.CancelledError:
@@ -396,12 +397,14 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
             return
 
     # ── Discard fragment echoes ──
-    # If the deferred text is a substring of the last processed user text
-    # it is just an echo/suffix Deepgram re-sent — not a new utterance.
+    # Only discard if the deferred text is an exact duplicate of the last
+    # processed user text — substring matching was too aggressive and
+    # discarded valid short answers like "Five" that happened to appear
+    # inside a previous longer utterance.
     last = session.last_processed_user_text.strip().lower()
-    if last and text.strip().lower() in last:
+    if last and text.strip().lower() == last:
         log.info(
-            "Descartando final diferido (fragmento duplicado) en %s: %s",
+            "Descartando final diferido (duplicado exacto) en %s: %s",
             session.session_key, text,
         )
         session.deferred_final_text = ""
