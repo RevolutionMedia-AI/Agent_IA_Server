@@ -26,6 +26,7 @@ log = logging.getLogger("stt_server")
 
 
 def emit_playback_item(session: CallSession, item: dict) -> bool:
+    log.debug("[PLAYBACK] Enqueue playback item: session=%s type=%s gen=%s bytes=%s", getattr(session, 'session_key', '?'), item.get('type'), item.get('generation'), len(item.get('data', b'')) if 'data' in item else '-')
     return enqueue_nowait_with_drop(session.playback_queue, item, "playback_queue")
 
 
@@ -114,6 +115,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         if session.stream_sid:
                             break
                 if not session.stream_sid:
+                    log.warning("[PLAYBACK] No stream_sid for audio item, skipping")
                     continue
 
                 if not session.assistant_speaking:
@@ -124,6 +126,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 sent_frames = 0
                 for start in range(0, len(chunk), TWILIO_OUTBOUND_CHUNK_BYTES):
                     frame = chunk[start : start + TWILIO_OUTBOUND_CHUNK_BYTES]
+                    log.debug("[PLAYBACK] Sending Twilio frame: session=%s gen=%s frame_bytes=%d", session.session_key, generation, len(frame))
                     if frame:
                         await send_twilio_media(ws, session.stream_sid, frame)
                         sent_frames += 1
@@ -131,7 +134,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                             await asyncio.sleep(TWILIO_OUTBOUND_PACING_MS / 1000.0)
                 if LOG_TWILIO_PLAYBACK and sent_frames:
                     log.debug(
-                        "Playback audio %s gen=%s bytes=%s frames=%s",
+                        "[PLAYBACK] Playback audio %s gen=%s bytes=%s frames=%s",
                         session.session_key,
                         generation,
                         len(chunk),
