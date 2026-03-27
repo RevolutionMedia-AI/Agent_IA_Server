@@ -84,6 +84,10 @@ MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
 DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "en").strip().lower()
 
+# If false, we buffer the full assistant reply and run TTS once per reply.
+# This avoids ultra-short TTS segments and reduces the chance of "first words only" failures.
+REALTIME_TTS_STREAMING = os.getenv("REALTIME_TTS_STREAMING", "false").strip().lower() in {"1", "true", "yes", "on"}
+
 
 LOG_TWILIO_PLAYBACK = os.getenv("LOG_TWILIO_PLAYBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 FILLER_TTS_ENABLED = os.getenv("FILLER_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}

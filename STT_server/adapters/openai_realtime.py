@@ -22,13 +22,13 @@ from STT_server.config import (
     MAX_RESPONSE_TOKENS,
     OPENAI_API_KEY,
     OPENAI_REALTIME_MODEL,
+    REALTIME_TTS_STREAMING,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
 )
 from STT_server.domain.language import (
     SYSTEM_PROMPT,
     extract_structured_data,
     get_language_instruction,
-    pop_streaming_segments,
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop
@@ -299,22 +299,31 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 if not delta or tq is None:
                     continue
                 current_response_text += delta
-                pending += delta
-                segments, pending = pop_streaming_segments(pending)
-                for seg in segments:
-                    enqueue_nowait_with_drop(tq, seg, "text_segment_queue")
+                if REALTIME_TTS_STREAMING:
+                    pending += delta
+                    from STT_server.domain.language import pop_streaming_segments
+                    segments, pending = pop_streaming_segments(pending)
+                    for seg in segments:
+                        enqueue_nowait_with_drop(tq, seg, "text_segment_queue")
                 continue
 
             if etype == "response.text.done":
                 tq = session.realtime_text_queue
-                if tq is not None and pending.strip():
+                if REALTIME_TTS_STREAMING and tq is not None and pending.strip():
+                    from STT_server.domain.language import pop_streaming_segments
                     segments, _ = pop_streaming_segments(pending, force=True)
                     for seg in segments:
                         enqueue_nowait_with_drop(tq, seg, "text_segment_queue")
-                pending = ""
+                    pending = ""
                 continue
 
             if etype == "response.done":
+                # If we are NOT streaming TTS, enqueue the full reply once.
+                if not REALTIME_TTS_STREAMING:
+                    tq = session.realtime_text_queue
+                    full_reply = current_response_text.strip()
+                    if tq is not None and full_reply:
+                        enqueue_nowait_with_drop(tq, full_reply, "text_segment_queue")
                 # Signal end-of-stream to TTS consumer
                 tq = session.realtime_text_queue
                 if tq is not None:

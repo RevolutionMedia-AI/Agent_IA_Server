@@ -33,17 +33,17 @@ log = logging.getLogger("stt_server")
 
 
 async def run_tts_with_retries(session: CallSession, text: str, generation: int) -> tuple[float | None, float]:
-    """Run one TTS segment with timeout + bounded retries."""
+    """Run one TTS segment with bounded retries.
+
+    Important: we avoid wrapping the whole streaming call in wait_for(),
+    because cancellation truncates audio mid-stream. The adapter itself
+    handles TTFB/idle timeouts.
+    """
     attempts = max(0, TTS_MAX_RETRIES) + 1
-    last_timeout = False
     for attempt in range(1, attempts + 1):
         try:
-            return await asyncio.wait_for(
-                stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item)),
-                timeout=TTS_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            last_timeout = True
+            return await stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item))
+        except (asyncio.TimeoutError, TimeoutError):
             log.warning(
                 "TTS timeout en %s (attempt %s/%s, text_len=%s)",
                 session.session_key,
@@ -54,17 +54,10 @@ async def run_tts_with_retries(session: CallSession, text: str, generation: int)
             if attempt < attempts:
                 await asyncio.sleep(max(0, TTS_RETRY_BACKOFF_MS) / 1000.0)
         except Exception:
-            log.exception(
-                "TTS error en %s (attempt %s/%s)",
-                session.session_key,
-                attempt,
-                attempts,
-            )
+            log.exception("TTS error en %s (attempt %s/%s)", session.session_key, attempt, attempts)
             raise
 
-    if last_timeout:
-        raise asyncio.TimeoutError()
-    raise RuntimeError("TTS failed without timeout detail")
+    raise asyncio.TimeoutError()
 
 
 # ── Echo / hallucination detection ──────────────────────────────────
