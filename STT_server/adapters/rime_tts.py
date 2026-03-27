@@ -156,8 +156,12 @@ async def stream_tts_segment(
                 per_recv_timeout = TTS_TTFB_TIMEOUT_SEC if not emitted_audio else TTS_IDLE_TIMEOUT_SEC
                 try:
                     raw_msg = await asyncio.wait_for(ws.recv(), timeout=per_recv_timeout)
-                except asyncio.TimeoutError:
+                except asyncio.CancelledError:
+                    # Propagate cancellation (e.g. generation change / overall segment timeout)
+                    raise
+                except (asyncio.TimeoutError, TimeoutError):
                     if not emitted_audio:
+                        # No audio ever arrived within TTFB timeout.
                         raise
                     # If audio already started and Rime goes idle, treat as end-of-stream.
                     log.warning(
@@ -222,6 +226,19 @@ async def stream_tts_segment(
                 # Unknown frame type — log and skip
                 log.warning("Rime WS unknown frame type=%s keys=%s", msg_type, list(msg.keys()))
 
+    except (asyncio.TimeoutError, TimeoutError):
+        # Treat as expected failure mode; retry logic lives upstream.
+        log.warning(
+            "Rime WS recv timeout: session=%s gen=%s emitted_audio=%s",
+            session.session_key,
+            generation,
+            emitted_audio,
+        )
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": "Rime WS timeout while waiting for audio",
+        })
     except websockets.exceptions.InvalidStatus as exc:
         body = ""
         if hasattr(exc, "response") and exc.response:
@@ -242,6 +259,9 @@ async def stream_tts_segment(
             "generation": generation,
             "message": f"Rime WS closed: {exc}",
         })
+    except asyncio.CancelledError:
+        # Do not emit error items on cancellation; caller requested stop.
+        raise
     except Exception as exc:
         log.exception("Rime WS TTS error in %s", session.session_key)
         emit_item({
