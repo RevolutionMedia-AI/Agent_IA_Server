@@ -25,7 +25,7 @@ from STT_server.services.playback_service import interrupt_current_turn
 
 
 log = logging.getLogger("stt_server")
-vad = webrtcvad.Vad(2)
+vad = webrtcvad.Vad(1)
 FRAME_SAMPLES = int(TWILIO_SR * FRAME_DURATION_MS / 1000)
 FRAME_BYTES = FRAME_SAMPLES * 2
 
