@@ -81,8 +81,10 @@ def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes =
     boundaries stay aligned across WebSocket messages.
     """
     data = remainder + pcm_bytes
-    usable = len(data) & ~1
-    leftover = data[usable:]  # 0 or 1 byte carried to next chunk
+    # Asegura que el chunk sea múltiplo de 160 bytes (20 ms @ 8kHz, 16 bits)
+    CHUNK_SIZE = 160  # 20 ms de audio a 8000 Hz, 16 bits, 1 canal
+    usable = len(data) - (len(data) % CHUNK_SIZE)
+    leftover = data[usable:]  # bytes restantes para el siguiente chunk
     if usable == 0:
         return b"", leftover
     n_samples = usable // 2
@@ -90,7 +92,8 @@ def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes =
     if src_rate != TWILIO_SAMPLE_RATE:
         samples = _downsample_linear(samples, src_rate, TWILIO_SAMPLE_RATE)
     pcm = struct.pack(f"<{len(samples)}h", *samples)
-    return _pcm16_to_mulaw(pcm), leftover
+    mulaw = _pcm16_to_mulaw(pcm)
+    return mulaw, leftover
 
 
 async def stream_tts_segment(
