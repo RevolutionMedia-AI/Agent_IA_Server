@@ -146,7 +146,6 @@ async def play_tts_from_text_queue(
     text_queue: asyncio.Queue[str | None],
 ) -> list[tuple[float | None, float]]:
     metrics: list[tuple[float | None, float]] = []
-    first_emitted = False
 
     while True:
         text = await text_queue.get()
@@ -155,31 +154,12 @@ async def play_tts_from_text_queue(
         if generation != session.active_generation:
             break
 
-        # After the first segment is spoken, merge any already-queued
-        # segments into a single TTS call to reduce inter-segment gaps.
-        end_of_stream = False
-        if first_emitted:
-            while not text_queue.empty():
-                try:
-                    peek = text_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if peek is None:
-                    end_of_stream = True
-                    break
-                text += " " + peek
-
-        first_emitted = True
-
         try:
             metric = await run_tts_with_retries(session, text, generation)
             metrics.append(metric)
         except asyncio.TimeoutError:
             break
         except Exception:
-            break
-
-        if end_of_stream:
             break
 
     return metrics
