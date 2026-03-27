@@ -171,19 +171,10 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 continue
 
             if item_type == "segment_end":
-                if not item.get("has_audio", False):
-                    # Avoid sending Twilio marks for empty/failed segments.
-                    # Marks without media can make logs look successful when
-                    # nothing was actually played.
-                    if not session.pending_marks:
-                        session.assistant_speaking = False
-                        session.assistant_started_at = None
-                    continue
-
-                if not session.stream_sid:
-                    session.assistant_speaking = False
-                    session.assistant_started_at = None
-                    continue
+                # Forzar unmute del STT al terminar cualquier segmento, con o sin audio
+                session.assistant_speaking = False
+                session.assistant_started_at = None
+                continue
 
                 session.mark_counter += 1
                 mark_name = f"gen-{generation}-seg-{session.mark_counter}"
