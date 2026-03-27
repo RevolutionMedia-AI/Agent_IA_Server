@@ -71,7 +71,7 @@ ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "1200"))
 
 STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5.0"))
-TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "5.0"))
+TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "10.0"))
 TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "1"))
 TTS_RETRY_BACKOFF_MS = int(os.getenv("TTS_RETRY_BACKOFF_MS", "250"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
