@@ -171,6 +171,15 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 continue
 
             if item_type == "segment_end":
+                if not item.get("has_audio", False):
+                    # Avoid sending Twilio marks for empty/failed segments.
+                    # Marks without media can make logs look successful when
+                    # nothing was actually played.
+                    if not session.pending_marks:
+                        session.assistant_speaking = False
+                        session.assistant_started_at = None
+                    continue
+
                 if not session.stream_sid:
                     session.assistant_speaking = False
                     session.assistant_started_at = None

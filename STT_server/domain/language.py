@@ -400,15 +400,18 @@ def extract_structured_data(text: str) -> dict[str, str]:
     if match:
         results["phone"] = match.group(1)
 
-    # Name pattern (simple)
-    if "my name is" in lowered or "mi nombre es" in lowered:
-        name_candidate = None
-        if "my name is" in lowered:
-            name_candidate = text.split("my name is", 1)[1].strip().split(" ")[0:3]
-        elif "mi nombre es" in lowered:
-            name_candidate = text.split("mi nombre es", 1)[1].strip().split(" ")[0:3]
-        if name_candidate:
-            results["name"] = " ".join(name_candidate).strip().strip(".?,!")
+    # Name pattern (simple, case-insensitive, robust to punctuation)
+    name_match = re.search(
+        r"\b(?:my name is|mi nombre es)\b\s+([A-Za-zÀ-ÿ'`-]+(?:\s+[A-Za-zÀ-ÿ'`-]+){0,2})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if name_match:
+        name_value = name_match.group(1).strip().strip(".?,!")
+        # Remove trailing conjunction if STT merged the next clause.
+        name_value = re.sub(r"\s+(?:and|y)$", "", name_value, flags=re.IGNORECASE)
+        if name_value:
+            results["name"] = name_value
 
     # Address or city request is more complex; skip for now.
     return results

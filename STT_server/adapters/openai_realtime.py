@@ -257,7 +257,15 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     if len(session.history) > MAX_HISTORY_MESSAGES:
                         session.history[:] = session.history[-MAX_HISTORY_MESSAGES:]
 
-                    structured = extract_structured_data(transcript)
+                    try:
+                        structured = extract_structured_data(transcript)
+                    except Exception:
+                        log.exception(
+                            "extract_structured_data failed for %s transcript=%r",
+                            session.session_key,
+                            transcript[:120],
+                        )
+                        structured = {}
                     if structured:
                         for k, v in structured.items():
                             session.collected_data[k] = v

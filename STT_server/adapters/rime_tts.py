@@ -99,6 +99,7 @@ async def stream_tts_segment(
 
     ttfb_ms: float | None = None
     started_at = time.perf_counter()
+    emitted_audio = False
 
     tts_language = (
         session.preferred_language
@@ -156,6 +157,7 @@ async def stream_tts_segment(
                         chunk = mulaw_bytes[i : i + 4096]
                         log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
                         emit_item({"type": "audio", "generation": generation, "data": chunk})
+                        emitted_audio = True
                     continue
 
                 # Text frame — JSON
@@ -194,6 +196,7 @@ async def stream_tts_segment(
                         chunk = mulaw_bytes[i : i + 4096]
                         log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
                         emit_item({"type": "audio", "generation": generation, "data": chunk})
+                        emitted_audio = True
                     continue
 
                 # Unknown frame type — log and skip
@@ -227,7 +230,7 @@ async def stream_tts_segment(
             "message": f"Rime WS error: {exc}",
         })
     finally:
-        emit_item({"type": "segment_end", "generation": generation})
+        emit_item({"type": "segment_end", "generation": generation, "has_audio": emitted_audio})
 
     total_ms = (time.perf_counter() - started_at) * 1000
     return ttfb_ms, total_ms
