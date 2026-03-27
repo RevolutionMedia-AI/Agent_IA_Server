@@ -7,7 +7,13 @@ import time
 
 import websockets
 
-from STT_server.config import RIME_API_KEY, RIME_TTS_MODEL_ID, RIME_TTS_SAMPLE_RATE
+from STT_server.config import (
+    RIME_API_KEY,
+    RIME_TTS_MODEL_ID,
+    RIME_TTS_SAMPLE_RATE,
+    TTS_IDLE_TIMEOUT_SEC,
+    TTS_TTFB_TIMEOUT_SEC,
+)
 from STT_server.domain.language import get_tts_model, infer_supported_language_from_text, normalize_supported_language
 from STT_server.domain.session import CallSession
 
@@ -146,7 +152,21 @@ async def stream_tts_segment(
 
             pcm_remainder = b""  # carry odd trailing byte across chunks
 
-            async for raw_msg in ws:
+            while True:
+                per_recv_timeout = TTS_TTFB_TIMEOUT_SEC if not emitted_audio else TTS_IDLE_TIMEOUT_SEC
+                try:
+                    raw_msg = await asyncio.wait_for(ws.recv(), timeout=per_recv_timeout)
+                except asyncio.TimeoutError:
+                    if not emitted_audio:
+                        raise
+                    # If audio already started and Rime goes idle, treat as end-of-stream.
+                    log.warning(
+                        "Rime WS idle timeout after audio started: session=%s gen=%s",
+                        session.session_key,
+                        generation,
+                    )
+                    break
+
                 # Binary frame = raw audio data (shouldn't happen on /ws3, but handle it)
                 if isinstance(raw_msg, bytes):
                     if ttfb_ms is None:

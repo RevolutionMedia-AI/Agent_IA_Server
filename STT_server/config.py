@@ -71,7 +71,13 @@ ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "1200"))
 
 STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5.0"))
-TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "10.0"))
+# TTS timeouts:
+# - TTS_TTFB_TIMEOUT_SEC: max wait for first audio chunk (TTFB)
+# - TTS_IDLE_TIMEOUT_SEC: max silence between frames once audio started
+# - TTS_TIMEOUT_SEC: max total time per segment (kept for compatibility)
+TTS_TTFB_TIMEOUT_SEC = float(os.getenv("TTS_TTFB_TIMEOUT_SEC", "6.0"))
+TTS_IDLE_TIMEOUT_SEC = float(os.getenv("TTS_IDLE_TIMEOUT_SEC", "10.0"))
+TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "45.0"))
 TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "1"))
 TTS_RETRY_BACKOFF_MS = int(os.getenv("TTS_RETRY_BACKOFF_MS", "250"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
