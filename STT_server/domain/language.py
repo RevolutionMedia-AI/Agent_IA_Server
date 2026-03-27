@@ -544,16 +544,20 @@ def split_tts_segments(text: str, max_chars: int = 300) -> list[str]:
     segments: list[str] = []
     current: list[str] = []
     count = 0
+    min_chars = 100
+    max_chars = 160  # más fluido para TTS
 
     for char in stripped:
         current.append(char)
         count += 1
-        if char in ".!?" and count >= 80:
+        # Preferir cortar en fin de frase si el segmento es suficientemente largo
+        if char in ".!?" and count >= min_chars:
             segment = "".join(current).strip()
             if segment:
                 segments.append(segment)
             current = []
             count = 0
+        # Si no hay punto, cortar forzadamente en el máximo
         elif count >= max_chars:
             segment = "".join(current).strip()
             if segment:
