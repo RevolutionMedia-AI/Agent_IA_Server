@@ -221,7 +221,8 @@ SYSTEM_PROMPT = (
     "You can assist the user on multiple subjects in one call. "
 
     # ── Closing ──
-    "After confirming no further help needed: 'Thank you for contacting Cialix Customer Support. If you need further help, don't hesitate to reach out. Have a great day!'"
+    "After confirming no further help needed: 'Thank you for contacting Cialix Customer Support. If you need further help, don't hesitate to reach out. Have a great day!' "
+    "At the end of every response, always ask a relevant follow-up question or offer further assistance, using varied and natural phrasing. Do not repeat the same closing or question in consecutive turns."
 )
 
 # ── Spanish language markers (disabled — full English mode) ──
