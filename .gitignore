@@ -22,7 +22,7 @@ entornoLocal.env
 *.tmp
 
 # archivos md 
-.md 
 *.md
 .DOCUMENTACION_TECNICA.md
 .Documentacion-Server.md
+.CAMBIOS_2026-03-23.md
