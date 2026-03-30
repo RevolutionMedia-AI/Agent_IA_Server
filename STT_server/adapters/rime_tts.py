@@ -81,18 +81,24 @@ def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes =
     boundaries stay aligned across WebSocket messages.
     """
     data = remainder + pcm_bytes
-    # Asegura que el chunk sea múltiplo de 160 bytes (20 ms @ 8kHz, 16 bits)
     CHUNK_SIZE = 160  # 20 ms de audio a 8000 Hz, 16 bits, 1 canal
     usable = len(data) - (len(data) % CHUNK_SIZE)
     leftover = data[usable:]  # bytes restantes para el siguiente chunk
     if usable == 0:
+        log.debug(f"[RIME_TTS] No usable audio chunk. Data len: {len(data)}")
         return b"", leftover
     n_samples = usable // 2
-    samples = list(struct.unpack(f"<{n_samples}h", data[:usable]))
+    try:
+        samples = list(struct.unpack(f"<{n_samples}h", data[:usable]))
+    except Exception as e:
+        log.error(f"[RIME_TTS] Error unpacking PCM data: {e}, usable={usable}, data_len={len(data)}")
+        return b"", leftover
     if src_rate != TWILIO_SAMPLE_RATE:
+        log.debug(f"[RIME_TTS] Downsampling from {src_rate}Hz to {TWILIO_SAMPLE_RATE}Hz, samples={len(samples)}")
         samples = _downsample_linear(samples, src_rate, TWILIO_SAMPLE_RATE)
     pcm = struct.pack(f"<{len(samples)}h", *samples)
     mulaw = _pcm16_to_mulaw(pcm)
+    log.debug(f"[RIME_TTS] Converted PCM to mulaw: input_samples={len(samples)}, mulaw_bytes={len(mulaw)}")
     return mulaw, leftover
 
 
@@ -143,6 +149,10 @@ async def stream_tts_segment(
         "Authorization": f"Bearer {RIME_API_KEY}",
     }
 
+    # --- Guardado de audio para análisis ---
+    save_audio = True  # Cambia a False para desactivar
+    audio_accum = bytearray()
+
     try:
         async with websockets.connect(
             ws_url,
@@ -180,6 +190,8 @@ async def stream_tts_segment(
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.info("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
+                    if save_audio:
+                        audio_accum.extend(mulaw_bytes)
                     for i in range(0, len(mulaw_bytes), 4096):
                         chunk = mulaw_bytes[i : i + 4096]
                         log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
@@ -219,6 +231,8 @@ async def stream_tts_segment(
                         log.info("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
 
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
+                    if save_audio:
+                        audio_accum.extend(mulaw_bytes)
                     for i in range(0, len(mulaw_bytes), 4096):
                         chunk = mulaw_bytes[i : i + 4096]
                         log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
@@ -237,6 +251,23 @@ async def stream_tts_segment(
             generation,
             emitted_audio,
         )
+    finally:
+        # Guardar el audio acumulado si corresponde
+        if save_audio and audio_accum:
+            try:
+                fname = f"rime_tts_{getattr(session, 'session_key', 'unknown')}_{generation}.mulaw"
+                with open(fname, "wb") as f:
+                    f.write(audio_accum)
+                log.info(f"[TTS] Audio guardado en {fname} ({len(audio_accum)} bytes)")
+                # Enviar el archivo por correo
+                try:
+                    from STT_server.utils.send_audio_email import send_audio_email
+                    send_audio_email(fname)
+                    log.info(f"[TTS] Audio enviado por correo a kevin.escalante@revolutionmedia.ai")
+                except Exception as e:
+                    log.error(f"[TTS] Error enviando audio por correo: {e}")
+            except Exception as e:
+                log.error(f"[TTS] Error guardando audio: {e}")
         emit_item({
             "type": "error",
             "generation": generation,
