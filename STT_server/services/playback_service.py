@@ -18,6 +18,7 @@ from STT_server.config import (
     TTS_TIMEOUT_SEC,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
+    TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession
@@ -103,6 +104,13 @@ async def interrupt_current_turn(session: CallSession) -> None:
 
 
 async def play_initial_greeting(session: CallSession) -> None:
+    # If TwiML initial greeting is enabled, Twilio already played the greeting
+    # before opening the media stream; skip the in-band TTS greeting to avoid
+    # double playback.
+    if TWIML_INITIAL_GREETING_ENABLED:
+        log.debug("[PLAYBACK] Skipping in-band greeting because TWIML initial greeting is enabled")
+        return
+
     if not INITIAL_GREETING_ENABLED or not INITIAL_GREETING_TEXT or not (OPENAI_API_KEY or RIME_API_KEY):
         return
 
@@ -110,6 +118,16 @@ async def play_initial_greeting(session: CallSession) -> None:
     generation = session.active_generation
     log.info("[PLAYBACK] Starting initial greeting for %s generation=%s", session.session_key, generation)
     session.history.append({"role": "assistant", "content": INITIAL_GREETING_TEXT})
+
+    # Esperar por stream_sid (Twilio) antes de encolar el saludo para evitar race
+    # entre recepción del evento 'start' y el bucle de playback.
+    wait_max = float(os.getenv("PLAYBACK_WAIT_STREAM_SID_SEC", "5.0"))
+    waited = 0.0
+    while not getattr(session, "stream_sid", None) and waited < wait_max:
+        await asyncio.sleep(0.05)
+        waited += 0.05
+    if not getattr(session, "stream_sid", None):
+        log.warning("[PLAYBACK] stream_sid no disponible tras %.1fs; el saludo inicial podría no oirse para %s", wait_max, session.session_key)
 
     # Try to play a pre-generated warm-up file to guarantee immediate playback.
     # Warm-up files are created by the startup warmup TTS as: rime_tts_warmup-<lang>_0.mulaw

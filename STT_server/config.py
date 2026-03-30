@@ -44,7 +44,7 @@ DEEPGRAM_STT_KEYWORDS: list[str] = [
 
 RIME_API_KEY = os.getenv("RIME_API_KEY")
 RIME_TTS_MODEL_ID = os.getenv("RIME_TTS_MODEL_ID", "arcana")
-RIME_TTS_SPEAKER_EN = os.getenv("RIME_TTS_SPEAKER_EN", "lyra")
+RIME_TTS_SPEAKER_EN = os.getenv("RIME_TTS_SPEAKER_EN", "Astra")
 RIME_TTS_SPEAKER_ES = os.getenv("RIME_TTS_SPEAKER_ES", "celestino")
 RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
 
@@ -67,6 +67,9 @@ MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
 BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "900"))
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
 ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "1200"))
+
+# webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive). Can be tuned via env.
+WEBRTC_VAD_MODE = int(os.getenv("WEBRTC_VAD_MODE", "1"))
 
 
 STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
@@ -127,4 +130,10 @@ INITIAL_GREETING_TEXT = os.getenv(
     "Thank you for calling the Cialix Support Line",
 ).strip()
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
+
+# If true, /voice will include a <Play> of a pre-generated TTS greeting file
+# before connecting the media stream. This guarantees playback through Twilio
+# before the websocket stream is opened.
+TWIML_INITIAL_GREETING_ENABLED = os.getenv("TWIML_INITIAL_GREETING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "en").strip().lower()
 

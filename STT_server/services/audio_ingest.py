@@ -8,6 +8,7 @@ import webrtcvad
 from STT_server.config import (
     ASSISTANT_ECHO_IGNORE_MS,
     BARGE_IN_MIN_RMS,
+    WEBRTC_VAD_MODE,
     DEEPGRAM_API_KEY,
     ENABLE_BARGE_IN,
     END_SILENCE_FRAMES,
@@ -25,7 +26,7 @@ from STT_server.services.playback_service import interrupt_current_turn
 
 
 log = logging.getLogger("stt_server")
-vad = webrtcvad.Vad(1)
+vad = webrtcvad.Vad(WEBRTC_VAD_MODE)
 FRAME_SAMPLES = int(TWILIO_SR * FRAME_DURATION_MS / 1000)
 FRAME_BYTES = FRAME_SAMPLES * 2
 

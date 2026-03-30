@@ -9,7 +9,19 @@ from fastapi.responses import Response
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
 from STT_server.adapters.openai_realtime import run_realtime_session
-from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_STT_LANGUAGE_HINT, DEEPGRAM_STT_MODEL, OPENAI_API_KEY, PORT, PUBLIC_URL, RIME_API_KEY, TWILIO_SR, USE_OPENAI_REALTIME
+from STT_server.config import (
+    DEEPGRAM_API_KEY,
+    DEEPGRAM_STT_LANGUAGE_HINT,
+    DEEPGRAM_STT_MODEL,
+    OPENAI_API_KEY,
+    PORT,
+    PUBLIC_URL,
+    RIME_API_KEY,
+    TWILIO_SR,
+    USE_OPENAI_REALTIME,
+    TWIML_INITIAL_GREETING_ENABLED,
+    TWIML_INITIAL_GREETING_LANG,
+)
 from STT_server.domain.language import detect_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_ingest import handle_incoming_media
@@ -71,7 +83,21 @@ async def voice() -> Response:
     else:
         ws_url = "wss://" + ws_url
 
-    twiml = f"""
+    # If configured, play a pre-generated greeting file (hosted on this server)
+    # before connecting the media stream. This ensures Twilio plays audio to
+    # the caller before opening the websocket stream.
+    if TWIML_INITIAL_GREETING_ENABLED:
+        play_url = f"{PUBLIC_URL.rstrip('/')}/greeting.wav"
+        twiml = f"""
+    <Response>
+        <Play>{play_url}</Play>
+        <Connect>
+            <Stream url=\"{ws_url}/media-stream\" />
+        </Connect>
+    </Response>
+    """
+    else:
+        twiml = f"""
     <Response>
         <Connect>
             <Stream url=\"{ws_url}/media-stream\" />
@@ -79,6 +105,42 @@ async def voice() -> Response:
     </Response>
     """
     return Response(content=twiml, media_type="application/xml")
+
+
+@app.get("/greeting.wav")
+async def greeting_wav() -> Response:
+    """Serve the pre-generated warm-up mulaw file as a WAV (mu-law -> PCM16).
+
+    Expects files named `rime_tts_warmup-<lang>_0.mulaw` in the working directory.
+    Falls back to English if the requested language file is missing.
+    """
+    import io
+    import wave
+    import audioop
+    from pathlib import Path
+
+    lang = TWIML_INITIAL_GREETING_LANG or "en"
+    fname = Path(f"rime_tts_warmup-{lang}_0.mulaw")
+    if not fname.exists():
+        # fallback to english
+        fname = Path("rime_tts_warmup-en_0.mulaw")
+        if not fname.exists():
+            return Response(content="", status_code=404)
+
+    try:
+        mulaw = fname.read_bytes()
+        pcm16 = audioop.mulaw2lin(mulaw, 2)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(TWILIO_SR)
+            wf.writeframes(pcm16)
+        buf.seek(0)
+        return Response(content=buf.read(), media_type="audio/wav")
+    except Exception as e:
+        log.exception("Error generating greeting.wav: %s", e)
+        return Response(content="", status_code=500)
 
 
 @app.websocket("/media-stream")
