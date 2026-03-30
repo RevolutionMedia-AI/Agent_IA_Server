@@ -14,7 +14,12 @@ from STT_server.config import (
     TTS_IDLE_TIMEOUT_SEC,
     TTS_TTFB_TIMEOUT_SEC,
 )
-from STT_server.domain.language import get_tts_model, infer_supported_language_from_text, normalize_supported_language
+from STT_server.domain.language import (
+    get_tts_model,
+    infer_supported_language_from_text,
+    normalize_supported_language,
+    sanitize_tts_text,
+)
 from STT_server.domain.session import CallSession
 
 
@@ -143,7 +148,14 @@ async def stream_tts_segment(
     })
     ws_url = f"{RIME_WS_URL}?{qs}"
 
-    ws_message = json.dumps({"text": text})
+    # Sanitize text to avoid problematic characters confusing the TTS engine
+    try:
+        safe_text = sanitize_tts_text(text)
+    except Exception:
+        safe_text = text
+    if safe_text != text:
+        log.info("[TTS] Sanitized text for Rime request: %.120r -> %.120r", text[:120], safe_text[:120])
+    ws_message = json.dumps({"text": safe_text})
 
     extra_headers = {
         "Authorization": f"Bearer {RIME_API_KEY}",
