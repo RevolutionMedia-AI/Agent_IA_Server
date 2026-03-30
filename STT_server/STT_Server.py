@@ -3,8 +3,10 @@ import json
 import logging
 
 import uvicorn
+import os
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
@@ -19,6 +21,7 @@ from STT_server.config import (
     RIME_API_KEY,
     TWILIO_SR,
     USE_OPENAI_REALTIME,
+    TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import detect_language, split_tts_segments
 from STT_server.domain.session import CallSession
@@ -47,6 +50,11 @@ if not RIME_API_KEY:
 
 app = FastAPI()
 
+# Serve static files (e.g. static/greeting.wav) at /static
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
 # Warm-up TTS removed: initial greeting/warm-up generation disabled per request.
 
 
@@ -61,14 +69,29 @@ async def voice() -> Response:
     else:
         ws_url = "wss://" + ws_url
 
-    # No initial TwiML <Play> greeting — connect the media stream directly.
-    twiml = f"""
+    # If a static greeting file exists or the TWIML flag is enabled,
+    # include a <Play> so Twilio plays the pre-recorded greeting before
+    # connecting the media stream. Otherwise connect directly.
+    static_local = os.path.join(os.path.dirname(__file__), "static", "greeting.wav")
+    if TWIML_INITIAL_GREETING_ENABLED or os.path.exists(static_local):
+        play_url = f"{PUBLIC_URL.rstrip('/')}/static/greeting.wav"
+        twiml = f"""
+    <Response>
+        <Play>{play_url}</Play>
+        <Connect>
+            <Stream url=\"{ws_url}/media-stream\" />
+        </Connect>
+    </Response>
+    """
+    else:
+        twiml = f"""
     <Response>
         <Connect>
             <Stream url=\"{ws_url}/media-stream\" />
         </Connect>
     </Response>
     """
+
     return Response(content=twiml, media_type="application/xml")
 
 
