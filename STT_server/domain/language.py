@@ -628,18 +628,12 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
     return segments, remainder
 
 
-def sanitize_tts_text(text: str, max_len: int = 1500) -> str:
-    """Sanitize text intended for TTS playback.
+def sanitize_tts_text(text: str, max_len: int = 1500, allowed_punct: set[str] | None = None) -> str:
+    """Sanitize text intended for TTS playback."""
 
-    - Normalize Unicode (NFKC).
-    - Remove control characters.
-    - Replace smart punctuation with plain ASCII equivalents.
-    - Expand simple currency patterns (e.g. "$5" -> "5 dollars").
-    - Remove a small set of symbols that tend to break TTS engines.
-    - Strip emoji and miscellaneous symbol characters.
-    - Collapse repeated punctuation and normalize whitespace.
-    - Truncate to `max_len` characters at a word boundary.
-    """
+    if allowed_punct is None:
+        allowed_punct = {".", ","}
+
     if not text:
         return ""
 
@@ -648,16 +642,19 @@ def sanitize_tts_text(text: str, max_len: int = 1500) -> str:
     # Remove C0/C1 control characters
     s = re.sub(r"[\x00-\x1F\x7F-\x9F]", "", s)
 
-    # Smart punctuation -> ASCII
+    # Replace common dash-like punctuation with space to avoid concatenation
+    s = s.replace("—", " ").replace("–", " ").replace("-", " ")
+
+    # Smart punctuation -> ASCII equivalents where appropriate
     replacements = {
         "“": '"', "”": '"', "‘": "'", "’": "'",
-        "—": "-", "–": "-", "…": "...",
-        "•": "-", "·": "-",
+        "…": "...",
+        "•": " ", "·": " ",
     }
     for k, v in replacements.items():
         s = s.replace(k, v)
 
-    # Expand dollar currency robustly: $12.34 -> "12 dollars and 34 cents"
+    # Expand dollar amounts robustly: $12.34 -> "12 dollars and 34 cents"
     def _expand_dollar(m: re.Match) -> str:
         amt = m.group(1)
         amt = amt.replace(",", "")
@@ -674,30 +671,37 @@ def sanitize_tts_text(text: str, max_len: int = 1500) -> str:
     s = re.sub(r"\$(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)", _expand_dollar, s)
     s = s.replace("€", " euros ").replace("£", " pounds ").replace("¥", " yen ")
 
-    # Remove angle brackets and script-like tokens
+    # Remove HTML/script-like tags entirely
     s = re.sub(r"<[^>]+>", " ", s)
 
-    # Build filtered output: allow letters, numbers, basic punctuation and whitespace only.
+    # Replace any remaining punctuation we don't allow with spaces
+    s = re.sub(r"[^\w\s\.,]", " ", s, flags=re.UNICODE)
+
+    # Build filtered output: allow letters (including unicode), numbers, whitespace, and allowed punctuation only
     def _allowed(ch: str) -> bool:
         if ch.isspace():
             return True
-        cat = unicodedata.category(ch)
-        # Letters (including accented) and numbers
-        if cat[0] in ("L", "N"):
+        if ch in allowed_punct:
             return True
-        # Permit a small set of ASCII punctuation
-        if ch in ".,!?-:;'\"()":
+        # alphanumeric for unicode letters/digits
+        if ch.isalnum():
             return True
         return False
 
     s = ''.join(ch for ch in s if _allowed(ch))
 
-    # Collapse repeated punctuation (e.g., !!! -> !, ??? -> ?)
-    s = re.sub(r"([!?.]){2,}", r"\1", s)
-    s = re.sub(r"-{2,}", "-", s)
+    # Collapse repeated allowed punctuation (e.g., ,, -> ,)
+    if "," in allowed_punct:
+        s = re.sub(r",{2,}", ",", s)
+    if "." in allowed_punct:
+        s = re.sub(r"\.{2,}", ".", s)
 
     # Normalize whitespace
     s = re.sub(r"\s+", " ", s).strip()
+
+    # Ensure no punctuation other than allowed remains adjacent to spaces (clean spacing)
+    s = re.sub(r"\s+([\.,])", r"\1", s)
+    s = re.sub(r"([\.,])\s+", r"\1 ", s)
 
     # Truncate at a word boundary if needed
     if len(s) > max_len:
