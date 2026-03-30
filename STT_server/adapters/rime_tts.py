@@ -244,13 +244,56 @@ async def stream_tts_segment(
                 log.warning("Rime WS unknown frame type=%s keys=%s", msg_type, list(msg.keys()))
 
     except (asyncio.TimeoutError, TimeoutError):
-        # Treat as expected failure mode; retry logic lives upstream.
         log.warning(
             "Rime WS recv timeout: session=%s gen=%s emitted_audio=%s",
             session.session_key,
             generation,
             emitted_audio,
         )
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": "Rime WS timeout while waiting for audio",
+        })
+
+    except websockets.exceptions.InvalidStatus as exc:
+        body = ""
+        if hasattr(exc, "response") and exc.response:
+            try:
+                body = exc.response.body.decode("utf-8", errors="replace") if exc.response.body else ""
+            except Exception:
+                pass
+        log.error(
+            "Rime WS handshake rejected HTTP %s — body: %s",
+            exc.response.status_code if hasattr(exc, "response") and exc.response else "?",
+            body,
+        )
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": f"Rime WS handshake error: {exc}",
+        })
+
+    except websockets.exceptions.ConnectionClosed as exc:
+        log.error("Rime WS connection closed unexpectedly: %s", exc)
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": f"Rime WS closed: {exc}",
+        })
+
+    except asyncio.CancelledError:
+        # Do not emit error items on cancellation; caller requested stop.
+        raise
+
+    except Exception as exc:
+        log.exception("Rime WS TTS error in %s", session.session_key)
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": f"Rime WS error: {exc}",
+        })
+
     finally:
         # Guardar el audio acumulado si corresponde
         if save_audio and audio_accum:
@@ -259,51 +302,16 @@ async def stream_tts_segment(
                 with open(fname, "wb") as f:
                     f.write(audio_accum)
                 log.info(f"[TTS] Audio guardado en {fname} ({len(audio_accum)} bytes)")
-                # Enviar el archivo por correo
                 try:
                     from STT_server.utils.send_audio_email import send_audio_email
                     send_audio_email(fname)
-                    log.info(f"[TTS] Audio enviado por correo a kevin.escalante@revolutionmedia.ai")
+                    log.info("[TTS] Audio enviado por correo a kevin.escalante@revolutionmedia.ai")
                 except Exception as e:
                     log.error(f"[TTS] Error enviando audio por correo: {e}")
             except Exception as e:
                 log.error(f"[TTS] Error guardando audio: {e}")
-        emit_item({
-            "type": "error",
-            "generation": generation,
-            "message": "Rime WS timeout while waiting for audio",
-        })
-    except websockets.exceptions.InvalidStatus as exc:
-        body = ""
-        if hasattr(exc, "response") and exc.response:
-            try:
-                body = exc.response.body.decode("utf-8", errors="replace") if exc.response.body else ""
-            except Exception:
-                pass
-        log.error("Rime WS handshake rejected HTTP %s — body: %s", exc.response.status_code if hasattr(exc, "response") and exc.response else "?", body)
-        emit_item({
-            "type": "error",
-            "generation": generation,
-            "message": f"Rime WS handshake error: {exc}",
-        })
-    except websockets.exceptions.ConnectionClosed as exc:
-        log.error("Rime WS connection closed unexpectedly: %s", exc)
-        emit_item({
-            "type": "error",
-            "generation": generation,
-            "message": f"Rime WS closed: {exc}",
-        })
-    except asyncio.CancelledError:
-        # Do not emit error items on cancellation; caller requested stop.
-        raise
-    except Exception as exc:
-        log.exception("Rime WS TTS error in %s", session.session_key)
-        emit_item({
-            "type": "error",
-            "generation": generation,
-            "message": f"Rime WS error: {exc}",
-        })
-    finally:
+
+        # Siempre emitir segment_end, sin importar qué excepción ocurrió
         emit_item({"type": "segment_end", "generation": generation, "has_audio": emitted_audio})
 
     total_ms = (time.perf_counter() - started_at) * 1000
