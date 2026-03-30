@@ -112,12 +112,25 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                     ENABLE_BARGE_IN
                     and session.assistant_speaking
                     and not assistant_recently_started
-                    and rms >= BARGE_IN_MIN_RMS
                     and session.voice_streak >= MIN_BARGE_IN_FRAMES
                 ):
-                    if session.assistant_started_at and (time.perf_counter() - session.assistant_started_at) >= 0.6:
-                        log.info("Barge-in detectado en %s rms=%s streak=%s", session.session_key, rms, session.voice_streak)
-                        await interrupt_current_turn(session)
+                    # Compute average RMS across the most recent frames to avoid
+                    # single-frame spikes causing false barge-in triggers.
+                    try:
+                        recent_frames = list(session.pre_speech_frames)[-MIN_BARGE_IN_FRAMES:]
+                        if recent_frames:
+                            total_r = sum(get_frame_rms(f) for f in recent_frames)
+                            avg_rms = int(total_r / len(recent_frames))
+                        else:
+                            avg_rms = rms
+                    except Exception as e:
+                        log.debug("[VAD] Error computing avg_rms for barge-in: %s", e)
+                        avg_rms = rms
+
+                    if avg_rms >= BARGE_IN_MIN_RMS:
+                        if session.assistant_started_at and (time.perf_counter() - session.assistant_started_at) >= 0.6:
+                            log.info("Barge-in detectado en %s avg_rms=%s streak=%s", session.session_key, avg_rms, session.voice_streak)
+                            await interrupt_current_turn(session)
 
                 if not session.assistant_speaking and session.voice_streak >= SPEECH_START_FRAMES:
                     session.last_activity_at = time.monotonic()

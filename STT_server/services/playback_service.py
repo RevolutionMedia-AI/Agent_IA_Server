@@ -162,7 +162,8 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
             if item_type == "audio":
                 if not session.stream_sid:
                     # Wait briefly for Twilio to send the stream SID.
-                    for _ in range(50):  # up to 2.5 s
+                    # Increased from 50 (2.5s) to 100 (5s) to avoid race conditions.
+                    for _ in range(100):  # up to 5.0 s
                         await asyncio.sleep(0.05)
                         if session.stream_sid:
                             break
@@ -180,6 +181,8 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     frame = chunk[start : start + TWILIO_OUTBOUND_CHUNK_BYTES]
                     log.debug("[PLAYBACK] Sending Twilio frame: session=%s gen=%s frame_bytes=%d", session.session_key, generation, len(frame))
                     if frame:
+                        if sent_frames == 0:
+                            log.info("[PLAYBACK] Sending first Twilio frame: session=%s gen=%s bytes=%d", session.session_key, generation, len(frame))
                         await send_twilio_media(ws, session.stream_sid, frame)
                         sent_frames += 1
                         if len(frame) == TWILIO_OUTBOUND_CHUNK_BYTES:
