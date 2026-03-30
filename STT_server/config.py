@@ -51,15 +51,15 @@ RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
 
 TWILIO_SR = 8000
 TWILIO_CHANNELS = 1
-FRAME_DURATION_MS = 30
+FRAME_DURATION_MS = 20
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
 TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 
 
 MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "180"))
 MIN_SPEECH_FRAMES = int(os.getenv("MIN_SPEECH_FRAMES", "5"))
-END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "18"))
-SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "2"))
+END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "14"))
+SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "1"))
 MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "12"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
 TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "6"))
@@ -104,8 +104,8 @@ PLAYBACK_QUEUE_MAXSIZE = int(os.getenv("PLAYBACK_QUEUE_MAXSIZE", "256"))
 TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "16"))
 
 
-STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "120"))
-STREAMING_FIRST_SEGMENT_CHARS = int(os.getenv("STREAMING_FIRST_SEGMENT_CHARS", "30"))
+STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "500"))
+STREAMING_FIRST_SEGMENT_CHARS = int(os.getenv("STREAMING_FIRST_SEGMENT_CHARS", "200"))
 FILLER_TEXT_EN = os.getenv("FILLER_TEXT_EN", "").strip()
 FILLER_TEXT_ES = os.getenv("FILLER_TEXT_ES", "").strip()
 FILLER_DELAY_MS = int(os.getenv("FILLER_DELAY_MS", "1200"))
@@ -123,8 +123,8 @@ STT_FAILURE_PROMPT_EN = os.getenv("STT_FAILURE_PROMPT_EN", "I'm having trouble h
 STT_FAILURE_PROMPT_ES = os.getenv("STT_FAILURE_PROMPT_ES", "Estoy teniendo problemas para escucharte en este momento.").strip()
 INITIAL_GREETING_ENABLED = os.getenv("INITIAL_GREETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 INITIAL_GREETING_TEXT = os.getenv(
-	"INITIAL_GREETING_TEXT",
-	"Thank you for calling Cialix Customer Support. My name is Tessa. How can I help you today?",
+    "INITIAL_GREETING_TEXT",
+    "Thank you for calling the Cialix Support Line",
 ).strip()
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 

@@ -90,7 +90,6 @@ def looks_like_digit_dictation(text: str) -> bool:
 SUPPORTED_LANGUAGES = ("en", "es")
 
 SYSTEM_PROMPT = (
-    # ── Voice behavior (top priority) ──
     "You are Tessa, Cialix Customer Service AI Assistant on a live phone call. "
     "Cialix is pronounced sigh-ah-licks. "
     "Be polite, professional, empathetic, calm, and clear. "

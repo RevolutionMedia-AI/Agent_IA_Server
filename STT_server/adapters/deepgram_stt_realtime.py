@@ -281,9 +281,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                             return
 
                         if not received_any_result:
-                            # Connection opened but dropped without sending
-                            # any results — try next candidate params instead
-                            # of wasting the entire reconnect attempt.
+
                             if sender_task is not None:
                                 sender_task.cancel()
                                 try:
