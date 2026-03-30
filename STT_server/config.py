@@ -127,7 +127,12 @@ STT_FAILURE_PROMPT_ES = os.getenv("STT_FAILURE_PROMPT_ES", "Estoy teniendo probl
 INITIAL_GREETING_ENABLED = os.getenv("INITIAL_GREETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 INITIAL_GREETING_TEXT = os.getenv(
     "INITIAL_GREETING_TEXT",
-    "Thank you for calling the Cialix Support Line",
+    "Thank you for calling Cialix Customer Support",
+).strip()
+# Optional Spanish initial greeting (fallback used when TWIML_INITIAL_GREETING_LANG=es)
+INITIAL_GREETING_TEXT_ES = os.getenv(
+    "INITIAL_GREETING_TEXT_ES",
+    "Gracias por llamar a la línea de atención al cliente de Cialix",
 ).strip()
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 

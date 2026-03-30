@@ -54,22 +54,19 @@ app = FastAPI()
 async def warmup_tts():
     from STT_server.adapters.rime_tts import stream_tts_segment
     from STT_server.domain.session import CallSession
+    from STT_server.config import INITIAL_GREETING_TEXT
+
     def dummy_emit(item):
         # Emisor sincrónico para evitar 'coroutine was never awaited' warnings
         return True
-    log.info("[WARMUP] Ejecutando warm-up TTS en inglés y español...")
+
+    log.info("[WARMUP] Generando warm-up TTS en inglés (initial greeting)...")
     try:
         session_en = CallSession(session_key="warmup-en")
         session_en.preferred_language = "en"
-        await stream_tts_segment(session_en, "This is a warm-up test.", 0, dummy_emit)
+        await stream_tts_segment(session_en, INITIAL_GREETING_TEXT, 0, dummy_emit)
     except Exception as e:
-        log.warning(f"[WARMUP] Error en warm-up TTS inglés: {e}")
-    try:
-        session_es = CallSession(session_key="warmup-es")
-        session_es.preferred_language = "es"
-        await stream_tts_segment(session_es, "Esto es una prueba de calentamiento.", 0, dummy_emit)
-    except Exception as e:
-        log.warning(f"[WARMUP] Error en warm-up TTS español: {e}")
+        log.warning(f"[WARMUP] Error generando warm-up TTS inglés: {e}")
 
 
 @app.post("/voice")
@@ -201,24 +198,24 @@ async def media_stream(ws: WebSocket) -> None:
                                 announce_stt_failure_once,
                             )
                         ),
-                    )
                     track_task(session, asyncio.create_task(process_transcripts(session)))
+                    from STT_server.adapters.rime_tts import stream_tts_segment
+                    from STT_server.config import INITIAL_GREETING_TEXT
                 track_task(session, asyncio.create_task(play_initial_greeting(session)))
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 continue
 
             if event == "media":
-                await handle_incoming_media(session, msg["media"]["payload"])
+                    log.info("[WARMUP] Ejecutando warm-up TTS en inglés (initial greeting)...")
                 continue
 
             if event == "mark":
-                mark = msg.get("mark", {}).get("name")
+                        await stream_tts_segment(session_en, INITIAL_GREETING_TEXT, 0, dummy_emit)
                 if mark and mark in session.pending_marks:
                     session.pending_marks.discard(mark)
                 if not session.pending_marks:
                     session.assistant_speaking = False
                 continue
-
             if event == "dtmf":
                 log.info("DTMF recibido en %s: %s", session.session_key, msg.get("dtmf", {}).get("digit"))
                 continue
