@@ -54,24 +54,22 @@ app = FastAPI()
 async def warmup_tts():
     from STT_server.adapters.rime_tts import stream_tts_segment
     from STT_server.domain.session import CallSession
-    from STT_server.config import INITIAL_GREETING_TEXT
-    from STT_server.domain.language import split_tts_segments
-
     def dummy_emit(item):
         # Emisor sincrónico para evitar 'coroutine was never awaited' warnings
         return True
-
-    log.info("[WARMUP] Generando warm-up TTS en inglés (initial greeting)...")
-    session_en = CallSession(session_key="warmup-en")
-    session_en.preferred_language = "en"
-
-    # Split long greetings into TTS segments to avoid single long-request timeouts
-    segments = split_tts_segments(INITIAL_GREETING_TEXT)
-    for gen, seg in enumerate(segments):
-        try:
-            await stream_tts_segment(session_en, seg, gen, dummy_emit)
-        except Exception as e:
-            log.warning("[WARMUP] Error generando warm-up segmento %s: %s", gen, e)
+    log.info("[WARMUP] Ejecutando warm-up TTS en inglés y español...")
+    try:
+        session_en = CallSession(session_key="warmup-en")
+        session_en.preferred_language = "en"
+        await stream_tts_segment(session_en, "This is a warm-up test.", 0, dummy_emit)
+    except Exception as e:
+        log.warning(f"[WARMUP] Error en warm-up TTS inglés: {e}")
+    try:
+        session_es = CallSession(session_key="warmup-es")
+        session_es.preferred_language = "es"
+        await stream_tts_segment(session_es, "Esto es una prueba de calentamiento.", 0, dummy_emit)
+    except Exception as e:
+        log.warning(f"[WARMUP] Error en warm-up TTS español: {e}")
 
 
 @app.post("/voice")
@@ -126,50 +124,17 @@ async def greeting_wav() -> Response:
     if not fname.exists():
         # fallback to english
         fname = Path("rime_tts_warmup-en_0.mulaw")
-
-    mulaw_data = None
-    if fname.exists():
-        try:
-            mulaw_data = fname.read_bytes()
-        except Exception:
-            log.exception("Error leyendo warm-up mulaw file %s", fname)
-
-    # If no warm-up file, attempt on-demand TTS generation (may still fail)
-    if not mulaw_data:
-        try:
-            log.info("[TTS] No warm-up file found; attempting on-demand TTS for greeting.wav")
-            from STT_server.adapters.rime_tts import stream_tts_segment
-            from STT_server.domain.session import CallSession
-            from STT_server.config import INITIAL_GREETING_TEXT
-
-            captured = bytearray()
-
-            def emit_capture(item: dict) -> bool:
-                if item.get("type") == "audio":
-                    captured.extend(item.get("data", b""))
-                return True
-
-            sess = CallSession(session_key="greeting-ondemand")
-            sess.preferred_language = "en"
-            # Call the streamer directly to capture mulaw chunks
-            await stream_tts_segment(sess, INITIAL_GREETING_TEXT, 0, emit_capture)
-            if captured:
-                mulaw_data = bytes(captured)
-        except Exception as e:
-            log.exception("On-demand TTS generation failed: %s", e)
-
-    if not mulaw_data:
-        # Still no audio available
-        log.warning("/greeting.wav: no mu-law audio available after warm-up and on-demand attempts")
-        return Response(content="", status_code=404)
+        if not fname.exists():
+            return Response(content="", status_code=404)
 
     try:
+        mulaw = fname.read_bytes()
         # Some Python builds expose `mulaw2lin`; others expose `ulaw2lin`.
         # Prefer `mulaw2lin`, fall back to `ulaw2lin` for compatibility.
         if hasattr(audioop, "mulaw2lin"):
-            pcm16 = audioop.mulaw2lin(mulaw_data, 2)
+            pcm16 = audioop.mulaw2lin(mulaw, 2)
         elif hasattr(audioop, "ulaw2lin"):
-            pcm16 = audioop.ulaw2lin(mulaw_data, 2)
+            pcm16 = audioop.ulaw2lin(mulaw, 2)
         else:
             raise RuntimeError("audioop lacks mulaw2lin/ulaw2lin")
         buf = io.BytesIO()
@@ -181,7 +146,7 @@ async def greeting_wav() -> Response:
         buf.seek(0)
         return Response(content=buf.read(), media_type="audio/wav")
     except Exception as e:
-        log.exception("Error generating greeting.wav from mulaw data: %s", e)
+        log.exception("Error generating greeting.wav: %s", e)
         return Response(content="", status_code=500)
 
 
@@ -281,73 +246,6 @@ async def test_llm_tts(q: str = Query(...)) -> dict:
         "tts_segments": len(segments),
         "tts_ready": bool(DEEPGRAM_API_KEY),
     }
-
-
-@app.post("/admin/regenerate-warmup")
-async def admin_regenerate_warmup() -> dict:
-    """Admin-only endpoint to re-run the warm-up TTS generation.
-
-    Protected by `require_debug_endpoints()` so it must be enabled explicitly.
-    Returns per-segment results and any errors.
-    """
-    require_debug_endpoints()
-    from STT_server.adapters.rime_tts import stream_tts_segment
-    from STT_server.domain.session import CallSession
-    from STT_server.config import INITIAL_GREETING_TEXT
-
-    session_en = CallSession(session_key="warmup-en")
-    session_en.preferred_language = "en"
-    segments = split_tts_segments(INITIAL_GREETING_TEXT)
-    results = {"segments": len(segments), "files": [], "errors": []}
-
-    def dummy_emit(item):
-        return True
-
-    for gen, seg in enumerate(segments):
-        try:
-            ttfb_ms, total_ms = await stream_tts_segment(session_en, seg, gen, dummy_emit)
-            results["files"].append({"file": f"rime_tts_warmup-en_{gen}.mulaw", "ttfb_ms": ttfb_ms, "total_ms": total_ms})
-        except Exception as e:
-            results["errors"].append({"segment": gen, "error": str(e)})
-
-    return results
-
-
-@app.get("/admin/test-rime")
-async def admin_test_rime() -> dict:
-    """Attempt a quick Rime WS handshake and return the first response (debug).
-
-    Requires `ENABLE_DEBUG_ENDPOINTS=true` to be set (protected via `require_debug_endpoints`).
-    """
-    require_debug_endpoints()
-    try:
-        from urllib.parse import urlencode
-        import websockets
-        from STT_server.adapters.rime_tts import RIME_WS_URL
-        from STT_server.config import RIME_API_KEY, RIME_TTS_MODEL_ID, RIME_TTS_SAMPLE_RATE
-
-        if not RIME_API_KEY:
-            return {"status": "error", "error": "RIME_API_KEY not set in environment"}
-
-        qs = urlencode({
-            "speaker": "Astra",
-            "modelId": RIME_TTS_MODEL_ID,
-            "lang": "eng",
-            "audioFormat": "pcm",
-            "samplingRate": str(RIME_TTS_SAMPLE_RATE),
-        })
-        ws_url = f"{RIME_WS_URL}?{qs}"
-
-        async with websockets.connect(ws_url, additional_headers={"Authorization": f"Bearer {RIME_API_KEY}"}, open_timeout=10) as ws:
-            await ws.send(json.dumps({"text": "ping"}))
-            try:
-                raw_msg = await asyncio.wait_for(ws.recv(), timeout=5)
-                return {"status": "ok", "first_msg": raw_msg}
-            except asyncio.TimeoutError:
-                return {"status": "connected_no_audio", "message": "Connected but no message received within 5s"}
-
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
 
 
 @app.post("/test-stt")
