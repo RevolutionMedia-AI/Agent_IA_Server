@@ -23,7 +23,20 @@ from STT_server.config import (
     TTS_RETRY_BACKOFF_MS,
     TTS_TIMEOUT_SEC,
 )
-from STT_server.domain.language import detect_language, extract_structured_data, get_filler_text, get_stt_failure_prompt, is_duplicate_collected_data, is_non_actionable_utterance, looks_like_digit_dictation, looks_like_incomplete_utterance, normalize_digits_in_text, normalize_supported_language, split_tts_segments
+from STT_server.domain.language import (
+    detect_language,
+    extract_structured_data,
+    get_filler_text,
+    get_stt_failure_prompt,
+    is_duplicate_collected_data,
+    is_non_actionable_utterance,
+    looks_like_digit_dictation,
+    looks_like_incomplete_utterance,
+    normalize_digits_in_text,
+    normalize_supported_language,
+    split_tts_segments,
+    sanitize_tts_text,
+)
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
@@ -147,8 +160,19 @@ async def play_tts_from_text_queue(
         if generation != session.active_generation:
             break
 
+        # Sanitize text segments coming from LLMs or other producers
         try:
-            metric = await run_tts_with_retries(session, text, generation)
+            safe_text = sanitize_tts_text(text)
+        except Exception:
+            safe_text = text
+        if not safe_text:
+            # Skip empty segments after sanitization
+            continue
+        if safe_text != text:
+            log.info("[TTS] Sanitized streaming segment for %s: %.120r -> %.120r", session.session_key, text[:120], safe_text[:120])
+
+        try:
+            metric = await run_tts_with_retries(session, safe_text, generation)
             metrics.append(metric)
         except asyncio.TimeoutError:
             break
@@ -165,7 +189,17 @@ async def speak_precomputed_reply(
 ) -> list[tuple[float | None, float]]:
     metrics: list[tuple[float | None, float]] = []
 
-    for segment in split_tts_segments(reply):
+    # Sanitize the full reply before splitting into TTS segments
+    try:
+        safe_reply = sanitize_tts_text(reply)
+    except Exception:
+        safe_reply = reply
+    if not safe_reply:
+        return metrics
+    if safe_reply != reply:
+        log.info("[TTS] Sanitized precomputed reply for %s: %.120r -> %.120r", session.session_key, reply[:120], safe_reply[:120])
+
+    for segment in split_tts_segments(safe_reply):
         if generation != session.active_generation:
             break
 
@@ -215,7 +249,15 @@ async def stream_llm_reply_with_tts(
     filler_task = asyncio.create_task(enqueue_delayed_filler(text_queue, filler_text, first_segment_event, generation, session))
 
     def emit_segment(segment: str) -> None:
-        loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, segment, "text_segment_queue")
+        try:
+            safe_seg = sanitize_tts_text(segment)
+        except Exception:
+            safe_seg = segment
+        if not safe_seg:
+            return
+        if safe_seg != segment:
+            log.info("[TTS] Sanitized streaming LLM segment for %s: %.120r -> %.120r", session.session_key, segment[:120], safe_seg[:120])
+        loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, safe_seg, "text_segment_queue")
 
     def emit_done() -> None:
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, None, "text_segment_queue")

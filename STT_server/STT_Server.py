@@ -23,7 +23,7 @@ from STT_server.config import (
     USE_OPENAI_REALTIME,
     TWIML_INITIAL_GREETING_ENABLED,
 )
-from STT_server.domain.language import detect_language, split_tts_segments
+from STT_server.domain.language import detect_language, split_tts_segments, sanitize_tts_text
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
@@ -187,10 +187,12 @@ async def test_llm_tts(q: str = Query(...)) -> dict:
     dummy_session = CallSession(session_key="test")
     dummy_session.preferred_language = detect_language(q)
     reply = await call_llm(dummy_session, q)
-    segments = split_tts_segments(reply)
+    safe_reply = sanitize_tts_text(reply)
+    segments = split_tts_segments(safe_reply)
     return {
         "input": q,
         "reply": reply,
+        "sanitized_reply": safe_reply,
         "tts_segments": len(segments),
         "tts_ready": bool(DEEPGRAM_API_KEY),
     }
