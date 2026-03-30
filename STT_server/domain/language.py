@@ -227,30 +227,29 @@ SYSTEM_PROMPT = (
     "After confirming no further help needed: 'Thank you for contacting Cialix Customer Support. If you need further help, don't hesitate to reach out. Have a great day!' "
     "At the end of every response, always ask a relevant follow-up question or offer further assistance, using varied and natural phrasing. Do not repeat the same closing or question in consecutive turns."
 )
+# Cleaned system prompt generator (keeps only letters, digits, spaces and specified punctuation)
+def clean_system_prompt(prompt: str, allowed_punct: set[str] | None = None) -> str:
+    """Return a cleaned copy of the system prompt that keeps only letters, digits,
+    whitespace, and the characters in `allowed_punct` (default: {'.', ','}).
+    Replaces other characters with spaces and collapses whitespace.
+    """
+    if allowed_punct is None:
+        allowed_punct = {".", ","}
+    s = unicodedata.normalize("NFKC", prompt)
+    out_chars: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace() or ch in allowed_punct:
+            out_chars.append(ch)
+        else:
+            # avoid producing repeated spaces
+            if out_chars and not out_chars[-1].isspace():
+                out_chars.append(" ")
+    out = "".join(out_chars)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
 
-    # Cleaned system prompt generator (keeps only letters, digits, spaces and specified punctuation)
-    def clean_system_prompt(prompt: str, allowed_punct: set[str] | None = None) -> str:
-        """Return a cleaned copy of the system prompt that keeps only letters, digits,
-        whitespace, and the characters in `allowed_punct` (default: {'.', ','}).
-        Replaces other characters with spaces and collapses whitespace.
-        """
-        if allowed_punct is None:
-            allowed_punct = {".", ","}
-        s = unicodedata.normalize("NFKC", prompt)
-        out_chars: list[str] = []
-        for ch in s:
-            if ch.isalnum() or ch.isspace() or ch in allowed_punct:
-                out_chars.append(ch)
-            else:
-                # avoid producing repeated spaces
-                if out_chars and not out_chars[-1].isspace():
-                    out_chars.append(" ")
-        out = "".join(out_chars)
-        out = re.sub(r"\s+", " ", out).strip()
-        return out
-
-    # Precomputed sanitized system prompt (keeps only '.' and ',' punctuation)
-    SANITIZED_SYSTEM_PROMPT = clean_system_prompt(SYSTEM_PROMPT, allowed_punct={".", ","})
+# Precomputed sanitized system prompt (keeps only '.' and ',' punctuation)
+SANITIZED_SYSTEM_PROMPT = clean_system_prompt(SYSTEM_PROMPT, allowed_punct={".", ","})
 
 # ── Spanish language markers (disabled — full English mode) ──
 # SPANISH_LANGUAGE_MARKERS = (
