@@ -129,7 +129,14 @@ async def greeting_wav() -> Response:
 
     try:
         mulaw = fname.read_bytes()
-        pcm16 = audioop.mulaw2lin(mulaw, 2)
+        # Some Python builds expose `mulaw2lin`; others expose `ulaw2lin`.
+        # Prefer `mulaw2lin`, fall back to `ulaw2lin` for compatibility.
+        if hasattr(audioop, "mulaw2lin"):
+            pcm16 = audioop.mulaw2lin(mulaw, 2)
+        elif hasattr(audioop, "ulaw2lin"):
+            pcm16 = audioop.ulaw2lin(mulaw, 2)
+        else:
+            raise RuntimeError("audioop lacks mulaw2lin/ulaw2lin")
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
