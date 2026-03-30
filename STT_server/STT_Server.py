@@ -198,24 +198,24 @@ async def media_stream(ws: WebSocket) -> None:
                                 announce_stt_failure_once,
                             )
                         ),
+                    )
                     track_task(session, asyncio.create_task(process_transcripts(session)))
-                    from STT_server.adapters.rime_tts import stream_tts_segment
-                    from STT_server.config import INITIAL_GREETING_TEXT
                 track_task(session, asyncio.create_task(play_initial_greeting(session)))
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 continue
 
             if event == "media":
-                    log.info("[WARMUP] Ejecutando warm-up TTS en inglés (initial greeting)...")
+                await handle_incoming_media(session, msg["media"]["payload"])
                 continue
 
             if event == "mark":
-                        await stream_tts_segment(session_en, INITIAL_GREETING_TEXT, 0, dummy_emit)
+                mark = msg.get("mark", {}).get("name")
                 if mark and mark in session.pending_marks:
                     session.pending_marks.discard(mark)
                 if not session.pending_marks:
                     session.assistant_speaking = False
                 continue
+
             if event == "dtmf":
                 log.info("DTMF recibido en %s: %s", session.session_key, msg.get("dtmf", {}).get("digit"))
                 continue
