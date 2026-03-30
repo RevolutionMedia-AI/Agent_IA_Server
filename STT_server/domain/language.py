@@ -219,6 +219,9 @@ SYSTEM_PROMPT = (
     "If caller is frustrated or inappropriate, stay calm and professional. "
     "Do not store or repeat sensitive info unnecessarily. "
     "You can assist the user on multiple subjects in one call. "
+    "MANDATORY: Do not produce emojis, excessive or non-standard punctuation, or unusual symbols (for example: © ™ ® @ # % ^ & * < > / \\ | ~ `). "
+    "Use only letters, digits, spaces, and the punctuation . , ? ! - : ; ' \" ( ) in spoken responses. "
+    "When stating currency, do NOT use currency symbols; instead use plain words such as 'X dollars' and 'Y cents' (for example, '$12.99' -> '12 dollars and 99 cents'). "
 
     # ── Closing ──
     "After confirming no further help needed: 'Thank you for contacting Cialix Customer Support. If you need further help, don't hesitate to reach out. Have a great day!' "
@@ -631,18 +634,44 @@ def sanitize_tts_text(text: str, max_len: int = 1500) -> str:
     for k, v in replacements.items():
         s = s.replace(k, v)
 
-    # Expand simple currency notations
-    s = re.sub(r"\$(\d+(?:\.\d+)?)", lambda m: f"{m.group(1)} dollars", s)
+    # Expand dollar currency robustly: $12.34 -> "12 dollars and 34 cents"
+    def _expand_dollar(m: re.Match) -> str:
+        amt = m.group(1)
+        amt = amt.replace(",", "")
+        try:
+            value = float(amt)
+        except Exception:
+            return amt + " dollars"
+        dollars = int(value)
+        cents = int(round((value - dollars) * 100))
+        if cents:
+            return f"{dollars} dollars and {cents} cents"
+        return f"{dollars} dollars"
+
+    s = re.sub(r"\$(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)", _expand_dollar, s)
     s = s.replace("€", " euros ").replace("£", " pounds ").replace("¥", " yen ")
 
-    # Remove some symbols that often confuse TTS engines
-    s = re.sub(r"[<>@\^~`#%&*=_\{\}\[\]|\\/]", " ", s)
+    # Remove angle brackets and script-like tokens
+    s = re.sub(r"<[^>]+>", " ", s)
 
-    # Collapse repeated end-of-sentence punctuation
+    # Build filtered output: allow letters, numbers, basic punctuation and whitespace only.
+    def _allowed(ch: str) -> bool:
+        if ch.isspace():
+            return True
+        cat = unicodedata.category(ch)
+        # Letters (including accented) and numbers
+        if cat[0] in ("L", "N"):
+            return True
+        # Permit a small set of ASCII punctuation
+        if ch in ".,!?-:;'\"()":
+            return True
+        return False
+
+    s = ''.join(ch for ch in s if _allowed(ch))
+
+    # Collapse repeated punctuation (e.g., !!! -> !, ??? -> ?)
     s = re.sub(r"([!?.]){2,}", r"\1", s)
-
-    # Remove miscellaneous symbol/emoji characters by Unicode category
-    s = ''.join(ch for ch in s if not unicodedata.category(ch).startswith(("So", "Cs")))
+    s = re.sub(r"-{2,}", "-", s)
 
     # Normalize whitespace
     s = re.sub(r"\s+", " ", s).strip()
@@ -650,7 +679,6 @@ def sanitize_tts_text(text: str, max_len: int = 1500) -> str:
     # Truncate at a word boundary if needed
     if len(s) > max_len:
         s = s[:max_len]
-        # avoid cutting mid-word
         if " " in s:
             s = s.rsplit(" ", 1)[0]
 
