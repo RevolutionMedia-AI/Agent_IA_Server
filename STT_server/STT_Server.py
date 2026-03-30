@@ -55,18 +55,23 @@ async def warmup_tts():
     from STT_server.adapters.rime_tts import stream_tts_segment
     from STT_server.domain.session import CallSession
     from STT_server.config import INITIAL_GREETING_TEXT
+    from STT_server.domain.language import split_tts_segments
 
     def dummy_emit(item):
         # Emisor sincrónico para evitar 'coroutine was never awaited' warnings
         return True
 
     log.info("[WARMUP] Generando warm-up TTS en inglés (initial greeting)...")
-    try:
-        session_en = CallSession(session_key="warmup-en")
-        session_en.preferred_language = "en"
-        await stream_tts_segment(session_en, INITIAL_GREETING_TEXT, 0, dummy_emit)
-    except Exception as e:
-        log.warning(f"[WARMUP] Error generando warm-up TTS inglés: {e}")
+    session_en = CallSession(session_key="warmup-en")
+    session_en.preferred_language = "en"
+
+    # Split long greetings into TTS segments to avoid single long-request timeouts
+    segments = split_tts_segments(INITIAL_GREETING_TEXT)
+    for gen, seg in enumerate(segments):
+        try:
+            await stream_tts_segment(session_en, seg, gen, dummy_emit)
+        except Exception as e:
+            log.warning("[WARMUP] Error generando warm-up segmento %s: %s", gen, e)
 
 
 @app.post("/voice")
