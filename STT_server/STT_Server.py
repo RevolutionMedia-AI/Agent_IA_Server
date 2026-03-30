@@ -126,17 +126,50 @@ async def greeting_wav() -> Response:
     if not fname.exists():
         # fallback to english
         fname = Path("rime_tts_warmup-en_0.mulaw")
-        if not fname.exists():
-            return Response(content="", status_code=404)
+
+    mulaw_data = None
+    if fname.exists():
+        try:
+            mulaw_data = fname.read_bytes()
+        except Exception:
+            log.exception("Error leyendo warm-up mulaw file %s", fname)
+
+    # If no warm-up file, attempt on-demand TTS generation (may still fail)
+    if not mulaw_data:
+        try:
+            log.info("[TTS] No warm-up file found; attempting on-demand TTS for greeting.wav")
+            from STT_server.adapters.rime_tts import stream_tts_segment
+            from STT_server.domain.session import CallSession
+            from STT_server.config import INITIAL_GREETING_TEXT
+
+            captured = bytearray()
+
+            def emit_capture(item: dict) -> bool:
+                if item.get("type") == "audio":
+                    captured.extend(item.get("data", b""))
+                return True
+
+            sess = CallSession(session_key="greeting-ondemand")
+            sess.preferred_language = "en"
+            # Call the streamer directly to capture mulaw chunks
+            await stream_tts_segment(sess, INITIAL_GREETING_TEXT, 0, emit_capture)
+            if captured:
+                mulaw_data = bytes(captured)
+        except Exception as e:
+            log.exception("On-demand TTS generation failed: %s", e)
+
+    if not mulaw_data:
+        # Still no audio available
+        log.warning("/greeting.wav: no mu-law audio available after warm-up and on-demand attempts")
+        return Response(content="", status_code=404)
 
     try:
-        mulaw = fname.read_bytes()
         # Some Python builds expose `mulaw2lin`; others expose `ulaw2lin`.
         # Prefer `mulaw2lin`, fall back to `ulaw2lin` for compatibility.
         if hasattr(audioop, "mulaw2lin"):
-            pcm16 = audioop.mulaw2lin(mulaw, 2)
+            pcm16 = audioop.mulaw2lin(mulaw_data, 2)
         elif hasattr(audioop, "ulaw2lin"):
-            pcm16 = audioop.ulaw2lin(mulaw, 2)
+            pcm16 = audioop.ulaw2lin(mulaw_data, 2)
         else:
             raise RuntimeError("audioop lacks mulaw2lin/ulaw2lin")
         buf = io.BytesIO()
@@ -148,7 +181,7 @@ async def greeting_wav() -> Response:
         buf.seek(0)
         return Response(content=buf.read(), media_type="audio/wav")
     except Exception as e:
-        log.exception("Error generating greeting.wav: %s", e)
+        log.exception("Error generating greeting.wav from mulaw data: %s", e)
         return Response(content="", status_code=500)
 
 
