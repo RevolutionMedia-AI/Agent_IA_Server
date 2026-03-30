@@ -166,8 +166,13 @@ async def play_tts_from_text_queue(
         except Exception:
             safe_text = text
         if not safe_text:
-            # Skip empty segments after sanitization
-            continue
+            # If sanitization removed all characters, fall back to the original
+            # text so we don't silently drop spoken content.
+            log.warning(
+                "[TTS] Sanitization removed all characters; falling back to original text for session=%s",
+                session.session_key,
+            )
+            safe_text = text
         if safe_text != text:
             log.info("[TTS] Sanitized streaming segment for %s: %.120r -> %.120r", session.session_key, text[:120], safe_text[:120])
 
@@ -195,7 +200,12 @@ async def speak_precomputed_reply(
     except Exception:
         safe_reply = reply
     if not safe_reply:
-        return metrics
+        # Avoid dropping the whole reply if sanitization removed content.
+        log.warning(
+            "[TTS] Sanitized precomputed reply became empty; using original reply for TTS: %s",
+            session.session_key,
+        )
+        safe_reply = reply
     if safe_reply != reply:
         log.info("[TTS] Sanitized precomputed reply for %s: %.120r -> %.120r", session.session_key, reply[:120], safe_reply[:120])
 
@@ -254,7 +264,13 @@ async def stream_llm_reply_with_tts(
         except Exception:
             safe_seg = segment
         if not safe_seg:
-            return
+            # If LLM segment sanitizes to empty, enqueue the original so TTS still
+            # attempts to speak it rather than dropping silently.
+            log.warning(
+                "[TTS] Sanitized LLM segment empty; enqueueing original segment for session=%s",
+                session.session_key,
+            )
+            safe_seg = segment
         if safe_seg != segment:
             log.info("[TTS] Sanitized streaming LLM segment for %s: %.120r -> %.120r", session.session_key, segment[:120], safe_seg[:120])
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, safe_seg, "text_segment_queue")
