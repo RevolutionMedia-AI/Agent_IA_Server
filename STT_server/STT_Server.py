@@ -37,6 +37,27 @@ if not RIME_API_KEY:
 
 app = FastAPI()
 
+# ── Warm-up TTS en startup ──
+@app.on_event("startup")
+async def warmup_tts():
+    from STT_server.adapters.rime_tts import stream_tts_segment
+    from STT_server.domain.session import CallSession
+    async def dummy_emit(item):
+        pass
+    log.info("[WARMUP] Ejecutando warm-up TTS en inglés y español...")
+    try:
+        session_en = CallSession(session_key="warmup-en")
+        session_en.preferred_language = "en"
+        await stream_tts_segment(session_en, "This is a warm-up test.", 0, dummy_emit)
+    except Exception as e:
+        log.warning(f"[WARMUP] Error en warm-up TTS inglés: {e}")
+    try:
+        session_es = CallSession(session_key="warmup-es")
+        session_es.preferred_language = "es"
+        await stream_tts_segment(session_es, "Esto es una prueba de calentamiento.", 0, dummy_emit)
+    except Exception as e:
+        log.warning(f"[WARMUP] Error en warm-up TTS español: {e}")
+
 
 @app.post("/voice")
 async def voice() -> Response:

@@ -58,7 +58,10 @@ async def run_tts_with_retries(session: CallSession, text: str, generation: int)
 
 def emit_playback_item(session: CallSession, item: dict) -> bool:
     log.debug("[PLAYBACK] Enqueue playback item: session=%s type=%s gen=%s bytes=%s", getattr(session, 'session_key', '?'), item.get('type'), item.get('generation'), len(item.get('data', b'')) if 'data' in item else '-')
-    return enqueue_nowait_with_drop(session.playback_queue, item, "playback_queue")
+    ok = enqueue_nowait_with_drop(session.playback_queue, item, "playback_queue")
+    if not ok:
+        log.warning("[PLAYBACK] Failed to enqueue playback item (queue full): session=%s type=%s gen=%s", getattr(session, 'session_key', '?'), item.get('type'), item.get('generation'))
+    return ok
 
 
 async def enqueue_playback_clear(session: CallSession) -> None:
@@ -104,6 +107,7 @@ async def play_initial_greeting(session: CallSession) -> None:
 
     session.active_generation += 1
     generation = session.active_generation
+    log.info("[PLAYBACK] Starting initial greeting for %s generation=%s", session.session_key, generation)
     session.history.append({"role": "assistant", "content": INITIAL_GREETING_TEXT})
 
     try:
@@ -171,18 +175,21 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 continue
 
             if item_type == "segment_end":
-                # Forzar unmute del STT al terminar cualquier segmento, con o sin audio
-                session.assistant_speaking = False
-                session.assistant_started_at = None
-                continue
-
-                session.mark_counter += 1
-                mark_name = f"gen-{generation}-seg-{session.mark_counter}"
-                session.pending_marks.add(mark_name)
-                await send_twilio_mark(ws, session.stream_sid, mark_name)
-                if LOG_TWILIO_PLAYBACK:
-                    log.info("Playback mark enviado %s %s", session.session_key, mark_name)
-                continue
+                    # Forzar unmute del STT al terminar cualquier segmento, con o sin audio
+                    session.assistant_speaking = False
+                    session.assistant_started_at = None
+                    # Enviar mark para rastrear segmento (si tenemos stream_sid)
+                    try:
+                        session.mark_counter += 1
+                        mark_name = f"gen-{generation}-seg-{session.mark_counter}"
+                        session.pending_marks.add(mark_name)
+                        if session.stream_sid:
+                            await send_twilio_mark(ws, session.stream_sid, mark_name)
+                            if LOG_TWILIO_PLAYBACK:
+                                log.info("Playback mark enviado %s %s", session.session_key, mark_name)
+                    except Exception:
+                        log.exception("Error enviando mark de playback para %s", session.session_key)
+                    continue
 
             if item_type == "error":
                 log.error("Playback error en %s: %s", session.session_key, item.get("message"))
