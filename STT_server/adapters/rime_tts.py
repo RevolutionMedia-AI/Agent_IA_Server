@@ -302,12 +302,6 @@ async def stream_tts_segment(
                 with open(fname, "wb") as f:
                     f.write(audio_accum)
                 log.info(f"[TTS] Audio guardado en {fname} ({len(audio_accum)} bytes)")
-                try:
-                    from STT_server.utils.send_audio_email import send_audio_email
-                    send_audio_email(fname)
-                    log.info("[TTS] Audio enviado por correo a kevin.escalante@revolutionmedia.ai")
-                except Exception as e:
-                    log.error(f"[TTS] Error enviando audio por correo: {e}")
             except Exception as e:
                 log.error(f"[TTS] Error guardando audio: {e}")
 

@@ -42,8 +42,9 @@ app = FastAPI()
 async def warmup_tts():
     from STT_server.adapters.rime_tts import stream_tts_segment
     from STT_server.domain.session import CallSession
-    async def dummy_emit(item):
-        pass
+    def dummy_emit(item):
+        # Emisor sincrónico para evitar 'coroutine was never awaited' warnings
+        return True
     log.info("[WARMUP] Ejecutando warm-up TTS en inglés y español...")
     try:
         session_en = CallSession(session_key="warmup-en")

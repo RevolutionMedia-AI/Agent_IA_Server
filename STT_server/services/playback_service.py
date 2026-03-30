@@ -22,6 +22,7 @@ from STT_server.config import (
 from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.common import drain_queue_nowait, enqueue_nowait_with_drop, enqueue_with_drop
+import os
 
 
 log = logging.getLogger("stt_server")
@@ -109,6 +110,25 @@ async def play_initial_greeting(session: CallSession) -> None:
     generation = session.active_generation
     log.info("[PLAYBACK] Starting initial greeting for %s generation=%s", session.session_key, generation)
     session.history.append({"role": "assistant", "content": INITIAL_GREETING_TEXT})
+
+    # Try to play a pre-generated warm-up file to guarantee immediate playback.
+    # Warm-up files are created by the startup warmup TTS as: rime_tts_warmup-<lang>_0.mulaw
+    lang = getattr(session, 'preferred_language', None) or os.getenv('DEFAULT_CALL_LANGUAGE', 'en')
+    lang_code = 'en' if lang.startswith('en') else 'es'
+    warmup_fname = f"rime_tts_warmup-{lang_code}_0.mulaw"
+    if os.path.exists(warmup_fname):
+        try:
+            log.info("[PLAYBACK] Found warm-up file %s, enqueuing for %s", warmup_fname, session.session_key)
+            with open(warmup_fname, 'rb') as f:
+                data = f.read()
+            # Split into frames matching Twilio outbound chunk size and enqueue
+            for start in range(0, len(data), TWILIO_OUTBOUND_CHUNK_BYTES):
+                frame = data[start:start+TWILIO_OUTBOUND_CHUNK_BYTES]
+                emit_playback_item(session, {"type": "audio", "generation": generation, "data": frame})
+            emit_playback_item(session, {"type": "segment_end", "generation": generation, "has_audio": True})
+            return
+        except Exception:
+            log.exception("[PLAYBACK] Error encolando warm-up file %s for %s", warmup_fname, session.session_key)
 
     try:
         for segment in split_tts_segments(INITIAL_GREETING_TEXT):
