@@ -42,6 +42,9 @@ def is_probable_voice(frame: bytes) -> tuple[bool, int]:
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
     raw = base64.b64decode(media_payload)
 
+    # Log formato de audio recibido
+    log.debug(f"[VAD] Audio recibido: len={len(raw)} bytes, sample_rate={TWILIO_SR}, channels=1, frame_dur_ms={FRAME_DURATION_MS}")
+
     # Route audio to the active STT backend
     if USE_OPENAI_REALTIME:
         target_queue = session.realtime_audio_queue
@@ -62,7 +65,17 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                     await enqueue_with_drop(target_queue, buffered_chunk, queue_name)
                 session.stt_mute_buffer.clear()
             await enqueue_with_drop(target_queue, raw, queue_name)
-    pcm16 = audioop.ulaw2lin(raw, 2)
+
+    # Conversión y chequeo de formato
+    try:
+        pcm16 = audioop.ulaw2lin(raw, 2)
+        # Verifica que el audio sea mono y 16-bit
+        if len(pcm16) % 2 != 0:
+            log.warning(f"[VAD] Audio PCM16 no tiene longitud par: {len(pcm16)}")
+    except Exception as e:
+        log.error(f"[VAD] Error al convertir audio a PCM16: {e}")
+        return
+
     session.vad_buffer.extend(pcm16)
 
     buf = session.vad_buffer
@@ -74,6 +87,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         offset += FRAME_BYTES
 
         is_voice, rms = is_probable_voice(frame)
+        log.debug(f"[VAD] Frame: offset={offset}, rms={rms}, is_voice={is_voice}")
         session.pre_speech_frames.append(frame)
 
         assistant_recently_started = (
@@ -83,6 +97,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         )
 
         if session.assistant_speaking and not ENABLE_BARGE_IN:
+            log.debug(f"[VAD] Ignorando voz porque el asistente está hablando (sin barge-in)")
             session.voice_streak = 0
             session.silence_frames = 0
             session.speech_frames.clear()
@@ -92,6 +107,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         if not session.speech_frames:
             if is_voice:
                 session.voice_streak += 1
+                log.debug(f"[VAD] Detected voice streak={session.voice_streak}")
                 if (
                     ENABLE_BARGE_IN
                     and session.assistant_speaking
@@ -108,6 +124,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                     session.speech_frames.extend(session.pre_speech_frames)
                     session.speech_frame_count = session.voice_streak
                     session.silence_frames = 0
+                    log.info(f"[VAD] INICIO DE VOZ: streak={session.voice_streak}, speech_frame_count={session.speech_frame_count}")
             else:
                 session.voice_streak = 0
             continue
@@ -117,12 +134,15 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
             session.silence_frames = 0
             session.speech_frames.append(frame)
             session.speech_frame_count += 1
+            log.debug(f"[VAD] Continuando voz: speech_frame_count={session.speech_frame_count}")
         else:
             session.voice_streak = 0
             session.speech_frames.append(frame)
             session.silence_frames += 1
+            log.debug(f"[VAD] Silencio: silence_frames={session.silence_frames}")
 
         if session.speech_frames and session.silence_frames >= END_SILENCE_FRAMES:
+            log.info(f"[VAD] FIN DE VOZ: speech_frame_count={session.speech_frame_count}, silence_frames={session.silence_frames}")
             session.speech_frames.clear()
             session.pre_speech_frames.clear()
             session.silence_frames = 0
