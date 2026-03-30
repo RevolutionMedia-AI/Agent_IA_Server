@@ -81,12 +81,12 @@ def _downsample_linear(samples: list[int], src_rate: int, dst_rate: int) -> list
 def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes = b"") -> tuple[bytes, bytes]:
     """Convert raw PCM16-LE bytes at *src_rate* to mu-law 8 kHz.
 
-    Returns ``(mulaw_bytes, leftover)`` where *leftover* is a 0-or-1 byte
-    remainder that should be prepended to the next chunk so sample
-    boundaries stay aligned across WebSocket messages.
+    Returns ``(mulaw_bytes, leftover)`` where *leftover* is the remaining
+    bytes (less than CHUNK_SIZE) that should be prepended to the next chunk
+    so sample boundaries stay aligned across WebSocket messages.
     """
     data = remainder + pcm_bytes
-    CHUNK_SIZE = 160  # 20 ms de audio a 8000 Hz, 16 bits, 1 canal
+    CHUNK_SIZE = 320  # 20 ms de audio a 8000 Hz, 16 bits, 1 canal (160 samples * 2 bytes)
     usable = len(data) - (len(data) % CHUNK_SIZE)
     leftover = data[usable:]  # bytes restantes para el siguiente chunk
     if usable == 0:
