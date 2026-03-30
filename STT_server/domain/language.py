@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
@@ -599,3 +600,58 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
         remainder = ""
 
     return segments, remainder
+
+
+def sanitize_tts_text(text: str, max_len: int = 1500) -> str:
+    """Sanitize text intended for TTS playback.
+
+    - Normalize Unicode (NFKC).
+    - Remove control characters.
+    - Replace smart punctuation with plain ASCII equivalents.
+    - Expand simple currency patterns (e.g. "$5" -> "5 dollars").
+    - Remove a small set of symbols that tend to break TTS engines.
+    - Strip emoji and miscellaneous symbol characters.
+    - Collapse repeated punctuation and normalize whitespace.
+    - Truncate to `max_len` characters at a word boundary.
+    """
+    if not text:
+        return ""
+
+    s = unicodedata.normalize("NFKC", text)
+
+    # Remove C0/C1 control characters
+    s = re.sub(r"[\x00-\x1F\x7F-\x9F]", "", s)
+
+    # Smart punctuation -> ASCII
+    replacements = {
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+        "—": "-", "–": "-", "…": "...",
+        "•": "-", "·": "-",
+    }
+    for k, v in replacements.items():
+        s = s.replace(k, v)
+
+    # Expand simple currency notations
+    s = re.sub(r"\$(\d+(?:\.\d+)?)", lambda m: f"{m.group(1)} dollars", s)
+    s = s.replace("€", " euros ").replace("£", " pounds ").replace("¥", " yen ")
+
+    # Remove some symbols that often confuse TTS engines
+    s = re.sub(r"[<>@\^~`#%&*=_\{\}\[\]|\\/]", " ", s)
+
+    # Collapse repeated end-of-sentence punctuation
+    s = re.sub(r"([!?.]){2,}", r"\1", s)
+
+    # Remove miscellaneous symbol/emoji characters by Unicode category
+    s = ''.join(ch for ch in s if not unicodedata.category(ch).startswith(("So", "Cs")))
+
+    # Normalize whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # Truncate at a word boundary if needed
+    if len(s) > max_len:
+        s = s[:max_len]
+        # avoid cutting mid-word
+        if " " in s:
+            s = s.rsplit(" ", 1)[0]
+
+    return s
