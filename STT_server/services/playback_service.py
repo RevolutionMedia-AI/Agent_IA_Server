@@ -104,59 +104,10 @@ async def interrupt_current_turn(session: CallSession) -> None:
 
 
 async def play_initial_greeting(session: CallSession) -> None:
-    # If TwiML initial greeting is enabled, Twilio already played the greeting
-    # before opening the media stream; skip the in-band TTS greeting to avoid
-    # double playback.
-    if TWIML_INITIAL_GREETING_ENABLED:
-        log.debug("[PLAYBACK] Skipping in-band greeting because TWIML initial greeting is enabled")
-        return
-
-    if not INITIAL_GREETING_ENABLED or not INITIAL_GREETING_TEXT or not (OPENAI_API_KEY or RIME_API_KEY):
-        return
-
-    session.active_generation += 1
-    generation = session.active_generation
-    log.info("[PLAYBACK] Starting initial greeting for %s generation=%s", session.session_key, generation)
-    session.history.append({"role": "assistant", "content": INITIAL_GREETING_TEXT})
-
-    # Esperar por stream_sid (Twilio) antes de encolar el saludo para evitar race
-    # entre recepción del evento 'start' y el bucle de playback.
-    wait_max = float(os.getenv("PLAYBACK_WAIT_STREAM_SID_SEC", "5.0"))
-    waited = 0.0
-    while not getattr(session, "stream_sid", None) and waited < wait_max:
-        await asyncio.sleep(0.05)
-        waited += 0.05
-    if not getattr(session, "stream_sid", None):
-        log.warning("[PLAYBACK] stream_sid no disponible tras %.1fs; el saludo inicial podría no oirse para %s", wait_max, session.session_key)
-
-    # Try to play a pre-generated warm-up file to guarantee immediate playback.
-    # Warm-up files are created by the startup warmup TTS as: rime_tts_warmup-<lang>_0.mulaw
-    lang = getattr(session, 'preferred_language', None) or os.getenv('DEFAULT_CALL_LANGUAGE', 'en')
-    lang_code = 'en' if lang.startswith('en') else 'es'
-    warmup_fname = f"rime_tts_warmup-{lang_code}_0.mulaw"
-    if os.path.exists(warmup_fname):
-        try:
-            log.info("[PLAYBACK] Found warm-up file %s, enqueuing for %s", warmup_fname, session.session_key)
-            with open(warmup_fname, 'rb') as f:
-                data = f.read()
-            # Split into frames matching Twilio outbound chunk size and enqueue
-            for start in range(0, len(data), TWILIO_OUTBOUND_CHUNK_BYTES):
-                frame = data[start:start+TWILIO_OUTBOUND_CHUNK_BYTES]
-                emit_playback_item(session, {"type": "audio", "generation": generation, "data": frame})
-            emit_playback_item(session, {"type": "segment_end", "generation": generation, "has_audio": True})
-            return
-        except Exception:
-            log.exception("[PLAYBACK] Error encolando warm-up file %s for %s", warmup_fname, session.session_key)
-
-    try:
-        for segment in split_tts_segments(INITIAL_GREETING_TEXT):
-            if generation != session.active_generation:
-                return
-            await run_tts_with_retries(session, segment, generation)
-    except asyncio.TimeoutError:
-        log.warning("TTS timeout en saludo inicial para %s", session.session_key)
-    except Exception:
-        log.exception("Error en saludo inicial para %s", session.session_key)
+    # Initial greeting functionality removed — keep function as a no-op to
+    # preserve callers that may still schedule it.
+    log.debug("[PLAYBACK] play_initial_greeting skipped (initial greeting disabled)")
+    return
 
 
 async def playback_loop(ws: WebSocket, session: CallSession) -> None:

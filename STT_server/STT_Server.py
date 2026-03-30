@@ -19,14 +19,12 @@ from STT_server.config import (
     RIME_API_KEY,
     TWILIO_SR,
     USE_OPENAI_REALTIME,
-    TWIML_INITIAL_GREETING_ENABLED,
-    TWIML_INITIAL_GREETING_LANG,
 )
 from STT_server.domain.language import detect_language, split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
-from STT_server.services.playback_service import play_initial_greeting, playback_loop
+from STT_server.services.playback_service import playback_loop
 from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, register_session, track_task
 from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_transcripts
 
@@ -49,27 +47,7 @@ if not RIME_API_KEY:
 
 app = FastAPI()
 
-# ── Warm-up TTS en startup ──
-@app.on_event("startup")
-async def warmup_tts():
-    from STT_server.adapters.rime_tts import stream_tts_segment
-    from STT_server.domain.session import CallSession
-    def dummy_emit(item):
-        # Emisor sincrónico para evitar 'coroutine was never awaited' warnings
-        return True
-    log.info("[WARMUP] Ejecutando warm-up TTS en inglés y español...")
-    try:
-        session_en = CallSession(session_key="warmup-en")
-        session_en.preferred_language = "en"
-        await stream_tts_segment(session_en, "This is a warm-up test.", 0, dummy_emit)
-    except Exception as e:
-        log.warning(f"[WARMUP] Error en warm-up TTS inglés: {e}")
-    try:
-        session_es = CallSession(session_key="warmup-es")
-        session_es.preferred_language = "es"
-        await stream_tts_segment(session_es, "Esto es una prueba de calentamiento.", 0, dummy_emit)
-    except Exception as e:
-        log.warning(f"[WARMUP] Error en warm-up TTS español: {e}")
+# Warm-up TTS removed: initial greeting/warm-up generation disabled per request.
 
 
 @app.post("/voice")
@@ -83,21 +61,8 @@ async def voice() -> Response:
     else:
         ws_url = "wss://" + ws_url
 
-    # If configured, play a pre-generated greeting file (hosted on this server)
-    # before connecting the media stream. This ensures Twilio plays audio to
-    # the caller before opening the websocket stream.
-    if TWIML_INITIAL_GREETING_ENABLED:
-        play_url = f"{PUBLIC_URL.rstrip('/')}/greeting.wav"
-        twiml = f"""
-    <Response>
-        <Play>{play_url}</Play>
-        <Connect>
-            <Stream url=\"{ws_url}/media-stream\" />
-        </Connect>
-    </Response>
-    """
-    else:
-        twiml = f"""
+    # No initial TwiML <Play> greeting — connect the media stream directly.
+    twiml = f"""
     <Response>
         <Connect>
             <Stream url=\"{ws_url}/media-stream\" />
@@ -107,47 +72,7 @@ async def voice() -> Response:
     return Response(content=twiml, media_type="application/xml")
 
 
-@app.get("/greeting.wav")
-async def greeting_wav() -> Response:
-    """Serve the pre-generated warm-up mulaw file as a WAV (mu-law -> PCM16).
-
-    Expects files named `rime_tts_warmup-<lang>_0.mulaw` in the working directory.
-    Falls back to English if the requested language file is missing.
-    """
-    import io
-    import wave
-    import audioop
-    from pathlib import Path
-
-    lang = TWIML_INITIAL_GREETING_LANG or "en"
-    fname = Path(f"rime_tts_warmup-{lang}_0.mulaw")
-    if not fname.exists():
-        # fallback to english
-        fname = Path("rime_tts_warmup-en_0.mulaw")
-        if not fname.exists():
-            return Response(content="", status_code=404)
-
-    try:
-        mulaw = fname.read_bytes()
-        # Some Python builds expose `mulaw2lin`; others expose `ulaw2lin`.
-        # Prefer `mulaw2lin`, fall back to `ulaw2lin` for compatibility.
-        if hasattr(audioop, "mulaw2lin"):
-            pcm16 = audioop.mulaw2lin(mulaw, 2)
-        elif hasattr(audioop, "ulaw2lin"):
-            pcm16 = audioop.ulaw2lin(mulaw, 2)
-        else:
-            raise RuntimeError("audioop lacks mulaw2lin/ulaw2lin")
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(TWILIO_SR)
-            wf.writeframes(pcm16)
-        buf.seek(0)
-        return Response(content=buf.read(), media_type="audio/wav")
-    except Exception as e:
-        log.exception("Error generating greeting.wav: %s", e)
-        return Response(content="", status_code=500)
+# Greeting WAV endpoint removed — initial greeting functionality disabled.
 
 
 @app.websocket("/media-stream")
@@ -203,7 +128,7 @@ async def media_stream(ws: WebSocket) -> None:
                         ),
                     )
                     track_task(session, asyncio.create_task(process_transcripts(session)))
-                track_task(session, asyncio.create_task(play_initial_greeting(session)))
+                # Initial greeting removed; do not schedule play_initial_greeting
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 continue
 

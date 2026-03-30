@@ -16,8 +16,6 @@ import websockets
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
-    INITIAL_GREETING_ENABLED,
-    INITIAL_GREETING_TEXT,
     MAX_HISTORY_MESSAGES,
     MAX_RESPONSE_TOKENS,
     OPENAI_API_KEY,
@@ -129,16 +127,7 @@ async def run_realtime_session(session: CallSession) -> None:
                 },
             }))
 
-            # ── Inject greeting into conversation context ──
-            if INITIAL_GREETING_ENABLED and INITIAL_GREETING_TEXT:
-                await ws.send(json.dumps({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": INITIAL_GREETING_TEXT}],
-                    },
-                }))
+            # Initial greeting injection removed — no assistant message pre-seeded.
 
             sender_task = asyncio.create_task(_audio_sender(ws, session))
             watcher_task = asyncio.create_task(_barge_in_watcher(ws, session))
