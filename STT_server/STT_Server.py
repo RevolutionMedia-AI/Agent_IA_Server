@@ -250,6 +250,36 @@ async def test_llm_tts(q: str = Query(...)) -> dict:
     }
 
 
+@app.post("/admin/regenerate-warmup")
+async def admin_regenerate_warmup() -> dict:
+    """Admin-only endpoint to re-run the warm-up TTS generation.
+
+    Protected by `require_debug_endpoints()` so it must be enabled explicitly.
+    Returns per-segment results and any errors.
+    """
+    require_debug_endpoints()
+    from STT_server.adapters.rime_tts import stream_tts_segment
+    from STT_server.domain.session import CallSession
+    from STT_server.config import INITIAL_GREETING_TEXT
+
+    session_en = CallSession(session_key="warmup-en")
+    session_en.preferred_language = "en"
+    segments = split_tts_segments(INITIAL_GREETING_TEXT)
+    results = {"segments": len(segments), "files": [], "errors": []}
+
+    def dummy_emit(item):
+        return True
+
+    for gen, seg in enumerate(segments):
+        try:
+            ttfb_ms, total_ms = await stream_tts_segment(session_en, seg, gen, dummy_emit)
+            results["files"].append({"file": f"rime_tts_warmup-en_{gen}.mulaw", "ttfb_ms": ttfb_ms, "total_ms": total_ms})
+        except Exception as e:
+            results["errors"].append({"segment": gen, "error": str(e)})
+
+    return results
+
+
 @app.post("/test-stt")
 async def test_stt() -> dict:
     require_debug_endpoints()
