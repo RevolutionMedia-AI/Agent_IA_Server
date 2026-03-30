@@ -313,6 +313,43 @@ async def admin_regenerate_warmup() -> dict:
     return results
 
 
+@app.get("/admin/test-rime")
+async def admin_test_rime() -> dict:
+    """Attempt a quick Rime WS handshake and return the first response (debug).
+
+    Requires `ENABLE_DEBUG_ENDPOINTS=true` to be set (protected via `require_debug_endpoints`).
+    """
+    require_debug_endpoints()
+    try:
+        from urllib.parse import urlencode
+        import websockets
+        from STT_server.adapters.rime_tts import RIME_WS_URL
+        from STT_server.config import RIME_API_KEY, RIME_TTS_MODEL_ID, RIME_TTS_SAMPLE_RATE
+
+        if not RIME_API_KEY:
+            return {"status": "error", "error": "RIME_API_KEY not set in environment"}
+
+        qs = urlencode({
+            "speaker": "Astra",
+            "modelId": RIME_TTS_MODEL_ID,
+            "lang": "eng",
+            "audioFormat": "pcm",
+            "samplingRate": str(RIME_TTS_SAMPLE_RATE),
+        })
+        ws_url = f"{RIME_WS_URL}?{qs}"
+
+        async with websockets.connect(ws_url, additional_headers={"Authorization": f"Bearer {RIME_API_KEY}"}, open_timeout=10) as ws:
+            await ws.send(json.dumps({"text": "ping"}))
+            try:
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                return {"status": "ok", "first_msg": raw_msg}
+            except asyncio.TimeoutError:
+                return {"status": "connected_no_audio", "message": "Connected but no message received within 5s"}
+
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @app.post("/test-stt")
 async def test_stt() -> dict:
     require_debug_endpoints()
