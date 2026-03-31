@@ -4,6 +4,7 @@ import json
 import logging
 import struct
 import time
+import os
 
 import websockets
 
@@ -132,10 +133,10 @@ async def stream_tts_segment(
     # Request 8 kHz directly so we avoid downsampling most of the time.
     sample_rate = RIME_TTS_SAMPLE_RATE
 
-    log.info(
-        "[TTS] Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d text=%.40r",
-        speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text), text[:40]
-    )
+        log.debug(
+            "[TTS] Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d text=%.40r",
+            speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text), text[:40]
+        )
 
     # Rime WS3 requires ALL config as query params; message body is text-only.
     from urllib.parse import urlencode
@@ -162,7 +163,8 @@ async def stream_tts_segment(
     }
 
     # --- Guardado de audio para análisis ---
-    save_audio = True  # Cambia a False para desactivar
+    # Can be enabled via env var RIME_SAVE_AUDIO=1 for diagnostics.
+    save_audio = os.getenv("RIME_SAVE_AUDIO", "false").strip().lower() in {"1", "true", "yes", "on"}
     audio_accum = bytearray()
 
     try:
@@ -173,7 +175,7 @@ async def stream_tts_segment(
             open_timeout=10,
         ) as ws:
             await ws.send(ws_message)
-            log.info("[TTS] Rime WS message sent, waiting for audio... text=%.40r", text[:40])
+                log.debug("[TTS] Rime WS message sent, waiting for audio... text=%.40r", text[:40])
 
             pcm_remainder = b""  # carry odd trailing byte across chunks
 
@@ -200,7 +202,7 @@ async def stream_tts_segment(
                 if isinstance(raw_msg, bytes):
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
-                        log.info("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
+                            log.debug("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
                     if save_audio:
                         audio_accum.extend(mulaw_bytes)
@@ -240,7 +242,7 @@ async def stream_tts_segment(
 
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
-                        log.info("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
+                            log.debug("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
 
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
                     if save_audio:
@@ -313,7 +315,7 @@ async def stream_tts_segment(
                 fname = f"rime_tts_{getattr(session, 'session_key', 'unknown')}_{generation}.mulaw"
                 with open(fname, "wb") as f:
                     f.write(audio_accum)
-                log.info(f"[TTS] Audio guardado en {fname} ({len(audio_accum)} bytes)")
+                    log.debug(f"[TTS] Audio guardado en {fname} ({len(audio_accum)} bytes)")
             except Exception as e:
                 log.error(f"[TTS] Error guardando audio: {e}")
 

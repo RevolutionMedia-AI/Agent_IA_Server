@@ -151,7 +151,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     log.debug("[PLAYBACK] Sending Twilio frame: session=%s gen=%s frame_bytes=%d", session.session_key, generation, len(frame))
                     if frame:
                         if sent_frames == 0:
-                            log.info("[PLAYBACK] Sending first Twilio frame: session=%s gen=%s bytes=%d", session.session_key, generation, len(frame))
+                            log.debug("[PLAYBACK] Sending first Twilio frame: session=%s gen=%s bytes=%d", session.session_key, generation, len(frame))
                         await send_twilio_media(ws, session.stream_sid, frame)
                         sent_frames += 1
                         # Pace outgoing frames proportionally to their duration.

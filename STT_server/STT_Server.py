@@ -32,7 +32,10 @@ from STT_server.services.session_runtime import cleanup_session, monitor_idle_si
 from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_transcripts
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
+# Reduce verbosity of commonly noisy third-party loggers (uvicorn/access, websockets)
+for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error", "websockets", "asyncio"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("stt_server")
 
 if not PUBLIC_URL:
