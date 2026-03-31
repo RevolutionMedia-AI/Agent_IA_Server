@@ -26,8 +26,7 @@ from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.common import drain_queue_nowait, enqueue_nowait_with_drop, enqueue_with_drop
 import os
-from STT_server.services.rnnoise_filter import RNNoiseFilter
-from STT_server.config import RNNOISE_ENABLED
+# RNNoise removed: playback sends mu-law frames directly to Twilio.
 
 
 log = logging.getLogger("stt_server")
@@ -149,12 +148,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     session.last_activity_at = time.monotonic()
                 session.assistant_speaking = True
                 chunk = item["data"]
-                # Lazily create per-session denoiser to preserve noise state per-call
-                if RNNOISE_ENABLED:
-                    if getattr(session, "rn_denoiser", None) is None:
-                        session.rn_denoiser = RNNoiseFilter()
-                else:
-                    session.rn_denoiser = None
+                # Direct pass-through of mu-law frames; no denoising applied.
                 sent_frames = 0
                 timings = []
                 for start in range(0, len(chunk), TWILIO_OUTBOUND_CHUNK_BYTES):
@@ -172,23 +166,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                             except Exception:
                                 log.exception("Error escribiendo frame Twilio para %s", session.session_key)
 
-                        # Optionally apply denoiser (mutates frame).
-                        # Run in executor to avoid blocking the async event loop
-                        if getattr(session, "rn_denoiser", None) is not None:
-                            try:
-                                loop = asyncio.get_running_loop()
-                                start_proc = time.perf_counter()
-                                # Skip denoising for synthetic TTS audio — RNNoise is
-                                # tuned for microphone noise removal and can degrade
-                                # synthesized audio quality.
-                                if item.get("source") == "tts":
-                                    log.debug("Skipping RNNoise for TTS chunk session=%s gen=%s", session.session_key, generation)
-                                else:
-                                    frame = await loop.run_in_executor(None, session.rn_denoiser.process_mulaw_frame, frame)
-                                proc_elapsed = time.perf_counter() - start_proc
-                                log.debug("RNNoise processing elapsed=%.4fs session=%s gen=%s", proc_elapsed, session.session_key, generation)
-                            except Exception:
-                                log.exception("RNNoise processing failed for %s", session.session_key)
+                        # No denoiser: send frame directly to Twilio.
 
                         send_start = time.perf_counter()
                         await send_twilio_media(ws, session.stream_sid, frame)

@@ -143,9 +143,5 @@ IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 TWIML_INITIAL_GREETING_ENABLED = os.getenv("TWIML_INITIAL_GREETING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "en").strip().lower()
 
-# RNNoise/denoising settings
-RNNOISE_ENABLED = os.getenv("RNNOISE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-# If true and RNNoise bindings are not available, fallback to a lightweight
-# spectral-gating denoiser implemented in NumPy.
-RNNOISE_FALLBACK_ENABLED = os.getenv("RNNOISE_FALLBACK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# RNNoise/denoising settings removed — pipeline sends mu-law frames directly.
 

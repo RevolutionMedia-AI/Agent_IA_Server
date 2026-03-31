@@ -29,6 +29,9 @@ log = logging.getLogger("stt_server")
 
 RIME_WS_URL = "wss://users-ws.rime.ai/ws3"
 TWILIO_SAMPLE_RATE = 8000
+_SCIPY_AVAILABLE = None
+_np = None
+_resample_poly = None
 
 # ── mu-law encoder (lookup-table, no audioop needed) ─────────────────────
 _MULAW_BIAS = 33
@@ -83,24 +86,43 @@ def _downsample_linear(samples: list[int], src_rate: int, dst_rate: int) -> list
 def _resample_samples(samples: list[int], src_rate: int, dst_rate: int) -> list[int]:
     """Resample using scipy.signal.resample_poly when available, fallback to linear.
 
-    This function imports scipy/numpy only at runtime to keep the module
-    importable when those optional dependencies are not installed.
+    This function uses a lazy, cached import so the optional scipy dependency
+    doesn't need to be present at module import time.
     """
     if src_rate == dst_rate:
         return samples
-    try:
-        import numpy as _np
-        from scipy.signal import resample_poly  # type: ignore
-
-        arr = _np.asarray(samples, dtype=_np.int16)
-        g = math.gcd(src_rate, dst_rate)
-        up = dst_rate // g
-        down = src_rate // g
-        res = resample_poly(arr.astype(_np.float64), up, down)
-        res = _np.round(res).astype(_np.int16)
-        return res.tolist()
-    except Exception:
+    if _scipy_available():
+        try:
+            arr = _np.asarray(samples, dtype=_np.int16)
+            g = math.gcd(src_rate, dst_rate)
+            up = dst_rate // g
+            down = src_rate // g
+            res = _resample_poly(arr.astype(_np.float64), up, down)
+            res = _np.round(res).astype(_np.int16)
+            log.debug("[TTS] Resampled with scipy.signal.resample_poly")
+            return res.tolist()
+        except Exception:
+            log.debug("[TTS] scipy resample failed, falling back to linear")
+            return _downsample_linear(samples, src_rate, dst_rate)
+    else:
+        log.debug("[TTS] scipy not available, using linear downsample")
         return _downsample_linear(samples, src_rate, dst_rate)
+
+
+def _scipy_available() -> bool:
+    """Lazy import and cache scipy/numpy resampling helpers."""
+    global _SCIPY_AVAILABLE, _np, _resample_poly
+    if _SCIPY_AVAILABLE is not None:
+        return _SCIPY_AVAILABLE
+    try:
+        import numpy as _np  # type: ignore
+        from scipy.signal import resample_poly as _resample_poly  # type: ignore
+        _SCIPY_AVAILABLE = True
+    except Exception:
+        _SCIPY_AVAILABLE = False
+        _np = None
+        _resample_poly = None
+    return _SCIPY_AVAILABLE
 
 
 def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes = b"") -> tuple[bytes, bytes]:

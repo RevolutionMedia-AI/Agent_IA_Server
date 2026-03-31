@@ -18,22 +18,13 @@ RUN apt-get update \
         ffmpeg \
         curl \
         wget \
+        libopenblas-dev \
+        gfortran \
         libtool-bin \
         m4 \
     && rm -rf /var/lib/apt/lists/*
 
-# Build and install RNNoise (system-wide)
-# Use GitHub mirror for reliability (git.xiph.org often fails DNS)
-# Build and install RNNoise (system-wide) with defensive steps
-RUN set -eux; \
-    git clone --depth 1 https://github.com/xiph/rnnoise.git /tmp/rnnoise || (echo "git clone failed, trying tarball" && curl -L https://github.com/xiph/rnnoise/archive/refs/heads/master.tar.gz | tar xz -C /tmp && mv /tmp/rnnoise-master /tmp/rnnoise); \
-    cd /tmp/rnnoise; \
-    ./autogen.sh || true; \
-    if [ -f configure ]; then ./configure; else echo "configure not found, attempting autoreconf -i" && autoreconf -i && ./configure; fi; \
-    make -j"$(nproc)"; \
-    make install; \
-    ldconfig; \
-    rm -rf /tmp/rnnoise
+# RNNoise removed: no native build step.
 
 # Copy project into image
 # Copy project into image
@@ -44,12 +35,11 @@ RUN if [ -f /app/start.sh ]; then chmod +x /app/start.sh; fi
 
 # Install Python dependencies
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && if [ -f /app/requirements.docker.txt ]; then pip install --no-cache-dir -r /app/requirements.docker.txt; fi
 
 # Default env vars — override in Railway or your env
-ENV RNNOISE_ENABLED=true \
-    RNNOISE_FALLBACK_ENABLED=true \
-    PORT=8080
+ENV PORT=8080
 
 EXPOSE 8080
 
