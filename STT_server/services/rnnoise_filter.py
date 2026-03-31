@@ -59,6 +59,40 @@ class RNNoiseFilter:
                     # Could try other bindings here; keep it simple.
                     log.debug("RNNoise binding not available; falling back")
 
+        # Safety: native RNNoise implementations expect a fixed frame size
+        # (typically 480 samples at 48 kHz). If our pipeline uses a different
+        # sample rate (e.g. Twilio 8 kHz) or frame length, do not call the
+        # native backend to avoid out-of-bounds reads in native code which can
+        # lead to segmentation faults. In that case we fall back to the
+        # spectral-gating denoiser below.
+        if self._backend_obj is not None:
+            try:
+                if self.sample_rate != 48000:
+                    log.warning(
+                        "Native RNNoise backend disabled: unsupported sample_rate=%s — using fallback",
+                        self.sample_rate,
+                    )
+                    self._backend_obj = None
+                    self.backend = None
+                else:
+                    # Expect 480-sample frames at 48k for 10ms frames; ensure
+                    # our frame length matches or warn.
+                    expected_len = int(480 * (self.frame_ms / 10.0))
+                    if self.frame_len != expected_len:
+                        log.warning(
+                            "Native RNNoise backend frame length mismatch: expected %s got %s — disabling native backend",
+                            expected_len,
+                            self.frame_len,
+                        )
+                        self._backend_obj = None
+                        self.backend = None
+            except Exception:
+                # If any runtime introspection fails, be conservative and
+                # disable native backend to avoid crashes.
+                log.exception("Error checking RNNoise backend compatibility; disabling native backend")
+                self._backend_obj = None
+                self.backend = None
+
         # Fallback denoiser state (spectral gating)
         self.noise_mag = None
         self.noise_alpha = 0.98  # EMA for noise spectrum
