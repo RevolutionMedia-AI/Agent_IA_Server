@@ -99,6 +99,12 @@ class RNNoiseFilter:
         self.noise_update_threshold = 200.0  # int16 RMS threshold to consider frame "noise" for update
         self.reduction_factor = 1.0
 
+        # Resampler states for converting between pipeline sample rate and
+        # RNNoise's expected 48 kHz processing rate. We keep separate state
+        # objects for up/down conversions so audioop.ratecv can maintain
+        # continuity across frames.
+        self._ratecv_up_state = None
+        self._ratecv_down_state = None
     def available(self) -> bool:
         return self.backend is not None or RNNOISE_FALLBACK_ENABLED
 
@@ -118,12 +124,70 @@ class RNNoiseFilter:
             if self._backend_obj is not None:
                 # Try RNNoise Python binding path (best-effort API assumption)
                 try:
-                    # Some bindings expect a numpy float array in [-1,1]
-                    arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                    out = self._backend_obj.filter(arr)
-                    out_int16 = np.clip((out * 32768.0), -32768, 32767).astype(np.int16)
-                    out_bytes = out_int16.tobytes()
-                    return audioop.lin2ulaw(out_bytes, 2)
+                        # If the pipeline sample rate is not 48 kHz, resample up to
+                        # 48 kHz, split into 480-sample blocks, process each block
+                        # with the native RNNoise backend, then resample down to
+                        # the original sample rate.
+                        if self.sample_rate != 48000:
+                            # Upsample PCM to 48k
+                            up_bytes, self._ratecv_up_state = audioop.ratecv(
+                                pcm, 2, 1, self.sample_rate, 48000, self._ratecv_up_state
+                            )
+
+                            up_samples = np.frombuffer(up_bytes, dtype=np.int16)
+                            if up_samples.size == 0:
+                                raise RuntimeError("resampler returned no samples")
+
+                            out_blocks = []
+                            # Process in 480-sample chunks expected by RNNoise
+                            for i in range(0, up_samples.size, 480):
+                                block = up_samples[i : i + 480]
+                                if block.size == 0:
+                                    continue
+                                if block.size < 480:
+                                    # Pad last block to 480 samples
+                                    pad = np.zeros(480 - block.size, dtype=np.int16)
+                                    block = np.concatenate([block, pad])
+
+                                arr = block.astype(np.float32) / 32768.0
+                                outf = self._backend_obj.filter(arr)
+                                outf = np.asarray(outf, dtype=np.float32)
+                                # Ensure output block length is 480
+                                if outf.size != 480:
+                                    if outf.size < 480:
+                                        outf = np.pad(outf, (0, 480 - outf.size), mode="constant")
+                                    else:
+                                        outf = outf[:480]
+
+                                out_int16 = np.clip(outf * 32768.0, -32768, 32767).astype(np.int16)
+                                out_blocks.append(out_int16)
+
+                            if not out_blocks:
+                                raise RuntimeError("no output blocks produced by RNNoise processing")
+
+                            out_resampled = np.concatenate(out_blocks)
+                            out_resampled_bytes = out_resampled.tobytes()
+
+                            # Downsample processed 48k audio back to original rate
+                            down_bytes, self._ratecv_down_state = audioop.ratecv(
+                                out_resampled_bytes, 2, 1, 48000, self.sample_rate, self._ratecv_down_state
+                            )
+
+                            # Ensure output length matches input length (pad/trim)
+                            if len(down_bytes) < len(pcm):
+                                down_bytes = down_bytes + (b"\x00" * (len(pcm) - len(down_bytes)))
+                            elif len(down_bytes) > len(pcm):
+                                down_bytes = down_bytes[: len(pcm)]
+
+                            return audioop.lin2ulaw(down_bytes, 2)
+
+                        else:
+                            # 48 kHz pipeline — direct processing
+                            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                            out = self._backend_obj.filter(arr)
+                            out_int16 = np.clip((out * 32768.0), -32768, 32767).astype(np.int16)
+                            out_bytes = out_int16.tobytes()
+                            return audioop.lin2ulaw(out_bytes, 2)
                 except Exception:
                     log.exception("RNNoise backend processing failed; falling back to spectral gate")
 
