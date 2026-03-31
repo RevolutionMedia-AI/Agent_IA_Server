@@ -36,7 +36,11 @@ RUN set -eux; \
     rm -rf /tmp/rnnoise
 
 # Copy project into image
+# Copy project into image
 COPY . /app
+
+# Ensure start script is executable (copied from repo root)
+RUN if [ -f /app/start.sh ]; then chmod +x /app/start.sh; fi
 
 # Install Python dependencies
 RUN python -m pip install --upgrade pip setuptools wheel \
@@ -50,4 +54,4 @@ ENV RNNOISE_ENABLED=true \
 EXPOSE 8000
 
 # Run the app (Railway provides $PORT at runtime)
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["/app/start.sh"]
