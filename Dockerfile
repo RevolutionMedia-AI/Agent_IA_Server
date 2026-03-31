@@ -17,6 +17,7 @@ RUN apt-get update \
         libsndfile1-dev \
         ffmpeg \
         curl \
+        wget \
         libtool-bin \
         m4 \
     && rm -rf /var/lib/apt/lists/*
