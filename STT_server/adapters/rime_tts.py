@@ -133,10 +133,10 @@ async def stream_tts_segment(
     # Request 8 kHz directly so we avoid downsampling most of the time.
     sample_rate = RIME_TTS_SAMPLE_RATE
 
-        log.debug(
-            "[TTS] Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d text=%.40r",
-            speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text), text[:40]
-        )
+    log.debug(
+        "[TTS] Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d text=%.40r",
+        speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text), text[:40]
+    )
 
     # Rime WS3 requires ALL config as query params; message body is text-only.
     from urllib.parse import urlencode
@@ -175,7 +175,7 @@ async def stream_tts_segment(
             open_timeout=10,
         ) as ws:
             await ws.send(ws_message)
-                log.debug("[TTS] Rime WS message sent, waiting for audio... text=%.40r", text[:40])
+            log.debug("[TTS] Rime WS message sent, waiting for audio... text=%.40r", text[:40])
 
             pcm_remainder = b""  # carry odd trailing byte across chunks
 
@@ -202,7 +202,7 @@ async def stream_tts_segment(
                 if isinstance(raw_msg, bytes):
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
-                            log.debug("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
+                        log.debug("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
                     if save_audio:
                         audio_accum.extend(mulaw_bytes)
@@ -242,7 +242,7 @@ async def stream_tts_segment(
 
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
-                            log.debug("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
+                        log.debug("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
 
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
                     if save_audio:
