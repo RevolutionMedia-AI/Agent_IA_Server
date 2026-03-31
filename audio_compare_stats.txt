@@ -1,0 +1,4 @@
+A: rime_tts_localtest_1.mulaw.wav
+B: twilio_out_localtest_1.mulaw.wav
+samples A=55040 B=55040 trimmed=55040
+sig_rms=5107.03 diff_rms=0.00 snr_db=inf

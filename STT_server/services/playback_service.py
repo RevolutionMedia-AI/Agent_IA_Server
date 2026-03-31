@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import json
 
 from fastapi import WebSocket
 
@@ -147,6 +148,7 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 session.assistant_speaking = True
                 chunk = item["data"]
                 sent_frames = 0
+                timings = []
                 for start in range(0, len(chunk), TWILIO_OUTBOUND_CHUNK_BYTES):
                     frame = chunk[start : start + TWILIO_OUTBOUND_CHUNK_BYTES]
                     log.debug("[PLAYBACK] Sending Twilio frame: session=%s gen=%s frame_bytes=%d", session.session_key, generation, len(frame))
@@ -172,12 +174,20 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                             pacing_ms = (len(frame) / TWILIO_OUTBOUND_CHUNK_BYTES) * TWILIO_OUTBOUND_PACING_MS
                         except Exception:
                             pacing_ms = TWILIO_OUTBOUND_PACING_MS
-                        if pacing_ms > 0:
-                            # Adjust sleep to account for send time to reduce drift/jitter
-                            elapsed = time.perf_counter() - send_start
-                            wait = (pacing_ms / 1000.0) - elapsed
-                            if wait > 0:
-                                await asyncio.sleep(wait)
+                        elapsed = time.perf_counter() - send_start
+                        wait = (pacing_ms / 1000.0) - elapsed if pacing_ms > 0 else 0.0
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+
+                        # Record timing diagnostic for this frame when saving frames
+                        timings.append({"idx": sent_frames - 1, "bytes": len(frame), "send_elapsed": elapsed, "pacing_ms": pacing_ms, "wait_applied_s": max(wait, 0.0)})
+                        if SAVE_TWILIO_FRAMES:
+                            try:
+                                tname = f"twilio_out_{session.session_key}_{generation}.timings.jsonl"
+                                with open(tname, "a", encoding="utf-8") as tf:
+                                    tf.write(json.dumps(timings[-1]) + "\n")
+                            except Exception:
+                                log.exception("Error escribiendo timings Twilio para %s", session.session_key)
                 if LOG_TWILIO_PLAYBACK and sent_frames:
                     log.debug(
                         "[PLAYBACK] Playback audio %s gen=%s bytes=%s frames=%s",
@@ -186,6 +196,14 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         len(chunk),
                         sent_frames,
                     )
+                # If we collected timings, compute simple stats and log
+                if timings:
+                    try:
+                        avg_send = sum(t["send_elapsed"] for t in timings) / len(timings)
+                        avg_wait = sum(t["wait_applied_s"] for t in timings) / len(timings)
+                        log.debug("[PLAYBACK] Timing stats session=%s gen=%s frames=%s avg_send_s=%.5f avg_wait_s=%.5f", session.session_key, generation, len(timings), avg_send, avg_wait)
+                    except Exception:
+                        log.exception("Error computing timing stats for playback")
                 continue
 
             if item_type == "segment_end":
