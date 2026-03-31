@@ -20,7 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Build and install RNNoise (system-wide)
-RUN git clone https://git.xiph.org/rnnoise.git /tmp/rnnoise \
+# Use GitHub mirror for reliability (git.xiph.org often fails DNS)
+RUN git clone https://github.com/xiph/rnnoise.git /tmp/rnnoise \
     && cd /tmp/rnnoise \
     && ./autogen.sh \
     && ./configure \
