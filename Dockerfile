@@ -17,18 +17,22 @@ RUN apt-get update \
         libsndfile1-dev \
         ffmpeg \
         curl \
+        libtool-bin \
+        m4 \
     && rm -rf /var/lib/apt/lists/*
 
 # Build and install RNNoise (system-wide)
 # Use GitHub mirror for reliability (git.xiph.org often fails DNS)
-RUN git clone https://github.com/xiph/rnnoise.git /tmp/rnnoise \
-    && cd /tmp/rnnoise \
-    && ./autogen.sh \
-    && ./configure \
-    && make -j"$(nproc)" \
-    && make install \
-    && ldconfig \
-    && rm -rf /tmp/rnnoise
+# Build and install RNNoise (system-wide) with defensive steps
+RUN set -eux; \
+    git clone --depth 1 https://github.com/xiph/rnnoise.git /tmp/rnnoise || (echo "git clone failed, trying tarball" && curl -L https://github.com/xiph/rnnoise/archive/refs/heads/master.tar.gz | tar xz -C /tmp && mv /tmp/rnnoise-master /tmp/rnnoise); \
+    cd /tmp/rnnoise; \
+    ./autogen.sh || true; \
+    if [ -f configure ]; then ./configure; else echo "configure not found, attempting autoreconf -i" && autoreconf -i && ./configure; fi; \
+    make -j"$(nproc)"; \
+    make install; \
+    ldconfig; \
+    rm -rf /tmp/rnnoise
 
 # Copy project into image
 COPY . /app
