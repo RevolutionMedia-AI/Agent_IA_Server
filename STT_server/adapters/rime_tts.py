@@ -158,6 +158,17 @@ async def stream_tts_segment(
         log.info("[TTS] Sanitized text for Rime request: %.120r -> %.120r", text[:120], safe_text[:120])
     ws_message = json.dumps({"text": safe_text})
 
+    # Registro esencial: qué dirá el TTS
+    try:
+        log.warning(
+            "[TTS] Texto a decir (session=%s gen=%s): %.512r",
+            getattr(session, "session_key", "?"),
+            generation,
+            safe_text,
+        )
+    except Exception:
+        pass
+
     extra_headers = {
         "Authorization": f"Bearer {RIME_API_KEY}",
     }
@@ -202,7 +213,7 @@ async def stream_tts_segment(
                 if isinstance(raw_msg, bytes):
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
-                        log.debug("Rime WS TTS TTFB (binary): %.1f ms", ttfb_ms)
+                        log.warning("[TTS] Rime WS TTFB (binary) ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
                     if save_audio:
                         audio_accum.extend(mulaw_bytes)
@@ -242,7 +253,7 @@ async def stream_tts_segment(
 
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
-                        log.debug("Rime WS TTS TTFB: %.1f ms", ttfb_ms)
+                        log.warning("[TTS] Rime WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
 
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
                     if save_audio:

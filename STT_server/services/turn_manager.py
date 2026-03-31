@@ -614,7 +614,8 @@ async def handle_agent_reply(
     prepared_reply: str | None = None,
 ) -> None:
     started_at = time.perf_counter()
-    log.info("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
+    # Registro esencial: lo que el usuario dijo al agente
+    log.warning("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
 
     if prepared_reply:
         reply = prepared_reply.strip()
@@ -636,11 +637,13 @@ async def handle_agent_reply(
     )
     trim_history(session)
 
-    log.info("Agente (%s): %s", session.session_key, reply)
+    # Registro esencial: lo que dice el asistente (TTS)
+    log.warning("Agente (%s): %s", session.session_key, reply)
 
     total_ms = (time.perf_counter() - started_at) * 1000
     first_tts_ms = next((metric[0] for metric in tts_metrics if metric[0] is not None), None)
-    log.info(
+    # Registro esencial: métricas del turno (incluye latencia TTS)
+    log.warning(
         "Turno %s gen=%s trigger=%s llm_ms=%.1f tts_ttfb_ms=%s total_ms=%.1f llm_error=%s",
         session.session_key,
         generation,
