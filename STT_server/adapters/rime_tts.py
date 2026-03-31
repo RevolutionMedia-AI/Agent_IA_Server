@@ -260,7 +260,7 @@ async def stream_tts_segment(
                     for i in range(0, len(mulaw_bytes), 4096):
                         chunk = mulaw_bytes[i : i + 4096]
                         log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
-                        emit_item({"type": "audio", "generation": generation, "data": chunk})
+                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
                         emitted_audio = True
                     continue
 
@@ -301,7 +301,7 @@ async def stream_tts_segment(
                     for i in range(0, len(mulaw_bytes), 4096):
                         chunk = mulaw_bytes[i : i + 4096]
                         log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
-                        emit_item({"type": "audio", "generation": generation, "data": chunk})
+                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
                         emitted_audio = True
                     continue
 

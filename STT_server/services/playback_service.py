@@ -178,7 +178,13 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                             try:
                                 loop = asyncio.get_running_loop()
                                 start_proc = time.perf_counter()
-                                frame = await loop.run_in_executor(None, session.rn_denoiser.process_mulaw_frame, frame)
+                                # Skip denoising for synthetic TTS audio — RNNoise is
+                                # tuned for microphone noise removal and can degrade
+                                # synthesized audio quality.
+                                if item.get("source") == "tts":
+                                    log.debug("Skipping RNNoise for TTS chunk session=%s gen=%s", session.session_key, generation)
+                                else:
+                                    frame = await loop.run_in_executor(None, session.rn_denoiser.process_mulaw_frame, frame)
                                 proc_elapsed = time.perf_counter() - start_proc
                                 log.debug("RNNoise processing elapsed=%.4fs session=%s gen=%s", proc_elapsed, session.session_key, generation)
                             except Exception:
