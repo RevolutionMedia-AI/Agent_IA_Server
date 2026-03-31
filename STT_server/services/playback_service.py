@@ -172,10 +172,15 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                             except Exception:
                                 log.exception("Error escribiendo frame Twilio para %s", session.session_key)
 
-                        # Optionally apply denoiser (mutates frame)
+                        # Optionally apply denoiser (mutates frame).
+                        # Run in executor to avoid blocking the async event loop
                         if getattr(session, "rn_denoiser", None) is not None:
                             try:
-                                frame = session.rn_denoiser.process_mulaw_frame(frame)
+                                loop = asyncio.get_running_loop()
+                                start_proc = time.perf_counter()
+                                frame = await loop.run_in_executor(None, session.rn_denoiser.process_mulaw_frame, frame)
+                                proc_elapsed = time.perf_counter() - start_proc
+                                log.debug("RNNoise processing elapsed=%.4fs session=%s gen=%s", proc_elapsed, session.session_key, generation)
                             except Exception:
                                 log.exception("RNNoise processing failed for %s", session.session_key)
 
