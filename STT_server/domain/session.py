@@ -26,6 +26,7 @@ class CallSession:
     voice_streak: int = 0
     silence_frames: int = 0
     active_generation: int = 0
+    response_active: bool = False
     history: list[dict[str, str]] = field(default_factory=list)
     utterance_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)
     playback_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE))

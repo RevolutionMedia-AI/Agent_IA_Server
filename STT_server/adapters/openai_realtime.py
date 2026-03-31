@@ -183,15 +183,35 @@ async def _barge_in_watcher(ws, session: CallSession) -> None:
         while not session.closed:
             await session.generation_changed.wait()
             session.generation_changed.clear()
+            # Only send a cancel if the session knows a response is active.
+            if not getattr(session, "response_active", False):
+                log.debug(
+                    "generation_changed but no active realtime response for %s; ignoring cancel",
+                    session.session_key,
+                )
+                continue
+
+            tq = session.realtime_text_queue
+            if tq is None:
+                log.debug(
+                    "response_active True but realtime_text_queue is None for %s; sending cancel anyway",
+                    session.session_key,
+                )
+
             try:
                 await ws.send(json.dumps({"type": "response.cancel"}))
             except Exception:
-                break
-            # Unblock the TTS consumer
-            tq = session.realtime_text_queue
+                # Log and continue watching — transient network or server errors
+                log.exception(
+                    "Failed to send response.cancel for %s",
+                    session.session_key,
+                )
+                continue
+
+            # Unblock and clear the TTS consumer queue after requesting cancel
             if tq is not None:
                 enqueue_nowait_with_drop(tq, None, "text_segment_queue")
-                session.realtime_text_queue = None
+            session.realtime_text_queue = None
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -274,6 +294,8 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 )
                 session.realtime_text_queue = text_queue
                 session.active_generation += 1
+                # Mark that a server-side response is now active (used to gate cancels)
+                session.response_active = True
                 generation = session.active_generation
                 playback_task = asyncio.create_task(
                     play_tts_from_text_queue(session, generation, text_queue),
@@ -333,6 +355,8 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     response_started_at = None
                     current_response_text = ""
                     pending = ""
+                    # Server-side response no longer active
+                    session.response_active = False
                     continue
 
                 # Normal completion
@@ -371,16 +395,27 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 playback_task = None
                 response_started_at = None
                 current_response_text = ""
+                # Server-side response finished normally
+                session.response_active = False
                 continue
 
             # ── Errors ──
             if etype == "error":
                 err = event.get("error", {})
-                log.error(
-                    "Realtime API error for %s: %s",
-                    session.session_key,
-                    err,
-                )
+                # Treat cancellation-not-active as non-fatal (likely a race).
+                code = err.get("code") if isinstance(err, dict) else None
+                if code == "response_cancel_not_active":
+                    log.debug(
+                        "Realtime API non-fatal cancel for %s: %s",
+                        session.session_key,
+                        err,
+                    )
+                else:
+                    log.error(
+                        "Realtime API error for %s: %s",
+                        session.session_key,
+                        err,
+                    )
                 continue
 
             # ── Known metadata events — ignore silently ──
@@ -413,3 +448,5 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 await playback_task
             except asyncio.CancelledError:
                 pass
+        # Ensure response_active is cleared on exit
+        session.response_active = False
