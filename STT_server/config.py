@@ -66,7 +66,7 @@ TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "6"
 MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
 BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "900"))
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
-ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "1200"))
+ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "2000"))
 
 # webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive). Can be tuned via env.
 WEBRTC_VAD_MODE = int(os.getenv("WEBRTC_VAD_MODE", "1"))

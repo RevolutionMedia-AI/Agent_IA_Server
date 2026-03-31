@@ -154,8 +154,15 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                             log.info("[PLAYBACK] Sending first Twilio frame: session=%s gen=%s bytes=%d", session.session_key, generation, len(frame))
                         await send_twilio_media(ws, session.stream_sid, frame)
                         sent_frames += 1
-                        if len(frame) == TWILIO_OUTBOUND_CHUNK_BYTES:
-                            await asyncio.sleep(TWILIO_OUTBOUND_PACING_MS / 1000.0)
+                        # Pace outgoing frames proportionally to their duration.
+                        # A full frame (TWILIO_OUTBOUND_CHUNK_BYTES) represents
+                        # TWILIO_OUTBOUND_PACING_MS milliseconds of audio.
+                        try:
+                            pacing_ms = (len(frame) / TWILIO_OUTBOUND_CHUNK_BYTES) * TWILIO_OUTBOUND_PACING_MS
+                        except Exception:
+                            pacing_ms = TWILIO_OUTBOUND_PACING_MS
+                        if pacing_ms > 0:
+                            await asyncio.sleep(pacing_ms / 1000.0)
                 if LOG_TWILIO_PLAYBACK and sent_frames:
                     log.debug(
                         "[PLAYBACK] Playback audio %s gen=%s bytes=%s frames=%s",
