@@ -49,9 +49,9 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # Default env vars — override in Railway or your env
 ENV RNNOISE_ENABLED=true \
     RNNOISE_FALLBACK_ENABLED=true \
-    PORT=8000
+    PORT=8080
 
-EXPOSE 8000
+EXPOSE 8080
 
 # Run the app (Railway provides $PORT at runtime)
 CMD ["/app/start.sh"]
