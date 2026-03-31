@@ -12,6 +12,8 @@ import ctypes
 import ctypes.util
 import logging
 import os
+import subprocess
+import sys
 from typing import Optional
 
 import numpy as np
@@ -52,6 +54,18 @@ class RNNoise:
         libpath = _find_lib()
         if not libpath:
             raise ImportError("librnnoise not found on system (RNNOISE_LIB)")
+        # Run a quick probe in a subprocess to ensure the native library
+        # can be safely loaded without risking a segmentation fault in the
+        # main process. The probe will crash the child process on failure,
+        # allowing the parent to fall back safely.
+        if os.getenv("RNNOISE_SKIP_PROBE", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+            probe = os.path.join(os.path.dirname(__file__), "rnnoise_probe.py")
+            try:
+                res = subprocess.run([sys.executable, probe, libpath], timeout=4)
+                if res.returncode != 0:
+                    raise ImportError(f"rnnoise probe failed (code={res.returncode})")
+            except subprocess.TimeoutExpired as e:
+                raise ImportError("rnnoise probe timed out") from e
 
         try:
             self._lib = ctypes.CDLL(libpath)
