@@ -18,6 +18,7 @@ from STT_server.config import (
     TTS_TIMEOUT_SEC,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
+    SAVE_TWILIO_FRAMES,
     TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import split_tts_segments
@@ -152,6 +153,16 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     if frame:
                         if sent_frames == 0:
                             log.debug("[PLAYBACK] Sending first Twilio frame: session=%s gen=%s bytes=%d", session.session_key, generation, len(frame))
+                        # Optionally save frames to disk for diagnostics
+                        if SAVE_TWILIO_FRAMES:
+                            try:
+                                fname = f"twilio_out_{session.session_key}_{generation}.mulaw"
+                                with open(fname, "ab") as f:
+                                    f.write(frame)
+                            except Exception:
+                                log.exception("Error escribiendo frame Twilio para %s", session.session_key)
+
+                        send_start = time.perf_counter()
                         await send_twilio_media(ws, session.stream_sid, frame)
                         sent_frames += 1
                         # Pace outgoing frames proportionally to their duration.
@@ -162,7 +173,11 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         except Exception:
                             pacing_ms = TWILIO_OUTBOUND_PACING_MS
                         if pacing_ms > 0:
-                            await asyncio.sleep(pacing_ms / 1000.0)
+                            # Adjust sleep to account for send time to reduce drift/jitter
+                            elapsed = time.perf_counter() - send_start
+                            wait = (pacing_ms / 1000.0) - elapsed
+                            if wait > 0:
+                                await asyncio.sleep(wait)
                 if LOG_TWILIO_PLAYBACK and sent_frames:
                     log.debug(
                         "[PLAYBACK] Playback audio %s gen=%s bytes=%s frames=%s",

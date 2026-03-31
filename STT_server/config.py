@@ -93,6 +93,7 @@ REALTIME_TTS_STREAMING = os.getenv("REALTIME_TTS_STREAMING", "false").strip().lo
 
 
 LOG_TWILIO_PLAYBACK = os.getenv("LOG_TWILIO_PLAYBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
+SAVE_TWILIO_FRAMES = os.getenv("SAVE_TWILIO_FRAMES", "false").strip().lower() in {"1", "true", "yes", "on"}
 FILLER_TTS_ENABLED = os.getenv("FILLER_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 

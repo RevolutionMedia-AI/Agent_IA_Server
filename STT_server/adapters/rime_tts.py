@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import math
 import logging
 import struct
 import time
@@ -79,33 +80,72 @@ def _downsample_linear(samples: list[int], src_rate: int, dst_rate: int) -> list
     return out
 
 
+def _resample_samples(samples: list[int], src_rate: int, dst_rate: int) -> list[int]:
+    """Resample using scipy.signal.resample_poly when available, fallback to linear.
+
+    This function imports scipy/numpy only at runtime to keep the module
+    importable when those optional dependencies are not installed.
+    """
+    if src_rate == dst_rate:
+        return samples
+    try:
+        import numpy as _np
+        from scipy.signal import resample_poly  # type: ignore
+
+        arr = _np.asarray(samples, dtype=_np.int16)
+        g = math.gcd(src_rate, dst_rate)
+        up = dst_rate // g
+        down = src_rate // g
+        res = resample_poly(arr.astype(_np.float64), up, down)
+        res = _np.round(res).astype(_np.int16)
+        return res.tolist()
+    except Exception:
+        return _downsample_linear(samples, src_rate, dst_rate)
+
+
 def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes = b"") -> tuple[bytes, bytes]:
     """Convert raw PCM16-LE bytes at *src_rate* to mu-law 8 kHz.
 
-    Returns ``(mulaw_bytes, leftover)`` where *leftover* is the remaining
-    bytes (less than CHUNK_SIZE) that should be prepended to the next chunk
-    so sample boundaries stay aligned across WebSocket messages.
+    Returns ``(mulaw_bytes, leftover_src_bytes)`` where *leftover_src_bytes* is
+    the remaining source PCM bytes that should be prepended to the next
+    chunk so sample/time boundaries stay aligned across messages.
     """
     data = remainder + pcm_bytes
-    CHUNK_SIZE = 320  # 20 ms de audio a 8000 Hz, 16 bits, 1 canal (160 samples * 2 bytes)
-    usable = len(data) - (len(data) % CHUNK_SIZE)
-    leftover = data[usable:]  # bytes restantes para el siguiente chunk
-    if usable == 0:
-        log.debug(f"[RIME_TTS] No usable audio chunk. Data len: {len(data)}")
-        return b"", leftover
-    n_samples = usable // 2
+    total_src_samples = len(data) // 2
+    if total_src_samples == 0:
+        log.debug(f"[RIME_TTS] No usable audio samples. Data len: {len(data)}")
+        return b"", data
+
     try:
-        samples = list(struct.unpack(f"<{n_samples}h", data[:usable]))
+        src_samples = list(struct.unpack(f"<{total_src_samples}h", data[: total_src_samples * 2]))
     except Exception as e:
-        log.error(f"[RIME_TTS] Error unpacking PCM data: {e}, usable={usable}, data_len={len(data)}")
-        return b"", leftover
+        log.error(f"[RIME_TTS] Error unpacking PCM data: {e}, total_src_samples={total_src_samples}, data_len={len(data)}")
+        return b"", data
+
+    # Resample to 8 kHz if needed
     if src_rate != TWILIO_SAMPLE_RATE:
-        log.debug(f"[RIME_TTS] Downsampling from {src_rate}Hz to {TWILIO_SAMPLE_RATE}Hz, samples={len(samples)}")
-        samples = _downsample_linear(samples, src_rate, TWILIO_SAMPLE_RATE)
-    pcm = struct.pack(f"<{len(samples)}h", *samples)
+        log.debug(f"[RIME_TTS] Resampling from {src_rate}Hz to {TWILIO_SAMPLE_RATE}Hz, src_samples={len(src_samples)}")
+        dest_samples = _resample_samples(src_samples, src_rate, TWILIO_SAMPLE_RATE)
+    else:
+        dest_samples = src_samples
+
+    dest_total = len(dest_samples)
+    FRAME_SAMPLES = 160  # 20 ms @ 8 kHz
+    usable_dest = dest_total - (dest_total % FRAME_SAMPLES)
+    if usable_dest == 0:
+        # Not enough resampled samples to emit a full 20ms frame yet.
+        return b"", data
+
+    # Map back to source samples consumed using time mapping
+    src_samples_used = int(round((usable_dest * src_rate) / TWILIO_SAMPLE_RATE))
+    used_src_bytes = src_samples_used * 2
+    leftover_src_bytes = data[used_src_bytes:]
+
+    out_samples = dest_samples[:usable_dest]
+    pcm = struct.pack(f"<{len(out_samples)}h", *out_samples)
     mulaw = _pcm16_to_mulaw(pcm)
-    log.debug(f"[RIME_TTS] Converted PCM to mulaw: input_samples={len(samples)}, mulaw_bytes={len(mulaw)}")
-    return mulaw, leftover
+    log.debug(f"[RIME_TTS] Converted PCM->mulaw: src_in={total_src_samples} used_src={src_samples_used} dest_out={len(out_samples)} mulaw_bytes={len(mulaw)}")
+    return mulaw, leftover_src_bytes
 
 
 async def stream_tts_segment(
