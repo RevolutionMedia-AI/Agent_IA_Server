@@ -79,12 +79,3 @@ Archivos clave
 - Servicio de reproducción: [STT_server/services/playback_service.py](STT_server/services/playback_service.py)
 - Envío a Twilio: [STT_server/adapters/twilio_media.py](STT_server/adapters/twilio_media.py)
 
-Notas sobre cambios recientes
-- Se aumentó `TTS_TTFB_TIMEOUT_SEC` a `15.0` por defecto.
-- Se añadió warm-up TTS en `startup` y reproducción de warm-up si existe.
-- Se eliminó el intento de enviar archivos TTS por correo; los archivos siguen guardándose para debugging.
-
-Contribuir
-- Abre un issue o PR con cambios. Mantén las claves fuera del repo.
-
-¿Necesitas que suba `README.md` al repositorio remoto (`git add/commit/push`) o que lo adapte con más detalles (diagramas, ejemplo de TwiML, etc.)?
