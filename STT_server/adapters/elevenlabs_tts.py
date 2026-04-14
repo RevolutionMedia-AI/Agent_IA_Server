@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -128,11 +129,37 @@ async def stream_tts_segment(
                         emitted_audio = True
                     continue
 
-                # Text frame -- JSON (could be error, done, or alignment info)
+                # Text frame -- JSON (could be audio with base64, error, done, or alignment info)
                 try:
                     msg = json.loads(raw_msg)
                 except Exception:
                     log.warning("[TTS] ElevenLabs unknown text frame: %s", raw_msg[:200])
+                    continue
+
+                # Audio chunk (base64-encoded in JSON text frame)
+                if "audio" in msg and isinstance(msg["audio"], str) and len(msg["audio"]) > 0:
+                    if ttfb_ms is None:
+                        ttfb_ms = (time.perf_counter() - started_at) * 1000
+                        log.warning("[TTS] ElevenLabs WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
+
+                    try:
+                        mulaw_bytes = base64.b64decode(msg["audio"])
+                    except Exception:
+                        log.warning("[TTS] ElevenLabs failed to decode base64 audio chunk")
+                        continue
+
+                    if save_audio:
+                        audio_accum.extend(mulaw_bytes)
+                    for i in range(0, len(mulaw_bytes), 4096):
+                        chunk = mulaw_bytes[i : i + 4096]
+                        log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
+                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
+                        emitted_audio = True
+
+                    # Check if this is the final audio chunk
+                    if msg.get("isFinal"):
+                        log.info("ElevenLabs WS TTS complete (isFinal=true)")
+                        break
                     continue
 
                 # Check for errors
@@ -151,12 +178,17 @@ async def stream_tts_segment(
                     log.info("ElevenLabs WS TTS complete (done frame)")
                     break
 
+                # isFinal without audio data = end of stream
+                if msg.get("isFinal"):
+                    log.info("ElevenLabs WS TTS complete (isFinal without audio)")
+                    break
+
                 # Alignment/timing info -- not end-of-stream; continue reading audio.
                 if msg.get("type") == "alignment":
                     continue
 
                 # Unknown frame type -- log and skip
-                log.warning("ElevenLabs WS unknown frame: %s", str(msg)[:200])
+                log.debug("ElevenLabs WS unknown frame: %s", str(msg)[:200])
 
     except (asyncio.TimeoutError, TimeoutError):
         log.warning(
