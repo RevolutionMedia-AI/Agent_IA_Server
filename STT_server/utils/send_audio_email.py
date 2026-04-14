@@ -10,7 +10,7 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 EMAIL_TO = "kevin.escalante@revolutionmedia.ai"
 
 
-def send_audio_email(audio_path, subject="Rime TTS Audio", body="Adjunto el archivo de audio generado por Rime TTS."):
+def send_audio_email(audio_path, subject="ElevenLabs TTS Audio", body="Adjunto el archivo de audio generado por ElevenLabs TTS."):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = SMTP_USER

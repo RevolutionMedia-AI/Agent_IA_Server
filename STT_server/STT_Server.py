@@ -18,7 +18,7 @@ from STT_server.config import (
     OPENAI_API_KEY,
     PORT,
     PUBLIC_URL,
-    RIME_API_KEY,
+    ELEVENLABS_API_KEY,
     TWILIO_SR,
     USE_OPENAI_REALTIME,
     TWIML_INITIAL_GREETING_ENABLED,
@@ -47,8 +47,8 @@ if not OPENAI_API_KEY:
 if not DEEPGRAM_API_KEY:
     log.warning("DEEPGRAM_API_KEY no configurada. El STT no estara disponible.")
 
-if not RIME_API_KEY:
-    log.warning("RIME_API_KEY no configurada. El TTS no estara disponible.")
+if not ELEVENLABS_API_KEY:
+    log.warning("ELEVENLABS_API_KEY no configurada. El TTS no estara disponible.")
 
 
 app = FastAPI()

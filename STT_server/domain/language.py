@@ -3,11 +3,10 @@ import unicodedata
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
+    ELEVENLABS_TTS_VOICE_ID,
     FILLER_TEXT_EN,
     FILLER_TEXT_ES,
     FILLER_TTS_ENABLED,
-    RIME_TTS_SPEAKER_EN,
-    RIME_TTS_SPEAKER_ES,
     STREAMING_FIRST_SEGMENT_CHARS,
     STREAMING_SEGMENT_MAX_CHARS,
     STT_FAILURE_PROMPT_EN,
@@ -456,11 +455,8 @@ def is_duplicate_collected_data(session, structured_data: dict[str, str]) -> boo
 
 
 def get_tts_model(lang: str) -> str:
-    # Full English mode — always returns English speaker.
-    return RIME_TTS_SPEAKER_EN
-    # if normalize_supported_language(lang) == "en":
-    #     return RIME_TTS_SPEAKER_EN
-    # return RIME_TTS_SPEAKER_ES
+    # Returns the configured ElevenLabs voice ID.
+    return ELEVENLABS_TTS_VOICE_ID
 
 
 def get_filler_text(lang: str) -> str:

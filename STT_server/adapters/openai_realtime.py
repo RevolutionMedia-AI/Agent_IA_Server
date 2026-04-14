@@ -3,7 +3,7 @@
 Audio from Twilio (g711_ulaw 8 kHz) is forwarded directly to the
 Realtime WebSocket.  OpenAI performs STT + turn detection + LLM
 inference.  Text deltas are segmented via pop_streaming_segments
-and fed to the existing Rime TTS pipeline.
+and fed to the existing ElevenLabs TTS pipeline.
 """
 
 import asyncio

@@ -4,7 +4,7 @@ import logging
 import re
 import time
 
-from STT_server.adapters.rime_tts import stream_tts_segment
+from STT_server.adapters.elevenlabs_tts import stream_tts_segment
 from STT_server.adapters.openai_llm import build_messages, call_llm, stream_llm_reply_sync
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
