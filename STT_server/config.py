@@ -24,11 +24,10 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
 DEEPGRAM_STT_PUNCTUATE = os.getenv("DEEPGRAM_STT_PUNCTUATE", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEEPGRAM_STT_SMART_FORMAT = os.getenv("DEEPGRAM_STT_SMART_FORMAT", "true").strip().lower() in {"1", "true", "yes", "on"}
-# Language detection disabled — full English mode.
-# To re-enable, change the default back to "true".
-DEEPGRAM_STT_DETECT_LANGUAGE = os.getenv("DEEPGRAM_STT_DETECT_LANGUAGE", "false").strip().lower() in {"1", "true", "yes", "on"}
-# Force English language hint for Deepgram STT.
-DEEPGRAM_STT_LANGUAGE_HINT = os.getenv("DEEPGRAM_STT_LANGUAGE_HINT", "en").strip().lower() or None
+# Language detection re-enabled — full Spanish mode.
+DEEPGRAM_STT_DETECT_LANGUAGE = os.getenv("DEEPGRAM_STT_DETECT_LANGUAGE", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Force Spanish language hint for Deepgram STT.
+DEEPGRAM_STT_LANGUAGE_HINT = os.getenv("DEEPGRAM_STT_LANGUAGE_HINT", "es").strip().lower() or None
 DEEPGRAM_STT_ENDPOINTING_MS = int(os.getenv("DEEPGRAM_STT_ENDPOINTING_MS", "500"))
 DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000"))
 DEEPGRAM_STT_NUMERALS = os.getenv("DEEPGRAM_STT_NUMERALS", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -83,7 +82,7 @@ TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "1"))
 TTS_RETRY_BACKOFF_MS = int(os.getenv("TTS_RETRY_BACKOFF_MS", "250"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
-DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "en").strip().lower()
+DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "es").strip().lower()
 
 # If false, we buffer the full assistant reply and run TTS once per reply.
 # This avoids ultra-short TTS segments and reduces the chance of "first words only" failures.
@@ -139,7 +138,7 @@ IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 # before connecting the media stream. This guarantees playback through Twilio
 # before the websocket stream is opened.
 TWIML_INITIAL_GREETING_ENABLED = os.getenv("TWIML_INITIAL_GREETING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "en").strip().lower()
+TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "es").strip().lower()
 
 # RNNoise/denoising settings removed — pipeline sends mu-law frames directly.
 

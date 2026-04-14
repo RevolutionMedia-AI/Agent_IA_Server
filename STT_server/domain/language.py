@@ -249,22 +249,22 @@ def clean_system_prompt(prompt: str, allowed_punct: set[str] | None = None) -> s
 # Precomputed sanitized system prompt (keeps only '.' and ',' punctuation)
 SANITIZED_SYSTEM_PROMPT = clean_system_prompt(SYSTEM_PROMPT, allowed_punct={".", ","})
 
-# ── Spanish language markers (disabled — full English mode) ──
-# SPANISH_LANGUAGE_MARKERS = (
-#     "hola",
-#     "gracias",
-#     "por favor",
-#     "buenos",
-#     "buenas",
-#     "necesito",
-#     "quiero",
-#     "puedo",
-#     "ayuda",
-#     "como",
-#     "donde",
-#     "cuanto",
-# )
-SPANISH_LANGUAGE_MARKERS: tuple[str, ...] = ()  # empty — Spanish detection disabled
+# ── Spanish language markers (re-enabled — full Spanish mode) ──
+SPANISH_LANGUAGE_MARKERS = (
+    "hola",
+    "gracias",
+    "por favor",
+    "buenos",
+    "buenas",
+    "necesito",
+    "quiero",
+    "puedo",
+    "ayuda",
+    "como",
+    "donde",
+    "cuanto",
+)
+# SPANISH_LANGUAGE_MARKERS: tuple[str, ...] = ()  # empty — Spanish detection disabled (English mode)
 
 ENGLISH_LANGUAGE_MARKERS = (
     "hello",
@@ -346,7 +346,7 @@ INCOMPLETE_TRAILING_PHRASES = {
 
 def normalize_supported_language(lang: str | None) -> str:
     if not lang:
-        return DEFAULT_CALL_LANGUAGE if DEFAULT_CALL_LANGUAGE in SUPPORTED_LANGUAGES else "en"
+        return DEFAULT_CALL_LANGUAGE if DEFAULT_CALL_LANGUAGE in SUPPORTED_LANGUAGES else "es"
 
     lowered = lang.strip().lower()
     if lowered in SUPPORTED_LANGUAGES:
@@ -355,13 +355,13 @@ def normalize_supported_language(lang: str | None) -> str:
         return "en"
     if lowered in {"spanish", "es-419", "es-es"} or lowered.startswith("es-"):
         return "es"
-    return DEFAULT_CALL_LANGUAGE if DEFAULT_CALL_LANGUAGE in SUPPORTED_LANGUAGES else "en"
+    return DEFAULT_CALL_LANGUAGE if DEFAULT_CALL_LANGUAGE in SUPPORTED_LANGUAGES else "es"
 
 
-def infer_supported_language_from_text(text: str, fallback: str = "en") -> str:
-    # ── Spanish detection disabled — full English mode ──
-    # To re-enable, uncomment the block below and SPANISH_LANGUAGE_MARKERS.
-    return "en"
+def infer_supported_language_from_text(text: str, fallback: str = "es") -> str:
+    # Full Spanish mode — always returns "es"
+    # To re-enable English, disable SPANISH_LANGUAGE_MARKERS and change return to "en"
+    return "es"
     # lowered = text.lower().strip()
     # if not lowered:
     #     return normalize_supported_language(fallback)
@@ -378,9 +378,9 @@ def infer_supported_language_from_text(text: str, fallback: str = "en") -> str:
 
 
 def detect_language(text: str) -> str:
-    # Full English mode — always returns "en".
+    # Full Spanish mode — always returns "es"
     # To re-enable detection, uncomment the original line.
-    return "en"
+    return "es"
     # return infer_supported_language_from_text(text, fallback=DEFAULT_CALL_LANGUAGE)
 
 
@@ -388,8 +388,8 @@ def get_language_instruction(lang: str) -> str:
     # Full English mode — always returns English instruction.
     # To re-enable Spanish, uncomment the block below.
     return (
-        "Reply only in English. "
-        "Do not switch language unless the user explicitly does."
+        "Responde solo en espanol. Maximo 1-2 frases cortas. "
+        "No cambies de idioma salvo que el usuario lo haga explicitamente."
     )
     # if normalize_supported_language(lang) == "en":
     #     return (
@@ -462,14 +462,14 @@ def get_tts_model(lang: str) -> str:
 def get_filler_text(lang: str) -> str:
     if not FILLER_TTS_ENABLED:
         return ""
-    # Full English mode — always returns English filler.
-    return FILLER_TEXT_EN
+    # Full Spanish mode — always returns Spanish filler.
+    return FILLER_TEXT_ES
     # return FILLER_TEXT_EN if normalize_supported_language(lang) == "en" else FILLER_TEXT_ES
 
 
 def get_stt_failure_prompt(lang: str) -> str:
-    # Full English mode — always returns English prompt.
-    return STT_FAILURE_PROMPT_EN
+    # Full Spanish mode — always returns Spanish prompt.
+    return STT_FAILURE_PROMPT_ES
     # return STT_FAILURE_PROMPT_EN if normalize_supported_language(lang) == "en" else STT_FAILURE_PROMPT_ES
 
 
