@@ -333,14 +333,13 @@ SYSTEM_PROMPT_ES = (
 SANITIZED_SYSTEM_PROMPT_ES = clean_system_prompt(SYSTEM_PROMPT_ES, allowed_punct={".", ","})
 
 
-def get_system_prompt(lang: str | None = None, custom_prompt: str | None = None) -> str:
-    """Return the appropriate system prompt based on language and optional custom prompt.
+def get_system_prompt(lang: str | None = None) -> str:
+    """Return the appropriate system prompt based on language.
     
-    If custom_prompt is provided (non-empty), it takes priority over the default prompts.
-    Otherwise returns the Spanish prompt for 'es' and the English prompt for 'en' or any other value.
+    Returns the Spanish prompt for 'es' and the English prompt for 'en' or any other value.
+    Note: custom_prompt handling is done in build_messages() — when a custom prompt is set,
+    it completely replaces this default prompt and the language instruction.
     """
-    if custom_prompt and custom_prompt.strip():
-        return custom_prompt.strip()
     from STT_server.config import DEFAULT_CALL_LANGUAGE
     resolved = lang or DEFAULT_CALL_LANGUAGE
     if resolved == "es":

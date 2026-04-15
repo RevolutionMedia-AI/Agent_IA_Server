@@ -15,10 +15,20 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]:
     # Include structured user state, not as a memory, but as a guide for LLM
     lang = session.preferred_language or detect_language(user_text)
-    messages = [
-        {"role": "system", "content": get_system_prompt(lang, custom_prompt=getattr(session, 'custom_prompt', None))},
-        {"role": "system", "content": get_language_instruction(lang)},
-    ]
+    custom_prompt = getattr(session, 'custom_prompt', None)
+
+    if custom_prompt and custom_prompt.strip():
+        # Custom prompt replaces EVERYTHING — user has full control over
+        # the agent's behavior, rules, and language. No default prompt
+        # or language instruction is appended.
+        messages = [
+            {"role": "system", "content": custom_prompt.strip()},
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": get_system_prompt(lang)},
+            {"role": "system", "content": get_language_instruction(lang)},
+        ]
 
     if session.collected_data:
         collected_items = ", ".join(f"{k}: {v}" for k, v in session.collected_data.items())
