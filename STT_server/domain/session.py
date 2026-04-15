@@ -4,6 +4,8 @@ import asyncio
 import time
 
 from STT_server.config import (
+    DEFAULT_CALL_LANGUAGE,
+    DEFAULT_TTS_PROVIDER,
     PLAYBACK_QUEUE_MAXSIZE,
     PRE_SPEECH_FRAMES,
     REALTIME_AUDIO_QUEUE_MAXSIZE,
@@ -12,13 +14,21 @@ from STT_server.config import (
     TRANSCRIPT_QUEUE_MAXSIZE,
 )
 
+# Valid TTS providers and languages
+VALID_TTS_PROVIDERS = {"elevenlabs", "rime"}
+VALID_LANGUAGES = {"en", "es"}
+
 
 @dataclass
 class CallSession:
     session_key: str
     call_sid: str | None = None
     stream_sid: str | None = None
-    preferred_language: str | None = None
+    preferred_language: str = field(default_factory=lambda: DEFAULT_CALL_LANGUAGE)
+    # Per-session custom system prompt (overrides default if set)
+    custom_prompt: str | None = None
+    # Per-session TTS provider: "elevenlabs" or "rime"
+    tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
     vad_buffer: bytearray = field(default_factory=bytearray)
     pre_speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=PRE_SPEECH_FRAMES))
     speech_frames: list[bytes] = field(default_factory=list)

@@ -5,7 +5,8 @@ import logging
 import uvicorn
 import os
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
@@ -24,7 +25,7 @@ from STT_server.config import (
     TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import detect_language, split_tts_segments, sanitize_tts_text
-from STT_server.domain.session import CallSession
+from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS, VALID_LANGUAGES
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import playback_loop
@@ -220,6 +221,114 @@ async def test_stt() -> dict:
 async def list_available_models() -> dict:
     require_debug_endpoints()
     return await list_models()
+
+
+# ── Session Configuration API ────────────────────────────────────────
+# These endpoints allow the frontend to configure per-session settings
+# such as TTS provider, language, and custom system prompt.
+
+
+@app.get("/config")
+async def get_available_config() -> dict:
+    """Return available TTS providers and languages."""
+    from STT_server.config import DEFAULT_TTS_PROVIDER, DEFAULT_CALL_LANGUAGE
+    return {
+        "tts_providers": sorted(VALID_TTS_PROVIDERS),
+        "default_tts_provider": DEFAULT_TTS_PROVIDER,
+        "languages": sorted(VALID_LANGUAGES),
+        "default_language": DEFAULT_CALL_LANGUAGE,
+    }
+
+
+@app.get("/sessions")
+async def list_sessions() -> dict:
+    """List active call sessions with their current configuration."""
+    from STT_server.services.session_runtime import sessions
+    result = {}
+    for key, s in sessions.items():
+        result[key] = {
+            "call_sid": s.call_sid,
+            "preferred_language": s.preferred_language,
+            "tts_provider": s.tts_provider,
+            "custom_prompt": (s.custom_prompt[:80] + "...") if s.custom_prompt and len(s.custom_prompt) > 80 else s.custom_prompt,
+            "assistant_speaking": s.assistant_speaking,
+            "closed": s.closed,
+        }
+    return {"sessions": result, "count": len(result)}
+
+
+class SessionConfigUpdate(BaseModel):
+    """Request body for PATCH /sessions/{session_key}."""
+    tts_provider: str | None = None
+    preferred_language: str | None = None
+    custom_prompt: str | None = None
+
+
+@app.get("/sessions/{session_key}")
+async def get_session_config(session_key: str) -> dict:
+    """Get the configuration of a specific session."""
+    from STT_server.services.session_runtime import sessions
+    session = sessions.get(session_key)
+    if not session:
+        return JSONResponse(status_code=404, content={"error": f"Session '{session_key}' not found"})
+    return {
+        "session_key": session.session_key,
+        "call_sid": session.call_sid,
+        "preferred_language": session.preferred_language,
+        "tts_provider": session.tts_provider,
+        "custom_prompt": session.custom_prompt,
+        "assistant_speaking": session.assistant_speaking,
+        "closed": session.closed,
+    }
+
+
+@app.patch("/sessions/{session_key}")
+async def update_session_config(session_key: str, body: SessionConfigUpdate = None) -> dict:
+    """Update per-session configuration: tts_provider, preferred_language, custom_prompt."""
+    from STT_server.services.session_runtime import sessions
+    session = sessions.get(session_key)
+    if not session:
+        return JSONResponse(status_code=404, content={"error": f"Session '{session_key}' not found"})
+
+    if body is None:
+        body = SessionConfigUpdate()
+
+    updated = {}
+
+    # Update TTS provider
+    if body.tts_provider is not None:
+        provider = body.tts_provider.strip().lower()
+        if provider not in VALID_TTS_PROVIDERS:
+            return JSONResponse(status_code=400, content={"error": f"Invalid tts_provider '{provider}'. Valid: {sorted(VALID_TTS_PROVIDERS)}"})
+        session.tts_provider = provider
+        updated["tts_provider"] = session.tts_provider
+        log.info("[CONFIG] Updated tts_provider for %s: %s", session_key, session.tts_provider)
+
+    # Update preferred language
+    if body.preferred_language is not None:
+        lang = body.preferred_language.strip().lower()
+        if lang not in VALID_LANGUAGES:
+            return JSONResponse(status_code=400, content={"error": f"Invalid preferred_language '{lang}'. Valid: {sorted(VALID_LANGUAGES)}"})
+        session.preferred_language = lang
+        updated["preferred_language"] = session.preferred_language
+        log.info("[CONFIG] Updated preferred_language for %s: %s", session_key, session.preferred_language)
+
+    # Update custom prompt
+    if body.custom_prompt is not None:
+        prompt = body.custom_prompt.strip() if body.custom_prompt else None
+        session.custom_prompt = prompt
+        updated["custom_prompt"] = session.custom_prompt
+        log.info("[CONFIG] Updated custom_prompt for %s (len=%d)", session_key, len(session.custom_prompt) if session.custom_prompt else 0)
+
+    return {
+        "session_key": session.session_key,
+        "updated": updated,
+        "current": {
+            "preferred_language": session.preferred_language,
+            "tts_provider": session.tts_provider,
+            "custom_prompt": session.custom_prompt,
+        },
+    }
 
 
 @app.get("/")

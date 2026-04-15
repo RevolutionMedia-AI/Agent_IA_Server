@@ -16,7 +16,7 @@ def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]
     # Include structured user state, not as a memory, but as a guide for LLM
     lang = session.preferred_language or detect_language(user_text)
     messages = [
-        {"role": "system", "content": get_system_prompt(lang)},
+        {"role": "system", "content": get_system_prompt(lang, custom_prompt=getattr(session, 'custom_prompt', None))},
         {"role": "system", "content": get_language_instruction(lang)},
     ]
 

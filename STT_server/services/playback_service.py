@@ -6,7 +6,7 @@ import json
 
 from fastapi import WebSocket
 
-from STT_server.adapters.elevenlabs_tts import stream_tts_segment
+from STT_server.adapters.tts_dispatcher import stream_tts_segment
 from STT_server.adapters.twilio_media import send_twilio_clear, send_twilio_mark, send_twilio_media
 from STT_server.config import (
     INITIAL_GREETING_ENABLED,
