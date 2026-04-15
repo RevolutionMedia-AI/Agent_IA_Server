@@ -24,9 +24,9 @@ from STT_server.config import (
     TEXT_SEGMENT_QUEUE_MAXSIZE,
 )
 from STT_server.domain.language import (
-    SYSTEM_PROMPT,
     extract_structured_data,
     get_language_instruction,
+    get_system_prompt,
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop
@@ -41,7 +41,7 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
 
 def _build_instructions(session: CallSession) -> str:
     """Compose the system instructions including dynamic session state."""
-    parts = [SYSTEM_PROMPT]
+    parts = [get_system_prompt(session.preferred_language or DEFAULT_CALL_LANGUAGE)]
     lang = session.preferred_language or DEFAULT_CALL_LANGUAGE
     parts.append(get_language_instruction(lang))
 

@@ -4,7 +4,7 @@ import logging
 from openai import OpenAI
 
 from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS, OPENAI_API_KEY, OPENAI_MODEL
-from STT_server.domain.language import SYSTEM_PROMPT, detect_language, get_language_instruction, pop_streaming_segments
+from STT_server.domain.language import detect_language, get_language_instruction, get_system_prompt, pop_streaming_segments
 from STT_server.domain.session import CallSession
 
 
@@ -16,7 +16,7 @@ def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]
     # Include structured user state, not as a memory, but as a guide for LLM
     lang = session.preferred_language or detect_language(user_text)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": get_system_prompt(lang)},
         {"role": "system", "content": get_language_instruction(lang)},
     ]
 
