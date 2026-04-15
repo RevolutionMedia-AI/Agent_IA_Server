@@ -26,6 +26,7 @@ from STT_server.config import (
 )
 from STT_server.domain.language import detect_language, split_tts_segments, sanitize_tts_text
 from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS, VALID_LANGUAGES
+from STT_server.domain.tenant import TenantConfig, tenant_store
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import playback_loop
@@ -63,7 +64,13 @@ if os.path.isdir(static_dir):
 
 
 @app.post("/voice")
-async def voice() -> Response:
+async def voice(tenant_id: str = Query(default=None)) -> Response:
+    """Twilio voice webhook. Accepts optional ?tenant_id= to link the call
+    to a specific tenant's configuration (prompt, TTS provider, language, etc.).
+
+    When a tenant configures their webhook via /tenants/{id}/configure-webhook,
+    the URL includes ?tenant_id=... so incoming calls are automatically linked.
+    """
     ws_url = PUBLIC_URL.rstrip("/")
 
     if ws_url.startswith("https://"):
@@ -72,6 +79,11 @@ async def voice() -> Response:
         ws_url = "ws://" + ws_url[7:]
     else:
         ws_url = "wss://" + ws_url
+
+    # Build the <Stream> element with optional tenant_id parameter
+    stream_params = ""
+    if tenant_id:
+        stream_params = f'<Parameter name="tenant_id" value="{tenant_id}" />'
 
     # If a static greeting file exists or the TWIML flag is enabled,
     # include a <Play> so Twilio plays the pre-recorded greeting before
@@ -83,7 +95,7 @@ async def voice() -> Response:
     <Response>
         <Play>{play_url}</Play>
         <Connect>
-            <Stream url=\"{ws_url}/media-stream\" />
+            <Stream url=\"{ws_url}/media-stream\">{stream_params}</Stream>
         </Connect>
     </Response>
     """
@@ -91,7 +103,7 @@ async def voice() -> Response:
         twiml = f"""
     <Response>
         <Connect>
-            <Stream url=\"{ws_url}/media-stream\" />
+            <Stream url=\"{ws_url}/media-stream\">{stream_params}</Stream>
         </Connect>
     </Response>
     """
@@ -136,8 +148,28 @@ async def media_stream(ws: WebSocket) -> None:
                 session.stream_sid = start.get("streamSid") or msg.get("streamSid")
                 if session.call_sid:
                     session.session_key = session.call_sid
+
+                # ── Apply tenant configuration ──
+                # Twilio sends custom <Parameter> values in start.customParameters
+                custom_params = start.get("customParameters") or {}
+                tenant_id = custom_params.get("tenant_id") if isinstance(custom_params, dict) else None
+                if tenant_id:
+                    tenant = tenant_store.get(tenant_id)
+                    if tenant:
+                        session.custom_prompt = tenant.custom_prompt
+                        session.tts_provider = tenant.tts_provider
+                        session.preferred_language = tenant.preferred_language
+                        session.tenant_id = tenant_id
+                        log.info(
+                            "[TENANT] Applied tenant %s config to session %s (prompt=%s, tts=%s, lang=%s)",
+                            tenant_id, session.session_key,
+                            bool(tenant.custom_prompt), tenant.tts_provider, tenant.preferred_language,
+                        )
+                    else:
+                        log.warning("[TENANT] tenant_id=%s not found, using defaults", tenant_id)
+
                 register_session(session)
-                log.info("callSid=%s streamSid=%s", session.call_sid, session.stream_sid)
+                log.info("callSid=%s streamSid=%s tenant_id=%s", session.call_sid, session.stream_sid, tenant_id)
                 if USE_OPENAI_REALTIME:
                     track_task(
                         session,
@@ -329,6 +361,236 @@ async def update_session_config(session_key: str, body: SessionConfigUpdate = No
             "custom_prompt": session.custom_prompt,
         },
     }
+
+
+# ── Tenant Management API ────────────────────────────────────────────
+# These endpoints allow the frontend to manage tenants (clients) with
+# their own Twilio credentials, phone numbers, and agent configuration.
+
+
+class TenantCreateRequest(BaseModel):
+    """Request body for creating/updating a tenant."""
+    name: str | None = None
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
+    twilio_phone_number: str | None = None
+    custom_prompt: str | None = None
+    tts_provider: str | None = None
+    preferred_language: str | None = None
+    openai_api_key: str | None = None
+    elevenlabs_api_key: str | None = None
+    elevenlabs_voice_id: str | None = None
+    deepgram_api_key: str | None = None
+
+
+class OutboundCallRequest(BaseModel):
+    """Request body for initiating an outbound call."""
+    to_number: str  # E.164 format, e.g. "+15071234567"
+
+
+@app.get("/tenants")
+async def list_tenants() -> dict:
+    """List all configured tenants."""
+    tenants = tenant_store.list_all()
+    return {
+        "tenants": [t.to_dict(include_secrets=False) for t in tenants],
+        "count": len(tenants),
+    }
+
+
+@app.post("/tenants")
+async def create_tenant(body: TenantCreateRequest) -> dict:
+    """Create a new tenant with Twilio credentials and agent configuration."""
+    import uuid
+    tenant_id = f"tenant-{uuid.uuid4().hex[:12]}"
+
+    tenant = TenantConfig(
+        tenant_id=tenant_id,
+        name=body.name or "",
+        twilio_account_sid=body.twilio_account_sid or "",
+        twilio_auth_token=body.twilio_auth_token or "",
+        twilio_phone_number=body.twilio_phone_number or "",
+        custom_prompt=body.custom_prompt,
+        tts_provider=body.tts_provider or "elevenlabs",
+        preferred_language=body.preferred_language or "es",
+        openai_api_key=body.openai_api_key,
+        elevenlabs_api_key=body.elevenlabs_api_key,
+        elevenlabs_voice_id=body.elevenlabs_voice_id,
+        deepgram_api_key=body.deepgram_api_key,
+    )
+
+    tenant_store.upsert(tenant)
+    log.info("[TENANT] Created tenant %s (%s)", tenant_id, tenant.name)
+
+    return {
+        "tenant_id": tenant_id,
+        "config": tenant.to_dict(include_secrets=False),
+    }
+
+
+@app.get("/tenants/{tenant_id}")
+async def get_tenant(tenant_id: str) -> dict:
+    """Get a tenant's configuration (secrets are masked)."""
+    tenant = tenant_store.get(tenant_id)
+    if not tenant:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    return tenant.to_dict(include_secrets=False)
+
+
+@app.patch("/tenants/{tenant_id}")
+async def update_tenant(tenant_id: str, body: TenantCreateRequest) -> dict:
+    """Update a tenant's configuration. Only provided fields are updated."""
+    tenant = tenant_store.get(tenant_id)
+    if not tenant:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+
+    import time
+    updated = {}
+
+    if body.name is not None:
+        tenant.name = body.name
+        updated["name"] = tenant.name
+    if body.twilio_account_sid is not None:
+        tenant.twilio_account_sid = body.twilio_account_sid
+        updated["twilio_account_sid"] = "updated"
+    if body.twilio_auth_token is not None:
+        tenant.twilio_auth_token = body.twilio_auth_token
+        updated["twilio_auth_token"] = "updated"
+    if body.twilio_phone_number is not None:
+        tenant.twilio_phone_number = body.twilio_phone_number
+        updated["twilio_phone_number"] = tenant.twilio_phone_number
+    if body.custom_prompt is not None:
+        tenant.custom_prompt = body.custom_prompt.strip() if body.custom_prompt else None
+        updated["custom_prompt"] = f"len={len(tenant.custom_prompt)}" if tenant.custom_prompt else "cleared"
+    if body.tts_provider is not None:
+        provider = body.tts_provider.strip().lower()
+        if provider not in VALID_TTS_PROVIDERS:
+            return JSONResponse(status_code=400, content={"error": f"Invalid tts_provider '{provider}'. Valid: {sorted(VALID_TTS_PROVIDERS)}"})
+        tenant.tts_provider = provider
+        updated["tts_provider"] = tenant.tts_provider
+    if body.preferred_language is not None:
+        lang = body.preferred_language.strip().lower()
+        if lang not in VALID_LANGUAGES:
+            return JSONResponse(status_code=400, content={"error": f"Invalid preferred_language '{lang}'. Valid: {sorted(VALID_LANGUAGES)}"})
+        tenant.preferred_language = lang
+        updated["preferred_language"] = tenant.preferred_language
+    if body.openai_api_key is not None:
+        tenant.openai_api_key = body.openai_api_key
+        updated["openai_api_key"] = "updated"
+    if body.elevenlabs_api_key is not None:
+        tenant.elevenlabs_api_key = body.elevenlabs_api_key
+        updated["elevenlabs_api_key"] = "updated"
+    if body.elevenlabs_voice_id is not None:
+        tenant.elevenlabs_voice_id = body.elevenlabs_voice_id
+        updated["elevenlabs_voice_id"] = tenant.elevenlabs_voice_id
+    if body.deepgram_api_key is not None:
+        tenant.deepgram_api_key = body.deepgram_api_key
+        updated["deepgram_api_key"] = "updated"
+
+    tenant.updated_at = time.time()
+    tenant_store.upsert(tenant)
+    log.info("[TENANT] Updated tenant %s: %s", tenant_id, list(updated.keys()))
+
+    return {
+        "tenant_id": tenant_id,
+        "updated": updated,
+        "current": tenant.to_dict(include_secrets=False),
+    }
+
+
+@app.delete("/tenants/{tenant_id}")
+async def delete_tenant(tenant_id: str) -> dict:
+    """Delete a tenant configuration."""
+    deleted = tenant_store.delete(tenant_id)
+    if not deleted:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    log.info("[TENANT] Deleted tenant %s", tenant_id)
+    return {"deleted": True, "tenant_id": tenant_id}
+
+
+@app.post("/tenants/{tenant_id}/validate-twilio")
+async def validate_tenant_twilio(tenant_id: str) -> dict:
+    """Validate a tenant's Twilio credentials."""
+    from STT_server.adapters.twilio_api import validate_twilio_credentials
+    tenant = tenant_store.get(tenant_id)
+    if not tenant:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    if not tenant.has_twilio_credentials:
+        return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
+
+    result = await validate_twilio_credentials(tenant.twilio_account_sid, tenant.twilio_auth_token)
+    return result
+
+
+@app.post("/tenants/{tenant_id}/configure-webhook")
+async def configure_tenant_webhook(tenant_id: str) -> dict:
+    """Automatically configure the Twilio webhook on the tenant's phone number.
+
+    This sets the voice URL to point to our /voice endpoint, so incoming
+    calls are routed to this server. The client does NOT need to manually
+    configure anything in the Twilio console.
+    """
+    from STT_server.adapters.twilio_api import configure_voice_webhook
+    tenant = tenant_store.get(tenant_id)
+    if not tenant:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    if not tenant.has_twilio_credentials:
+        return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
+
+    webhook_url = f"{PUBLIC_URL.rstrip('/')}/voice?tenant_id={tenant_id}"
+    result = await configure_voice_webhook(
+        tenant.twilio_account_sid,
+        tenant.twilio_auth_token,
+        tenant.twilio_phone_number,
+        webhook_url,
+    )
+
+    if result.get("success"):
+        tenant.webhook_configured = True
+        import time
+        tenant.updated_at = time.time()
+        tenant_store.upsert(tenant)
+        log.info("[TENANT] Webhook configured for %s -> %s", tenant_id, webhook_url)
+
+    return result
+
+
+@app.post("/tenants/{tenant_id}/list-numbers")
+async def list_tenant_numbers(tenant_id: str) -> dict:
+    """List all phone numbers in the tenant's Twilio account."""
+    from STT_server.adapters.twilio_api import list_phone_numbers
+    tenant = tenant_store.get(tenant_id)
+    if not tenant:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    if not tenant.twilio_account_sid or not tenant.twilio_auth_token:
+        return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
+
+    return await list_phone_numbers(tenant.twilio_account_sid, tenant.twilio_auth_token)
+
+
+@app.post("/tenants/{tenant_id}/call")
+async def make_call(tenant_id: str, body: OutboundCallRequest) -> dict:
+    """Initiate an outbound call from the tenant's phone number."""
+    from STT_server.adapters.twilio_api import make_outbound_call
+    tenant = tenant_store.get(tenant_id)
+    if not tenant:
+        return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    if not tenant.has_twilio_credentials:
+        return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
+
+    webhook_url = f"{PUBLIC_URL.rstrip('/')}/voice?tenant_id={tenant_id}"
+    result = await make_outbound_call(
+        tenant.twilio_account_sid,
+        tenant.twilio_auth_token,
+        tenant.twilio_phone_number,
+        body.to_number,
+        webhook_url,
+    )
+
+    if result.get("success"):
+        log.info("[TENANT] Outbound call from %s: %s -> %s", tenant_id, tenant.twilio_phone_number, body.to_number)
+
+    return result
 
 
 @app.get("/")

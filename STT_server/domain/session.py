@@ -29,6 +29,8 @@ class CallSession:
     custom_prompt: str | None = None
     # Per-session TTS provider: "elevenlabs" or "rime"
     tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
+    # Tenant ID this session belongs to (set when call comes from a configured tenant)
+    tenant_id: str | None = None
     vad_buffer: bytearray = field(default_factory=bytearray)
     pre_speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=PRE_SPEECH_FRAMES))
     speech_frames: list[bytes] = field(default_factory=list)

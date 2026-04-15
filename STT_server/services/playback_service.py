@@ -210,9 +210,11 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 continue
 
             if item_type == "segment_end":
-                    # Forzar unmute del STT al terminar cualquier segmento, con o sin audio
-                    session.assistant_speaking = False
-                    session.assistant_started_at = None
+                    # Do NOT set assistant_speaking = False here!
+                    # The audio is still being played by Twilio. We must wait
+                    # for the Twilio "mark" event to confirm playback finished.
+                    # Setting assistant_speaking = False here causes the STT to
+                    # pick up the agent's own voice as user input (echo loop).
                     # Enviar mark para rastrear segmento (si tenemos stream_sid)
                     try:
                         session.mark_counter += 1
