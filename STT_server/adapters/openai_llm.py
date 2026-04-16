@@ -21,12 +21,15 @@ def build_messages(session: CallSession, user_text: str) -> list[dict[str, str]]
         # Custom prompt replaces EVERYTHING — user has full control over
         # the agent's behavior, rules, and language. No default prompt
         # or language instruction is appended.
+        log.info("[LLM] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
         messages = [
             {"role": "system", "content": custom_prompt.strip()},
         ]
     else:
+        system_prompt = get_system_prompt(lang)
+        log.info("[LLM] Using default system prompt for session=%s lang=%s prompt_len=%d", session.session_key, lang, len(system_prompt))
         messages = [
-            {"role": "system", "content": get_system_prompt(lang)},
+            {"role": "system", "content": system_prompt},
             {"role": "system", "content": get_language_instruction(lang)},
         ]
 

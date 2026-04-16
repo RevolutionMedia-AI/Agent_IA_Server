@@ -41,9 +41,16 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
 
 def _build_instructions(session: CallSession) -> str:
     """Compose the system instructions including dynamic session state."""
-    parts = [get_system_prompt(session.preferred_language or DEFAULT_CALL_LANGUAGE)]
-    lang = session.preferred_language or DEFAULT_CALL_LANGUAGE
-    parts.append(get_language_instruction(lang))
+    custom_prompt = getattr(session, 'custom_prompt', None)
+
+    if custom_prompt and custom_prompt.strip():
+        # Custom prompt replaces EVERYTHING — same logic as build_messages()
+        log.info("[REALTIME] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
+        parts = [custom_prompt.strip()]
+    else:
+        parts = [get_system_prompt(session.preferred_language or DEFAULT_CALL_LANGUAGE)]
+        lang = session.preferred_language or DEFAULT_CALL_LANGUAGE
+        parts.append(get_language_instruction(lang))
 
     if session.collected_data:
         collected = ", ".join(f"{k}: {v}" for k, v in session.collected_data.items())

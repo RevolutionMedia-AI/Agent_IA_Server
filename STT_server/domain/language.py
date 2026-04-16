@@ -335,16 +335,15 @@ SANITIZED_SYSTEM_PROMPT_ES = clean_system_prompt(SYSTEM_PROMPT_ES, allowed_punct
 
 def get_system_prompt(lang: str | None = None) -> str:
     """Return the appropriate system prompt based on language.
-    
-    Returns the Spanish prompt for 'es' and the English prompt for 'en' or any other value.
+
+    Always returns the Spanish (Tigo/Camila) prompt as the default — this agent
+    is designed for Tigo Panama and must always use the Spanish system prompt.
+    The prompt itself instructs the agent to always respond in Spanish regardless
+    of the user's language.
     Note: custom_prompt handling is done in build_messages() — when a custom prompt is set,
     it completely replaces this default prompt and the language instruction.
     """
-    from STT_server.config import DEFAULT_CALL_LANGUAGE
-    resolved = lang or DEFAULT_CALL_LANGUAGE
-    if resolved == "es":
-        return SYSTEM_PROMPT_ES
-    return ""
+    return SYSTEM_PROMPT_ES
 
 
 def get_sanitized_system_prompt(lang: str | None = None) -> str:
