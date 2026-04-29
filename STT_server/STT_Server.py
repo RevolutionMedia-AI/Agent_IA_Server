@@ -8,6 +8,10 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+
+# Importar routers
+from STT_server.routes.auth import router as auth_router
 
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
@@ -55,6 +59,15 @@ if not ELEVENLABS_API_KEY:
 
 app = FastAPI()
 
+# CORS middleware para permitir conexiones desde el frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Serve static files (e.g. static/greeting.wav) at /static
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(static_dir):
@@ -95,7 +108,7 @@ async def voice(tenant_id: str = Query(default=None)) -> Response:
     <Response>
         <Play>{play_url}</Play>
         <Connect>
-            <Stream url=\"{ws_url}/media-stream\">{stream_params}</Stream>
+            <Stream url="{ws_url}/media-stream">{stream_params}</Stream>
         </Connect>
     </Response>
     """
@@ -103,7 +116,7 @@ async def voice(tenant_id: str = Query(default=None)) -> Response:
         twiml = f"""
     <Response>
         <Connect>
-            <Stream url=\"{ws_url}/media-stream\">{stream_params}</Stream>
+            <Stream url="{ws_url}/media-stream">{stream_params}</Stream>
         </Connect>
     </Response>
     """
@@ -596,6 +609,10 @@ async def make_call(tenant_id: str, body: OutboundCallRequest) -> dict:
 @app.get("/")
 async def root() -> dict:
     return {"status": "ok", "message": "STT server running"}
+
+
+# ── Incluir routers ─────────────────────────────────────────────────────────
+app.include_router(auth_router)
 
 
 if __name__ == "__main__":
