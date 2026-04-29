@@ -10,7 +10,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Header, Body
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
 router = APIRouter(prefix="/auth", tags=["Autenticación"])
@@ -23,11 +23,11 @@ SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 # ── Modelos Pydantic ─────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
     name: str
-    email: EmailStr
+    email: str
     password: str
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class TokenResponse(BaseModel):
