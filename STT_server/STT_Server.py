@@ -4,7 +4,7 @@ import logging
 
 import uvicorn
 import os
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Importar routers
 from STT_server.routes.auth import router as auth_router
+from STT_server.routes.api import api_router, require_auth
 
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
@@ -59,10 +60,16 @@ if not ELEVENLABS_API_KEY:
 
 app = FastAPI()
 
-# CORS middleware para permitir conexiones desde el frontend
+# CORS allowlist — comma-separated env var, defaults to local dev origins.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
+    ).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -285,7 +292,7 @@ async def get_available_config() -> dict:
     }
 
 
-@app.get("/sessions")
+@app.get("/sessions", dependencies=[Depends(require_auth)])
 async def list_sessions() -> dict:
     """List active call sessions with their current configuration."""
     from STT_server.services.session_runtime import sessions
@@ -309,7 +316,7 @@ class SessionConfigUpdate(BaseModel):
     custom_prompt: str | None = None
 
 
-@app.get("/sessions/{session_key}")
+@app.get("/sessions/{session_key}", dependencies=[Depends(require_auth)])
 async def get_session_config(session_key: str) -> dict:
     """Get the configuration of a specific session."""
     from STT_server.services.session_runtime import sessions
@@ -327,7 +334,7 @@ async def get_session_config(session_key: str) -> dict:
     }
 
 
-@app.patch("/sessions/{session_key}")
+@app.patch("/sessions/{session_key}", dependencies=[Depends(require_auth)])
 async def update_session_config(session_key: str, body: SessionConfigUpdate = None) -> dict:
     """Update per-session configuration: tts_provider, preferred_language, custom_prompt."""
     from STT_server.services.session_runtime import sessions
@@ -401,7 +408,7 @@ class OutboundCallRequest(BaseModel):
     to_number: str  # E.164 format, e.g. "+15071234567"
 
 
-@app.get("/tenants")
+@app.get("/tenants", dependencies=[Depends(require_auth)])
 async def list_tenants() -> dict:
     """List all configured tenants."""
     tenants = tenant_store.list_all()
@@ -411,7 +418,7 @@ async def list_tenants() -> dict:
     }
 
 
-@app.post("/tenants")
+@app.post("/tenants", dependencies=[Depends(require_auth)])
 async def create_tenant(body: TenantCreateRequest) -> dict:
     """Create a new tenant with Twilio credentials and agent configuration."""
     import uuid
@@ -441,7 +448,7 @@ async def create_tenant(body: TenantCreateRequest) -> dict:
     }
 
 
-@app.get("/tenants/{tenant_id}")
+@app.get("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
 async def get_tenant(tenant_id: str) -> dict:
     """Get a tenant's configuration (secrets are masked)."""
     tenant = tenant_store.get(tenant_id)
@@ -450,7 +457,7 @@ async def get_tenant(tenant_id: str) -> dict:
     return tenant.to_dict(include_secrets=False)
 
 
-@app.patch("/tenants/{tenant_id}")
+@app.patch("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
 async def update_tenant(tenant_id: str, body: TenantCreateRequest) -> dict:
     """Update a tenant's configuration. Only provided fields are updated."""
     tenant = tenant_store.get(tenant_id)
@@ -511,7 +518,7 @@ async def update_tenant(tenant_id: str, body: TenantCreateRequest) -> dict:
     }
 
 
-@app.delete("/tenants/{tenant_id}")
+@app.delete("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
 async def delete_tenant(tenant_id: str) -> dict:
     """Delete a tenant configuration."""
     deleted = tenant_store.delete(tenant_id)
@@ -521,7 +528,7 @@ async def delete_tenant(tenant_id: str) -> dict:
     return {"deleted": True, "tenant_id": tenant_id}
 
 
-@app.post("/tenants/{tenant_id}/validate-twilio")
+@app.post("/tenants/{tenant_id}/validate-twilio", dependencies=[Depends(require_auth)])
 async def validate_tenant_twilio(tenant_id: str) -> dict:
     """Validate a tenant's Twilio credentials."""
     from STT_server.adapters.twilio_api import validate_twilio_credentials
@@ -535,7 +542,7 @@ async def validate_tenant_twilio(tenant_id: str) -> dict:
     return result
 
 
-@app.post("/tenants/{tenant_id}/configure-webhook")
+@app.post("/tenants/{tenant_id}/configure-webhook", dependencies=[Depends(require_auth)])
 async def configure_tenant_webhook(tenant_id: str) -> dict:
     """Automatically configure the Twilio webhook on the tenant's phone number.
 
@@ -568,7 +575,7 @@ async def configure_tenant_webhook(tenant_id: str) -> dict:
     return result
 
 
-@app.post("/tenants/{tenant_id}/list-numbers")
+@app.post("/tenants/{tenant_id}/list-numbers", dependencies=[Depends(require_auth)])
 async def list_tenant_numbers(tenant_id: str) -> dict:
     """List all phone numbers in the tenant's Twilio account."""
     from STT_server.adapters.twilio_api import list_phone_numbers
@@ -581,7 +588,7 @@ async def list_tenant_numbers(tenant_id: str) -> dict:
     return await list_phone_numbers(tenant.twilio_account_sid, tenant.twilio_auth_token)
 
 
-@app.post("/tenants/{tenant_id}/call")
+@app.post("/tenants/{tenant_id}/call", dependencies=[Depends(require_auth)])
 async def make_call(tenant_id: str, body: OutboundCallRequest) -> dict:
     """Initiate an outbound call from the tenant's phone number."""
     from STT_server.adapters.twilio_api import make_outbound_call
@@ -613,6 +620,7 @@ async def root() -> dict:
 
 # ── Incluir routers ─────────────────────────────────────────────────────────
 app.include_router(auth_router)
+app.include_router(api_router)
 
 
 if __name__ == "__main__":

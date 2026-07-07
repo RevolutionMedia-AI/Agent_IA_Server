@@ -1,0 +1,461 @@
+"""
+Admin API routes for the frontend app: dashboard stats, agents, phone numbers,
+tools/integrations, settings, and /me alias. All endpoints (except where noted)
+require a valid Bearer token; auth helper reads STT_server/data/sessions.json.
+Persistence is JSON-file based so the user can swap to SQLite/Postgres later
+without breaking the route contracts.
+"""
+import os
+import json
+import uuid
+import hashlib
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Optional, List
+
+from fastapi import APIRouter, Header, HTTPException, Depends
+from pydantic import BaseModel, Field
+
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+AGENTS_FILE = os.path.join(DATA_DIR, "agents.json")
+NUMBERS_FILE = os.path.join(DATA_DIR, "phone_numbers.json")
+TOOLS_FILE = os.path.join(DATA_DIR, "tools_integrations.json")
+SETTINGS_DIR = os.path.join(DATA_DIR, "settings")
+
+
+# ponytail: single lock around the data dir's read-modify-write sequences.
+# Without it, two concurrent creates (e.g. user double-clicks + background reload)
+# can race _load → mutate → _save and lose one write. This lock makes every
+# RMW atomic. Fine for MVP volume; drop the lock when you swap to SQLite.
+_data_io_lock = threading.Lock()
+
+
+@contextmanager
+def _data_lock():
+    with _data_io_lock:
+        yield
+
+
+def _load(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return default
+
+
+def _save(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _hash_password(pwd: str) -> str:
+    return hashlib.sha256(pwd.encode()).hexdigest()
+
+
+# ponytail: in-memory cache of valid (token -> entry). require_auth first checks
+# here, then falls back to the file on miss. Cache is invalidated by
+# `auth.py` logout/password-change via `invalidate_session` (no such call exists
+# in auth.py yet — see the W7 todo in routes/auth.py). Stale entries are
+# lazy-evicted on access when expired.
+_session_cache = {}  # token -> {"entry": {...}, "expires_at": datetime}
+
+
+def _cache_get(token: str):
+    cached = _session_cache.get(token)
+    if not cached:
+        return None
+    if cached["expires_at"] < datetime.now(timezone.utc):
+        _session_cache.pop(token, None)
+        return None
+    return cached["entry"]
+
+
+def _cache_put(token: str, entry: dict) -> None:
+    try:
+        expires_at = datetime.fromisoformat(entry["expires_at"].replace("Z", "+00:00"))
+    except (ValueError, KeyError):
+        return
+    _session_cache[token] = {"entry": entry, "expires_at": expires_at}
+
+
+def invalidate_session(token: str) -> None:
+    _session_cache.pop(token, None)
+
+
+def invalidate_user_sessions(user_id: str) -> None:
+    for tok, payload in list(_session_cache.items()):
+        if payload["entry"].get("user_id") == user_id:
+            _session_cache.pop(tok, None)
+
+
+def require_auth(authorization: str = Header(None)) -> dict:
+    """Resolve Bearer token; raise 401 on failure.
+
+    Tries the in-memory cache first, falls back to sessions.json. Updates the
+    cache and persists expirations to disk on miss.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization[len("Bearer "):]
+    cached = _cache_get(token)
+    if cached is not None:
+        return cached
+    with _data_lock():
+        sessions = _load(SESSIONS_FILE, {})
+        entry = sessions.get(token)
+        if not entry:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        try:
+            expires_at = datetime.fromisoformat(entry["expires_at"].replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Token corrupted")
+        if datetime.now(timezone.utc) > expires_at:
+            sessions.pop(token, None)
+            _save(SESSIONS_FILE, sessions)
+            raise HTTPException(status_code=401, detail="Token expired")
+        _cache_put(token, entry)
+        return entry
+
+
+def _get_user(user_id: str) -> Optional[dict]:
+    users = _load(USERS_FILE, [])
+    return next((u for u in users if u.get("id") == user_id), None)
+
+
+api_router = APIRouter()
+
+
+# ---------- Pydantic schemas ----------
+
+class AgentCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    voice: Optional[str] = None
+    language: Optional[str] = "English"
+    campaign: Optional[str] = None
+    status: Optional[str] = "Active"
+    description: Optional[str] = None
+    tone: Optional[str] = None
+    prompt: Optional[str] = None
+
+
+class AgentUpdate(BaseModel):
+    name: Optional[str] = None
+    voice: Optional[str] = None
+    language: Optional[str] = None
+    campaign: Optional[str] = None
+    status: Optional[str] = None
+    description: Optional[str] = None
+    tone: Optional[str] = None
+    prompt: Optional[str] = None
+
+
+class PhoneNumberCreate(BaseModel):
+    provider: str = "twilio"
+    country: str = "+1"
+    number: str
+    agent: Optional[str] = None
+    label: Optional[str] = None
+
+
+class PhoneNumberUpdate(BaseModel):
+    agent: Optional[str] = None
+    status: Optional[str] = None
+    label: Optional[str] = None
+
+
+class ToolConnect(BaseModel):
+    credentials: Optional[dict] = None
+
+
+class SettingsUpdate(BaseModel):
+    name: Optional[str] = None
+    company: Optional[str] = None
+    timezone: Optional[str] = None
+    notifications: Optional[dict] = None
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+
+# ---------- /me (alias) ----------
+
+@api_router.get("/me")
+def me_alias(auth: dict = Depends(require_auth)):
+    user = _get_user(auth["user_id"])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "created_at": user.get("created_at", ""),
+    }
+
+
+# ---------- /dashboard/stats ----------
+
+@api_router.get("/dashboard/stats")
+def dashboard_stats(auth: dict = Depends(require_auth)):
+    agents = _load(AGENTS_FILE, [])
+    numbers = _load(NUMBERS_FILE, [])
+    user_agents = [a for a in agents if a.get("user_id") == auth["user_id"]]
+    user_numbers = [n for n in numbers if n.get("user_id") == auth["user_id"]]
+    active_agents = sum(1 for a in user_agents if a.get("status") == "Active")
+    total_calls = 0
+    for a in user_agents:
+        c = str(a.get("calls", "0")).replace(",", "")
+        try:
+            total_calls += int(c)
+        except ValueError:
+            pass
+    avg_qa = 0
+    if user_agents:
+        avg_qa = sum(int(a.get("perf", 0)) for a in user_agents) / len(user_agents)
+    return {
+        "active_agents": active_agents,
+        "calls_today": total_calls,
+        "avg_qa_score": f"{int(avg_qa)}%",
+        "recent_agents": user_agents[:5],
+        "numbers_count": len(user_numbers),
+    }
+
+
+# ---------- /agents CRUD ----------
+
+@api_router.get("/agents")
+def list_agents(auth: dict = Depends(require_auth)):
+    agents = _load(AGENTS_FILE, [])
+    return [a for a in agents if a.get("user_id") == auth["user_id"]]
+
+
+@api_router.post("/agents")
+def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        agents = _load(AGENTS_FILE, [])
+        new_agent = {
+            "id": f"agent-{uuid.uuid4().hex[:8]}",
+            **data.dict(),
+            "user_id": auth["user_id"],
+            "calls": "0",
+            "perf": 0,
+            "created_at": _now_iso(),
+        }
+        agents.append(new_agent)
+        _save(AGENTS_FILE, agents)
+    return new_agent
+
+
+@api_router.put("/agents/{agent_id}")
+def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        agents = _load(AGENTS_FILE, [])
+        for a in agents:
+            if a["id"] == agent_id and a.get("user_id") == auth["user_id"]:
+                for k, v in data.dict(exclude_none=True).items():
+                    a[k] = v
+                _save(AGENTS_FILE, agents)
+                return a
+    raise HTTPException(status_code=404, detail="Agent not found")
+
+
+@api_router.delete("/agents/{agent_id}")
+def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        agents = _load(AGENTS_FILE, [])
+        before = len(agents)
+        agents = [a for a in agents if not (a["id"] == agent_id and a.get("user_id") == auth["user_id"])]
+        if len(agents) == before:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        _save(AGENTS_FILE, agents)
+    return {"success": True}
+
+
+# ---------- /phone-numbers CRUD (and /numbers alias) ----------
+
+@api_router.get("/phone-numbers")
+def list_phone_numbers(auth: dict = Depends(require_auth)):
+    numbers = _load(NUMBERS_FILE, [])
+    return [n for n in numbers if n.get("user_id") == auth["user_id"]]
+
+
+@api_router.post("/phone-numbers")
+def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        numbers = _load(NUMBERS_FILE, [])
+        formatted = _format_phone_number(data.country, data.number)
+        new_number = {
+            "id": f"num-{uuid.uuid4().hex[:8]}",
+            "provider": data.provider,
+            "country": data.country,
+            "number": data.number,
+            "display": formatted,
+            "label": data.label or formatted,
+            "agent": data.agent,
+            "user_id": auth["user_id"],
+            "calls": "0",
+            "status": "Active",
+            "created_at": _now_iso(),
+        }
+        numbers.append(new_number)
+        _save(NUMBERS_FILE, numbers)
+    return new_number
+
+
+@api_router.put("/phone-numbers/{number_id}")
+def update_phone_number(number_id: str, data: PhoneNumberUpdate, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        numbers = _load(NUMBERS_FILE, [])
+        for n in numbers:
+            if n["id"] == number_id and n.get("user_id") == auth["user_id"]:
+                for k, v in data.dict(exclude_none=True).items():
+                    n[k] = v
+                _save(NUMBERS_FILE, numbers)
+                return n
+    raise HTTPException(status_code=404, detail="Phone number not found")
+
+
+@api_router.delete("/phone-numbers/{number_id}")
+def delete_phone_number(number_id: str, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        numbers = _load(NUMBERS_FILE, [])
+        before = len(numbers)
+        numbers = [n for n in numbers if not (n["id"] == number_id and n.get("user_id") == auth["user_id"])]
+        if len(numbers) == before:
+            raise HTTPException(status_code=404, detail="Phone number not found")
+        _save(NUMBERS_FILE, numbers)
+    return {"success": True}
+
+
+# /numbers — alias used by some FE code paths
+@api_router.get("/numbers")
+def list_numbers_alias(auth: dict = Depends(require_auth)):
+    return list_phone_numbers(auth)
+
+
+@api_router.post("/numbers")
+def create_number_alias(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
+    return create_phone_number(data, auth)
+
+
+def _format_phone_number(country: str, digits: str) -> str:
+    d = digits.strip()
+    if country == "+52":
+        return f"+52 {d[:2]} {d[2:6]} {d[6:]}" if len(d) >= 10 else f"+52 {d}"
+    if country == "+1":
+        return f"+1 {d[:3]} {d[3:6]} {d[6:]}" if len(d) >= 10 else f"+1 {d}"
+    return f"{country}{d}"
+
+
+# ---------- /tools CRUD ----------
+
+@api_router.get("/tools")
+def list_tools(auth: dict = Depends(require_auth)):
+    tools = _load(TOOLS_FILE, [])
+    return [t for t in tools if t.get("user_id") == auth["user_id"]]
+
+
+@api_router.post("/tools/{tool_id}/connect")
+def connect_tool(tool_id: str, data: ToolConnect, auth: dict = Depends(require_auth)):
+    tools = _load(TOOLS_FILE, [])
+    for t in tools:
+        if t["id"] == tool_id and t.get("user_id") == auth["user_id"]:
+            t["connected"] = True
+            t["credentials"] = data.credentials or {}
+            t["connected_at"] = _now_iso()
+            _save(TOOLS_FILE, tools)
+            return t
+    raise HTTPException(status_code=404, detail="Tool not found")
+
+
+@api_router.delete("/tools/{tool_id}")
+def disconnect_tool(tool_id: str, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        tools = _load(TOOLS_FILE, [])
+        for t in tools:
+            if t["id"] == tool_id and t.get("user_id") == auth["user_id"]:
+                t["connected"] = False
+                t["credentials"] = {}
+                _save(TOOLS_FILE, tools)
+                return {"success": True}
+    raise HTTPException(status_code=404, detail="Tool not found")
+
+
+# ---------- /settings ----------
+
+def _settings_path(user_id: str) -> str:
+    return os.path.join(SETTINGS_DIR, f"{user_id}.json")
+
+
+@api_router.get("/settings")
+def get_settings(auth: dict = Depends(require_auth)):
+    user = _get_user(auth["user_id"])
+    defaults = {
+        "name": user.get("name", "") if user else "",
+        "email": user.get("email", auth.get("email", "")) if user else auth.get("email", ""),
+        "company": "",
+        "timezone": "America/Mexico_City",
+        "notifications": {
+            "calls": True,
+            "qa": True,
+            "weekly": False,
+            "marketing": False,
+        },
+    }
+    stored = _load(_settings_path(auth["user_id"]), {})
+    return {**defaults, **stored}
+
+
+@api_router.put("/settings")
+def update_settings(data: SettingsUpdate, auth: dict = Depends(require_auth)):
+    path = _settings_path(auth["user_id"])
+    with _data_lock():
+        current = _load(path, {})
+        for k, v in data.dict(exclude_none=True).items():
+            current[k] = v
+        _save(path, current)
+        # Mirror name into users.json
+        if "name" in data.dict(exclude_none=True):
+            users = _load(USERS_FILE, [])
+            for u in users:
+                if u.get("id") == auth["user_id"]:
+                    u["name"] = data.name
+                    _save(USERS_FILE, users)
+                    break
+    return current
+
+
+@api_router.put("/settings/password")
+def change_password(data: PasswordChange, auth: dict = Depends(require_auth)):
+    with _data_lock():
+        users = _load(USERS_FILE, [])
+        user = _get_user(auth["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if _hash_password(data.current_password) != user["password"]:
+            raise HTTPException(status_code=401, detail="Current password incorrect")
+        if len(data.new_password) < 8:
+            raise HTTPException(status_code=400, detail="New password too short")
+        user["password"] = _hash_password(data.new_password)
+        user["updated_at"] = _now_iso()
+        _save(USERS_FILE, users)
+        # Invalidate all sessions for this user (file + cache)
+        sessions = _load(SESSIONS_FILE, {})
+        sessions = {k: v for k, v in sessions.items() if v.get("user_id") != auth["user_id"]}
+        _save(SESSIONS_FILE, sessions)
+    invalidate_user_sessions(auth["user_id"])
+    return {"success": True, "message": "Password updated. Please log in again."}
