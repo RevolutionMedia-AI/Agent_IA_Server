@@ -1,6 +1,6 @@
 [build]
-builder = "RAILPACK"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-# Run start script via a shell so environment variables like $PORT are expanded
 startCommand = "sh -lc '/app/start.sh'"

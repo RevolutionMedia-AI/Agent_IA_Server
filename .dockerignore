@@ -1,0 +1,19 @@
+.git/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local env / config
+.env
+.env.local
+*.local
+
+# Data de usuario (passwords, tokens — NUNCA commitear)
+STT_server/data/
+
+# Dev logs
+test.err
+test.out
+uvicorn.err
+uvicorn.out
