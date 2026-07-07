@@ -192,6 +192,13 @@ class PasswordChange(BaseModel):
     new_password: str
 
 
+class ApiKeyUpdate(BaseModel):
+    """Body for PUT /settings/api-keys/{service}. credentials is an
+    opaque dict whose shape is defined per-service in API_KEY_SERVICES.
+    """
+    credentials: dict
+
+
 # ---------- /me (alias) ----------
 
 @api_router.get("/me")
@@ -459,3 +466,176 @@ def change_password(data: PasswordChange, auth: dict = Depends(require_auth)):
         _save(SESSIONS_FILE, sessions)
     invalidate_user_sessions(auth["user_id"])
     return {"success": True, "message": "Password updated. Please log in again."}
+
+
+# ---------- /settings/api-keys (per-user provider credentials) ----------
+# ----------------------------------------------------------------------------
+# El deployer pone OPENAI_API_KEY / ELEVENLABS_API_KEY / etc. en Railway como
+# defaults del sistema. Cada user final puede subir sus propias keys desde
+# Settings → API. La BE lee primero del storage del user y, si no hay,
+# hace fallback al env var. Asi un admin puede usar su key de OpenAI y
+# otro user del mismo deploy puede tener la suya sin tocarse.
+# ----------------------------------------------------------------------------
+
+API_KEY_SERVICES = [
+    {
+        "id": "openai",
+        "name": "OpenAI",
+        "description": "Powers the language model in voice calls and admin tools.",
+        "fields": [
+            {"name": "api_key", "label": "API Key", "type": "password", "placeholder": "sk-..."},
+        ],
+        "env_var": "OPENAI_API_KEY",
+    },
+    {
+        "id": "twilio",
+        "name": "Twilio",
+        "description": "Routes inbound and outbound phone calls.",
+        "fields": [
+            {"name": "account_sid",  "label": "Account SID",  "type": "text",     "placeholder": "AC..."},
+            {"name": "auth_token",   "label": "Auth Token",   "type": "password", "placeholder": ""},
+            {"name": "phone_number", "label": "Phone Number", "type": "text",     "placeholder": "+1..."},
+        ],
+        "env_var": None,  # multi-field, usa get_user_credentials
+    },
+    {
+        "id": "elevenlabs",
+        "name": "ElevenLabs",
+        "description": "Text-to-speech provider.",
+        "fields": [
+            {"name": "api_key", "label": "API Key", "type": "password"},
+        ],
+        "env_var": "ELEVENLABS_API_KEY",
+    },
+    {
+        "id": "deepgram",
+        "name": "Deepgram",
+        "description": "Speech-to-text provider.",
+        "fields": [
+            {"name": "api_key", "label": "API Key", "type": "password"},
+        ],
+        "env_var": "DEEPGRAM_API_KEY",
+    },
+    {
+        "id": "assemblyai",
+        "name": "AssemblyAI",
+        "description": "Speech-to-text provider (alternative to Deepgram).",
+        "fields": [
+            {"name": "api_key", "label": "API Key", "type": "password"},
+        ],
+        "env_var": "ASSEMBLYAI_API_KEY",
+    },
+    {
+        "id": "inworld",
+        "name": "Inworld",
+        "description": "Voice synthesis with character personas.",
+        "fields": [
+            {"name": "api_key", "label": "API Key", "type": "password"},
+        ],
+        "env_var": "INWORLD_API_KEY",
+    },
+]
+
+
+def get_user_credentials(user_id: str, service_id: str) -> dict:
+    """Returns the user's stored credentials for a service, or {}.
+
+    Looks up the user's tools_integrations row for the given service and
+    returns the credentials dict if connected. The caller decides which
+    field to use (or how to merge with env-var defaults).
+    """
+    tools = _load(TOOLS_FILE, [])
+    user_tool = next(
+        (t for t in tools
+         if t["id"] == service_id and t.get("user_id") == user_id),
+        None,
+    )
+    if user_tool and user_tool.get("connected") and user_tool.get("credentials"):
+        return user_tool["credentials"]
+    return {}
+
+
+def get_user_credential(user_id: str, service_id: str, env_var: str = None) -> str:
+    """Returns the primary credential string for a service.
+
+    Resolution order: per-user tools_integrations → env var → ''. For
+    services with a single API key (openai, elevenlabs, ...) returns
+    `credentials['api_key']` or `credentials['value']`. For multi-field
+    services (twilio) it returns `credentials['account_sid']` (or
+    `value`/`api_key` if Twilio is later collapsed).
+    """
+    creds = get_user_credentials(user_id, service_id)
+    for f in ("api_key", "value", "account_sid"):
+        if creds.get(f):
+            return creds[f]
+    if env_var:
+        return os.environ.get(env_var, "")
+    return ""
+
+
+@api_router.get("/settings/api-keys")
+def list_api_keys(auth: dict = Depends(require_auth)):
+    """Returns the catalog of available services with the user's connection status.
+
+    Does NOT return the actual credentials — only whether each one is
+    connected. The modal asks for empty fields, the user fills them,
+    the FE sends back the full dict as an opaque blob.
+    """
+    with _data_lock():
+        tools = _load(TOOLS_FILE, [])
+    configured_ids = {
+        t["id"] for t in tools
+        if t.get("user_id") == auth["user_id"] and t.get("connected")
+    }
+    return {
+        "services": [
+            {**svc, "connected": svc["id"] in configured_ids}
+            for svc in API_KEY_SERVICES
+        ]
+    }
+
+
+@api_router.put("/settings/api-keys/{service_id}")
+def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(require_auth)):
+    """Stores/updates the user's credentials for a service."""
+    if not any(s["id"] == service_id for s in API_KEY_SERVICES):
+        raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
+    if not body.credentials or not isinstance(body.credentials, dict):
+        raise HTTPException(status_code=400, detail="credentials object is required")
+    with _data_lock():
+        tools = _load(TOOLS_FILE, [])
+        existing = next(
+            (t for t in tools
+             if t["id"] == service_id and t.get("user_id") == auth["user_id"]),
+            None,
+        )
+        if existing:
+            existing["credentials"] = body.credentials
+            existing["connected"] = True
+            existing["connected_at"] = _now_iso()
+        else:
+            tools.append({
+                "id": service_id,
+                "user_id": auth["user_id"],
+                "connected": True,
+                "credentials": body.credentials,
+                "connected_at": _now_iso(),
+            })
+        _save(TOOLS_FILE, tools)
+    return {"success": True}
+
+
+@api_router.delete("/settings/api-keys/{service_id}")
+def delete_api_key(service_id: str, auth: dict = Depends(require_auth)):
+    """Disconnects a service for the user (falls back to env var default)."""
+    with _data_lock():
+        tools = _load(TOOLS_FILE, [])
+        before = len(tools)
+        tools = [
+            t for t in tools
+            if not (t["id"] == service_id and t.get("user_id") == auth["user_id"])
+        ]
+        if len(tools) == before:
+            raise HTTPException(status_code=404, detail="Key not configured")
+        _save(TOOLS_FILE, tools)
+    return {"success": True}
