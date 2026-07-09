@@ -806,27 +806,63 @@ def _test_gemini(creds: dict[str, str]) -> tuple[bool, str]:
 
 
 def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
-    """Hit MiniMax /v1/models with bearer auth — auth-protected, cheap."""
+    """Hit MiniMax /v1/models with bearer auth.
+
+    ponytail: MiniMax tiene varios endpoints publicos segun el tenant
+    (api.MiniMax.com, api.MiniMax.chat, MiniMax.com/v1/api/...). Pruebo
+    en orden hasta que alguno responda 200. Si ninguno anda, devuelvo
+    el body del ultimo response para que el usuario sepa QUE esta
+    pasando (el codigo 401 anterior era opaco).
+
+    Override con la env var MINIMAX_BASE_URL si tu tenant usa uno
+    personalizado.
+    """
     import urllib.error
     import urllib.request
     key = creds.get("api_key")
     if not key:
         return False, "api_key is required"
-    try:
-        # ponytail: real base URL is per-tenant in MiniMax; default to the
-        # public endpoint shipped by MiniMax. Set MINIMAX_BASE_URL in
-        # Railway if your tenant uses a regional endpoint.
-        base = os.environ.get("MINIMAX_BASE_URL", "https://api.MiniMax.chat/v1")
-        req = urllib.request.Request(
-            f"{base}/models",
-            headers={"Authorization": f"Bearer {key}"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200, f"HTTP {resp.status}"
-    except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code}"
-    except Exception as exc:
-        return False, str(exc)[:300]
+
+    candidate_bases = []
+    if os.environ.get("MINIMAX_BASE_URL"):
+        candidate_bases.append(os.environ["MINIMAX_BASE_URL"].rstrip("/"))
+    # Orden de preferencia: el endpoint estandar OpenAI-compatible.
+    candidate_bases.extend([
+        "https://api.MiniMax.com/v1",
+        "https://MiniMax.com/v1/api",
+        "https://api.MiniMax.chat/v1",
+        "https://MiniMax.com/v1",
+    ])
+
+    last_status = None
+    last_body = ""
+    last_url = ""
+    seen = set()
+    for base in candidate_bases:
+        if base in seen:
+            continue
+        seen.add(base)
+        url = f"{base}/models"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return True, f"HTTP {resp.status} via {base}"
+        except urllib.error.HTTPError as exc:
+            last_status = exc.code
+            last_url = base
+            try:
+                last_body = exc.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                last_body = "(no body)"
+            continue
+        except Exception as exc:
+            last_url = base
+            last_body = str(exc)[:200]
+            continue
+    return False, f"HTTP {last_status} via {last_url}: {last_body}"
 
 
 def _test_twilio(creds: dict[str, str]) -> tuple[bool, str]:
