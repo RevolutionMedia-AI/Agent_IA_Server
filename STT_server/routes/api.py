@@ -699,13 +699,30 @@ async def test_api_key(
     Returns ``{valid, message, source}`` where ``source`` is
     'inline' (caller-supplied) | 'user' | 'env' | 'none'.
     """
+    import logging
+    log = logging.getLogger("stt_server.test_endpoint")
+    has_inline = body is not None and isinstance(body.credentials, dict)
+    inline_key = body.credentials.get("api_key") if has_inline else None
+    log.warning(
+        "/test hit: service=%s has_body=%s body_type=%s has_key=%s key_len=%s key_preview=%s",
+        service_id,
+        body is not None,
+        type(body.credentials).__name__ if has_inline else "n/a",
+        inline_key is not None,
+        len(inline_key) if inline_key else 0,
+        (inline_key[:4] + "…" + inline_key[-4:]) if inline_key and len(inline_key) > 8 else "(too short or empty)",
+    )
     if get_provider_spec(service_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
-    inline_key = None
-    if body is not None and isinstance(body.credentials, dict):
-        inline_key = body.credentials.get("api_key") or None
     import asyncio as _aio
     result = await _aio.to_thread(test_provider, auth["user_id"], service_id, inline_key)
+    log.warning(
+        "/test result: service=%s source=%s valid=%s msg=%s",
+        service_id,
+        result.get("source"),
+        result.get("valid"),
+        (result.get("message") or "(none)")[:200],
+    )
     return result
 
 
