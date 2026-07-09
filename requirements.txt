@@ -12,3 +12,4 @@ websockets
 setuptools<81
 scipy>=1.17.1
 cryptography  # Fernet encryption for per-user provider credentials at rest
+psycopg2-binary  # Postgres driver. Optional — BE falls back to JSON files if DATABASE_URL is unset (local dev).

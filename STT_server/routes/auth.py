@@ -1,24 +1,34 @@
 """
 Rutas de autenticación para el servidor STT.
 Proporciona endpoints para registro, login, logout y gestión de usuarios.
+
+Storage: la persistencia de users + sessions va por dos caminos:
+  - DATABASE_URL seteado: Postgres (ver STT_server/db.py + db_users.py).
+  - DATABASE_URL ausente: fallback a JSON files (STT_server/data/*.json).
+Las funciones load_users / save_users / load_sessions / save_sessions
+se resuelven en db_users.py segun que backend este disponible.
 """
 
 import os
 import json
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Header, Body
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
-router = APIRouter(prefix="/auth", tags=["Autenticación"])
+# Import the storage shim. This rebinds load_users/save_users/etc
+# to the JSON or Postgres implementation based on DATABASE_URL.
+from STT_server.db_users import (
+    load_users,
+    save_users,
+    load_sessions,
+    save_sessions,
+)
 
-# ── Rutas de almacenamiento ──────────────────────────────────────────────────
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+router = APIRouter(prefix="/auth", tags=["Autenticación"])
 
 # ── Modelos Pydantic ─────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
@@ -42,26 +52,9 @@ class UserResponse(BaseModel):
     created_at: str
 
 # ── Funciones auxiliares ───────────────────────────────────────────────────────
-def ensure_data_dir():
-    """Crear directorio de datos si no existe."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-def load_users() -> list:
-    """Cargar usuarios desde el archivo JSON."""
-    ensure_data_dir()
-    if not os.path.exists(USERS_FILE):
-        return []
-    try:
-        with open(USERS_FILE, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return []
-
-def save_users(users: list):
-    """Guardar usuarios en el archivo JSON."""
-    ensure_data_dir()
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
+# load_users / save_users / load_sessions / save_sessions vienen de
+# STT_server.db_users (import arriba) y resuelven al backend Postgres
+# o JSON segun DATABASE_URL.
 
 def hash_password(password: str) -> str:
     """Hashear contraseña con SHA-256."""
@@ -75,22 +68,35 @@ def generate_token() -> str:
     """Generar token de sesión seguro."""
     return secrets.token_urlsafe(32)
 
-def load_sessions() -> dict:
-    """Cargar sesiones desde el archivo JSON."""
-    ensure_data_dir()
-    if not os.path.exists(SESSIONS_FILE):
-        return {}
-    try:
-        with open(SESSIONS_FILE, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
 
-def save_sessions(sessions: dict):
-    """Guardar sesiones en el archivo JSON."""
-    ensure_data_dir()
-    with open(SESSIONS_FILE, 'w') as f:
-        json.dump(sessions, f, indent=2)
+def _parse_expires(raw) -> datetime:
+    """Coerce the various shapes an expires_at can come in:
+      - JSON backend: ISO string (naive, no tz) like "2026-07-14T12:54:16.280444"
+      - Postgres backend: timezone-aware datetime via TIMESTAMPTZ
+      - None / missing: epoch-zero
+    Returns a datetime. When naive, treat as UTC (the JSON files always
+    wrote UTC, just without the suffix)."""
+    if raw is None:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    if isinstance(raw, str):
+        s = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    raise TypeError(f"unsupported expires_at: {type(raw).__name__}")
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def is_expired(expires_at_raw) -> bool:
+    return _now() > _parse_expires(expires_at_raw)
+
+
+# load_sessions / save_sessions vienen de STT_server.db_users (import
+# arriba) y resuelven al backend Postgres o JSON segun DATABASE_URL.
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -209,10 +215,12 @@ async def get_me(authorization: str = Header(None)):
         )
     
     session_data = sessions[token]
-    
-    # Verificar expiración
-    expires_at = datetime.fromisoformat(session_data['expires_at'])
-    if datetime.now() > expires_at:
+
+    # Verificar expiración. Tolerar naive/aware (JSON: naive UTC;
+    # Postgres: aware via TIMESTAMPTZ). El bug original era comparar
+    # naive <-> aware y romper el login cada vez que se cambiaba de
+    # backend. is_expires() normaliza ambos.
+    if is_expired(session_data.get('expires_at')):
         del sessions[token]
         save_sessions(sessions)
         raise HTTPException(
@@ -272,9 +280,8 @@ async def verify_token(authorization: str = Header(None)):
         return {"valid": False, "message": "Invalid token"}
     
     session_data = sessions[token]
-    expires_at = datetime.fromisoformat(session_data['expires_at'])
-    
-    if datetime.now() > expires_at:
+
+    if is_expired(session_data.get('expires_at')):
         return {"valid": False, "message": "Token expired"}
     
     return {"valid": True, "user_id": session_data['user_id']}
