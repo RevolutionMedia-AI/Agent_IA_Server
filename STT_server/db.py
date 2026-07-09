@@ -74,12 +74,18 @@ def _init_pool():
                 "Either set DATABASE_URL in the environment, or use the JSON "
                 "backend (don't call db.get_conn() when DATABASE_URL is unset)."
             )
-        # Lazy import — keeps the JSON-only deployments free of psycopg2.
-        import psycopg2
-        from psycopg2 import pool as pg_pool
-        log.warning("[db] connecting to Postgres: host=%s db=%s", url.split("@")[-1], url.split("/")[-1])
-        _pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=url)
-        return _pool
+    # Lazy import — keeps the JSON-only deployments free of psycopg2.
+    import psycopg2
+    from psycopg2 import pool as pg_pool
+    from psycopg2.extras import RealDictCursor
+    log.warning("[db] connecting to Postgres: host=%s db=%s", url.split("@")[-1], url.split("/")[-1])
+    # ponytail: RealDictCursor so fetchall() returns dicts and we can do
+    # row["id"] instead of row[0]. The plain cursor returned tuples,
+    # which made _row_to_user crash with "tuple indices must be integers".
+    _pool = pg_pool.ThreadedConnectionPool(
+        minconn=1, maxconn=10, dsn=url, cursor_factory=RealDictCursor,
+    )
+    return _pool
 
 
 @contextmanager
