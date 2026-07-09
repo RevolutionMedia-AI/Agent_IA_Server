@@ -26,10 +26,13 @@ from STT_server.services.credentials_resolver import (
     PROVIDER_CATALOG,
     get_provider_spec,
     is_provider_configured,
+    list_provider_models,
     resolve_provider,
     test_provider,
     validate_credentials,
 )
+
+VALID_MODEL_SERVICES = {"stt", "tts", "llm"}
 
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -174,6 +177,15 @@ class AgentCreate(BaseModel):
     description: Optional[str] = None
     tone: Optional[str] = None
     prompt: Optional[str] = None
+    # Per-service provider/model selection (New Agent flow).
+    # All optional — omitting them leaves the agent with the user's
+    # default provider config at call time.
+    stt_provider: Optional[str] = None
+    stt_model: Optional[str] = None
+    tts_provider: Optional[str] = None
+    tts_model: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
 
 
 class AgentUpdate(BaseModel):
@@ -185,6 +197,13 @@ class AgentUpdate(BaseModel):
     description: Optional[str] = None
     tone: Optional[str] = None
     prompt: Optional[str] = None
+    # Per-service provider/model selection (New Agent flow)
+    stt_provider: Optional[str] = None
+    stt_model: Optional[str] = None
+    tts_provider: Optional[str] = None
+    tts_model: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
 
 
 class PhoneNumberCreate(BaseModel):
@@ -277,6 +296,12 @@ def list_agents(auth: dict = Depends(require_auth)):
 
 @api_router.post("/agents")
 def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
+    # ponytail: validate provider ids BEFORE the agent hits disk so a
+    # typo'd "openai" doesn't quietly lie in agents.json forever.
+    for k in ("stt_provider", "tts_provider", "llm_provider"):
+        v = getattr(data, k)
+        if v and not get_provider_spec(v):
+            raise HTTPException(status_code=400, detail=f"Unknown provider '{v}'")
     with _data_lock():
         agents = _load(AGENTS_FILE, [])
         new_agent = {
@@ -299,6 +324,14 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
         for a in agents:
             if a["id"] == agent_id and a.get("user_id") == auth["user_id"]:
                 for k, v in data.dict(exclude_none=True).items():
+                    # ponytail: validate provider ids before they reach disk.
+                    # Cheap defense — no live API call, just catalog lookup.
+                    if k in {"stt_provider", "tts_provider", "llm_provider"}:
+                        if not get_provider_spec(v):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Unknown provider '{v}'",
+                            )
                     a[k] = v
                 _save(AGENTS_FILE, agents)
                 return a
@@ -665,4 +698,38 @@ async def test_api_key(service_id: str, auth: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
     import asyncio as _aio
     result = await _aio.to_thread(test_provider, auth["user_id"], service_id)
+    return result
+
+
+class ListModelsRequest(BaseModel):
+    """Body for POST /providers/models. The FE passes the API key the
+    user just typed in the New Agent modal. If absent, falls back to
+    the user's stored credential (per-user → env var).
+    """
+    service: str  # "stt" | "tts" | "llm"
+    provider: str
+    api_key: str | None = None
+
+
+@api_router.post("/providers/models")
+async def list_models(body: ListModelsRequest, auth: dict = Depends(require_auth)):
+    """Returns the catalog of models/voices for a (service, provider) pair.
+
+    Used by the New Agent modal — after the user picks a provider and
+    enters their API key, the FE calls this to populate the secondary
+    dropdown with that provider's actual models. Live fetches are done
+    server-side so we can swallow CORS / network failures and return a
+    graceful fallback.
+    """
+    if body.service not in VALID_MODEL_SERVICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"service must be one of {sorted(VALID_MODEL_SERVICES)}",
+        )
+    if get_provider_spec(body.provider) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{body.provider}'")
+    import asyncio as _aio
+    result = await _aio.to_thread(
+        list_provider_models, body.service, body.provider, body.api_key
+    )
     return result
