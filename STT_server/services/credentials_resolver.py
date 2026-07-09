@@ -833,26 +833,41 @@ def _test_twilio(creds: dict[str, str]) -> tuple[bool, str]:
         return False, str(exc)[:300]
 
 
-def test_provider(user_id: str | None, provider_id: str) -> dict:
+def test_provider(
+    user_id: str | None,
+    provider_id: str,
+    api_key: str | None = None,
+) -> dict:
     """Run the catalog-defined test_fn against the resolved credentials.
 
+    Priority order for the key:
+      1. ``api_key`` argument — what the FE just typed in the New Agent flow.
+      2. Per-user stored credential (``tools_integrations.json``).
+      3. System env-var fallback.
+
     Returns a dict with ``valid`` (bool), ``message`` (str) and
-    ``source`` ('user' | 'env' | 'none') so the FE can show where the
-    tested key came from.
+    ``source`` ('inline' | 'user' | 'env' | 'none') so the FE can show
+    where the tested key came from.
     """
     spec = get_provider_spec(provider_id)
     if spec is None:
         return {"valid": False, "message": f"Unknown service '{provider_id}'", "source": "none"}
 
-    creds = resolve_provider(user_id, provider_id)
-    if not creds:
-        return {"valid": False, "message": "No credentials configured for this user or system default.", "source": "none"}
-
-    # Did the active value come from per-user storage or env? Inspect raw
-    # storage vs env so the FE can show "using your key" vs "using system default".
-    per_user_keys = set(_read_per_user(user_id, provider_id).keys())
-    has_per_user = any(per_user_keys & creds.keys())
-    source = "user" if has_per_user else "env"
+    if api_key and api_key.strip():
+        # Caller passed an explicit key (New Agent flow). Use it directly,
+        # don't read from disk — the key is not necessarily persisted.
+        creds = {"api_key": api_key.strip()}
+        source = "inline"
+    else:
+        creds = resolve_provider(user_id, provider_id)
+        if not creds:
+            return {"valid": False, "message": "No credentials configured for this user or system default.", "source": "none"}
+        # Did the active value come from per-user storage or env? Inspect raw
+        # storage vs env so the FE can show "using your key" vs "using
+        # system default".
+        per_user_keys = set(_read_per_user(user_id, provider_id).keys())
+        has_per_user = any(per_user_keys & creds.keys())
+        source = "user" if has_per_user else "env"
 
     if not spec.test_fn:
         return {"valid": True, "message": "Format is valid. No live test available for this provider.", "source": source}

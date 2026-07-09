@@ -240,7 +240,7 @@ class ApiKeyUpdate(BaseModel):
     """Body for PUT /settings/api-keys/{service}. credentials is an
     opaque dict whose shape is defined per-service in API_KEY_SERVICES.
     """
-    credentials: dict
+    credentials: dict | None = None
 
 
 # ---------- /me (alias) ----------
@@ -685,19 +685,27 @@ def reveal_api_key(service_id: str, auth: dict = Depends(require_auth)):
 
 
 @api_router.post("/settings/api-keys/{service_id}/test")
-async def test_api_key(service_id: str, auth: dict = Depends(require_auth)):
-    """Live-validates the user's credentials for a service.
+async def test_api_key(
+    service_id: str,
+    body: ApiKeyUpdate | None = None,
+    auth: dict = Depends(require_auth),
+):
+    """Live-validates the credentials for a service.
 
-    Resolves the active key (per-user first, env-var fallback) and
-    pings the provider's cheapest auth-protected endpoint. Returns
-    ``{valid, message, source}`` where ``source`` is 'user' | 'env' |
-    'none'. The FE uses this for the "Test connection" button in the
-    Settings → API modal.
+    The New Agent modal passes the key the user just typed via
+    ``body.credentials.api_key``. Settings → API passes nothing and
+    we fall back to the per-user stored credential (or env-var).
+
+    Returns ``{valid, message, source}`` where ``source`` is
+    'inline' (caller-supplied) | 'user' | 'env' | 'none'.
     """
     if get_provider_spec(service_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
+    inline_key = None
+    if body is not None and isinstance(body.credentials, dict):
+        inline_key = body.credentials.get("api_key") or None
     import asyncio as _aio
-    result = await _aio.to_thread(test_provider, auth["user_id"], service_id)
+    result = await _aio.to_thread(test_provider, auth["user_id"], service_id, inline_key)
     return result
 
 
