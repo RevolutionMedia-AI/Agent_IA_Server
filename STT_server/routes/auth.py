@@ -211,26 +211,32 @@ async def login(user: UserLogin):
 @router.get("/me", response_model=UserResponse)
 async def get_me(authorization: str = Header(None)):
     """Obtener el usuario actual."""
+    import logging
+    log = logging.getLogger("stt_server.auth")
     if not authorization:
+        log.warning("/me: no Authorization header")
         raise HTTPException(
             status_code=401,
             detail="No se proporcionó token de autenticación"
         )
-    
+
     # Extraer token del header "Bearer <token>"
     if authorization.startswith("Bearer "):
         token = authorization[7:]
     else:
         token = authorization
-    
+
     sessions = load_sessions()
-    
+    log.warning("/me: token_prefix=%r session_count=%d has_token=%s",
+                token[:8] + '...', len(sessions), token in sessions)
+
     if token not in sessions:
+        log.warning("/me: token NOT in sessions")
         raise HTTPException(
             status_code=401,
             detail="Token inválido o expirado"
         )
-    
+
     session_data = sessions[token]
 
     # Verificar expiración. Tolerar naive/aware (JSON: naive UTC;
@@ -240,12 +246,14 @@ async def get_me(authorization: str = Header(None)):
     if is_expired(session_data.get('expires_at')):
         del sessions[token]
         save_sessions(sessions)
+        log.warning("/me: token EXPIRED. expires_at=%r", session_data.get('expires_at'))
         raise HTTPException(
             status_code=401,
             detail="Token expirado"
         )
-    
+
     users = load_users()
+    log.warning("/me: user_count=%d looking_for_id=%r", len(users), session_data.get('user_id'))
     for u in users:
         if u['id'] == session_data['user_id']:
             return UserResponse(
