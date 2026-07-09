@@ -255,6 +255,9 @@ async def get_me(authorization: str = Header(None)):
     users = load_users()
     log.warning("/me: user_count=%d looking_for_id=%r", len(users), session_data.get('user_id'))
     for u in users:
+        log.warning("/me: comparing ids: u.id=%r == session.user_id=%r match=%s",
+                    u.get('id'), session_data.get('user_id'),
+                    u.get('id') == session_data.get('user_id'))
         if u['id'] == session_data['user_id']:
             return UserResponse(
                 id=u['id'],
