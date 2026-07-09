@@ -693,6 +693,20 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
             if provider_id == "assemblyai":
                 return {"models": _HARDCODED_STT_MODELS["assemblyai"]}
             if provider_id == "openai":
+                # ponytail: fetch /v1/models live y filtrar transcribe/realtime
+                # en vez de hardcodear 3 modelos. Cuando OpenAI agregue uno
+                # nuevo, aparece automaticamente sin tocar codigo.
+                if creds:
+                    try:
+                        models = _fetch_openai_models(creds)
+                        stt = [m for m in models
+                               if "transcribe" in m["id"].lower()
+                               or "whisper" in m["id"].lower()
+                               or m["id"].startswith("gpt-4o-realtime")]
+                        if stt:
+                            return {"models": stt}
+                    except Exception:
+                        pass
                 return {"models": _HARDCODED_STT_MODELS["openai"]}
             if provider_id == "rime":
                 return {"models": _HARDCODED_STT_MODELS["rime"]}
