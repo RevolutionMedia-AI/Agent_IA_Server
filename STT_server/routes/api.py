@@ -132,30 +132,38 @@ def invalidate_user_sessions(user_id: str) -> None:
 def require_auth(authorization: str = Header(None)) -> dict:
     """Resolve Bearer token; raise 401 on failure.
 
-    Tries the in-memory cache first, falls back to sessions.json. Updates the
-    cache and persists expirations to disk on miss.
+    ponytail: usa la misma shim que /auth/login y /me. Antes leia
+    STT_server/data/sessions.json mientras el login guardaba en Postgres,
+    asi /me devolvia 200 pero /agents y /dashboard/stats (que usan
+    require_auth) devolvian 401. El setOnUnauthorized del AuthContext
+    se disparaba y el usuario quedaba kicked out aunque el login
+    habia sido exitoso.
+
+    La shim load_sessions() de STT_server.db_users decide sola
+    entre Postgres (si DATABASE_URL esta seteado) y JSON (fallback),
+    asi require_auth queda consistente con el resto del flow.
     """
+    from STT_server.db_users import load_sessions, save_sessions
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = authorization[len("Bearer "):]
-    cached = _cache_get(token)
-    if cached is not None:
-        return cached
-    with _data_lock():
-        sessions = _load(SESSIONS_FILE, {})
-        entry = sessions.get(token)
-        if not entry:
-            raise HTTPException(status_code=401, detail="Invalid token")
+    sessions = load_sessions()
+    entry = sessions.get(token)
+    if not entry:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    try:
+        expires_at = _parse_expires_at(entry["expires_at"])
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Token corrupted")
+    if datetime.now(timezone.utc) > expires_at:
+        # Best-effort delete; on Postgres the JSON fallback is a no-op.
         try:
-            expires_at = _parse_expires_at(entry["expires_at"])
-        except ValueError:
-            raise HTTPException(status_code=401, detail="Token corrupted")
-        if datetime.now(timezone.utc) > expires_at:
             sessions.pop(token, None)
-            _save(SESSIONS_FILE, sessions)
-            raise HTTPException(status_code=401, detail="Token expired")
-        _cache_put(token, entry)
-        return entry
+            save_sessions(sessions)
+        except Exception:
+            pass
+        raise HTTPException(status_code=401, detail="Token expired")
+    return entry
 
 
 def _get_user(user_id: str) -> Optional[dict]:
