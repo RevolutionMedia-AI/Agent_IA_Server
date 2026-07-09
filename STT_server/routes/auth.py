@@ -149,23 +149,40 @@ async def register(user: UserCreate):
 @router.post("/login", response_model=TokenResponse)
 async def login(user: UserLogin):
     """Iniciar sesión."""
+    import logging
+    log = logging.getLogger("stt_server.auth")
     users = load_users()
-    
+    log.warning("[auth] login attempt: email=%r user_count=%d", user.email, len(users))
+    if users:
+        # ponytail: log the first user's email so we can tell whether
+        # 'no match' is 'no user in DB' or 'wrong email'.
+        log.warning("[auth] first user in DB: email=%r", users[0].get('email'))
+
     # Buscar usuario
     found_user = None
     for u in users:
         if u.get('email') == user.email:
             found_user = u
             break
-    
+
     if not found_user:
+        log.warning("[auth] no user matches email=%r", user.email)
         raise HTTPException(
             status_code=401,
             detail="Credenciales inválidas"
         )
-    
-    # Verificar contraseña
-    if not verify_password(user.password, found_user.get('password', '')):
+
+    # Verificar contraseña. Logueamos explicitamente los hashes
+    # en juego para descartar silenciar el caso 'same hash different
+    # encoding' que ya nos mordio antes.
+    incoming_hash = hash_password(user.password)
+    stored_hash = found_user.get('password', '') or ''
+    log.warning("[auth] pw compare: incoming=%r len=%d  stored=%r len=%d  match=%s",
+                incoming_hash, len(incoming_hash),
+                stored_hash, len(stored_hash),
+                verify_password(user.password, stored_hash))
+    if not verify_password(user.password, stored_hash):
+        log.warning("[auth] WRONG PASSWORD for %r", user.email)
         raise HTTPException(
             status_code=401,
             detail="Credenciales inválidas"
