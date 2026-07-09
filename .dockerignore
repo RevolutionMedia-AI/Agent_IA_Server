@@ -9,11 +9,20 @@ __pycache__/
 .env.local
 *.local
 
-# Data de usuario (passwords, tokens — NUNCA commitear)
-STT_server/data/
-
 # Dev logs
 test.err
 test.out
 uvicorn.err
 uvicorn.out
+
+# ponytail: STT_server/data/ used to be excluded here ("NUNCA commitear")
+# to keep credential hashes out of the public repo, but that was over-
+# protective and bit us in prod: the deployed container had no users.json,
+# so login returned 401 for EVERYONE (the auth code calls load_users(),
+# gets [], no user matches).
+#
+# The hashes are already public in db/migrations/002_seed_admin.sql, so
+# excluding the data dir buys zero extra security. We ship it with the
+# image now. Future hardening: move the user store to Postgres and drop
+# the JSON files entirely.
+# STT_server/data/
