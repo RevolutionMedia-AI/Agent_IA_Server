@@ -180,10 +180,15 @@ async def media_stream(ws: WebSocket) -> None:
                         session.tts_provider = tenant.tts_provider
                         session.preferred_language = tenant.preferred_language
                         session.tenant_id = tenant_id
+                        # tenant.user_id was added in 003_tenant_user_link.sql.
+                        # Falls back to None for tenants created before that
+                        # migration — they keep using system env-var defaults.
+                        session.user_id = getattr(tenant, "user_id", None)
                         log.info(
-                            "[TENANT] Applied tenant %s config to session %s (prompt=%s, tts=%s, lang=%s)",
+                            "[TENANT] Applied tenant %s config to session %s (prompt=%s, tts=%s, lang=%s, user_id=%s)",
                             tenant_id, session.session_key,
                             bool(tenant.custom_prompt), tenant.tts_provider, tenant.preferred_language,
+                            session.user_id,
                         )
                     else:
                         log.warning("[TENANT] tenant_id=%s not found, using defaults", tenant_id)

@@ -10,7 +10,6 @@ import os
 import websockets
 
 from STT_server.config import (
-    RIME_API_KEY,
     RIME_TTS_MODEL_ID,
     RIME_TTS_SAMPLE_RATE,
     TTS_IDLE_TIMEOUT_SEC,
@@ -23,6 +22,7 @@ from STT_server.domain.language import (
     sanitize_tts_text,
 )
 from STT_server.domain.session import CallSession
+from STT_server.services.credentials_resolver import resolve_provider
 
 
 log = logging.getLogger("stt_server")
@@ -177,8 +177,11 @@ async def stream_tts_segment(
     emit_item,
 ) -> tuple[float | None, float]:
     """Stream TTS audio from Rime via WebSocket, emitting mulaw chunks as they arrive."""
-    if not RIME_API_KEY:
-        raise RuntimeError("RIME_API_KEY no configurada")
+    user_id = getattr(session, "user_id", None)
+    creds = resolve_provider(user_id, "rime")
+    api_key = creds.get("api_key")
+    if not api_key:
+        raise RuntimeError("RIME_API_KEY no configurada. Define la env var o sube tu key en Settings → API.")
 
     ttfb_ms: float | None = None
     started_at = time.perf_counter()
@@ -189,22 +192,32 @@ async def stream_tts_segment(
         if session.preferred_language
         else infer_supported_language_from_text(text, fallback="en")
     )
-    speaker = get_tts_model(tts_language)
-    lang_code = "eng" if normalize_supported_language(tts_language) == "en" else "spa"
+    # Per-user speaker override beats the system speaker map. The catalog
+    # exposes two fields (speaker_en / speaker_es) so bilingual users can
+    # pick a different voice for each language.
+    lang_norm = normalize_supported_language(tts_language)
+    if lang_norm == "en" and creds.get("speaker_en"):
+        speaker = creds["speaker_en"]
+    elif lang_norm == "es" and creds.get("speaker_es"):
+        speaker = creds["speaker_es"]
+    else:
+        speaker = get_tts_model(tts_language)
+    model_id = creds.get("model_id") or RIME_TTS_MODEL_ID
+    lang_code = "eng" if lang_norm == "en" else "spa"
 
     # Request 8 kHz directly so we avoid downsampling most of the time.
     sample_rate = RIME_TTS_SAMPLE_RATE
 
     log.debug(
         "[TTS] Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d text=%.40r",
-        speaker, RIME_TTS_MODEL_ID, lang_code, sample_rate, len(text), text[:40]
+        speaker, model_id, lang_code, sample_rate, len(text), text[:40]
     )
 
     # Rime WS3 requires ALL config as query params; message body is text-only.
     from urllib.parse import urlencode
     qs = urlencode({
         "speaker": speaker,
-        "modelId": RIME_TTS_MODEL_ID,
+        "modelId": model_id,
         "lang": lang_code,
         "audioFormat": "pcm",
         "samplingRate": str(sample_rate),
@@ -232,7 +245,7 @@ async def stream_tts_segment(
         pass
 
     extra_headers = {
-        "Authorization": f"Bearer {RIME_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
     }
 
     # --- Guardado de audio para análisis ---

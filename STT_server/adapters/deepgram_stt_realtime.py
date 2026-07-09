@@ -8,7 +8,6 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
-    DEEPGRAM_API_KEY,
     DEEPGRAM_STT_DETECT_LANGUAGE,
     DEEPGRAM_STT_ENDPOINTING_MS,
     DEEPGRAM_STT_KEYWORDS,
@@ -25,6 +24,7 @@ from STT_server.config import (
 )
 from STT_server.domain.language import infer_supported_language_from_text, normalize_deepgram_language, normalize_supported_language
 from STT_server.domain.session import CallSession
+from STT_server.services.credentials_resolver import resolve_provider
 
 
 log = logging.getLogger("stt_server")
@@ -172,8 +172,16 @@ async def deepgram_audio_sender(dg_ws, session: CallSession) -> None:
 
 
 async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> None:
-    if not DEEPGRAM_API_KEY:
+    # Per-user Deepgram key. If the user has nothing configured, we
+    # bail — the env-var default also returns empty and the rest of
+    # the pipeline knows to skip STT. Model override follows the same
+    # chain (per-user > DEEPGRAM_STT_MODEL env var).
+    user_id = getattr(session, "user_id", None)
+    creds = resolve_provider(user_id, "deepgram")
+    api_key = creds.get("api_key")
+    if not api_key:
         return
+    user_stt_model = creds.get("model") or None
 
     connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
     attempt = 0
@@ -200,18 +208,21 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
         received_any_result = False
         try:
             for params in build_deepgram_realtime_candidates(session.preferred_language):
+                # Apply per-user model override on top of the system default.
+                if user_stt_model and params.get("model") == DEEPGRAM_STT_MODEL:
+                    params = {**params, "model": user_stt_model}
                 url = build_deepgram_realtime_url_from_params(params)
                 try:
                     try:
                         realtime_connection = websockets.connect(
                             url,
-                            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                            additional_headers={"Authorization": f"Token {api_key}"},
                             **connect_kwargs,
                         )
                     except TypeError:
                         realtime_connection = websockets.connect(
                             url,
-                            extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                            extra_headers={"Authorization": f"Token {api_key}"},
                             **connect_kwargs,
                         )
 

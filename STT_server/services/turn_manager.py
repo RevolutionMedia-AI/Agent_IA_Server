@@ -279,6 +279,11 @@ async def stream_llm_reply_with_tts(
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, None, "text_segment_queue")
 
     llm_started = time.perf_counter()
+    # Resolve the per-user OpenAI client once and pass it to the streaming
+    # worker — the worker no longer touches session/global state, so two
+    # concurrent calls in the same process each see the right key.
+    from STT_server.adapters.openai_llm import _client_for_session
+    llm_client = _client_for_session(session)
     producer_task = asyncio.create_task(
         asyncio.to_thread(
             stream_llm_reply_sync,
@@ -287,6 +292,7 @@ async def stream_llm_reply_with_tts(
             emit_segment,
             emit_done,
             first_segment_event.set,
+            llm_client,
         )
     )
 

@@ -6,17 +6,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from STT_server.config import DEEPGRAM_API_KEY, DEEPGRAM_TTS_ENCODING, DEEPGRAM_TTS_SAMPLE_RATE
+from STT_server.config import DEEPGRAM_TTS_ENCODING, DEEPGRAM_TTS_SAMPLE_RATE
 from STT_server.domain.language import get_tts_model, infer_supported_language_from_text
 from STT_server.domain.session import CallSession
+from STT_server.services.credentials_resolver import resolve_provider
 
 
 log = logging.getLogger("stt_server")
 
 
 async def stream_tts_segment(session: CallSession, text: str, generation: int, emit_item) -> tuple[float | None, float]:
-    if not DEEPGRAM_API_KEY:
-        raise RuntimeError("Deepgram no configurado")
+    user_id = getattr(session, "user_id", None)
+    creds = resolve_provider(user_id, "deepgram")
+    api_key = creds.get("api_key")
+    if not api_key:
+        raise RuntimeError("Deepgram no configurado. Define DEEPGRAM_API_KEY o sube tu key en Settings → API.")
 
     loop = asyncio.get_running_loop()
     ttfb_ms: float | None = None
@@ -34,7 +38,7 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
     url = f"https://api.deepgram.com/v1/speak?{params}"
     payload = json.dumps({"text": text}).encode("utf-8")
     headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Authorization": f"Token {api_key}",
         "Content-Type": "application/json",
     }
 

@@ -8,7 +8,6 @@ import os
 import websockets
 
 from STT_server.config import (
-    ELEVENLABS_API_KEY,
     ELEVENLABS_TTS_MODEL_ID,
     ELEVENLABS_TTS_VOICE_ID,
     TTS_IDLE_TIMEOUT_SEC,
@@ -19,6 +18,7 @@ from STT_server.domain.language import (
     sanitize_tts_text,
 )
 from STT_server.domain.session import CallSession
+from STT_server.services.credentials_resolver import resolve_provider
 
 
 log = logging.getLogger("stt_server")
@@ -38,8 +38,17 @@ async def stream_tts_segment(
     which produces mu-law 8 kHz audio directly compatible with Twilio -- no
     resampling or mu-law encoding needed.
     """
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("ELEVENLABS_API_KEY no configurada")
+    user_id = getattr(session, "user_id", None)
+    creds = resolve_provider(user_id, "elevenlabs")
+    api_key = creds.get("api_key")
+    if not api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY no configurada. Define la env var o sube tu key en Settings → API.")
+
+    # Per-user voice_id and model_id override the system defaults. The
+    # adapter layer was already dispatching on session.tts_provider; the
+    # provider-specific knobs now come from the same per-user store.
+    voice_id = creds.get("voice_id") or ELEVENLABS_TTS_VOICE_ID
+    model_id = creds.get("model_id") or ELEVENLABS_TTS_MODEL_ID
 
     ttfb_ms: float | None = None
     started_at = time.perf_counter()
@@ -66,12 +75,12 @@ async def stream_tts_segment(
 
     # Build WebSocket URL with voice_id, output format, and model
     ws_url = (
-        f"{ELEVENLABS_WS_URL}/{ELEVENLABS_TTS_VOICE_ID}/stream-input"
-        f"?output_format=ulaw_8000&model_id={ELEVENLABS_TTS_MODEL_ID}"
+        f"{ELEVENLABS_WS_URL}/{voice_id}/stream-input"
+        f"?output_format=ulaw_8000&model_id={model_id}"
     )
 
     extra_headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
+        "xi-api-key": api_key,
     }
 
     # --- Guardado de audio para analisis ---

@@ -11,3 +11,4 @@ twilio
 websockets
 setuptools<81
 scipy>=1.17.1
+cryptography  # Fernet encryption for per-user provider credentials at rest

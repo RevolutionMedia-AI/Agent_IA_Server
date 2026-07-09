@@ -16,7 +16,20 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, Header, HTTPException, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from STT_server.security.credentials import (
+    encrypt_credentials, decrypt_credentials, decrypt_value,
+)
+from STT_server.services.credentials_resolver import (
+    PROVIDER_CATALOG,
+    get_provider_spec,
+    is_provider_configured,
+    resolve_provider,
+    test_provider,
+    validate_credentials,
+)
 
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -85,10 +98,22 @@ def _cache_get(token: str):
 
 def _cache_put(token: str, entry: dict) -> None:
     try:
-        expires_at = datetime.fromisoformat(entry["expires_at"].replace("Z", "+00:00"))
+        expires_at = _parse_expires_at(entry["expires_at"])
     except (ValueError, KeyError):
         return
     _session_cache[token] = {"entry": entry, "expires_at": expires_at}
+
+
+def _parse_expires_at(raw) -> datetime:
+    """Parse a stored expires_at value, tolerating both offset-aware and
+    naive ISO strings. Sessions written before the auth refactor don't
+    carry a timezone suffix, so we attach UTC defensively — the on-disk
+    clock was always UTC. Returns an aware datetime.
+    """
+    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def invalidate_session(token: str) -> None:
@@ -119,7 +144,7 @@ def require_auth(authorization: str = Header(None)) -> dict:
         if not entry:
             raise HTTPException(status_code=401, detail="Invalid token")
         try:
-            expires_at = datetime.fromisoformat(entry["expires_at"].replace("Z", "+00:00"))
+            expires_at = _parse_expires_at(entry["expires_at"])
         except ValueError:
             raise HTTPException(status_code=401, detail="Token corrupted")
         if datetime.now(timezone.utc) > expires_at:
@@ -475,102 +500,40 @@ def change_password(data: PasswordChange, auth: dict = Depends(require_auth)):
 # Settings → API. La BE lee primero del storage del user y, si no hay,
 # hace fallback al env var. Asi un admin puede usar su key de OpenAI y
 # otro user del mismo deploy puede tener la suya sin tocarse.
+#
+# El catalogo de proveedores vive en
+# STT_server.services.credentials_resolver.PROVIDER_CATALOG y es la unica
+# fuente de verdad. Anade ahi un nuevo ProviderSpec y FE + BE lo recogen.
 # ----------------------------------------------------------------------------
 
-API_KEY_SERVICES = [
-    {
-        "id": "openai",
-        "name": "OpenAI",
-        "description": "Powers the language model in voice calls and admin tools.",
-        "fields": [
-            {"name": "api_key", "label": "API Key", "type": "password", "placeholder": "sk-..."},
-        ],
-        "env_var": "OPENAI_API_KEY",
-    },
-    {
-        "id": "twilio",
-        "name": "Twilio",
-        "description": "Routes inbound and outbound phone calls.",
-        "fields": [
-            {"name": "account_sid",  "label": "Account SID",  "type": "text",     "placeholder": "AC..."},
-            {"name": "auth_token",   "label": "Auth Token",   "type": "password", "placeholder": ""},
-            {"name": "phone_number", "label": "Phone Number", "type": "text",     "placeholder": "+1..."},
-        ],
-        "env_var": None,  # multi-field, usa get_user_credentials
-    },
-    {
-        "id": "elevenlabs",
-        "name": "ElevenLabs",
-        "description": "Text-to-speech provider.",
-        "fields": [
-            {"name": "api_key", "label": "API Key", "type": "password"},
-        ],
-        "env_var": "ELEVENLABS_API_KEY",
-    },
-    {
-        "id": "deepgram",
-        "name": "Deepgram",
-        "description": "Speech-to-text provider.",
-        "fields": [
-            {"name": "api_key", "label": "API Key", "type": "password"},
-        ],
-        "env_var": "DEEPGRAM_API_KEY",
-    },
-    {
-        "id": "assemblyai",
-        "name": "AssemblyAI",
-        "description": "Speech-to-text provider (alternative to Deepgram).",
-        "fields": [
-            {"name": "api_key", "label": "API Key", "type": "password"},
-        ],
-        "env_var": "ASSEMBLYAI_API_KEY",
-    },
-    {
-        "id": "inworld",
-        "name": "Inworld",
-        "description": "Voice synthesis with character personas.",
-        "fields": [
-            {"name": "api_key", "label": "API Key", "type": "password"},
-        ],
-        "env_var": "INWORLD_API_KEY",
-    },
-]
-
-
-def get_user_credentials(user_id: str, service_id: str) -> dict:
-    """Returns the user's stored credentials for a service, or {}.
-
-    Looks up the user's tools_integrations row for the given service and
-    returns the credentials dict if connected. The caller decides which
-    field to use (or how to merge with env-var defaults).
-    """
-    tools = _load(TOOLS_FILE, [])
-    user_tool = next(
-        (t for t in tools
-         if t["id"] == service_id and t.get("user_id") == user_id),
-        None,
-    )
-    if user_tool and user_tool.get("connected") and user_tool.get("credentials"):
-        return user_tool["credentials"]
-    return {}
-
-
-def get_user_credential(user_id: str, service_id: str, env_var: str = None) -> str:
-    """Returns the primary credential string for a service.
-
-    Resolution order: per-user tools_integrations → env var → ''. For
-    services with a single API key (openai, elevenlabs, ...) returns
-    `credentials['api_key']` or `credentials['value']`. For multi-field
-    services (twilio) it returns `credentials['account_sid']` (or
-    `value`/`api_key` if Twilio is later collapsed).
-    """
-    creds = get_user_credentials(user_id, service_id)
-    for f in ("api_key", "value", "account_sid"):
-        if creds.get(f):
-            return creds[f]
-    if env_var:
-        return os.environ.get(env_var, "")
-    return ""
+def _serialize_provider(spec, user_id: str) -> dict:
+    """Render a ProviderSpec for the FE modal. Drops the test_fn path."""
+    fields = [
+        {
+            "name": f.name,
+            "label": f.label,
+            "type": f.type,
+            "placeholder": f.placeholder,
+            "required": f.required,
+            "pattern": f.pattern,
+            "min_length": f.min_length,
+            "max_length": f.max_length,
+            "help": f.help,
+        }
+        for f in spec.fields
+    ]
+    return {
+        "id": spec.id,
+        "name": spec.name,
+        "description": spec.description,
+        "category": spec.category,
+        "fields": fields,
+        # True if the user has a saved per-user key for this provider.
+        "connected": is_provider_configured(user_id, spec.id)
+                     and bool(resolve_provider(user_id, spec.id).get("api_key")
+                              or resolve_provider(user_id, spec.id).get("account_sid")),
+        "supports_test": bool(spec.test_fn),
+    }
 
 
 @api_router.get("/settings/api-keys")
@@ -578,30 +541,50 @@ def list_api_keys(auth: dict = Depends(require_auth)):
     """Returns the catalog of available services with the user's connection status.
 
     Does NOT return the actual credentials — only whether each one is
-    connected. The modal asks for empty fields, the user fills them,
-    the FE sends back the full dict as an opaque blob.
+    connected. The user can fetch the values explicitly via
+    GET /settings/api-keys/{service_id}/value.
     """
+    user_id = auth["user_id"]
     with _data_lock():
         tools = _load(TOOLS_FILE, [])
     configured_ids = {
         t["id"] for t in tools
-        if t.get("user_id") == auth["user_id"] and t.get("connected")
+        if t.get("user_id") == user_id and t.get("connected")
     }
-    return {
-        "services": [
-            {**svc, "connected": svc["id"] in configured_ids}
-            for svc in API_KEY_SERVICES
-        ]
-    }
+    services = []
+    for spec in PROVIDER_CATALOG:
+        item = _serialize_provider(spec, user_id)
+        # "connected" = the user has saved a per-user key for this service.
+        # System defaults don't count as "connected" — the FE renders those
+        # as "Using system default" instead of "Connected".
+        item["connected"] = spec.id in configured_ids
+        services.append(item)
+    return {"services": services}
 
 
 @api_router.put("/settings/api-keys/{service_id}")
 def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(require_auth)):
-    """Stores/updates the user's credentials for a service."""
-    if not any(s["id"] == service_id for s in API_KEY_SERVICES):
+    """Stores/updates the user's credentials for a service.
+
+    Values are validated against the per-field regex/length in the
+    provider catalog before encryption, so a typo returns a clean 400
+    instead of a confusing 401 from the upstream provider on the next call.
+    """
+    if get_provider_spec(service_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
     if not body.credentials or not isinstance(body.credentials, dict):
         raise HTTPException(status_code=400, detail="credentials object is required")
+
+    cleaned, errors = validate_credentials(service_id, body.credentials)
+    if errors:
+        # 422 keeps Pydantic semantics intact; the FE reads `errors` to
+        # highlight the offending input.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Validation failed", "errors": errors},
+        )
+
+    encrypted = encrypt_credentials(cleaned)
     with _data_lock():
         tools = _load(TOOLS_FILE, [])
         existing = next(
@@ -610,16 +593,16 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
             None,
         )
         if existing:
-            existing["credentials"] = body.credentials
-            existing["connected"] = True
-            existing["connected_at"] = _now_iso()
+            existing["credentials"] = encrypted
+            existing["connected"] = bool(encrypted)
+            existing["connected_at"] = _now_iso() if encrypted else None
         else:
             tools.append({
                 "id": service_id,
                 "user_id": auth["user_id"],
-                "connected": True,
-                "credentials": body.credentials,
-                "connected_at": _now_iso(),
+                "connected": bool(encrypted),
+                "credentials": encrypted,
+                "connected_at": _now_iso() if encrypted else None,
             })
         _save(TOOLS_FILE, tools)
     return {"success": True}
@@ -639,3 +622,47 @@ def delete_api_key(service_id: str, auth: dict = Depends(require_auth)):
             raise HTTPException(status_code=404, detail="Key not configured")
         _save(TOOLS_FILE, tools)
     return {"success": True}
+
+
+@api_router.get("/settings/api-keys/{service_id}/value")
+def reveal_api_key(service_id: str, auth: dict = Depends(require_auth)):
+    """Returns the user's decrypted credentials for a service.
+
+    This is the only endpoint that exposes plaintext values. It's only
+    accessible to the user who owns the credentials (auth check), and
+    is intended to be called explicitly when the user clicks a "show"
+    toggle in the FE. The list endpoint never returns the values.
+    """
+    if get_provider_spec(service_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
+    # Read directly from per-user storage (NOT the resolver — we don't
+    # want to leak system env-var values through the reveal endpoint).
+    with _data_lock():
+        tools = _load(TOOLS_FILE, [])
+    row = next(
+        (t for t in tools
+         if t["id"] == service_id and t.get("user_id") == auth["user_id"]
+         and t.get("connected") and t.get("credentials")),
+        None,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Key not configured")
+    creds = decrypt_credentials(row["credentials"])
+    return {"service": service_id, "credentials": creds}
+
+
+@api_router.post("/settings/api-keys/{service_id}/test")
+async def test_api_key(service_id: str, auth: dict = Depends(require_auth)):
+    """Live-validates the user's credentials for a service.
+
+    Resolves the active key (per-user first, env-var fallback) and
+    pings the provider's cheapest auth-protected endpoint. Returns
+    ``{valid, message, source}`` where ``source`` is 'user' | 'env' |
+    'none'. The FE uses this for the "Test connection" button in the
+    Settings → API modal.
+    """
+    if get_provider_spec(service_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
+    import asyncio as _aio
+    result = await _aio.to_thread(test_provider, auth["user_id"], service_id)
+    return result

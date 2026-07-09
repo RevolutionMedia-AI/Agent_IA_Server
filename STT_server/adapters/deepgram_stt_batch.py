@@ -15,7 +15,6 @@ _BATCH_RETRY_BASE_DELAY = 1.0  # seconds
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
-    DEEPGRAM_API_KEY,
     DEEPGRAM_STT_KEYWORDS,
     DEEPGRAM_STT_MODEL,
     DEEPGRAM_STT_NUMERALS,
@@ -30,6 +29,7 @@ from STT_server.domain.language import (
     normalize_deepgram_language,
     normalize_supported_language,
 )
+from STT_server.services.credentials_resolver import resolve_provider
 
 
 def pcm16_to_wav_bytes(pcm16_audio: bytes, sample_rate: int = TWILIO_SR, channels: int = TWILIO_CHANNELS) -> bytes:
@@ -71,16 +71,27 @@ def extract_deepgram_transcript(payload: dict, fallback_language: str | None = N
     return ([transcript] if transcript else []), detected_language or fallback
 
 
-def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tuple[list[str], str]:
-    if not DEEPGRAM_API_KEY:
-        raise RuntimeError("Deepgram no configurado. Define DEEPGRAM_API_KEY.")
+def transcribe_sync(
+    pcm16_audio: bytes,
+    language_hint: str | None = None,
+    user_id: str | None = None,
+) -> tuple[list[str], str]:
+    # Per-user Deepgram key. Falls back to the DEEPGRAM_API_KEY env var
+    # when no user_id is provided (test endpoints, admin tools).
+    creds = resolve_provider(user_id, "deepgram")
+    api_key = creds.get("api_key")
+    if not api_key:
+        raise RuntimeError("Deepgram no configurado. Define DEEPGRAM_API_KEY o sube tu key en Settings → API.")
 
     fallback_language = normalize_supported_language(language_hint or DEFAULT_CALL_LANGUAGE)
     if not pcm16_audio:
         return [], fallback_language
 
+    # Per-user model override; otherwise the system default.
+    stt_model = creds.get("model") or DEEPGRAM_STT_MODEL
+
     params = {
-        "model": DEEPGRAM_STT_MODEL,
+        "model": stt_model,
         "punctuate": str(DEEPGRAM_STT_PUNCTUATE).lower(),
         "smart_format": str(DEEPGRAM_STT_SMART_FORMAT).lower(),
         "numerals": str(DEEPGRAM_STT_NUMERALS).lower(),
@@ -101,7 +112,7 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
     url = f"https://api.deepgram.com/v1/listen?{qs}"
     wav_audio = pcm16_to_wav_bytes(pcm16_audio)
     headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Authorization": f"Token {api_key}",
         "Content-Type": "audio/wav",
         "Accept": "application/json",
     }
@@ -135,5 +146,9 @@ def transcribe_sync(pcm16_audio: bytes, language_hint: str | None = None) -> tup
     raise RuntimeError(f"Deepgram STT connection error after {_BATCH_MAX_RETRIES + 1} attempts: {last_exc}") from last_exc
 
 
-async def transcribe_block(pcm16_audio: bytes, language_hint: str | None = None) -> tuple[list[str], str]:
-    return await asyncio.to_thread(transcribe_sync, pcm16_audio, language_hint)
+async def transcribe_block(
+    pcm16_audio: bytes,
+    language_hint: str | None = None,
+    user_id: str | None = None,
+) -> tuple[list[str], str]:
+    return await asyncio.to_thread(transcribe_sync, pcm16_audio, language_hint, user_id)

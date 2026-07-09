@@ -18,7 +18,6 @@ from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     MAX_HISTORY_MESSAGES,
     MAX_RESPONSE_TOKENS,
-    OPENAI_API_KEY,
     OPENAI_REALTIME_MODEL,
     REALTIME_TTS_STREAMING,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
@@ -30,6 +29,7 @@ from STT_server.domain.language import (
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop
+from STT_server.services.credentials_resolver import resolve_provider
 
 
 log = logging.getLogger("stt_server")
@@ -79,13 +79,21 @@ def _build_instructions(session: CallSession) -> str:
 
 async def run_realtime_session(session: CallSession) -> None:
     """Connect to OpenAI Realtime and run for the lifetime of the call."""
-    if not OPENAI_API_KEY:
-        log.error("OPENAI_API_KEY not set — cannot start Realtime session")
+    user_id = getattr(session, "user_id", None)
+    creds = resolve_provider(user_id, "openai")
+    api_key = creds.get("api_key")
+    if not api_key:
+        log.error("OpenAI API key not configured (per-user or system) — cannot start Realtime session")
         return
 
-    url = f"{REALTIME_WS_URL}?model={OPENAI_REALTIME_MODEL}"
+    # Per-user realtime_model overrides the env-var default. The FE
+    # never sets a model that the OpenAI Realtime API doesn't accept —
+    # validated against the regex in the provider catalog.
+    model = creds.get("realtime_model") or OPENAI_REALTIME_MODEL
+
+    url = f"{REALTIME_WS_URL}?model={model}"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "OpenAI-Beta": "realtime=v1",
     }
 
@@ -109,9 +117,10 @@ async def run_realtime_session(session: CallSession) -> None:
 
         async with ws_connect as ws:
             log.info(
-                "OpenAI Realtime connected for %s model=%s",
+                "OpenAI Realtime connected for %s model=%s user_id=%s",
                 session.session_key,
-                OPENAI_REALTIME_MODEL,
+                model,
+                user_id,
             )
 
             # ── Configure session ──
