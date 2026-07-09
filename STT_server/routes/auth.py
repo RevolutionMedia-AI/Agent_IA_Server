@@ -311,3 +311,65 @@ async def health_check():
         "service": "auth",
         "timestamp": datetime.now().isoformat()
     }
+
+
+@router.get("/debug/auth-diag")
+async def debug_auth_diag():
+    """ponytail: one-shot diagnostic for the 401 the user is hitting.
+    Reads the admin row from whatever backend is active, prints the
+    stored hash, the hash the BE would compute, and whether they
+    match. Plus the users table columns. Wire to a curl so the user
+    can see the diagnostic without SSH access into the container.
+
+    Remove this endpoint once the auth issue is resolved.
+    """
+    import logging
+    log = logging.getLogger("stt_server.diag")
+    out = {"stage": "ok"}
+    try:
+        from STT_server.db_users import load_users
+        users = load_users()
+        out["user_count"] = len(users)
+        if users:
+            out["first_user"] = {
+                "id": users[0].get("id"),
+                "email": users[0].get("email"),
+                "role": users[0].get("role"),
+                "password_hash_len": len(users[0].get("password", "") or ""),
+            }
+        target_user = next(
+            (u for u in users if (u.get("email") or "").lower() == "admin@revolutionmedia.ai"),
+            None,
+        )
+        if target_user is None:
+            out["admin_row"] = "NOT_FOUND"
+        else:
+            stored = target_user.get("password") or ""
+            out["admin_row"] = {
+                "id": target_user.get("id"),
+                "email": target_user.get("email"),
+                "role": target_user.get("role"),
+                "stored_hash_first_8": stored[:8] if stored else "(empty)",
+                "stored_hash_len": len(stored),
+            }
+        from STT_server.db import is_postgres
+        if is_postgres():
+            from STT_server.db import get_conn
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_name = 'users' ORDER BY ordinal_position"
+                    )
+                    out["users_columns"] = [
+                        {"name": r["column_name"], "type": r["data_type"]}
+                        for r in cur.fetchall()
+                    ]
+        import hashlib
+        out["sha256_of_Adminrevolutionmedia@109"] = hashlib.sha256(b"Adminrevolutionmedia@109").hexdigest()
+        if target_user:
+            out["hash_matches"] = (target_user.get("password") or "") == out["sha256_of_Adminrevolutionmedia@109"]
+    except Exception as exc:
+        out["stage"] = "error"
+        out["error"] = repr(exc)
+    return out
