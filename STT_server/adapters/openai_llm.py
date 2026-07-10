@@ -659,3 +659,28 @@ def client_for_session(session: CallSession):
     except Exception:
         log.exception("[LLM] client_for_session failed for provider=%s", provider)
         return None
+
+
+# ponytail: /list-models is a debug endpoint (only behind
+# ENABLE_DEBUG_ENDPOINTS) that returns the catalog of OpenAI models
+# the system key can see. Was here in the previous version of this
+# file; the rewrite accidentally dropped it and the BE crashed on
+# import. Re-added as a thin async wrapper around the OpenAI SDK
+# list() call so STT_Server.py can keep its existing import.
+async def list_models() -> dict:
+    client = _default_openai_client()
+    if client is None:
+        return {"error": "OpenAI not configured"}
+
+    def sync_list() -> dict:
+        try:
+            models_page = client.models.list()
+            if hasattr(models_page, "data"):
+                models = [model.id for model in models_page.data]
+            else:
+                models = [model.id for model in models_page]
+            return {"models": models}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    return await asyncio.to_thread(sync_list)
