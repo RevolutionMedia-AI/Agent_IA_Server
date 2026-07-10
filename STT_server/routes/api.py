@@ -232,6 +232,12 @@ class PhoneNumberCreate(BaseModel):
     sip_host: Optional[str] = None
     sip_username: Optional[str] = None
     sip_password: Optional[str] = None
+    # WhatsApp Business API fields. WhatsApp needs a Meta-assigned
+    # phone_number_id (NOT the E.164 number) and a long-lived access
+    # token. Webhook URL + verify token are app-level config, not per
+    # number, so we don't accept them here.
+    whatsapp_phone_number_id: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
     label: Optional[str] = None
 
 
@@ -425,6 +431,10 @@ def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_au
             new_number["sip_username"] = data.sip_username
         if data.sip_password:
             new_number["sip_password"] = data.sip_password
+        if data.whatsapp_phone_number_id:
+            new_number["whatsapp_phone_number_id"] = data.whatsapp_phone_number_id
+        if data.whatsapp_access_token:
+            new_number["whatsapp_access_token"] = data.whatsapp_access_token
         numbers.append(new_number)
         _save(NUMBERS_FILE, numbers)
     return new_number
