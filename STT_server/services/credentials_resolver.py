@@ -97,7 +97,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="anthropic",
         name="Anthropic",
         category="llm",
-        description="Anthropic Claude models. Reserved for future use; the voice pipeline currently uses OpenAI.",
+        description="Anthropic Claude models (claude-3-5-sonnet, claude-3-5-haiku, claude-3-opus) via the Anthropic API.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -106,9 +106,15 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 min_length=20,
                 placeholder="sk-ant-...",
             ),
+            FieldSpec(
+                name="base_url", label="Base URL", type="text",
+                required=False,
+                placeholder="https://api.anthropic.com",
+                help="Required for custom-tenant / proxy endpoints. Leave empty to use the canonical api.anthropic.com.",
+            ),
         ),
-        env_fallbacks=(("ANTHROPIC_API_KEY", "api_key"),),
-        test_fn=None,
+        env_fallbacks=(("ANTHROPIC_API_KEY", "api_key"), ("ANTHROPIC_BASE_URL", "base_url")),
+        test_fn="STT_server.services.credentials_resolver._test_anthropic",
     ),
     ProviderSpec(
         id="gemini",
@@ -124,8 +130,14 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 placeholder="AIza...",
                 help="Google AI Studio API key. Starts with 'AIza'.",
             ),
+            FieldSpec(
+                name="base_url", label="Base URL", type="text",
+                required=False,
+                placeholder="https://generativelanguage.googleapis.com/v1beta",
+                help="Required for custom-tenant / proxy endpoints.",
+            ),
         ),
-        env_fallbacks=(("GEMINI_API_KEY", "api_key"),),
+        env_fallbacks=(("GEMINI_API_KEY", "api_key"), ("GEMINI_BASE_URL", "base_url")),
         test_fn="STT_server.services.credentials_resolver._test_gemini",
     ),
     ProviderSpec(
@@ -855,20 +867,59 @@ def _test_gemini(creds: dict[str, str]) -> tuple[bool, str]:
         return False, _sanitize_error(str(exc))[:300]
 
 
+def _test_anthropic(creds: dict[str, str]) -> tuple[bool, str]:
+    """Hit Anthropic's /v1/messages with a 1-token reply request. Cheap
+    (≤ 50 input tokens) and proves the key can authenticate.
+    """
+    import urllib.error
+    import urllib.request
+    import json
+    key = creds.get("api_key")
+    if not key:
+        return False, "api_key is required"
+    base = (creds.get("base_url") or "https://api.anthropic.com").rstrip("/")
+    try:
+        req = urllib.request.Request(
+            f"{base}/v1/messages",
+            data=json.dumps({
+                "model": "claude-3-5-haiku-20241022",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            body = "(no body)"
+        return False, f"HTTP {exc.code}: {body}"
+    except Exception as exc:
+        return False, _sanitize_error(str(exc))[:300]
+
+
 def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     """Hit MiniMax /v1/models with bearer auth.
 
-    ponytail: MiniMax tiene varios endpoints publicos segun el tenant
-    (api.MiniMax.com, api.MiniMax.chat, MiniMax.com/v1/api/...). Pruebo
-    en orden hasta que alguno responda 200. Si ninguno anda, devuelvo
-    el body del ultimo response para que el usuario sepa QUE esta
-    pasando (el codigo 401 anterior era opaco).
+    Resolution order:
+      1. creds["base_url"]   (user typed it in Settings → API)
+      2. MINIMAX_BASE_URL env (server-wide override)
+      3. The single canonical candidate: api.MiniMax.com/v1
 
-    Override con la env var MINIMAX_BASE_URL si tu tenant usa uno
-    personalizado. Si el usuario escribe una base_url en Settings → API
-    (creds["base_url"]), gana sobre cualquier otra fuente — eso es lo
-    que arregla el caso del plan token / coding donde ninguno de los
-    candidatos hardcoded aplica.
+    ponytail: previous versions carried four hardcoded candidates.
+    Two of them (`MiniMax.com/v1/api`, `MiniMax.com/v1`) looked like
+    placeholder strings that were never replaced with the real URLs —
+    they returned Network unreachable in production and just produced
+    a misleading error. Dropped in favor of the `base_url` override
+    path: if your tenant isn't on the canonical endpoint, set the URL
+    explicitly via Settings → API or the env var.
     """
     import urllib.error
     import urllib.request
@@ -876,24 +927,14 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     if not key:
         return False, "api_key is required"
 
-    candidate_bases = []
-    # ponytail: priority order — user-supplied base_url first, then env
-    # var, then hardcoded candidates. We dedupe with a seen set so a
-    # user who sets the same value in creds + env doesn't hit the same
-    # URL twice.
+    candidate_bases: list[str] = []
     creds_base = (creds.get("base_url") or "").strip().rstrip("/")
     if creds_base:
         candidate_bases.append(creds_base)
     env_base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
     if env_base and env_base != creds_base:
         candidate_bases.append(env_base)
-    # Orden de preferencia: el endpoint estandar OpenAI-compatible.
-    candidate_bases.extend([
-        "https://api.MiniMax.com/v1",
-        "https://MiniMax.com/v1/api",
-        "https://api.MiniMax.chat/v1",
-        "https://MiniMax.com/v1",
-    ])
+    candidate_bases.append("https://api.MiniMax.com/v1")
 
     last_status = None
     last_body = ""

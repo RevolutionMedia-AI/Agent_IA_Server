@@ -41,6 +41,16 @@ class CallSession:
     welcome_message: str | None = None
     # Per-session TTS provider: "elevenlabs" or "rime"
     tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
+    # ponytail: which LLM provider the agent picked. Mirrors the FE's
+    # llm_provider dropdown — read by openai_llm._client_for_session so
+    # the dispatch goes to OpenAI, MiniMax (OpenAI-compat with custom
+    # base_url), Anthropic or Gemini. Defaults to openai for backwards
+    # compat with tenants / agents that predate the field.
+    llm_provider: str = "openai"
+    # Concrete model id to send to that provider (gpt-4o-mini,
+    # claude-3-5-sonnet-20241022, gemini-1.5-pro, minimax, ...).
+    # Comes from the agent config at call start.
+    llm_model: str | None = None
     # Tenant ID this session belongs to (set when call comes from a configured tenant)
     tenant_id: str | None = None
     # Owning user — resolved from the tenant (or set by an admin tool call).

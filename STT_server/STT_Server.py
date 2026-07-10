@@ -289,6 +289,14 @@ async def media_stream(ws: WebSocket) -> None:
                     # ponytail: usage record needs to know which agent
                     # took this call so the per-agent totals are right.
                     session.agent_id = agent_cfg.get('id') or agent_id_from_params
+                    # LLM dispatch + model selection for this session.
+                    # Defaulting to "openai" keeps backwards compat with
+                    # any tenant/agent that doesn't set llm_provider.
+                    session.llm_provider = (agent_cfg.get('llm_provider') or 'openai').strip().lower()
+                    session.llm_model = (agent_cfg.get('llm_model') or None)
+                    if session.llm_model:
+                        log.info("[AGENT] session %s llm=%s model=%s",
+                                 session.session_key, session.llm_provider, session.llm_model)
                 if USE_OPENAI_REALTIME:
                     track_task(
                         session,
