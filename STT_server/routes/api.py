@@ -10,6 +10,7 @@ import json
 import uuid
 import re
 import hashlib
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, Header, HTTPException, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from STT_server.security.credentials import (
@@ -827,3 +828,55 @@ async def list_models(body: ListModelsRequest, auth: dict = Depends(require_auth
         list_provider_models, body.service, body.provider, body.api_key
     )
     return result
+
+
+class TtsPreviewRequest(BaseModel):
+    """Body for POST /tts/preview. The FE uses this to let the user
+    preview a TTS voice/model before saving the agent config."""
+    provider: str  # "elevenlabs" | "rime"
+    voice_id: str | None = None
+    model_id: str | None = None
+    text: str = "Hello, this is a preview of how I will sound on your calls."
+    api_key: str | None = None
+
+
+@api_router.post("/tts/preview")
+async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth)):
+    """Generate a short TTS sample and return mu-law 8 kHz audio bytes
+    (audio/mulaw content type, same format Twilio consumes). The FE plays
+    this in a regular <audio> element via a Blob URL.
+
+    Same code path the live call uses, so what the user hears in the
+    preview is what callers will hear in production.
+
+    Per-user API key is read from the user's stored credentials (falls
+    back to env var); if the FE just typed a new key in the modal, it
+    can pass it via `api_key` to override.
+    """
+    from STT_server.adapters.tts_preview import preview_tts
+    import asyncio as _aio
+    tts_log = logging.getLogger("stt_server.tts_preview")
+    creds = resolve_provider(auth["user_id"], body.provider) if auth["user_id"] else {}
+    user_key = (body.api_key or creds.get("api_key") or "").strip() or None
+    if not user_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{body.provider} API key not configured. Add it in Settings -> API or pass api_key in the request body.",
+        )
+    try:
+        audio_bytes = await preview_tts(
+            user_id=auth["user_id"],
+            provider=body.provider,
+            text=body.text,
+            voice_id=body.voice_id,
+            model_id=body.model_id,
+        )
+    except Exception as exc:
+        tts_log.error("tts_preview failed for provider=%s voice=%s: %s", body.provider, body.voice_id, exc)
+        raise HTTPException(status_code=502, detail=f"TTS preview failed: {exc}")
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail="TTS provider returned no audio. Check that the voice_id is valid for the selected provider.",
+        )
+    return Response(content=audio_bytes, media_type="audio/wav")
