@@ -493,6 +493,12 @@ _HARDCODED_STT_MODELS = {
         {"id": "best",  "name": "Best",  "description": "Highest accuracy, multilingual"},
         {"id": "nano",  "name": "Nano",  "description": "Lowest latency, lower accuracy"},
         {"id": "slam-1", "name": "SLAM-1", "description": "Streaming speech LM"},
+        # ponytail: Universal-Streaming family. Listed so the FE can
+        # attach per-model pricing; these names also match what the
+        # AssemblyAI docs publish today.
+        {"id": "universal-streaming",                "name": "Universal-Streaming",                "description": "English streaming, balanced"},
+        {"id": "universal-streaming-multilingual",   "name": "Universal-Streaming Multilingual",   "description": "Multilingual streaming"},
+        {"id": "universal-3.5-pro-realtime",         "name": "Universal-3.5 Pro Realtime",         "description": "Highest accuracy, realtime"},
     ],
     "openai": [
         {"id": "gpt-4o-transcribe",      "name": "GPT-4o Transcribe",      "description": "Latest OpenAI STT via Realtime API"},
