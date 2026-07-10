@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import uvicorn
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Depends, Request
@@ -216,6 +217,12 @@ async def media_stream(ws: WebSocket) -> None:
                 session.stream_sid = start.get("streamSid") or msg.get("streamSid")
                 if session.call_sid:
                     session.session_key = session.call_sid
+                # ponytail: usage tracking. wall-clock start so duration
+                # is real seconds, not monotonic. agent_id is set
+                # below from customParameters — initialise here so it's
+                # always defined even if no agent is configured.
+                session.started_at = time.time()
+                session.agent_id = None
 
                 # ── Apply tenant configuration ──
                 # Twilio sends custom <Parameter> values in start.customParameters
@@ -279,6 +286,9 @@ async def media_stream(ws: WebSocket) -> None:
                         session.welcome_message = agent_cfg['welcome_message']
                         log.info("[AGENT] Stored welcome_message for agent %s (len=%d)",
                                  agent_id_from_params, len(agent_cfg['welcome_message']))
+                    # ponytail: usage record needs to know which agent
+                    # took this call so the per-agent totals are right.
+                    session.agent_id = agent_cfg.get('id') or agent_id_from_params
                 if USE_OPENAI_REALTIME:
                     track_task(
                         session,

@@ -151,3 +151,12 @@ IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 TWIML_INITIAL_GREETING_ENABLED = os.getenv("TWIML_INITIAL_GREETING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "es").strip().lower()
 
+# ponytail: per-minute pricing in USD. Two tiers:
+# - own_key: the user is bringing their own provider credential, we just
+#   charge a platform fee for running the orchestration.
+# - platform_key: the user is using our provisioned credential, so the
+#   provider cost is baked into our rate.
+# Defaults are illustrative; tune via env when real billing lands.
+PRICE_OWN_KEY_PER_MIN = float(os.getenv("PRICE_OWN_KEY_PER_MIN", "0.07"))
+PRICE_PLATFORM_KEY_PER_MIN = float(os.getenv("PRICE_PLATFORM_KEY_PER_MIN", "0.14"))
+

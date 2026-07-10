@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
+import json
 import logging
+import os
 import time
 
 from fastapi import WebSocket
@@ -8,11 +10,38 @@ from fastapi import WebSocket
 from STT_server.config import IDLE_SILENCE_TIMEOUT_SEC
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_with_drop
+from STT_server.services.usage_store import has_user_stored_key, record_call
 
 
 log = logging.getLogger("stt_server")
 
 sessions: dict[str, CallSession] = {}
+
+# ponytail: agents.json lookup for the per-call usage record. We need
+# the agent's stt_provider/llm_provider (the session only carries
+# tts_provider); loading the whole file here is fine — it's small and
+# the lookup happens once per call end.
+_AGENTS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "data",
+    "agents.json",
+)
+
+
+def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]:
+    if not agent_id:
+        return (None, None)
+    try:
+        with open(_AGENTS_FILE, "r", encoding="utf-8") as f:
+            agents = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        return (None, None)
+    if not isinstance(agents, list):
+        return (None, None)
+    for a in agents:
+        if isinstance(a, dict) and a.get("id") == agent_id:
+            return (a.get("stt_provider"), a.get("llm_provider"))
+    return (None, None)
 
 
 def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:
@@ -30,6 +59,15 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
         return
 
     session.closed = True
+
+    # ponytail: write the per-call usage record BEFORE we lose the
+    # session data. The aggregation in /api/usage reads from this
+    # ledger, so dropping the write means the call is invisible to
+    # billing.
+    try:
+        _record_usage_for(session)
+    except Exception as exc:  # noqa: BLE001 — never crash cleanup on billing
+        log.warning("[usage] record failed for %s: %s", session.session_key, exc)
 
     with contextlib.suppress(Exception):
         await enqueue_with_drop(session.stt_audio_queue, None, "stt_audio_queue")
@@ -56,6 +94,37 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
         await ws.close()
     except Exception:
         pass
+
+
+def _record_usage_for(session: CallSession) -> None:
+    """Best-effort: write one usage row per call. Skipped silently
+    when there's no user_id (anonymous test calls) or no start ts.
+    """
+    user_id = session.user_id
+    if not user_id:
+        return
+    if session.started_at is None:
+        return
+    stt_provider, llm_provider = _load_agent_providers(session.agent_id)
+    providers = {
+        "stt": stt_provider,
+        "llm": llm_provider,
+        "tts": session.tts_provider,
+    }
+    used_platform = any(
+        p and not has_user_stored_key(user_id, p)
+        for p in providers.values()
+    )
+    record_call(
+        user_id=user_id,
+        agent_id=session.agent_id,
+        tenant_id=session.tenant_id,
+        call_sid=session.call_sid,
+        started_at=session.started_at,
+        ended_at=time.time(),
+        providers=providers,
+        used_platform_keys=used_platform,
+    )
 
 
 async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:

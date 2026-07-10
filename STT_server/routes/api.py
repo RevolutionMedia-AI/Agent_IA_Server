@@ -324,6 +324,36 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
     }
 
 
+# ---------- /usage (call-minutes + cost ledger) ----------
+
+@api_router.get("/usage")
+def usage_summary(auth: dict = Depends(require_auth)):
+    """Aggregated call-minutes + cost for the authenticated user.
+
+    Each call is recorded by session_runtime.cleanup_session with
+    duration, agent_id, the providers it used, and a flag for whether
+    it fell back to the platform key for any of those providers. Cost
+    is `duration_seconds / 60 * rate`, where the rate depends on the
+    own-vs-platform split (config.py).
+
+    Returns totals, per-agent breakdown, and the 50 most recent calls.
+    """
+    from STT_server.services.usage_store import aggregate_usage
+
+    # ponytail: build a name lookup once so the FE doesn't have to
+    # reconcile agent_id → name itself on every render.
+    agents = _load(AGENTS_FILE, [])
+    name_lookup = {
+        a.get("id"): a.get("name") or a.get("id")
+        for a in agents
+        if isinstance(a, dict) and a.get("id")
+    }
+    return aggregate_usage(
+        user_id=auth["user_id"],
+        agent_name_lookup=name_lookup,
+    )
+
+
 # ---------- /agents CRUD ----------
 
 @api_router.get("/agents")

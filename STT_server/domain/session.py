@@ -24,6 +24,13 @@ class CallSession:
     session_key: str
     call_sid: str | None = None
     stream_sid: str | None = None
+    # ponytail: usage tracking. started_at is wall-clock seconds since
+    # epoch, set when Twilio sends the `start` event. agent_id comes
+    # from the <Parameter name="agent_id" /> Twilio passes through
+    # customParameters. Both feed the per-call record written at
+    # cleanup_session time.
+    started_at: float | None = None
+    agent_id: str | None = None
     preferred_language: str = field(default_factory=lambda: DEFAULT_CALL_LANGUAGE)
     # Per-session custom system prompt (overrides default if set)
     custom_prompt: str | None = None
