@@ -106,10 +106,24 @@ async def interrupt_current_turn(session: CallSession) -> None:
 
 
 async def play_initial_greeting(session: CallSession) -> None:
-    # Initial greeting functionality removed — keep function as a no-op to
-    # preserve callers that may still schedule it.
-    log.debug("[PLAYBACK] play_initial_greeting skipped (initial greeting disabled)")
-    return
+    """Play the agent's welcome_message (set by media_stream at call start)
+    via the TTS pipeline so the caller hears the agent greet them first.
+    No-op if welcome_message is empty / not configured.
+    """
+    welcome = getattr(session, 'welcome_message', None)
+    if not welcome or not welcome.strip():
+        log.debug("[PLAYBACK] play_initial_greeting skipped (no welcome_message)")
+        return
+    log.info("[PLAYBACK] playing initial greeting (%d chars) for session=%s", len(welcome), session.session_key)
+    # Wait a moment for the audio stream to be established.
+    await asyncio.sleep(0.4)
+    # Generate the TTS via the session's configured TTS provider. The
+    # playback_loop will pick up the queued audio and stream it to Twilio.
+    from STT_server.services.turn_manager import run_tts_with_retries, enqueue_transcript_event
+    try:
+        await run_tts_with_retries(session, welcome.strip(), session.active_generation)
+    except Exception as exc:
+        log.warning("[PLAYBACK] initial greeting TTS failed: %s", exc)
 
 
 async def playback_loop(ws: WebSocket, session: CallSession) -> None:

@@ -1,10 +1,11 @@
 import asyncio
 import json
 import logging
+import os
+import re
 
 import uvicorn
-import os
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
@@ -84,12 +85,17 @@ if os.path.isdir(static_dir):
 
 
 @app.post("/voice")
-async def voice(tenant_id: str = Query(default=None)) -> Response:
+async def voice(
+    tenant_id: str = Query(default=None),
+    request: Request = None,
+) -> Response:
     """Twilio voice webhook. Accepts optional ?tenant_id= to link the call
     to a specific tenant's configuration (prompt, TTS provider, language, etc.).
 
-    When a tenant configures their webhook via /tenants/{id}/configure-webhook,
-    the URL includes ?tenant_id=... so incoming calls are automatically linked.
+    Also reads the form-encoded `To` field (the called number) and
+    looks up the matching phone number in phone_numbers.json. If it
+    has an agent linked, the agent_id is added to the stream's
+    custom parameters so media_stream can pick it up at call start.
     """
     ws_url = PUBLIC_URL.rstrip("/")
 
@@ -100,10 +106,52 @@ async def voice(tenant_id: str = Query(default=None)) -> Response:
     else:
         ws_url = "wss://" + ws_url
 
-    # Build the <Stream> element with optional tenant_id parameter
-    stream_params = ""
+    # Resolve agent_id from the called number (if any). Twilio POSTs
+    # the called number as form-encoded 'To' (E.164, like +15551234567).
+    # We look it up in phone_numbers.json and pass agent_id to the
+    # stream so media_stream can read it from customParameters and
+    # pull the per-agent prompt + welcome_message.
+    stream_params = []
     if tenant_id:
-        stream_params = f'<Parameter name="tenant_id" value="{tenant_id}" />'
+        stream_params.append(f'<Parameter name="tenant_id" value="{tenant_id}" />')
+
+    agent_id = None
+    try:
+        if request is not None:
+            form = await request.form()
+            called_to = form.get('To') or form.get('to')
+            if called_to:
+                e164 = str(called_to).strip()
+                numbers_path = os.path.join(
+                    os.path.dirname(__file__), 'data', 'phone_numbers.json'
+                )
+                if os.path.exists(numbers_path):
+                    with open(numbers_path, 'r', encoding='utf-8') as f:
+                        numbers = json.load(f) or []
+                    for n in numbers:
+                        # phone_numbers.json stores country ('+1') and
+                        # number ('5551234567') separately; full E.164 is
+                        # '+<country><number>'. Match either way for
+                        # robustness against future format changes.
+                        country = n.get('country') or ''
+                        number = n.get('number') or ''
+                        if not number:
+                            continue
+                        full_e164 = f"{country}{number}" if country else number
+                        if e164 == full_e164 or e164 == number or e164.endswith(number):
+                            agent_id = n.get('agent') or None
+                            log.info(
+                                "[VOICE] matched phone %s -> agent_id=%s",
+                                e164, agent_id
+                            )
+                            break
+    except Exception as exc:
+        log.warning("[VOICE] failed to look up phone number for agent: %s", exc)
+
+    if agent_id:
+        stream_params.append(f'<Parameter name="agent_id" value="{agent_id}" />')
+
+    stream_params_str = ''.join(stream_params)
 
     # If a static greeting file exists or the TWIML flag is enabled,
     # include a <Play> so Twilio plays the pre-recorded greeting before
@@ -195,6 +243,42 @@ async def media_stream(ws: WebSocket) -> None:
 
                 register_session(session)
                 log.info("callSid=%s streamSid=%s tenant_id=%s", session.call_sid, session.stream_sid, tenant_id)
+
+                # ── Apply agent config (system prompt + welcome message) ──
+                # ponytail: look up the agent via the agent_id we passed
+                # in customParameters from the voice() webhook. If found,
+                # the agent's prompt overrides the tenant's, and its
+                # welcome_message is stored on the session for the
+                # initial greeting scheduled below.
+                if isinstance(start.get('customParameters'), dict):
+                    agent_id_from_params = start['customParameters'].get('agent_id')
+                else:
+                    agent_id_from_params = None
+
+                agent_cfg = None
+                if agent_id_from_params:
+                    try:
+                        _agents_path = os.path.join(os.path.dirname(__file__), 'data', 'agents.json')
+                        with open(_agents_path, 'r', encoding='utf-8') as f:
+                            agents_list = json.load(f) or []
+                        for a in agents_list:
+                            if a.get('id') == agent_id_from_params:
+                                agent_cfg = a
+                                break
+                    except (FileNotFoundError, json.JSONDecodeError, IOError):
+                        pass
+
+                if agent_cfg:
+                    # Agent's system_prompt overrides the tenant's.
+                    if agent_cfg.get('prompt'):
+                        session.custom_prompt = agent_cfg['prompt']
+                        log.info("[AGENT] Overrode tenant prompt with agent %s prompt (len=%d)",
+                                 agent_id_from_params, len(agent_cfg['prompt']))
+                    # Stash the welcome_message for play_initial_greeting.
+                    if agent_cfg.get('welcome_message'):
+                        session.welcome_message = agent_cfg['welcome_message']
+                        log.info("[AGENT] Stored welcome_message for agent %s (len=%d)",
+                                 agent_id_from_params, len(agent_cfg['welcome_message']))
                 if USE_OPENAI_REALTIME:
                     track_task(
                         session,
@@ -212,7 +296,16 @@ async def media_stream(ws: WebSocket) -> None:
                         ),
                     )
                     track_task(session, asyncio.create_task(process_transcripts(session)))
-                # Initial greeting removed; do not schedule play_initial_greeting
+                # ponytail: if the agent has a welcome_message, schedule
+                # play_initial_greeting so the TTS speaks first. It's a
+                # no-op for agents without one (preserves the previous
+                # silent-start behavior).
+                if getattr(session, 'welcome_message', None):
+                    from STT_server.services.playback_service import play_initial_greeting
+                    track_task(
+                        session,
+                        asyncio.create_task(play_initial_greeting(session))
+                    )
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 continue
 

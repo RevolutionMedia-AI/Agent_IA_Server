@@ -27,6 +27,11 @@ class CallSession:
     preferred_language: str = field(default_factory=lambda: DEFAULT_CALL_LANGUAGE)
     # Per-session custom system prompt (overrides default if set)
     custom_prompt: str | None = None
+    # ponytail: the agent's welcome message, set on the session at
+    # call start if the linked phone number has an agent with one.
+    # played by play_initial_greeting() so the caller hears the
+    # agent speak first.
+    welcome_message: str | None = None
     # Per-session TTS provider: "elevenlabs" or "rime"
     tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
     # Tenant ID this session belongs to (set when call comes from a configured tenant)
