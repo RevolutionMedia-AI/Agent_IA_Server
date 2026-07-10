@@ -185,7 +185,12 @@ class AgentCreate(BaseModel):
     status: Optional[str] = "Active"
     description: Optional[str] = None
     tone: Optional[str] = None
+    # System prompt - injected into the LLM context at call time so the
+    # agent knows its role, rules, and customer-specific data.
     prompt: Optional[str] = None
+    # Welcome message - first thing the agent says when the call
+    # connects. Empty = the agent starts silently.
+    welcome_message: Optional[str] = None
     # Per-service provider/model selection (New Agent flow).
     # All optional — omitting them leaves the agent with the user's
     # default provider config at call time.
@@ -205,7 +210,12 @@ class AgentUpdate(BaseModel):
     status: Optional[str] = None
     description: Optional[str] = None
     tone: Optional[str] = None
+    # System prompt — gets injected into the LLM context at call time
+    # so the agent knows its role, rules, and customer-specific data.
     prompt: Optional[str] = None
+    # Welcome message — first thing the agent says when the call
+    # connects. Empty = the agent starts silently (caller speaks first).
+    welcome_message: Optional[str] = None
     # Per-service provider/model selection (New Agent flow)
     stt_provider: Optional[str] = None
     stt_model: Optional[str] = None
