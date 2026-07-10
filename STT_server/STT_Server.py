@@ -297,12 +297,27 @@ async def media_stream(ws: WebSocket) -> None:
                     if session.llm_model:
                         log.info("[AGENT] session %s llm=%s model=%s",
                                  session.session_key, session.llm_provider, session.llm_model)
-                if USE_OPENAI_REALTIME:
+                    # ponytail: STT dispatch — per-session, not global.
+                    # Default falls back to the previous global behaviour
+                    # (openai_realtime when USE_OPENAI_REALTIME, else
+                    # deepgram) so existing deployments keep working.
+                    session.stt_provider = (
+                        (agent_cfg.get('stt_provider') or '').strip().lower()
+                        or ('openai_realtime' if USE_OPENAI_REALTIME else 'deepgram')
+                    )
+                    session.stt_model = (agent_cfg.get('stt_model') or None)
+                    log.info("[AGENT] session %s stt=%s model=%s",
+                             session.session_key, session.stt_provider, session.stt_model or '-')
+                if session.stt_provider == 'openai_realtime':
                     track_task(
                         session,
                         asyncio.create_task(run_realtime_session(session)),
                     )
                 else:
+                    # ponytail: non-openai STT currently routes through
+                    # Deepgram. Future providers (assemblyai, rime, ...)
+                    # join this branch once their adapters are in place;
+                    # the dispatcher lives in adapters/stt_dispatcher.py.
                     track_task(
                         session,
                         asyncio.create_task(

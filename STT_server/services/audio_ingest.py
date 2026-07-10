@@ -18,7 +18,6 @@ from STT_server.config import (
     PRE_SPEECH_FRAMES,
     SPEECH_START_FRAMES,
     TWILIO_SR,
-    USE_OPENAI_REALTIME,
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_with_drop
@@ -47,7 +46,11 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
     log.debug(f"[VAD] Audio recibido: len={len(raw)} bytes, sample_rate={TWILIO_SR}, channels=1, frame_dur_ms={FRAME_DURATION_MS}")
 
     # Route audio to the active STT backend
-    if USE_OPENAI_REALTIME:
+    # ponytail: per-session routing. session.stt_provider is set in
+    # STT_Server.py from the agent config (with USE_OPENAI_REALTIME as
+    # the default when unset). CallSession sets the attribute lazily
+    # so we guard with getattr for sessions that pre-date the change.
+    if getattr(session, "stt_provider", "openai_realtime") == "openai_realtime":
         target_queue = session.realtime_audio_queue
         queue_name = "realtime_audio_queue"
     elif DEEPGRAM_API_KEY:
