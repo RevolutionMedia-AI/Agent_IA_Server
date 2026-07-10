@@ -803,19 +803,31 @@ async def test_api_key(
     log = logging.getLogger("stt_server.test_endpoint")
     has_inline = body is not None and isinstance(body.credentials, dict)
     inline_key = body.credentials.get("api_key") if has_inline else None
+    # ponytail: forward optional base_url alongside the api_key so the
+    # MiniMax validator can hit a token-plan / coding-plan endpoint
+    # that isn't in its hardcoded candidate list. The Settings modal
+    # surfaces this as a free-text field under the API Key.
+    inline_base_url = body.credentials.get("base_url") if has_inline else None
     log.warning(
-        "/test hit: service=%s has_body=%s body_type=%s has_key=%s key_len=%s key_preview=%s",
+        "/test hit: service=%s has_body=%s body_type=%s has_key=%s key_len=%s key_preview=%s has_base_url=%s",
         service_id,
         body is not None,
         type(body.credentials).__name__ if has_inline else "n/a",
         inline_key is not None,
         len(inline_key) if inline_key else 0,
         (inline_key[:4] + "…" + inline_key[-4:]) if inline_key and len(inline_key) > 8 else "(too short or empty)",
+        bool(inline_base_url and inline_base_url.strip()),
     )
     if get_provider_spec(service_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
     import asyncio as _aio
-    result = await _aio.to_thread(test_provider, auth["user_id"], service_id, inline_key)
+    result = await _aio.to_thread(
+        test_provider,
+        auth["user_id"],
+        service_id,
+        inline_key,
+        (inline_base_url or "").strip() or None,
+    )
     log.warning(
         "/test result: service=%s source=%s valid=%s msg=%s",
         service_id,

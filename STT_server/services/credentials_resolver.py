@@ -141,8 +141,19 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 placeholder="ey...",
                 help="MiniMax API key. Format varies by tier.",
             ),
+            # ponytail: optional base URL override. MiniMax has multiple
+            # public endpoints depending on the user's plan (token plan
+            # vs coding plan vs subscription) and tenant. Without this,
+            # validate tries 4 hardcoded candidates and gives up if none
+            # match. With it, we hit exactly the URL the user expects.
+            FieldSpec(
+                name="base_url", label="Base URL", type="text",
+                required=False,
+                placeholder="https://api.MiniMax.com/v1",
+                help="Required for token-plan / coding-plan / custom-tenant endpoints. Leave empty to use the standard candidates.",
+            ),
         ),
-        env_fallbacks=(("MINIMAX_API_KEY", "api_key"),),
+        env_fallbacks=(("MINIMAX_API_KEY", "api_key"), ("MINIMAX_BASE_URL", "base_url")),
         test_fn="STT_server.services.credentials_resolver._test_minimax",
     ),
     ProviderSpec(
@@ -854,7 +865,10 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     pasando (el codigo 401 anterior era opaco).
 
     Override con la env var MINIMAX_BASE_URL si tu tenant usa uno
-    personalizado.
+    personalizado. Si el usuario escribe una base_url en Settings → API
+    (creds["base_url"]), gana sobre cualquier otra fuente — eso es lo
+    que arregla el caso del plan token / coding donde ninguno de los
+    candidatos hardcoded aplica.
     """
     import urllib.error
     import urllib.request
@@ -863,8 +877,16 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
         return False, "api_key is required"
 
     candidate_bases = []
-    if os.environ.get("MINIMAX_BASE_URL"):
-        candidate_bases.append(os.environ["MINIMAX_BASE_URL"].rstrip("/"))
+    # ponytail: priority order — user-supplied base_url first, then env
+    # var, then hardcoded candidates. We dedupe with a seen set so a
+    # user who sets the same value in creds + env doesn't hit the same
+    # URL twice.
+    creds_base = (creds.get("base_url") or "").strip().rstrip("/")
+    if creds_base:
+        candidate_bases.append(creds_base)
+    env_base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+    if env_base and env_base != creds_base:
+        candidate_bases.append(env_base)
     # Orden de preferencia: el endpoint estandar OpenAI-compatible.
     candidate_bases.extend([
         "https://api.MiniMax.com/v1",
@@ -926,6 +948,7 @@ def test_provider(
     user_id: str | None,
     provider_id: str,
     api_key: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Run the catalog-defined test_fn against the resolved credentials.
 
@@ -933,6 +956,11 @@ def test_provider(
       1. ``api_key`` argument — what the FE just typed in the New Agent flow.
       2. Per-user stored credential (``tools_integrations.json``).
       3. System env-var fallback.
+
+    ``base_url`` is the parallel override for providers whose test_fn
+    needs to hit a custom endpoint (MiniMax token plan / coding plan).
+    Same priority order: caller > per-user > env. Both are forwarded
+    into the creds dict that the test_fn consumes.
 
     Returns a dict with ``valid`` (bool), ``message`` (str) and
     ``source`` ('inline' | 'user' | 'env' | 'none') so the FE can show
@@ -946,6 +974,8 @@ def test_provider(
         # Caller passed an explicit key (New Agent flow). Use it directly,
         # don't read from disk — the key is not necessarily persisted.
         creds = {"api_key": api_key.strip()}
+        if base_url and base_url.strip():
+            creds["base_url"] = base_url.strip()
         source = "inline"
     else:
         creds = resolve_provider(user_id, provider_id)
