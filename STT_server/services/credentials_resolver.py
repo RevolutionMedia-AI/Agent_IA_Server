@@ -920,6 +920,11 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     a misleading error. Dropped in favor of the `base_url` override
     path: if your tenant isn't on the canonical endpoint, set the URL
     explicitly via Settings → API or the env var.
+
+    DNS failures (`Name or service not known`, errno -2) are reported
+    distinctly from HTTP failures so the FE can tell the user "this
+    URL is unreachable from our network" instead of misleading them
+    with an opaque "HTTP None via ..." message.
     """
     import urllib.error
     import urllib.request
@@ -939,6 +944,7 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     last_status = None
     last_body = ""
     last_url = ""
+    last_kind = "http"  # "http" | "dns" | "network"
     seen = set()
     for base in candidate_bases:
         if base in seen:
@@ -955,6 +961,7 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
         except urllib.error.HTTPError as exc:
             last_status = exc.code
             last_url = base
+            last_kind = "http"
             try:
                 last_body = exc.read().decode("utf-8", errors="replace")[:200]
             except Exception:
@@ -962,8 +969,22 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
             continue
         except Exception as exc:
             last_url = base
-            last_body = _sanitize_error(str(exc))[:200]
+            msg = _sanitize_error(str(exc))
+            last_body = msg[:200]
+            # ponytail: errno -2 (EAI_NONAME) is "Name or service not
+            # known" — pure DNS failure, not auth. Report it distinctly
+            # so the FE doesn't render "HTTP None via ..." which makes
+            # the user think their key is bad when the real problem
+            # is that the host doesn't resolve from this container.
+            if "Name or service not known" in msg or "No such host" in msg:
+                last_kind = "dns"
+            else:
+                last_kind = "network"
             continue
+    if last_kind == "dns":
+        return False, f"DNS unreachable: {last_url} (hostname doesn't resolve from this server)"
+    if last_kind == "network":
+        return False, f"Network error via {last_url}: {last_body}"
     return False, f"HTTP {last_status} via {last_url}: {last_body}"
 
 
