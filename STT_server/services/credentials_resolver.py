@@ -716,7 +716,7 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
 
         return {"models": [], "error": f"Unknown service '{service}'"}
     except Exception as exc:
-        return {"models": [], "error": str(exc)[:300]}
+        return {"models": [], "error": _sanitize_error(str(exc))[:300]}
 
 
 # ── Connection test helpers (used by /test endpoint) ────────────────────────
@@ -725,6 +725,39 @@ def _import(path: str):
     module_name, _, attr = path.rpartition(".")
     mod = __import__(module_name, fromlist=[attr])
     return getattr(mod, attr)
+
+
+def _sanitize_error(message: str) -> str:
+    """Redact any API-key-like substrings from an error message.
+
+    ponytail: the OpenAI Python SDK (and Anthropic, Google, etc.)
+    include the first/last few characters of the key in their error
+    responses for debugging. We don't want the user to see that in
+    the FE. Match common key shapes and replace with `***`. The
+    rest of the message (HTTP code, endpoint hint, retry advice) is
+    preserved so the user still gets useful feedback.
+    """
+    if not message:
+        return message
+    import re as _re
+    # OpenAI: sk-..., sk-proj-..., sk-svcacct-...
+    # Match the prefix + at least 8 chars (a real key is 40+; this
+    # threshold just avoids false positives on things like 'sk-abc'
+    # in error text).
+    msg = _re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "sk-***", message)
+    # Anthropic: sk-ant-...
+    msg = _re.sub(r"\bsk-ant-[A-Za-z0-9_\-]{8,}", "sk-ant-***", msg)
+    # Google: AIza... real keys are 39 chars total; allow {15,} after
+    # the prefix to catch truncated strings (the original OpenAI /
+    # Google message often masks the key leaving only ~19 chars).
+    msg = _re.sub(r"\bAIza[A-Za-z0-9_\-]{15,}", "AIza***", msg)
+    # Generic Bearer/Basic tokens in URLs or messages
+    msg = _re.sub(r"(?i)(bearer|basic)\s+[A-Za-z0-9_\-\.=]{12,}", r"\1 ***", msg)
+    # Long hex/alnum blobs that look like raw keys (30+ chars in a row,
+    # with a word boundary so we don't redact normal text). Real API
+    # keys are 32+ chars; 30 gives a small buffer.
+    msg = _re.sub(r"\b[A-Za-z0-9_\-]{30,}\b", "***", msg)
+    return msg
 
 
 def _test_openai(creds: dict[str, str]) -> tuple[bool, str]:
@@ -744,7 +777,7 @@ def _test_openai(creds: dict[str, str]) -> tuple[bool, str]:
         first = next(iter(page), None)
         return True, "ok" if first is not None else "no models returned"
     except Exception as exc:
-        return False, str(exc)[:300]
+        return False, _sanitize_error(str(exc))[:300]
 
 
 def _test_deepgram(creds: dict[str, str]) -> tuple[bool, str]:
@@ -764,7 +797,7 @@ def _test_deepgram(creds: dict[str, str]) -> tuple[bool, str]:
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except Exception as exc:
-        return False, str(exc)[:300]
+        return False, _sanitize_error(str(exc))[:300]
 
 
 def _test_elevenlabs(creds: dict[str, str]) -> tuple[bool, str]:
@@ -784,7 +817,7 @@ def _test_elevenlabs(creds: dict[str, str]) -> tuple[bool, str]:
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except Exception as exc:
-        return False, str(exc)[:300]
+        return False, _sanitize_error(str(exc))[:300]
 
 
 def _test_gemini(creds: dict[str, str]) -> tuple[bool, str]:
@@ -802,7 +835,7 @@ def _test_gemini(creds: dict[str, str]) -> tuple[bool, str]:
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except Exception as exc:
-        return False, str(exc)[:300]
+        return False, _sanitize_error(str(exc))[:300]
 
 
 def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
@@ -860,7 +893,7 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
             continue
         except Exception as exc:
             last_url = base
-            last_body = str(exc)[:200]
+            last_body = _sanitize_error(str(exc))[:200]
             continue
     return False, f"HTTP {last_status} via {last_url}: {last_body}"
 
@@ -880,7 +913,7 @@ def _test_twilio(creds: dict[str, str]) -> tuple[bool, str]:
         account = client.api.accounts(sid).fetch()
         return True, f"account status: {account.status}"
     except Exception as exc:
-        return False, str(exc)[:300]
+        return False, _sanitize_error(str(exc))[:300]
 
 
 def test_provider(
@@ -930,5 +963,5 @@ def test_provider(
     try:
         ok, message = fn(creds)
     except Exception as exc:
-        ok, message = False, str(exc)[:300]
+        ok, message = False, _sanitize_error(str(exc))[:300]
     return {"valid": bool(ok), "message": message, "source": source}
