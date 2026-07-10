@@ -8,6 +8,7 @@ without breaking the route contracts.
 import os
 import json
 import uuid
+import re
 import hashlib
 import threading
 import time
@@ -218,7 +219,19 @@ class PhoneNumberCreate(BaseModel):
     provider: str = "twilio"
     country: str = "+1"
     number: str
+    label: Optional[str] = None
     agent: Optional[str] = None
+    # ponytail: credenciales de Twilio opcionales. Si el provider es
+    # 'twilio' o 'sip' y se pasan, se validan y guardan en el record
+    # del phone number (asi cada number puede usar credenciales distintas
+    # si el user lo necesita). Si no se pasan, el record queda sin
+    # credenciales y el runtime tendra que caer al global.
+    twilio_account_sid: Optional[str] = None
+    twilio_auth_token: Optional[str] = None
+    # SIP trunk fields
+    sip_host: Optional[str] = None
+    sip_username: Optional[str] = None
+    sip_password: Optional[str] = None
     label: Optional[str] = None
 
 
@@ -368,6 +381,21 @@ def list_phone_numbers(auth: dict = Depends(require_auth)):
 
 @api_router.post("/phone-numbers")
 def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
+    # ponytail: validate Twilio creds server-side too. Client should
+    # validate but never trust it — el regex del FE es solo UX hint.
+    if data.provider in ("twilio", "sip"):
+        if data.twilio_account_sid is not None and data.twilio_account_sid != "":
+            if not re.match(r"^AC[0-9a-fA-F]{32}$", data.twilio_account_sid):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Twilio Account SID must start with 'AC' followed by 32 hex characters",
+                )
+        if data.twilio_auth_token is not None and data.twilio_auth_token != "":
+            if len(data.twilio_auth_token) < 32 or len(data.twilio_auth_token) > 64:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Twilio Auth Token must be 32-64 characters",
+                )
     with _data_lock():
         numbers = _load(NUMBERS_FILE, [])
         formatted = _format_phone_number(data.country, data.number)
@@ -384,6 +412,19 @@ def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_au
             "status": "Active",
             "created_at": _now_iso(),
         }
+        # ponytail: store provider creds if provided. Optional - we
+        # don't require them at create-time (the runtime will fall back
+        # to env-var if missing) but if the user provided them, we save.
+        if data.twilio_account_sid:
+            new_number["twilio_account_sid"] = data.twilio_account_sid
+        if data.twilio_auth_token:
+            new_number["twilio_auth_token"] = data.twilio_auth_token
+        if data.sip_host:
+            new_number["sip_host"] = data.sip_host
+        if data.sip_username:
+            new_number["sip_username"] = data.sip_username
+        if data.sip_password:
+            new_number["sip_password"] = data.sip_password
         numbers.append(new_number)
         _save(NUMBERS_FILE, numbers)
     return new_number
