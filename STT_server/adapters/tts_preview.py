@@ -11,6 +11,10 @@ from __future__ import annotations
 import io
 import logging
 import wave
+import asyncio
+import json
+import urllib.parse
+import urllib.request
 from typing import Optional
 
 import numpy as np
@@ -73,6 +77,74 @@ async def preview_tts(
     elif provider == "rime":
         from STT_server.adapters.rime_tts import stream_tts_segment
         await stream_tts_segment(session, text, 0, _collect)
+    elif provider == "openai":
+        # ponytail: OpenAI TTS preview. We don't have a streaming
+        # adapter (the live call path is a future feature); the
+        # preview hits /v1/audio/speech once and converts the raw
+        # PCM16 LE 24 kHz response to mu-law 8 kHz via the helpers
+        # rime_tts already ships. Inline-key wins over stored.
+        if not inline_key:
+            raise RuntimeError("OpenAI API key not configured.")
+        body = json.dumps({
+            "model": model_id or "tts-1",
+            "input": text,
+            "voice": voice_id or "alloy",
+            "response_format": "pcm",  # raw PCM16 LE mono @ 24 kHz
+            "speed": 1.0,
+        }).encode("utf-8")
+
+        def _oai_fetch() -> bytes:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/audio/speech",
+                data=body,
+                headers={"Authorization": f"Bearer {inline_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return resp.read()
+
+        try:
+            pcm_bytes = await asyncio.to_thread(_oai_fetch)
+        except Exception as exc:
+            log.warning("[tts_preview] provider=openai fetch failed: %s", exc)
+            raise
+        from STT_server.adapters.rime_tts import _pcm16_bytes_to_mulaw_8k
+        mulaw, _ = _pcm16_bytes_to_mulaw_8k(pcm_bytes, 24000)
+        if mulaw:
+            chunks.append(mulaw)
+    elif provider == "deepgram":
+        # ponytail: Deepgram TTS preview. We bypass deepgram_tts.py
+        # (its stream_tts_segment ignores inline keys) and POST
+        # /v1/speak directly with mu-law/8000/container=none, the
+        # exact params the live call uses. The response is already
+        # mu-law 8 kHz so no conversion is needed.
+        if not inline_key:
+            raise RuntimeError("Deepgram API key not configured.")
+        params = urllib.parse.urlencode({
+            "model": model_id or "aura-asteria-en",
+            "encoding": "mulaw",
+            "sample_rate": "8000",
+            "container": "none",
+        })
+        body = json.dumps({"text": text}).encode("utf-8")
+        url = f"https://api.deepgram.com/v1/speak?{params}"
+
+        def _dg_fetch() -> bytes:
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Authorization": f"Token {inline_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return resp.read()
+
+        try:
+            raw = await asyncio.to_thread(_dg_fetch)
+        except Exception as exc:
+            log.warning("[tts_preview] provider=deepgram fetch failed: %s", exc)
+            raise
+        if raw:
+            chunks.append(bytes(raw))
     else:
         # ponytail: validation-only path. Providers without a
         # streaming adapter (Inworld today, future ones) still need
