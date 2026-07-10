@@ -142,9 +142,9 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
     ),
     ProviderSpec(
         id="minimax",
-        name="MiniMax (MiniMax)",
+        name="MiniMax",
         category="llm",
-        description="MiniMax (formerly MiniMax AI) chat completions. Picked as the agent's LLM in Settings → New Agent.",
+        description="MiniMax chat completions (MiniMax-M3, MiniMax-M2.7, MiniMax-M2.5). OpenAI-compatible API at api.minimax.io.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -538,10 +538,15 @@ _HARDCODED_STT_MODELS = {
 
 _HARDCODED_LLM_MODELS = {
     "minimax": [
-        {"id": "minimax",        "name": "MiniMax",        "description": "Default MiniMax chat model"},
-        {"id": "minimax-v1",     "name": "MiniMax v1",     "description": "Stable v1 release"},
-        {"id": "abab6.5s-chat",  "name": "abab6.5s-chat",  "description": "MiniMax abab6.5s series"},
-        {"id": "abab5.5-chat",   "name": "abab5.5-chat",   "description": "MiniMax abab5.5 series"},
+        # ponytail: real model IDs from api.minimax.io/v1/models.
+        # The previous catalog (minimax / minimax-v1 / abab*) was
+        # placeholder names that the dev had typed while waiting on
+        # access to the real MiniMax API. Replaced with the IDs the
+        # /v1/models endpoint actually returns, otherwise the FE
+        # dropdown would ship model ids the LLM rejects.
+        {"id": "MiniMax-M3",   "name": "MiniMax-M3",   "description": "Latest MiniMax model"},
+        {"id": "MiniMax-M2.7", "name": "MiniMax-M2.7", "description": "Mid-tier MiniMax model"},
+        {"id": "MiniMax-M2.5", "name": "MiniMax-M2.5", "description": "Smaller / cheaper MiniMax model"},
     ],
     "anthropic": [
         {"id": "claude-3-5-sonnet-20241022", "name": "Claude 3.5 Sonnet", "description": "Latest balanced model"},
@@ -911,15 +916,14 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     Resolution order:
       1. creds["base_url"]   (user typed it in Settings → API)
       2. MINIMAX_BASE_URL env (server-wide override)
-      3. The single canonical candidate: api.MiniMax.com/v1
+      3. The single canonical candidate: api.minimax.io/v1
 
-    ponytail: previous versions carried four hardcoded candidates.
-    Two of them (`MiniMax.com/v1/api`, `MiniMax.com/v1`) looked like
-    placeholder strings that were never replaced with the real URLs —
-    they returned Network unreachable in production and just produced
-    a misleading error. Dropped in favor of the `base_url` override
-    path: if your tenant isn't on the canonical endpoint, set the URL
-    explicitly via Settings → API or the env var.
+    ponytail: previous versions carried placeholder hostnames
+    (`api.MiniMax.com`, `MiniMax.com/v1/api`, etc.) that never
+    resolved from production. The real MiniMax API is at
+    api.minimax.io (OpenAI-compatible, all lowercase). If your
+    tenant needs a custom endpoint, set the URL explicitly via
+    Settings → API or the env var.
 
     DNS failures (`Name or service not known`, errno -2) are reported
     distinctly from HTTP failures so the FE can tell the user "this
@@ -939,7 +943,7 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     env_base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
     if env_base and env_base != creds_base:
         candidate_bases.append(env_base)
-    candidate_bases.append("https://api.MiniMax.com/v1")
+    candidate_bases.append("https://api.minimax.io/v1")
 
     last_status = None
     last_body = ""

@@ -25,7 +25,7 @@ _client_cache: dict[str, object] = {}
 
 _DEFAULT_BASE_URLS = {
     "openai":    "",                            # SDK default
-    "minimax":   "https://api.MiniMax.com/v1",  # OpenAI-compat endpoint
+    "minimax":   "https://api.minimax.io/v1",   # OpenAI-compat endpoint
     "anthropic": "https://api.anthropic.com",
     "gemini":    "https://generativelanguage.googleapis.com/v1beta",
 }
