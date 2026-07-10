@@ -16,7 +16,7 @@ from typing import Optional
 import numpy as np
 
 from STT_server.domain.session import CallSession
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_provider, test_provider
 
 log = logging.getLogger("stt_server.tts_preview")
 
@@ -27,18 +27,27 @@ async def preview_tts(
     text: str,
     voice_id: Optional[str] = None,
     model_id: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> bytes:
     """Run a single TTS call and return the raw mu-law 8 kHz audio bytes.
 
     `voice_id` and `model_id` come from the agent's per-user config or
     the per-provider defaults. `text` should be short (1-2 sentences)
     so the preview is fast.
+
+    `api_key` (optional) lets the FE inline a fresh key for the test
+    without going through the persisted credential. Same priority as
+    the test endpoint: caller-supplied > stored > env.
     """
     # Build a synthetic session with the user's resolved TTS config.
     # `stream_tts_segment` reads credentials via resolve_provider(user_id,
     # provider) so we don't need to set anything beyond what the
     # resolution path expects.
-    creds = resolve_provider(user_id, provider) if user_id else {}
+    inline_key = api_key.strip() if api_key and api_key.strip() else None
+    if inline_key:
+        creds = {"api_key": inline_key}
+    else:
+        creds = resolve_provider(user_id, provider) if user_id else {}
     session = CallSession(session_key="preview")
     session.user_id = user_id
     session.tts_provider = provider
@@ -65,7 +74,29 @@ async def preview_tts(
         from STT_server.adapters.rime_tts import stream_tts_segment
         await stream_tts_segment(session, text, 0, _collect)
     else:
-        raise ValueError(f"Unsupported TTS provider for preview: {provider!r}")
+        # ponytail: validation-only path. Providers without a
+        # streaming adapter (Inworld today, future ones) still need
+        # a working /tts/preview so the FE can confirm "your key
+        # works against this provider's catalog endpoint and the
+        # text you typed was received". We hit the provider's
+        # catalog/auth check, then return a tiny silent WAV as
+        # placeholder audio. The FE renders a "preview not
+        # available for this provider" message instead of the audio.
+        try:
+            result = test_provider(user_id, provider, inline_key)
+            if not result.get("valid"):
+                raise RuntimeError(result.get("message") or "validation failed")
+            log.info(
+                "[tts_preview] provider=%s validation-only OK (text=%d chars, voice=%s, model=%s)",
+                provider, len(text or ""), voice_id or "-", model_id or "-",
+            )
+        except Exception as exc:
+            log.warning("[tts_preview] provider=%s validation failed: %s", provider, exc)
+            raise
+        # 1 second of mu-law silence = 0xFF byte repeated. Wrapped
+        # in PCM16 WAV so the FE <audio> can decode it on every
+        # browser.
+        return _wrap_mulaw_as_wav_pcm16(b'\xff' * 8000)
 
     mulaw_bytes = b"".join(chunks)
     return _wrap_mulaw_as_wav_pcm16(mulaw_bytes)

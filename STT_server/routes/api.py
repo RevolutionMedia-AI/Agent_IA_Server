@@ -912,6 +912,7 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
             text=body.text,
             voice_id=body.voice_id,
             model_id=body.model_id,
+            api_key=body.api_key,
         )
     except Exception as exc:
         tts_log.error("tts_preview failed for provider=%s voice=%s: %s", body.provider, body.voice_id, exc)
