@@ -145,6 +145,26 @@ async def preview_tts(
             raise
         if raw:
             chunks.append(bytes(raw))
+    elif provider == "inworld":
+        # ponytail: Inworld TTS preview. Asks the non-streaming
+        # /tts/v1/voice for MULAW@8k; the bytes Inworld returns go
+        # straight to the WAV wrapper with no conversion. Live
+        # streaming path lives in adapters/inworld_tts.py and shares
+        # the same audioConfig.
+        if not inline_key:
+            raise RuntimeError("Inworld API key not configured.")
+        from STT_server.adapters.inworld_tts import fetch_preview as _iw_fetch
+
+        def _iw_run() -> bytes:
+            return _iw_fetch(text, voice_id or "", model_id or "", inline_key)
+
+        try:
+            mulaw = await asyncio.to_thread(_iw_run)
+        except Exception as exc:
+            log.warning("[tts_preview] provider=inworld fetch failed: %s", exc)
+            raise
+        if mulaw:
+            chunks.append(bytes(mulaw))
     else:
         # ponytail: validation-only path. Providers without a
         # streaming adapter (Inworld today, future ones) still need

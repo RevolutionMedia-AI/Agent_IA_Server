@@ -68,6 +68,10 @@ async def stream_tts_segment(
         from STT_server.adapters.rime_tts import stream_tts_segment as _rime
         return await _rime(session, text, generation, emit_item)
 
+    if provider == "inworld":
+        from STT_server.adapters.inworld_tts import stream_tts_segment as _inworld
+        return await _inworld(session, text, generation, emit_item)
+
     # ponytail: HTTP-only providers (no streaming adapter) get an inline
     # implementation here. They collect one response and emit it as a
     # single chunk - latency is dominated by the provider's first byte

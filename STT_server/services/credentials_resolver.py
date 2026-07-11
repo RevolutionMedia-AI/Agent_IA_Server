@@ -501,6 +501,16 @@ _HARDCODED_TTS_VOICES = {
         {"id": "aura-orion-en",   "name": "Orion (en)",   "description": "Male, narrative"},
         {"id": "aura-athena-en",  "name": "Athena (en)",  "description": "Female, professional"},
     ],
+    # ponytail: Inworld TTS voice catalog is intentionally tiny here.
+    # The full list is fetched via GET /voice/v1/voices (Inworld Voice
+    # API) once we wire that call into list_provider_models. Until
+    # then we ship the doc-example voice (Dennis) and one default so
+    # the FE dropdown is never empty. If the user picks a different
+    # voice in the API and types the id directly, it still works
+    # because the live path forwards voiceId as-is.
+    "inworld": [
+        {"id": "Dennis",          "name": "Dennis",       "description": "Inworld stock voice (docs example)"},
+    ],
 }
 
 _HARDCODED_STT_MODELS = {
@@ -709,8 +719,9 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_TTS_VOICES["deepgram"]}
             if provider_id == "inworld":
-                return {"models": _HARDCODED_TTS_VOICES.get("elevenlabs", [])}
-                # Inworld has no canonical voice catalog publicly; reuse curated list.
+                return {"models": _HARDCODED_TTS_VOICES["inworld"]}
+                # ponytail: stock catalog above. Future: fetch the live
+                # list from GET /voice/v1/voices and merge.
             return {"models": []}
 
         if service == "stt":
