@@ -9,7 +9,6 @@ from STT_server.config import (
     ASSISTANT_ECHO_IGNORE_MS,
     BARGE_IN_MIN_RMS,
     WEBRTC_VAD_MODE,
-    DEEPGRAM_API_KEY,
     ENABLE_BARGE_IN,
     END_SILENCE_FRAMES,
     FRAME_DURATION_MS,
@@ -50,15 +49,16 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
     # STT_Server.py from the agent config (with USE_OPENAI_REALTIME as
     # the default when unset). CallSession sets the attribute lazily
     # so we guard with getattr for sessions that pre-date the change.
+    # Deepgram, Inworld, and any other bidirectional-WS STT share
+    # stt_audio_queue and the per-adapter conversion happens inside
+    # the adapter (mulaw -> LINEAR16 for Inworld, mulaw passthrough
+    # for Deepgram).
     if getattr(session, "stt_provider", "openai_realtime") == "openai_realtime":
         target_queue = session.realtime_audio_queue
         queue_name = "realtime_audio_queue"
-    elif DEEPGRAM_API_KEY:
+    else:
         target_queue = session.stt_audio_queue
         queue_name = "stt_audio_queue"
-    else:
-        target_queue = None
-        queue_name = ""
 
     if target_queue is not None:
         if session.assistant_speaking:

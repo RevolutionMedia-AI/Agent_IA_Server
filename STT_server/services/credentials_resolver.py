@@ -542,7 +542,12 @@ _HARDCODED_STT_MODELS = {
         {"id": "mist-v2", "name": "Mist v2", "description": "Rime STT default"},
     ],
     "inworld": [
-        {"id": "inworld-default", "name": "Inworld Default", "description": "Inworld ASR default model"},
+        # ponytail: real Inworld model id per
+        # https://docs.inworld.ai/stt/overview. The placeholder
+        # `inworld-default` we used to ship was rejected by the
+        # /stt/v1/transcribe:streamBidirectional handshake.
+        {"id": "inworld/inworld-stt-1", "name": "Inworld STT-1",
+         "description": "Inworld first-party STT, 30 languages, voice profile + turn detection"},
     ],
 }
 

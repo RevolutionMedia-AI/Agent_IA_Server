@@ -16,7 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from STT_server.routes.auth import router as auth_router
 from STT_server.routes.api import api_router, require_auth
 
-from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt
+from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt as run_deepgram_realtime_stt
+from STT_server.adapters.inworld_stt_realtime import run_realtime_stt as run_inworld_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
 from STT_server.adapters.openai_realtime import run_realtime_session
 from STT_server.config import (
@@ -313,15 +314,28 @@ async def media_stream(ws: WebSocket) -> None:
                         session,
                         asyncio.create_task(run_realtime_session(session)),
                     )
-                else:
-                    # ponytail: non-openai STT currently routes through
-                    # Deepgram. Future providers (assemblyai, rime, ...)
-                    # join this branch once their adapters are in place;
-                    # the dispatcher lives in adapters/stt_dispatcher.py.
+                elif session.stt_provider == 'inworld':
                     track_task(
                         session,
                         asyncio.create_task(
-                            run_realtime_stt(
+                            run_inworld_realtime_stt(
+                                session,
+                                lambda item: enqueue_transcript_event(session, item),
+                                announce_stt_failure_once,
+                            )
+                        ),
+                    )
+                    track_task(session, asyncio.create_task(process_transcripts(session)))
+                else:
+                    # ponytail: default STT is Deepgram (the previous
+                    # legacy behaviour when the global USE_OPENAI_REALTIME
+                    # toggle was off). Future bidirectional-WS providers
+                    # (assemblyai, soniox, ...) join the elif chain above
+                    # once their adapters are in place.
+                    track_task(
+                        session,
+                        asyncio.create_task(
+                            run_deepgram_realtime_stt(
                                 session,
                                 lambda item: enqueue_transcript_event(session, item),
                                 announce_stt_failure_once,
