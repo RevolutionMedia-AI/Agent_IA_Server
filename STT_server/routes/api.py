@@ -341,11 +341,12 @@ class PhoneNumberCreate(BaseModel):
     provider: str = "twilio"
     country: str = "+1"
     number: str
-    # ponytail: human-friendly name for the number ("Soporte principal",
-    # "Línea de ventas MX"). Optional but recommended — the FE shows
-    # it as the primary label in the phone-number list, and operators
-    # skim the list way faster with names than with raw E.164 digits.
-    name: Optional[str] = None
+    # ponytail: the display label is derived from the assigned agent
+    # at render time. No free-text `name` on the number — operators
+    # kept giving the line and the agent different labels and the
+    # list drifted out of sync. The phone_numbers.label column is
+    # still accepted (an explicit override) but the FE never sets it
+    # today; the FE asks agentsApiV2.list() and shows agent.name.
     label: Optional[str] = None
     # ponytail: campaign routing. Same options the agent modal exposes
     # so a single call flow (call comes in → matches this number →
@@ -373,7 +374,6 @@ class PhoneNumberCreate(BaseModel):
 
 
 class PhoneNumberUpdate(BaseModel):
-    name: Optional[str] = None
     agent: Optional[str] = None
     status: Optional[str] = None
     label: Optional[str] = None
