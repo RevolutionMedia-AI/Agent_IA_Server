@@ -732,13 +732,21 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 # an empty list when no key/credentials are available
                 # (the FE then shows "No options" and the user can type
                 # an id manually).
+                # ponytail: local urllib import. The elevenlabs branch
+                # below also does this; Python sees the `urllib` name
+                # bound inside the function and marks it local for the
+                # whole function, so the inworld branch needs its own
+                # import too (or every reference becomes
+                # UnboundLocalError).
+                import urllib.error as _ue_inw
+                import urllib.request as _ur_inw
                 if creds:
                     try:
-                        req = urllib.request.Request(
+                        req = _ur_inw.Request(
                             "https://api.inworld.ai/voices/v1/voices?pageSize=200",
                             headers={"Authorization": f"Basic {creds}"},
                         )
-                        with urllib.request.urlopen(req, timeout=10) as resp:
+                        with _ur_inw.urlopen(req, timeout=10) as resp:
                             payload = json.loads(resp.read().decode("utf-8"))
                         voices_raw = payload.get("voices") or []
                         live = [
@@ -764,7 +772,7 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                             "[inworld-voice-catalog] no voices mapped — keys=%s",
                             list((voices_raw[0] or {}).keys()) if voices_raw else "(empty list)",
                         )
-                    except urllib.error.HTTPError as exc:
+                    except _ue_inw.HTTPError as exc:
                         err_body = ""
                         try:
                             err_body = exc.read().decode("utf-8", errors="replace").strip()
@@ -819,6 +827,8 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
 
         return {"models": [], "error": f"Unknown service '{service}'"}
     except Exception as exc:
+        import traceback as _tb
+        _tb.print_exc(file=__import__('sys').stderr)
         return {"models": [], "error": _sanitize_error(str(exc))[:300]}
 
 
