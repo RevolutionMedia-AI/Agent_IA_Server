@@ -162,10 +162,27 @@ def fetch_preview(
         headers={"Authorization": f"Basic {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # ponytail: surface Inworld's actual error body so the FE log
+        # shows "voice X not found" instead of an opaque "HTTP 400".
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Inworld TTS error {exc.code}: {err_body or exc.reason}"
+        ) from exc
     b64_audio = (payload.get("audioContent") or "").strip()
     if not b64_audio:
+        # Some error responses come back 200 with an `error` field;
+        # surface that too.
+        err = payload.get("error") or {}
+        if err:
+            raise RuntimeError(f"Inworld TTS: {err.get('message') or err}")
         return b""
     try:
         return base64.b64decode(b64_audio, validate=False)

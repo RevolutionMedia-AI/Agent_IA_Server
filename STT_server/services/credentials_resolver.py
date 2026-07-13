@@ -324,7 +324,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
             ),
         ),
         env_fallbacks=(("INWORLD_API_KEY", "api_key"),),
-        test_fn=None,
+        test_fn="STT_server.services.credentials_resolver._test_inworld",
     ),
 )
 
@@ -1016,6 +1016,45 @@ def _test_twilio(creds: dict[str, str]) -> tuple[bool, str]:
         return False, f"twilio SDK not installed: {exc}"
     sid = creds.get("account_sid")
     token = creds.get("auth_token")
+
+
+def _test_inworld(creds: dict[str, str]) -> tuple[bool, str]:
+    """Real roundtrip on /tts/v1/voice. Returns the Inworld error
+    message verbatim so the FE can show 'Unknown voice: Dennis'
+    instead of a generic 'invalid request'. The default voice id
+    below is the one Inworld uses in their own cURL sample; if your
+    account uses different voice ids, the error will name the
+    missing one and you can correct it from Settings."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    key = creds.get("api_key")
+    if not key:
+        return False, "api_key is required"
+    body = _json.dumps({
+        "text": "hi",
+        "voiceId": "Dennis",
+        "modelId": "inworld-tts-1.5-mini",
+        "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": 8000},
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            "https://api.inworld.ai/tts/v1/voice",
+            data=body,
+            headers={"Authorization": f"Basic {key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        return False, f"Inworld {exc.code}: {err_body or exc.reason}"
+    except Exception as exc:
+        return False, _sanitize_error(str(exc))[:300]
     if not sid or not token:
         return False, "account_sid and auth_token are required"
     try:
