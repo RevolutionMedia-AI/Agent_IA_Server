@@ -33,6 +33,28 @@ from STT_server.services.credentials_resolver import (
     test_provider,
     validate_credentials,
 )
+from STT_server.db import is_postgres
+from STT_server.db_agents import (
+    list_agents as db_list_agents,
+    create_agent as db_create_agent,
+    update_agent as db_update_agent,
+    delete_agent as db_delete_agent,
+)
+from STT_server.db_phone_numbers import (
+    list_numbers as db_list_numbers,
+    create_number as db_create_number,
+    update_number as db_update_number,
+    delete_number as db_delete_number,
+)
+from STT_server.db_tools import (
+    list_tools as db_list_tools,
+    upsert_tool as db_upsert_tool,
+    delete_tool as db_delete_tool,
+)
+from STT_server.db_settings import (
+    get_settings as db_get_settings,
+    upsert_settings as db_upsert_settings,
+)
 
 VALID_MODEL_SERVICES = {"stt", "tts", "llm"}
 
@@ -355,66 +377,67 @@ def usage_summary(auth: dict = Depends(require_auth)):
 
 
 # ---------- /agents CRUD ----------
+# ponytail: backed by Postgres when DATABASE_URL is set, otherwise the
+# legacy JSON file (same shape). Switching is invisible to the FE.
 
 @api_router.get("/agents")
 def list_agents(auth: dict = Depends(require_auth)):
-    agents = _load(AGENTS_FILE, [])
-    return [a for a in agents if a.get("user_id") == auth["user_id"]]
+    return db_list_agents(auth["user_id"])
 
 
 @api_router.post("/agents")
 def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
     # ponytail: validate provider ids BEFORE the agent hits disk so a
-    # typo'd "openai" doesn't quietly lie in agents.json forever.
+    # typo'd "openai" doesn't quietly lie in the store forever.
     for k in ("stt_provider", "tts_provider", "llm_provider"):
         v = getattr(data, k)
         if v and not get_provider_spec(v):
             raise HTTPException(status_code=400, detail=f"Unknown provider '{v}'")
-    with _data_lock():
-        agents = _load(AGENTS_FILE, [])
-        new_agent = {
-            "id": f"agent-{uuid.uuid4().hex[:8]}",
-            **data.dict(),
-            "user_id": auth["user_id"],
-            "calls": "0",
-            "perf": 0,
-            "created_at": _now_iso(),
-        }
-        agents.append(new_agent)
-        _save(AGENTS_FILE, agents)
-    return new_agent
+    return db_create_agent(auth["user_id"], data.dict())
 
 
 @api_router.put("/agents/{agent_id}")
 def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_auth)):
-    with _data_lock():
-        agents = _load(AGENTS_FILE, [])
-        for a in agents:
-            if a["id"] == agent_id and a.get("user_id") == auth["user_id"]:
-                for k, v in data.dict(exclude_none=True).items():
-                    # ponytail: validate provider ids before they reach disk.
-                    # Cheap defense — no live API call, just catalog lookup.
-                    if k in {"stt_provider", "tts_provider", "llm_provider"}:
-                        if not get_provider_spec(v):
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Unknown provider '{v}'",
-                            )
-                    a[k] = v
-                _save(AGENTS_FILE, agents)
-                return a
-    raise HTTPException(status_code=404, detail="Agent not found")
+    # ponytail: validate provider ids before they reach the store. Cheap
+    # defense — no live API call, just catalog lookup.
+    for k in ("stt_provider", "tts_provider", "llm_provider"):
+        v = getattr(data, k)
+        if v and not get_provider_spec(v):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown provider '{v}'",
+            )
+    payload = data.dict(exclude_none=True)
+    if not is_postgres():
+        # JSON path still needs the lock for RMW atomicity.
+        with _data_lock():
+            agents = _load(AGENTS_FILE, [])
+            for a in agents:
+                if a["id"] == agent_id and a.get("user_id") == auth["user_id"]:
+                    for k, v in payload.items():
+                        a[k] = v
+                    _save(AGENTS_FILE, agents)
+                    return a
+        raise HTTPException(status_code=404, detail="Agent not found")
+    updated = db_update_agent(agent_id, auth["user_id"], payload)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return updated
 
 
 @api_router.delete("/agents/{agent_id}")
 def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
-    with _data_lock():
-        agents = _load(AGENTS_FILE, [])
-        before = len(agents)
-        agents = [a for a in agents if not (a["id"] == agent_id and a.get("user_id") == auth["user_id"])]
-        if len(agents) == before:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        _save(AGENTS_FILE, agents)
+    if not is_postgres():
+        with _data_lock():
+            agents = _load(AGENTS_FILE, [])
+            before = len(agents)
+            agents = [a for a in agents if not (a["id"] == agent_id and a.get("user_id") == auth["user_id"])]
+            if len(agents) == before:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            _save(AGENTS_FILE, agents)
+        return {"success": True}
+    if not db_delete_agent(agent_id, auth["user_id"]):
+        raise HTTPException(status_code=404, detail="Agent not found")
     return {"success": True}
 
 
@@ -422,8 +445,7 @@ def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
 
 @api_router.get("/phone-numbers")
 def list_phone_numbers(auth: dict = Depends(require_auth)):
-    numbers = _load(NUMBERS_FILE, [])
-    return [n for n in numbers if n.get("user_id") == auth["user_id"]]
+    return db_list_numbers(auth["user_id"])
 
 
 @api_router.post("/phone-numbers")
@@ -443,66 +465,40 @@ def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_au
                     status_code=400,
                     detail="Twilio Auth Token must be 32-64 characters",
                 )
-    with _data_lock():
-        numbers = _load(NUMBERS_FILE, [])
-        formatted = _format_phone_number(data.country, data.number)
-        new_number = {
-            "id": f"num-{uuid.uuid4().hex[:8]}",
-            "provider": data.provider,
-            "country": data.country,
-            "number": data.number,
-            "display": formatted,
-            "label": data.label or formatted,
-            "agent": data.agent,
-            "user_id": auth["user_id"],
-            "calls": "0",
-            "status": "Active",
-            "created_at": _now_iso(),
-        }
-        # ponytail: store provider creds if provided. Optional - we
-        # don't require them at create-time (the runtime will fall back
-        # to env-var if missing) but if the user provided them, we save.
-        if data.twilio_account_sid:
-            new_number["twilio_account_sid"] = data.twilio_account_sid
-        if data.twilio_auth_token:
-            new_number["twilio_auth_token"] = data.twilio_auth_token
-        if data.sip_host:
-            new_number["sip_host"] = data.sip_host
-        if data.sip_username:
-            new_number["sip_username"] = data.sip_username
-        if data.sip_password:
-            new_number["sip_password"] = data.sip_password
-        if data.whatsapp_phone_number_id:
-            new_number["whatsapp_phone_number_id"] = data.whatsapp_phone_number_id
-        if data.whatsapp_access_token:
-            new_number["whatsapp_access_token"] = data.whatsapp_access_token
-        numbers.append(new_number)
-        _save(NUMBERS_FILE, numbers)
-    return new_number
+    return db_create_number(auth["user_id"], data.dict())
 
 
 @api_router.put("/phone-numbers/{number_id}")
 def update_phone_number(number_id: str, data: PhoneNumberUpdate, auth: dict = Depends(require_auth)):
-    with _data_lock():
-        numbers = _load(NUMBERS_FILE, [])
-        for n in numbers:
-            if n["id"] == number_id and n.get("user_id") == auth["user_id"]:
-                for k, v in data.dict(exclude_none=True).items():
-                    n[k] = v
-                _save(NUMBERS_FILE, numbers)
-                return n
-    raise HTTPException(status_code=404, detail="Phone number not found")
+    payload = data.dict(exclude_none=True)
+    if not is_postgres():
+        with _data_lock():
+            numbers = _load(NUMBERS_FILE, [])
+            for n in numbers:
+                if n["id"] == number_id and n.get("user_id") == auth["user_id"]:
+                    n.update(payload)
+                    _save(NUMBERS_FILE, numbers)
+                    return n
+        raise HTTPException(status_code=404, detail="Phone number not found")
+    updated = db_update_number(number_id, auth["user_id"], payload)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Phone number not found")
+    return updated
 
 
 @api_router.delete("/phone-numbers/{number_id}")
 def delete_phone_number(number_id: str, auth: dict = Depends(require_auth)):
-    with _data_lock():
-        numbers = _load(NUMBERS_FILE, [])
-        before = len(numbers)
-        numbers = [n for n in numbers if not (n["id"] == number_id and n.get("user_id") == auth["user_id"])]
-        if len(numbers) == before:
-            raise HTTPException(status_code=404, detail="Phone number not found")
-        _save(NUMBERS_FILE, numbers)
+    if not is_postgres():
+        with _data_lock():
+            numbers = _load(NUMBERS_FILE, [])
+            before = len(numbers)
+            numbers = [n for n in numbers if not (n["id"] == number_id and n.get("user_id") == auth["user_id"])]
+            if len(numbers) == before:
+                raise HTTPException(status_code=404, detail="Phone number not found")
+            _save(NUMBERS_FILE, numbers)
+        return {"success": True}
+    if not db_delete_number(number_id, auth["user_id"]):
+        raise HTTPException(status_code=404, detail="Phone number not found")
     return {"success": True}
 
 
@@ -530,34 +526,64 @@ def _format_phone_number(country: str, digits: str) -> str:
 
 @api_router.get("/tools")
 def list_tools(auth: dict = Depends(require_auth)):
-    tools = _load(TOOLS_FILE, [])
-    return [t for t in tools if t.get("user_id") == auth["user_id"]]
+    return db_list_tools(auth["user_id"])
 
 
 @api_router.post("/tools/{tool_id}/connect")
 def connect_tool(tool_id: str, data: ToolConnect, auth: dict = Depends(require_auth)):
-    tools = _load(TOOLS_FILE, [])
-    for t in tools:
-        if t["id"] == tool_id and t.get("user_id") == auth["user_id"]:
-            t["connected"] = True
-            t["credentials"] = data.credentials or {}
-            t["connected_at"] = _now_iso()
-            _save(TOOLS_FILE, tools)
-            return t
-    raise HTTPException(status_code=404, detail="Tool not found")
+    payload = {"credentials": data.credentials or {}, "connected": True}
+    if not is_postgres():
+        # JSON path - keep creating on first connect.
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(TOOLS_FILE, "r", encoding="utf-8") as f:
+                data_all = json.load(f) or []
+        except (json.JSONDecodeError, IOError):
+            data_all = []
+        with _data_lock():
+            existing = None
+            for t in data_all:
+                if t.get("id") == tool_id and t.get("user_id") == auth["user_id"]:
+                    existing = t
+                    break
+            if existing:
+                existing["connected"] = True
+                existing["credentials"] = payload["credentials"]
+                existing["connected_at"] = _now_iso()
+            else:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                data_all.append({
+                    "user_id": auth["user_id"], "id": tool_id, "connected": True,
+                    "credentials": payload["credentials"], "connected_at": now,
+                })
+            with open(TOOLS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data_all, f, indent=2, ensure_ascii=False)
+        return db_get_tool(auth["user_id"], tool_id) or {
+            "user_id": auth["user_id"], "id": tool_id, "connected": True,
+            "credentials": payload["credentials"],
+        }
+    return db_upsert_tool(auth["user_id"], tool_id, payload)
 
 
 @api_router.delete("/tools/{tool_id}")
 def disconnect_tool(tool_id: str, auth: dict = Depends(require_auth)):
-    with _data_lock():
-        tools = _load(TOOLS_FILE, [])
-        for t in tools:
-            if t["id"] == tool_id and t.get("user_id") == auth["user_id"]:
-                t["connected"] = False
-                t["credentials"] = {}
-                _save(TOOLS_FILE, tools)
-                return {"success": True}
-    raise HTTPException(status_code=404, detail="Tool not found")
+    if not is_postgres():
+        with _data_lock():
+            tools = _load(TOOLS_FILE, [])
+            for t in tools:
+                if t["id"] == tool_id and t.get("user_id") == auth["user_id"]:
+                    t["connected"] = False
+                    t["credentials"] = {}
+                    _save(TOOLS_FILE, tools)
+                    return {"success": True}
+        raise HTTPException(status_code=404, detail="Tool not found")
+    # ponytail: on Postgres the row may not exist (the user never
+    # connected it). We accept that and return success - the FE
+    # interprets DELETE on a non-existent tool as "it's not
+    # connected anymore", which is the correct end state.
+    db_upsert_tool(auth["user_id"], tool_id, {"connected": False, "credentials": {}})
+    return {"success": True}
 
 
 # ---------- /settings ----------
@@ -587,21 +613,33 @@ def get_settings(auth: dict = Depends(require_auth)):
 
 @api_router.put("/settings")
 def update_settings(data: SettingsUpdate, auth: dict = Depends(require_auth)):
-    path = _settings_path(auth["user_id"])
-    with _data_lock():
-        current = _load(path, {})
-        for k, v in data.dict(exclude_none=True).items():
-            current[k] = v
-        _save(path, current)
-        # Mirror name into users.json
-        if "name" in data.dict(exclude_none=True):
-            users = _load(USERS_FILE, [])
-            for u in users:
-                if u.get("id") == auth["user_id"]:
-                    u["name"] = data.name
-                    _save(USERS_FILE, users)
-                    break
-    return current
+    payload = data.dict(exclude_none=True)
+    if not is_postgres():
+        path = _settings_path(auth["user_id"])
+        with _data_lock():
+            current = _load(path, {})
+            for k, v in payload.items():
+                current[k] = v
+            _save(path, current)
+            if "name" in payload:
+                users = _load(USERS_FILE, [])
+                for u in users:
+                    if u.get("id") == auth["user_id"]:
+                        u["name"] = payload["name"]
+                        _save(USERS_FILE, users)
+                        break
+        return current
+    stored = db_upsert_settings(auth["user_id"], payload)
+    # ponytail: when on Postgres, mirror name into the users row so
+    # login /me sees it. db_users helpers stay out of api.py to keep
+    # the auth file as the only consumer.
+    if "name" in payload and stored is not None:
+        try:
+            from STT_server.db_users import update_user_name
+            update_user_name(auth["user_id"], payload["name"])
+        except Exception as exc:
+            log.warning("[settings] could not mirror name into Postgres users: %s", exc)
+    return stored
 
 
 @api_router.put("/settings/password")

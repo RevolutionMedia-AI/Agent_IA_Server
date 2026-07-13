@@ -57,6 +57,52 @@ if pg_url:
         # can run the migration manually. Log clearly so the cause
         # is visible in Railway logs.
         print(f"[startup] WARN: could not seed admin in Postgres: {exc}")
+
+    # ponytail: auto-apply the schema extensions on every start.
+    # 001_schema.sql + 004_extend_business_tables.sql are idempotent
+    # (CREATE TABLE IF NOT EXISTS / ALTER TABLE ADD COLUMN IF NOT
+    # EXISTS) so re-running is safe. Without this the FE would write
+    # stt_provider/tts_model/welcome_message into columns that don't
+    # exist yet, and Postgres would reject the INSERT.
+    if [ -d /app/db/migrations ]; then
+        for m in /app/db/migrations/*.sql; do
+            echo "[startup] applying migration $(basename $m)"
+            python -c "
+import sys
+with open('$m', 'r') as f:
+    sql = f.read()
+try:
+    import psycopg2
+    c = psycopg2.connect('$pg_url')
+    with c.cursor() as cur:
+        cur.execute(sql)
+    c.commit()
+    c.close()
+    print('  OK')
+except Exception as e:
+    print(f'  WARN: {e}')
+" || true
+        done
+    fi
+
+    # ponytail: backfill JSON -> Postgres on first boot so existing
+    # local-dev data (agents, numbers, API keys) survives the first
+    # Postgres-backed deploy. Idempotent - skips rows already present.
+    python -c "
+import sys
+sys.path.insert(0, '/app')
+try:
+    from STT_server.db_agents import backfill_from_json as a_backfill
+    from STT_server.db_phone_numbers import backfill_from_json as n_backfill
+    from STT_server.db_tools import backfill_from_json as t_backfill
+    a = a_backfill(); n = n_backfill(); t = t_backfill()
+    if a or n or t:
+        print(f'[startup] backfilled from JSON -> Postgres: agents={a} numbers={n} tools={t}')
+    else:
+        print('[startup] JSON backfill: nothing to copy (empty or already migrated)')
+except Exception as e:
+    print(f'[startup] WARN: JSON backfill failed: {e}')
+" || true
 else:
     # JSON backend. Same self-heal as before.
     p = Path('/app/STT_server/data/users.json')

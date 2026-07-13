@@ -199,6 +199,23 @@ def _parse_iso(s):
         return None
 
 
+def update_user_name(user_id: str, name: str) -> None:
+    """Mirror a display-name change into the users table.
+
+    Used by routes/api.py's settings PUT when running on Postgres.
+    On the JSON backend the settings handler writes users.json directly
+    so this helper is unused there.
+    """
+    if not is_postgres():
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET name = %s, updated_at = NOW() WHERE id = %s",
+                (name, user_id),
+            )
+
+
 # ── Public API: pick the right backend at import time ────────────────
 
 # The two globals below are read by routes/auth.py. They are
