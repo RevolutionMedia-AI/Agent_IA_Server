@@ -76,7 +76,7 @@ def list_numbers(user_id: str) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, user_id, provider, country, number, display, label, agent, "
+                "SELECT id, user_id, provider, country, number, display, label, name, campaign, agent, "
                 "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
                 "sip_username, sip_password, whatsapp_phone_number_id, "
                 "whatsapp_access_token, created_at, updated_at "
@@ -133,7 +133,12 @@ def create_number(user_id: str, payload: dict) -> dict:
         "country": payload.get("country", "+1"),
         "number": payload.get("number"),
         "display": display,
-        "label": payload.get("label") or display,
+        # ponytail: name wins over label/display so the operator sees a
+        # friendly label first ("Soporte principal") before falling
+        # back to the auto-generated display ("+52 55 1234 5678").
+        "label": payload.get("label") or payload.get("name") or display,
+        "name": payload.get("name"),
+        "campaign": payload.get("campaign"),
         "agent": payload.get("agent"),
         "calls": "0",
         "status": "Active",
@@ -158,6 +163,7 @@ def create_number(user_id: str, payload: dict) -> dict:
             json.dump(data, f, indent=2, ensure_ascii=False)
         return record
     cols = ["id", "user_id", "provider", "country", "number", "display", "label",
+            "name", "campaign",
             "agent", "calls", "status",
             "twilio_account_sid", "twilio_auth_token", "sip_host", "sip_username",
             "sip_password", "whatsapp_phone_number_id", "whatsapp_access_token"]
@@ -167,7 +173,7 @@ def create_number(user_id: str, payload: dict) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 f"INSERT INTO phone_numbers ({', '.join(cols)}) VALUES ({placeholders}) "
-                "RETURNING id, user_id, provider, country, number, display, label, agent, "
+                "RETURNING id, user_id, provider, country, number, display, label, name, campaign, agent, "
                 "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
                 "sip_username, sip_password, whatsapp_phone_number_id, "
                 "whatsapp_access_token, created_at, updated_at",
@@ -193,7 +199,7 @@ def update_number(number_id: str, user_id: str, payload: dict) -> dict | None:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 return n
         return None
-    allowed = {"agent", "status", "label"}
+    allowed = {"agent", "status", "label", "name", "campaign"}
     set_clauses, values = [], []
     for k, v in payload.items():
         if v is None or k not in allowed:
@@ -209,7 +215,7 @@ def update_number(number_id: str, user_id: str, payload: dict) -> dict | None:
             cur.execute(
                 f"UPDATE phone_numbers SET {', '.join(set_clauses)} "
                 "WHERE id = %s AND user_id = %s "
-                "RETURNING id, user_id, provider, country, number, display, label, agent, "
+                "RETURNING id, user_id, provider, country, number, display, label, name, campaign, agent, "
                 "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
                 "sip_username, sip_password, whatsapp_phone_number_id, "
                 "whatsapp_access_token, created_at, updated_at",

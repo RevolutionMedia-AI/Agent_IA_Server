@@ -340,7 +340,17 @@ class PhoneNumberCreate(BaseModel):
     provider: str = "twilio"
     country: str = "+1"
     number: str
+    # ponytail: human-friendly name for the number ("Soporte principal",
+    # "Línea de ventas MX"). Optional but recommended — the FE shows
+    # it as the primary label in the phone-number list, and operators
+    # skim the list way faster with names than with raw E.164 digits.
+    name: Optional[str] = None
     label: Optional[str] = None
+    # ponytail: campaign routing. Same options the agent modal exposes
+    # so a single call flow (call comes in → matches this number →
+    # tagged with this campaign) lines up end-to-end with the agent's
+    # campaign config. Optional, defaults to no campaign on the BE.
+    campaign: Optional[str] = None
     agent: Optional[str] = None
     # ponytail: credenciales de Twilio opcionales. Si el provider es
     # 'twilio' o 'sip' y se pasan, se validan y guardan en el record
@@ -359,13 +369,14 @@ class PhoneNumberCreate(BaseModel):
     # number, so we don't accept them here.
     whatsapp_phone_number_id: Optional[str] = None
     whatsapp_access_token: Optional[str] = None
-    label: Optional[str] = None
 
 
 class PhoneNumberUpdate(BaseModel):
+    name: Optional[str] = None
     agent: Optional[str] = None
     status: Optional[str] = None
     label: Optional[str] = None
+    campaign: Optional[str] = None
 
 
 class ToolConnect(BaseModel):
