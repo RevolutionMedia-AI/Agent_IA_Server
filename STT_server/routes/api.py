@@ -537,7 +537,7 @@ def list_phone_numbers(auth: dict = Depends(require_auth)):
 
 
 @api_router.post("/phone-numbers")
-def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
+async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
     # ponytail: validate Twilio creds server-side too. Client should
     # validate but never trust it — el regex del FE es solo UX hint.
     if data.provider in ("twilio", "sip"):
@@ -561,18 +561,24 @@ def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_au
     # creds the user just submitted (with fallback to the env var
     # TWILIO_AUTH_TOKEN). On failure we surface the Twilio error to the
     # FE but keep the row - the user can retry via PUT.
+    #
+    # The previous version called `asyncio.run(configure_voice_webhook(...))`
+    # inside an async endpoint. asyncio.run() cannot be called from a
+    # running event loop, so the route crashed with 500 on every Twilio
+    # number creation. The fix is to make the endpoint async and await
+    # the coroutine directly - configure_voice_webhook already returns
+    # one.
     if data.provider == "twilio" and data.twilio_account_sid and data.twilio_auth_token:
         try:
-            import asyncio
             from STT_server.adapters.twilio_api import configure_voice_webhook
             from STT_server.config import PUBLIC_URL
             webhook_url = f"{PUBLIC_URL.rstrip('/')}/voice"
-            result = asyncio.run(configure_voice_webhook(
+            result = await configure_voice_webhook(
                 data.twilio_account_sid,
                 data.twilio_auth_token,
                 data.number,
                 webhook_url,
-            ))
+            )
             if not result.get("success"):
                 log.warning("[phone-numbers] webhook config failed: %s", result.get("error"))
                 new_number["webhook_warning"] = result.get("error", "unknown")
