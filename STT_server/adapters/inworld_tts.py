@@ -32,7 +32,7 @@ from STT_server.services.credentials_resolver import resolve_provider
 
 log = logging.getLogger("stt_server")
 
-DEFAULT_MODEL_ID = "inworld-tts-1.5-mini"
+DEFAULT_MODEL_ID = "inworld-tts-2"
 DEFAULT_VOICE_ID = "Dennis"
 
 
