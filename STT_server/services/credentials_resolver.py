@@ -568,6 +568,43 @@ _HARDCODED_LLM_MODELS = {
         {"id": "claude-3-5-haiku-20241022",  "name": "Claude 3.5 Haiku",  "description": "Fast, lower-cost"},
         {"id": "claude-3-opus-20240229",     "name": "Claude 3 Opus",     "description": "Highest capability, slower"},
     ],
+    # ponytail: OpenAI / Gemini / MiniMax fallback catalogs so the
+    # dropdown is never empty when the user hasn't validated a key
+    # yet (live fetch is the path of least surprise when the key IS
+    # valid, but until then we still want the operator to see the
+    # canonical model list and pick one). Mirrored from the FE pricing
+    # table so the two stay in sync.
+    "openai": [
+        {"id": "gpt-5.6",       "name": "gpt-5.6",       "description": "Flagship preview"},
+        {"id": "gpt-5.6-terra", "name": "gpt-5.6-terra", "description": "Mid-tier preview"},
+        {"id": "gpt-5.6-luna",  "name": "gpt-5.6-luna",  "description": "Smaller preview"},
+        {"id": "gpt-5.5",       "name": "gpt-5.5",       "description": "GA flagship"},
+        {"id": "gpt-5.5-pro",   "name": "gpt-5.5-pro",   "description": "GA premium"},
+        {"id": "gpt-5.4",       "name": "gpt-5.4",       "description": "Standard"},
+        {"id": "gpt-5.4-mini",  "name": "gpt-5.4-mini",  "description": "Cheap, fast"},
+        {"id": "gpt-5.4-nano",  "name": "gpt-5.4-nano",  "description": "Cheapest"},
+        {"id": "gpt-4.1",       "name": "gpt-4.1",       "description": "Legacy 4.1"},
+        {"id": "gpt-4.1-mini",  "name": "gpt-4.1-mini",  "description": "Legacy cheap"},
+        {"id": "gpt-4.1-nano",  "name": "gpt-4.1-nano",  "description": "Legacy cheapest"},
+        {"id": "gpt-4o",        "name": "gpt-4o",        "description": "Legacy 4o"},
+        {"id": "gpt-4o-mini",   "name": "gpt-4o-mini",   "description": "Legacy cheap"},
+        {"id": "o3",            "name": "o3",            "description": "Reasoning"},
+        {"id": "o3-pro",        "name": "o3-pro",        "description": "Reasoning premium"},
+        {"id": "o4-mini",       "name": "o4-mini",       "description": "Reasoning cheap"},
+        {"id": "o4-mini-high",  "name": "o4-mini-high",  "description": "Reasoning higher"},
+    ],
+    "gemini": [
+        {"id": "gemini-3-1-pro",        "name": "gemini-3-1-pro",        "description": "Flagship ≤200K"},
+        {"id": "gemini-3-1-pro-long",   "name": "gemini-3-1-pro-long",   "description": "Flagship >200K"},
+        {"id": "gemini-3-5-flash",      "name": "gemini-3-5-flash",      "description": "Standard"},
+        {"id": "gemini-3-flash",        "name": "gemini-3-flash",        "description": "Fast, cheap"},
+        {"id": "gemini-3-1-flash-lite", "name": "gemini-3-1-flash-lite", "description": "Cheapest fast"},
+        {"id": "gemini-2-5-pro",        "name": "gemini-2-5-pro",        "description": "Legacy pro"},
+        {"id": "gemini-2-5-pro-long",   "name": "gemini-2-5-pro-long",   "description": "Legacy pro long"},
+        {"id": "gemini-2-5-flash",      "name": "gemini-2-5-flash",      "description": "Legacy flash"},
+        {"id": "gemini-2-5-flash-lite", "name": "gemini-2-5-flash-lite", "description": "Legacy cheap"},
+        {"id": "gemini-embeddings",      "name": "gemini-embeddings",      "description": "Embeddings"},
+    ],
 }
 
 
