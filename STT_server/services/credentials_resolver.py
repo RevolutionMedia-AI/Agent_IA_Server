@@ -738,6 +738,7 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         )
                         with urllib.request.urlopen(req, timeout=10) as resp:
                             payload = json.loads(resp.read().decode("utf-8"))
+                        voices_raw = payload.get("voices") or []
                         live = [
                             {
                                 "id": v["voiceId"],
@@ -748,13 +749,34 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                                     f"({v.get('source', '')})" if v.get("source") else "",
                                 ])).strip(" ·") or "Inworld voice",
                             }
-                            for v in payload.get("voices", [])
+                            for v in voices_raw
                             if v.get("voiceId")
                         ]
+                        log.info(
+                            "[inworld-voice-catalog] fetch ok status=200 raw_voices=%d mapped=%d totalSize=%s",
+                            len(voices_raw), len(live), payload.get("totalSize"),
+                        )
                         if live:
                             return {"models": live}
-                    except Exception:
-                        pass
+                        log.warning(
+                            "[inworld-voice-catalog] no voices mapped — keys=%s",
+                            list((voices_raw[0] or {}).keys()) if voices_raw else "(empty list)",
+                        )
+                    except urllib.error.HTTPError as exc:
+                        err_body = ""
+                        try:
+                            err_body = exc.read().decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            pass
+                        log.warning(
+                            "[inworld-voice-catalog] HTTP %s body=%s",
+                            exc.code, err_body[:300],
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "[inworld-voice-catalog] exception type=%s msg=%s",
+                            type(exc).__name__, _sanitize_error(str(exc))[:300],
+                        )
                 return {"models": _HARDCODED_TTS_VOICES["inworld"]}
             return {"models": []}
 
