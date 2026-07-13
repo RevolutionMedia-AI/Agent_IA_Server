@@ -661,22 +661,31 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
 
     try:
         if service == "llm":
-            if provider_id == "openai":
-                return {"models": _fetch_openai_models(creds) if creds else _HARDCODED_LLM_MODELS["anthropic"]}
-                # NOTE: fallback above is a safety valve — when called for openai LLM
-                # without a key, we return Anthropic's catalog so the FE never crashes
-                # on an empty response. The FE should never reach this branch in
-                # practice; it's only hit if the user picks OpenAI LLM and has no
-                # stored key.
-            if provider_id == "anthropic":
-                return {"models": _HARDCODED_LLM_MODELS["anthropic"]}
-            if provider_id == "gemini":
-                models = _fetch_gemini_models(creds) if creds else []
-                return {"models": models or _HARDCODED_LLM_MODELS["anthropic"]}
-                # Same safety-valve fallback when key missing.
-            if provider_id == "minimax":
-                return {"models": _HARDCODED_LLM_MODELS["minimax"]}
-            return {"models": []}
+                if provider_id == "openai":
+                    # Live fetch when the user has a key. Without a key we
+                    # fall back to the provider's own hardcoded catalog so
+                    # the dropdown is never empty *and never shows the wrong
+                    # provider's models* (the previous Anthropic fallback
+                    # was the source of the dropdown cross-contamination bug).
+                    if creds:
+                        models = _fetch_openai_models(creds)
+                        if models:
+                            return {"models": models}
+                    return {"models": _HARDCODED_LLM_MODELS.get("openai", [])}
+                if provider_id == "anthropic":
+                    return {"models": _HARDCODED_LLM_MODELS["anthropic"]}
+                if provider_id == "gemini":
+                    if creds:
+                        models = _fetch_gemini_models(creds)
+                        if models:
+                            return {"models": models}
+                    # Empty list when no key - the dropdown shows "No options"
+                    # and the FE can prompt the user to validate first. Same
+                    # rationale as the OpenAI branch above.
+                    return {"models": _HARDCODED_LLM_MODELS.get("gemini", [])}
+                if provider_id == "minimax":
+                    return {"models": _HARDCODED_LLM_MODELS["minimax"]}
+                return {"models": []}
 
         if service == "tts":
             # Live for OpenAI if key present, hardcoded catalog otherwise.
