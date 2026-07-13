@@ -122,23 +122,47 @@ async def voice(
         except Exception:
             form_dict = {}
 
-    if TWILIO_AUTH_TOKEN and form_dict:
+    # ponytail: per-number Twilio auth token. Twilio signs each webhook
+    # with the auth token of the Twilio account that owns the phone
+    # number that's calling - not the deployer's account. We resolve
+    # the called number first, then verify against THAT account's
+    # auth token. The TWILIO_AUTH_TOKEN env var is only a fallback for
+    # deployments where the operator and the phone-number owner are
+    # the same entity (e.g. internal use).
+    if form_dict:
         from STT_server.adapters.twilio_api import validate_twilio_signature
-        # ponytail: Twilio signs the URL the request hit. When the
-        # request goes through a reverse proxy (Railway, Cloudflare)
-        # the Host header reflects the public hostname but the path
-        # the signature was computed against is the original PUBLIC_URL
-        # path. We rebuild the URL from PUBLIC_URL + request.url.path
-        # so signature verification works behind a proxy.
-        signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
-        if request.url.query:
-            signature_url += f"?{request.url.query}"
-        sig = request.headers.get("X-Twilio-Signature", "")
-        if sig and not validate_twilio_signature(
-            TWILIO_AUTH_TOKEN, signature_url, sig, form_dict
-        ):
-            log.warning("[VOICE] invalid Twilio signature from %s", request.client.host if request.client else "?")
-            return Response(content="invalid signature", status_code=403)
+        from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
+        per_number_token = None
+        try:
+            called_to = form_dict.get("To") or form_dict.get("to")
+            if called_to:
+                row = _find_num_for_sig(called_to)
+                if row:
+                    per_number_token = row.get("twilio_auth_token") or None
+        except Exception as exc:
+            log.warning("[VOICE] could not look up per-number auth token: %s", exc)
+        token_to_check = per_number_token or TWILIO_AUTH_TOKEN
+        if token_to_check:
+            # ponytail: Twilio signs the URL the request hit. When the
+            # request goes through a reverse proxy (Railway, Cloudflare)
+            # the Host header reflects the public hostname but the path
+            # the signature was computed against is the original
+            # PUBLIC_URL path. We rebuild the URL from PUBLIC_URL +
+            # request.url.path so signature verification works behind a
+            # proxy.
+            signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
+            if request.url.query:
+                signature_url += f"?{request.url.query}"
+            sig = request.headers.get("X-Twilio-Signature", "")
+            if sig and not validate_twilio_signature(
+                token_to_check, signature_url, sig, form_dict
+            ):
+                log.warning(
+                    "[VOICE] invalid Twilio signature from %s (per_number=%s)",
+                    request.client.host if request.client else "?",
+                    bool(per_number_token),
+                )
+                return Response(content="invalid signature", status_code=403)
 
     ws_url = PUBLIC_URL.rstrip("/")
 
