@@ -1,110 +1,105 @@
 #!/bin/sh
-set -e
 # Default to 8080 when PORT is not set
 PORT="${PORT:-8080}"
 echo "Starting app on port $PORT"
 
-# ponytail: self-heal the active auth backend. The .dockerignore once
-# excluded STT_server/data/ from the build context, which meant a
-# fresh deploy shipped a container with no users.json at all ->
-# load_users() returned [] -> /auth/login returned 401 for everyone.
-# Even after the .dockerignore was fixed, Railway can cache the build
-# context and keep shipping the broken image.
+# ponytail: self-heal the active auth backend + auto-apply migrations
+# + backfill JSON to Postgres. All inline as a single heredoc so we
+# don't depend on quoting tricks that can break under different shells
+# (the previous version used `python -c "..."` with f-strings and
+# produced a SyntaxError on every restart).
 #
-# This runtime now seeds WHATEVER backend the BE is about to use:
-#   - Postgres (DATABASE_URL set): INSERT ... ON CONFLICT DO NOTHING
-#   - JSON (no DATABASE_URL): write users.json with the default admin
-#
-# Both branches are idempotent — running on every restart doesn't
-# duplicate or break data.
-python - <<'PY'
-import hashlib, json, os
-from pathlib import Path
+# Why heredoc and not python -c: the previous version embedded
+# `$m` (the migration filename) and `$pg_url` (the DATABASE_URL)
+# inside a double-quoted python -c string. The shell expanded them
+# before handing the string to python, but inside the string we also
+# had f-strings and single-quoted literals that confused the parser
+# depending on whether $m contained special characters. The heredoc
+# sidesteps all of that.
+ADMIN_ID='user-admin-001'
+ADMIN_EMAIL='admin@revolutionmedia.ai'
+ADMIN_NAME='Revolution Media Admin'
+ADMIN_ROLE='admin'
+ADMIN_HASH=$(printf '%s' 'Adminrevolutionmedia@109' | python -c 'import sys, hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
 
-ADMIN_ID    = 'user-admin-001'
-ADMIN_EMAIL = 'admin@revolutionmedia.ai'
-ADMIN_NAME  = 'Revolution Media Admin'
-ADMIN_ROLE  = 'admin'
-ADMIN_HASH  = hashlib.sha256(b'Adminrevolutionmedia@109').hexdigest()
+# Resolve DATABASE_URL (Railway sometimes splits across PG* vars).
+if [ -z "$DATABASE_URL" ] && [ -n "$PGHOST" ] && [ -n "$PGUSER" ] && [ -n "$PGPASSWORD" ] && [ -n "$PGDATABASE" ]; then
+    export DATABASE_URL="postgresql://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE}"
+fi
 
-pg_url = os.environ.get('DATABASE_URL') or ''
-# Railway also splits the URL across PG* vars. Fall back if so.
-if not pg_url:
-    parts = {k: os.environ.get(k) for k in ('PGHOST','PGPORT','PGUSER','PGPASSWORD','PGDATABASE')}
-    if all(parts.values()):
-        pg_url = f"postgresql://{parts['PGUSER']}:{parts['PGPASSWORD']}@{parts['PGHOST']}:{parts.get('PGPORT','5432')}/{parts['PGDATABASE']}"
+# --- DB init script. Runs once at container start. ---
+# We branch on DATABASE_URL: with one, we seed the admin in Postgres
+# and apply migrations; without one, we fall back to writing
+# users.json. Both branches are idempotent.
+export ADMIN_ID ADMIN_EMAIL ADMIN_NAME ADMIN_ROLE ADMIN_HASH
+python <<'PYEOF'
+import os
+ADMIN_ID    = os.environ['ADMIN_ID']
+ADMIN_EMAIL = os.environ['ADMIN_EMAIL']
+ADMIN_NAME  = os.environ['ADMIN_NAME']
+ADMIN_ROLE  = os.environ['ADMIN_ROLE']
+ADMIN_HASH  = os.environ['ADMIN_HASH']
+PG_URL      = os.environ.get('DATABASE_URL', '')
 
-if pg_url:
-    # Postgres backend. Insert the admin if missing. ON CONFLICT
-    # DO NOTHING means re-running on every container start is safe.
+if PG_URL:
+    import psycopg2
+    # 1. Seed the admin user (idempotent).
     try:
-        import psycopg2
-        conn = psycopg2.connect(pg_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO users (id, name, email, password, role) "
-                    "VALUES (%s, %s, %s, %s, %s) "
-                    "ON CONFLICT (id) DO NOTHING",
-                    (ADMIN_ID, ADMIN_NAME, ADMIN_EMAIL, ADMIN_HASH, ADMIN_ROLE),
-                )
-                conn.commit()
-            print(f"[startup] admin ensured in Postgres ({ADMIN_EMAIL})")
-        finally:
-            conn.close()
+        conn = psycopg2.connect(PG_URL)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (id, name, email, password, role) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (ADMIN_ID, ADMIN_NAME, ADMIN_EMAIL, ADMIN_HASH, ADMIN_ROLE),
+            )
+            conn.commit()
+        conn.close()
+        print(f"[startup] admin ensured in Postgres ({ADMIN_EMAIL})")
     except Exception as exc:
-        # Don't fail the container if the DB is down — the user
-        # can run the migration manually. Log clearly so the cause
-        # is visible in Railway logs.
         print(f"[startup] WARN: could not seed admin in Postgres: {exc}")
 
-    # ponytail: auto-apply the schema extensions on every start.
-    # 001_schema.sql + 004_extend_business_tables.sql are idempotent
-    # (CREATE TABLE IF NOT EXISTS / ALTER TABLE ADD COLUMN IF NOT
-    # EXISTS) so re-running is safe. Without this the FE would write
-    # stt_provider/tts_model/welcome_message into columns that don't
-    # exist yet, and Postgres would reject the INSERT.
-    if [ -d /app/db/migrations ]; then
-        for m in /app/db/migrations/*.sql; do
-            echo "[startup] applying migration $(basename $m)"
-            python -c "
-import sys
-with open('$m', 'r') as f:
-    sql = f.read()
-try:
-    import psycopg2
-    c = psycopg2.connect('$pg_url')
-    with c.cursor() as cur:
-        cur.execute(sql)
-    c.commit()
-    c.close()
-    print('  OK')
-except Exception as e:
-    print(f'  WARN: {e}')
-" || true
-        done
-    fi
+    # 2. Apply migrations from /app/db/migrations/*.sql in order.
+    #    Each file is idempotent (CREATE TABLE IF NOT EXISTS /
+    #    ALTER TABLE ADD COLUMN IF NOT EXISTS) so re-running is safe.
+    import glob
+    for m in sorted(glob.glob('/app/db/migrations/*.sql')):
+        name = os.path.basename(m)
+        print(f"[startup] applying migration {name}")
+        try:
+            with open(m, 'r') as f:
+                sql = f.read()
+            conn = psycopg2.connect(PG_URL)
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+            conn.close()
+            print(f"  OK")
+        except Exception as exc:
+            print(f"  WARN: {exc}")
 
-    # ponytail: backfill JSON -> Postgres on first boot so existing
-    # local-dev data (agents, numbers, API keys) survives the first
-    # Postgres-backed deploy. Idempotent - skips rows already present.
-    python -c "
-import sys
-sys.path.insert(0, '/app')
-try:
-    from STT_server.db_agents import backfill_from_json as a_backfill
-    from STT_server.db_phone_numbers import backfill_from_json as n_backfill
-    from STT_server.db_tools import backfill_from_json as t_backfill
-    a = a_backfill(); n = n_backfill(); t = t_backfill()
-    if a or n or t:
-        print(f'[startup] backfilled from JSON -> Postgres: agents={a} numbers={n} tools={t}')
-    else:
-        print('[startup] JSON backfill: nothing to copy (empty or already migrated)')
-except Exception as e:
-    print(f'[startup] WARN: JSON backfill failed: {e}')
-" || true
+    # 3. Backfill JSON -> Postgres so existing local-dev data
+    #    (agents, phone numbers, API keys) survives the first
+    #    Postgres-backed deploy. Idempotent — skips rows that
+    #    already exist.
+    sys_path = '/app'
+    if sys_path not in __import__('sys').path:
+        __import__('sys').path.insert(0, sys_path)
+    try:
+        from STT_server.db_agents import backfill_from_json as a_backfill
+        from STT_server.db_phone_numbers import backfill_from_json as n_backfill
+        from STT_server.db_tools import backfill_from_json as t_backfill
+        a = a_backfill(); n = n_backfill(); t = t_backfill()
+        if a or n or t:
+            print(f"[startup] backfilled from JSON -> Postgres: agents={a} numbers={n} tools={t}")
+        else:
+            print("[startup] JSON backfill: nothing to copy (empty or already migrated)")
+    except Exception as exc:
+        print(f"[startup] WARN: JSON backfill failed: {exc}")
 else:
-    # JSON backend. Same self-heal as before.
+    # JSON backend. Self-heal users.json if missing.
+    import json
+    from pathlib import Path
     p = Path('/app/STT_server/data/users.json')
     existing = []
     if p.exists():
@@ -116,7 +111,7 @@ else:
         (u.get('email', '').lower() == ADMIN_EMAIL) for u in existing
     )
     if needs_seed:
-        print(f'[startup] users.json missing or has no admin -> seeding default admin')
+        print('[startup] users.json missing or has no admin -> seeding default admin')
         p.parent.mkdir(parents=True, exist_ok=True)
         admin = {
             'id': ADMIN_ID,
@@ -131,6 +126,6 @@ else:
         print(f"[startup] admin seeded: {ADMIN_EMAIL}")
     else:
         print(f"[startup] users.json OK ({len(existing)} user(s), admin present)")
-PY
+PYEOF
 
 exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
