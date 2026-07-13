@@ -139,7 +139,11 @@ def create_number(user_id: str, payload: dict) -> dict:
         "label": payload.get("label") or payload.get("name") or display,
         "name": payload.get("name"),
         "campaign": payload.get("campaign"),
-        "agent": payload.get("agent"),
+        # ponytail: empty-string "agent" from the FE would violate the FK
+        # to agents(id). Coerce to None so the column stays NULL (the
+        # FK is ON DELETE SET NULL anyway, so an unset agent is the
+        # intended state for "no agent linked yet").
+        "agent": payload.get("agent") or None,
         "calls": "0",
         "status": "Active",
     }
@@ -184,6 +188,10 @@ def create_number(user_id: str, payload: dict) -> dict:
 
 
 def update_number(number_id: str, user_id: str, payload: dict) -> dict | None:
+    # ponytail: same coercion as create_number - empty-string "agent"
+    # violates the FK. Normalize before either backend writes.
+    if "agent" in payload and not payload["agent"]:
+        payload = {**payload, "agent": None}
     if not is_postgres():
         if not NUMBERS_FILE.exists():
             return None
