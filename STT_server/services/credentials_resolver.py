@@ -1072,13 +1072,26 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
 
 
 def _test_twilio(creds: dict[str, str]) -> tuple[bool, str]:
-    """Validate the SID + token pair by fetching the account."""
+    """Validate the SID + token pair by fetching the account.
+
+    Uses the Twilio SDK's Client.api.accounts(sid).fetch() which is the
+    same call the official docs recommend. Returns (True, status) on
+    success or (False, message) on auth failure / SDK missing.
+    """
     try:
         from twilio.rest import Client
     except Exception as exc:
         return False, f"twilio SDK not installed: {exc}"
     sid = creds.get("account_sid")
     token = creds.get("auth_token")
+    if not sid or not token:
+        return False, "account_sid and auth_token are required"
+    try:
+        client = Client(sid, token)
+        account = client.api.accounts(sid).fetch()
+        return True, f"account status: {account.status}"
+    except Exception as exc:
+        return False, _sanitize_error(str(exc))[:300]
 
 
 def _test_inworld(creds: dict[str, str]) -> tuple[bool, str]:
@@ -1106,14 +1119,6 @@ def _test_inworld(creds: dict[str, str]) -> tuple[bool, str]:
         except Exception:
             pass
         return False, f"Inworld {exc.code}: {err_body or exc.reason}"
-    except Exception as exc:
-        return False, _sanitize_error(str(exc))[:300]
-    if not sid or not token:
-        return False, "account_sid and auth_token are required"
-    try:
-        client = Client(sid, token)
-        account = client.api.accounts(sid).fetch()
-        return True, f"account status: {account.status}"
     except Exception as exc:
         return False, _sanitize_error(str(exc))[:300]
 

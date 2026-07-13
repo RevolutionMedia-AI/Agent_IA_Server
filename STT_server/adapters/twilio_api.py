@@ -4,14 +4,59 @@ Uses the Twilio SDK to:
 - Configure the voice webhook on a phone number
 - Initiate outbound calls
 - Validate credentials
+- Validate Twilio signatures on inbound webhooks
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 from typing import Any
+from urllib.parse import quote_plus
 
 log = logging.getLogger("stt_server")
+
+
+def validate_twilio_signature(
+    auth_token: str,
+    full_url: str,
+    received_signature: str,
+    form_params: dict,
+) -> bool:
+    """Verify that an inbound request came from Twilio.
+
+    Twilio signs every webhook call with HMAC-SHA1 over the URL + sorted
+    form params (each value URL-encoded). The signature arrives as the
+    `X-Twilio-Signature` header. We recompute it and compare in
+    constant time.
+
+    Algorithm (from Twilio's docs):
+      1. Sort form_params by key.
+      2. Concatenate key + URL-encoded value for each pair.
+      3. Append the result to the full URL.
+      4. HMAC-SHA1 with the auth token as key.
+      5. Base64-encode and compare with X-Twilio-Signature.
+
+    See: https://www.twilio.com/docs/usage/webhooks/webhooks-security
+    """
+    import base64
+    if not auth_token or not received_signature or not full_url:
+        return False
+    pieces = [full_url]
+    for k in sorted(form_params.keys()):
+        # quote_plus matches Twilio's URL encoding (spaces -> '+').
+        v = form_params[k] if form_params[k] is not None else ""
+        pieces.append(f"{k}{quote_plus(str(v), safe='-_.~')}")
+    data = "".join(pieces).encode("utf-8")
+    expected = hmac.new(
+        auth_token.encode("utf-8"),
+        data,
+        hashlib.sha1,
+    ).digest()
+    expected_b64 = base64.b64encode(expected).decode("ascii")
+    return hmac.compare_digest(expected_b64, received_signature)
+
 
 
 def _get_twilio_client(account_sid: str, auth_token: str):

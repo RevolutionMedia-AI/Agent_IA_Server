@@ -41,6 +41,15 @@ class CallSession:
     welcome_message: str | None = None
     # Per-session TTS provider: "elevenlabs" or "rime"
     tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
+    # ponytail: tts_model = concrete model id sent to the TTS provider.
+    # Set from the agent config at call start so the dispatcher picks
+    # the right model (e.g. "inworld-tts-2", "aura-asteria-en").
+    tts_model: str | None = None
+    # ponytail: voice_id for TTS. ElevenLabs / Inworld take a voice id,
+    # Deepgram / OpenAI take a voice name. The agent's voice field is
+    # also kept on the session as `tts_voice` for UI display.
+    voice_id: str | None = None
+    tts_voice: str | None = None
     # ponytail: which LLM provider the agent picked. Mirrors the FE's
     # llm_provider dropdown — read by openai_llm._client_for_session so
     # the dispatch goes to OpenAI, MiniMax (OpenAI-compat with custom

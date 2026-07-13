@@ -198,6 +198,94 @@ def _get_user(user_id: str) -> Optional[dict]:
 api_router = APIRouter()
 
 
+# ---------- /call-status (Twilio status callback) ----------
+# ----------------------------------------------------------------------------
+# Twilio's `configure_voice_webhook` sets this URL as the call's
+# statusCallback. Twilio POSTs here with form-encoded fields like
+# CallSid, CallStatus (initiated/ringing/answered/completed/busy/etc),
+# To, From, Direction, Duration. We just record the latest status
+# per call_sid in memory; the per-call record already has duration
+# at cleanup time so this is mostly observability.
+# ----------------------------------------------------------------------------
+
+@api_router.post("/call-status")
+async def call_status(request: Request) -> dict:
+    """Twilio status callback. Twilio POSTs form-encoded data here as
+    the call progresses. We accept any status and return 200 so Twilio
+    doesn't retry. No auth: Twilio signature validation lives in
+    STT_Server.py's /voice webhook instead (this endpoint is only
+    informational).
+    """
+    try:
+        form = await request.form()
+    except Exception as exc:
+        log.warning("[call-status] could not read form: %s", exc)
+        return {"ok": True}
+    call_sid = form.get("CallSid")
+    call_status_val = form.get("CallStatus")
+    duration = form.get("Duration")
+    log.info("[call-status] call_sid=%s status=%s duration=%s",
+             call_sid, call_status_val, duration)
+    return {"ok": True}
+
+
+# ---------- /health (call-path readiness) ----------
+# ----------------------------------------------------------------------------
+# Lightweight health endpoint that checks the dependencies the call
+# path actually needs (DB reachable, PUBLIC_URL set, at least one
+# provider key configured). Railway uses this to know the service is
+# really ready to handle traffic, not just that the process started.
+# ----------------------------------------------------------------------------
+
+@api_router.get("/health")
+def health() -> dict:
+    out = {
+        "ok": True,
+        "checks": {},
+    }
+    # 1. DB reachable?
+    try:
+        from STT_server.db import is_postgres, get_conn
+        if is_postgres():
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            out["checks"]["postgres"] = "ok"
+        else:
+            out["checks"]["postgres"] = "skipped (JSON backend)"
+    except Exception as exc:
+        out["ok"] = False
+        out["checks"]["postgres"] = f"FAIL: {exc}"
+    # 2. PUBLIC_URL set?
+    from STT_server.config import PUBLIC_URL
+    if PUBLIC_URL:
+        out["checks"]["public_url"] = "ok"
+    else:
+        out["ok"] = False
+        out["checks"]["public_url"] = "FAIL: PUBLIC_URL env not set"
+    # 3. At least one TTS provider reachable?
+    from STT_server.config import (
+        ELEVENLABS_API_KEY, OPENAI_API_KEY, DEEPGRAM_API_KEY, INWORLD_API_KEY,
+    )
+    from STT_server.adapters.tts_dispatcher import VALID_TTS_PROVIDERS
+    keys = {
+        "elevenlabs": bool(ELEVENLABS_API_KEY),
+        "openai": bool(OPENAI_API_KEY),
+        "deepgram": bool(DEEPGRAM_API_KEY),
+        "inworld": bool(INWORLD_API_KEY),
+    }
+    out["checks"]["tts_env_keys"] = keys
+    if not any(keys.values()):
+        # Not fatal — users can bring their own per-provider keys via
+        # Settings → API. Flag it but don't fail the healthcheck.
+        out["checks"]["tts_env_keys_warning"] = "no system-level TTS keys; users must configure their own"
+    # 4. Rime and AssemblyAI live under credentials_resolver env names
+    from STT_server.config import RIME_API_KEY
+    keys["rime"] = bool(RIME_API_KEY)
+    return out
+
+
 # ---------- Pydantic schemas ----------
 
 class AgentCreate(BaseModel):
@@ -465,7 +553,35 @@ def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_au
                     status_code=400,
                     detail="Twilio Auth Token must be 32-64 characters",
                 )
-    return db_create_number(auth["user_id"], data.dict())
+    new_number = db_create_number(auth["user_id"], data.dict())
+
+    # ponytail: configure the Twilio webhook so calls actually route
+    # to us. Without this the number lives in our DB but Twilio has no
+    # idea where to send inbound audio. We use the per-number Twilio
+    # creds the user just submitted (with fallback to the env var
+    # TWILIO_AUTH_TOKEN). On failure we surface the Twilio error to the
+    # FE but keep the row - the user can retry via PUT.
+    if data.provider == "twilio" and data.twilio_account_sid and data.twilio_auth_token:
+        try:
+            import asyncio
+            from STT_server.adapters.twilio_api import configure_voice_webhook
+            from STT_server.config import PUBLIC_URL
+            webhook_url = f"{PUBLIC_URL.rstrip('/')}/voice"
+            result = asyncio.run(configure_voice_webhook(
+                data.twilio_account_sid,
+                data.twilio_auth_token,
+                data.number,
+                webhook_url,
+            ))
+            if not result.get("success"):
+                log.warning("[phone-numbers] webhook config failed: %s", result.get("error"))
+                new_number["webhook_warning"] = result.get("error", "unknown")
+            else:
+                new_number["webhook_configured"] = True
+        except Exception as exc:
+            log.warning("[phone-numbers] webhook config exception: %s", exc)
+            new_number["webhook_warning"] = str(exc)
+    return new_number
 
 
 @api_router.put("/phone-numbers/{number_id}")

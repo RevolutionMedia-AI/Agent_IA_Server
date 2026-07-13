@@ -28,6 +28,7 @@ from STT_server.config import (
     PORT,
     PUBLIC_URL,
     ELEVENLABS_API_KEY,
+    TWILIO_AUTH_TOKEN,
     TWILIO_SR,
     USE_OPENAI_REALTIME,
     TWIML_INITIAL_GREETING_ENABLED,
@@ -98,7 +99,47 @@ async def voice(
     looks up the matching phone number in phone_numbers.json. If it
     has an agent linked, the agent_id is added to the stream's
     custom parameters so media_stream can pick it up at call start.
+
+    When TWILIO_AUTH_TOKEN is set in the environment, we verify the
+    X-Twilio-Signature header against the incoming form params. Any
+    request without a valid signature is rejected with 403. This
+    blocks attackers who could otherwise POST audio frames to /voice
+    and consume our TTS/LLM quota. Set TWILIO_AUTH_TOKEN to enable;
+    leaving it unset keeps the endpoint open for local dev.
     """
+    # ponytail: Twilio signature verification. We accept form twice
+    # here because Twilio sends it as application/x-www-form-urlencoded
+    # and the verifier needs the same dict. Reading the body once and
+    # caching it avoids the parser being called twice on the wire.
+    form_dict: dict = {}
+    if request is not None:
+        try:
+            form = await request.form()
+            # Convert to plain dict (form items are multi-dict-aware
+            # but Twilio sends each key once). Convert values to str so
+            # the signature helper sees the same shape Twilio signed.
+            form_dict = {k: str(v) if v is not None else "" for k, v in form.items()}
+        except Exception:
+            form_dict = {}
+
+    if TWILIO_AUTH_TOKEN and form_dict:
+        from STT_server.adapters.twilio_api import validate_twilio_signature
+        # ponytail: Twilio signs the URL the request hit. When the
+        # request goes through a reverse proxy (Railway, Cloudflare)
+        # the Host header reflects the public hostname but the path
+        # the signature was computed against is the original PUBLIC_URL
+        # path. We rebuild the URL from PUBLIC_URL + request.url.path
+        # so signature verification works behind a proxy.
+        signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
+        if request.url.query:
+            signature_url += f"?{request.url.query}"
+        sig = request.headers.get("X-Twilio-Signature", "")
+        if sig and not validate_twilio_signature(
+            TWILIO_AUTH_TOKEN, signature_url, sig, form_dict
+        ):
+            log.warning("[VOICE] invalid Twilio signature from %s", request.client.host if request.client else "?")
+            return Response(content="invalid signature", status_code=403)
+
     ws_url = PUBLIC_URL.rstrip("/")
 
     if ws_url.startswith("https://"):
@@ -124,29 +165,14 @@ async def voice(
             called_to = form.get('To') or form.get('to')
             if called_to:
                 e164 = str(called_to).strip()
-                numbers_path = os.path.join(
-                    os.path.dirname(__file__), 'data', 'phone_numbers.json'
-                )
-                if os.path.exists(numbers_path):
-                    with open(numbers_path, 'r', encoding='utf-8') as f:
-                        numbers = json.load(f) or []
-                    for n in numbers:
-                        # phone_numbers.json stores country ('+1') and
-                        # number ('5551234567') separately; full E.164 is
-                        # '+<country><number>'. Match either way for
-                        # robustness against future format changes.
-                        country = n.get('country') or ''
-                        number = n.get('number') or ''
-                        if not number:
-                            continue
-                        full_e164 = f"{country}{number}" if country else number
-                        if e164 == full_e164 or e164 == number or e164.endswith(number):
-                            agent_id = n.get('agent') or None
-                            log.info(
-                                "[VOICE] matched phone %s -> agent_id=%s",
-                                e164, agent_id
-                            )
-                            break
+                from STT_server.db_phone_numbers import find_by_number as find_num
+                num_row = find_num(e164)
+                if num_row:
+                    agent_id = num_row.get("agent") or None
+                    log.info(
+                        "[VOICE] matched phone %s -> agent_id=%s (db=%s)",
+                        e164, agent_id, "postgres" if is_postgres() else "json",
+                    )
     except Exception as exc:
         log.warning("[VOICE] failed to look up phone number for agent: %s", exc)
 
@@ -190,8 +216,16 @@ async def media_stream(ws: WebSocket) -> None:
     session = CallSession(session_key=f"ws-{id(ws)}")
 
     try:
+        # ponytail: process_transcripts is started exactly once, inside
+        # the `start` event handler after the STT engine is wired up.
+        # Previously it was also kicked off here unconditionally, which
+        # caused two consumers to race on session.transcript_queue
+        # whenever the session's STT engine dispatched into the same
+        # queue (Deepgram, Inworld). The race produced inconsistent
+        # transcript ordering - both consumers pulled from the same
+        # queue and one could process partial finals while the other
+        # held back. Single consumer only.
         track_task(session, asyncio.create_task(playback_loop(ws, session)))
-        track_task(session, asyncio.create_task(process_transcripts(session)))
 
         while True:
             try:
@@ -265,16 +299,15 @@ async def media_stream(ws: WebSocket) -> None:
 
                 agent_cfg = None
                 if agent_id_from_params:
+                    # ponytail: read the agent from Postgres (with JSON
+                    # fallback for local dev). db_agents.get_agent
+                    # returns the same shape the route layer sees, so
+                    # the fields below don't need to change.
                     try:
-                        _agents_path = os.path.join(os.path.dirname(__file__), 'data', 'agents.json')
-                        with open(_agents_path, 'r', encoding='utf-8') as f:
-                            agents_list = json.load(f) or []
-                        for a in agents_list:
-                            if a.get('id') == agent_id_from_params:
-                                agent_cfg = a
-                                break
-                    except (FileNotFoundError, json.JSONDecodeError, IOError):
-                        pass
+                        from STT_server.db_agents import get_agent as _get_agent_db
+                        agent_cfg = _get_agent_db(agent_id_from_params)
+                    except Exception as exc:
+                        log.warning("[AGENT] db lookup failed for %s: %s", agent_id_from_params, exc)
 
                 if agent_cfg:
                     # Agent's system_prompt overrides the tenant's.
@@ -309,6 +342,29 @@ async def media_stream(ws: WebSocket) -> None:
                     session.stt_model = (agent_cfg.get('stt_model') or None)
                     log.info("[AGENT] session %s stt=%s model=%s",
                              session.session_key, session.stt_provider, session.stt_model or '-')
+                    # ponytail: TTS dispatch — same pattern as STT. The
+                    # agent's tts_provider/tts_model flow through to the
+                    # TTS dispatcher. Without these the call would use
+                    # the system default (elevenlabs) regardless of what
+                    # the user picked in the FE.
+                    session.tts_provider = (
+                        (agent_cfg.get('tts_provider') or '').strip().lower()
+                        or DEFAULT_TTS_PROVIDER
+                    )
+                    session.tts_model = (agent_cfg.get('tts_model') or None)
+                    session.voice_id = agent_cfg.get('voice_id') or None
+                    session.tts_voice = agent_cfg.get('voice') or None
+                    log.info("[AGENT] session %s tts=%s model=%s voice=%s",
+                             session.session_key, session.tts_provider,
+                             session.tts_model or '-', session.tts_voice or '-')
+                    # ponytail: per-user credentials. The agent row
+                    # carries user_id, so per-user API keys are now
+                    # reachable via resolve_provider(session.user_id,
+                    # provider) inside the adapters.
+                    session.user_id = agent_cfg.get('user_id') or session.user_id
+                    if session.user_id:
+                        log.info("[AGENT] session %s user_id=%s (per-user keys)",
+                                 session.session_key, session.user_id)
                 if session.stt_provider == 'openai_realtime':
                     track_task(
                         session,

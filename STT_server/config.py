@@ -59,6 +59,11 @@ DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "elevenlabs").strip().l
 
 TWILIO_SR = 8000
 TWILIO_CHANNELS = 1
+# ponytail: Twilio auth token for inbound signature validation. When set,
+# /voice rejects any request whose X-Twilio-Signature doesn't match the
+# HMAC-SHA1 of (URL + form params). Leave unset to skip the check
+# (local dev only - production should always set this).
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 FRAME_DURATION_MS = 20
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
 TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
