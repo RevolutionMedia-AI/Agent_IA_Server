@@ -18,6 +18,7 @@ Add a new provider here and the FE + BE pick it up automatically.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -501,16 +502,13 @@ _HARDCODED_TTS_VOICES = {
         {"id": "aura-orion-en",   "name": "Orion (en)",   "description": "Male, narrative"},
         {"id": "aura-athena-en",  "name": "Athena (en)",  "description": "Female, professional"},
     ],
-    # ponytail: Inworld TTS voice catalog is intentionally tiny here.
-    # The full list is fetched via GET /voice/v1/voices (Inworld Voice
-    # API) once we wire that call into list_provider_models. Until
-    # then we ship the doc-example voice (Dennis) and one default so
-    # the FE dropdown is never empty. If the user picks a different
-    # voice in the API and types the id directly, it still works
-    # because the live path forwards voiceId as-is.
-    "inworld": [
-        {"id": "Dennis",          "name": "Dennis",       "description": "Inworld stock voice (docs example)"},
-    ],
+    # ponytail: Inworld voice catalog is fetched live from
+    # GET /voices/v1/voices in list_provider_models. This hardcoded
+    # entry is only the fallback for when the user has no Inworld key
+    # configured (the FE then shows an empty dropdown). The "Dennis"
+    # placeholder we shipped before turned out to be an ElevenLabs
+    # voice id - not Inworld - and produced HTTP 400 on every request.
+    "inworld": [],
 }
 
 _HARDCODED_STT_MODELS = {
@@ -724,9 +722,40 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_TTS_VOICES["deepgram"]}
             if provider_id == "inworld":
+                # ponytail: live fetch from GET /voices/v1/voices. The
+                # hardcoded "Dennis" we shipped before was wrong - it
+                # was an ElevenLabs voice id, not Inworld. We now query
+                # the workspace's actual voice catalog so the FE
+                # dropdown only shows voices that exist. Falls back to
+                # an empty list when no key/credentials are available
+                # (the FE then shows "No options" and the user can type
+                # an id manually).
+                if creds:
+                    try:
+                        req = urllib.request.Request(
+                            "https://api.inworld.ai/voices/v1/voices?pageSize=200",
+                            headers={"Authorization": f"Basic {creds}"},
+                        )
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            payload = json.loads(resp.read().decode("utf-8"))
+                        live = [
+                            {
+                                "id": v["voiceId"],
+                                "name": v.get("displayName") or v["voiceId"],
+                                "description": " · ".join(filter(None, [
+                                    v.get("description") or "",
+                                    f"{v.get('gender', '')} {v.get('ageGroup', '')}".strip(),
+                                    f"({v.get('source', '')})" if v.get("source") else "",
+                                ])).strip(" ·") or "Inworld voice",
+                            }
+                            for v in payload.get("voices", [])
+                            if v.get("voiceId")
+                        ]
+                        if live:
+                            return {"models": live}
+                    except Exception:
+                        pass
                 return {"models": _HARDCODED_TTS_VOICES["inworld"]}
-                # ponytail: stock catalog above. Future: fetch the live
-                # list from GET /voice/v1/voices and merge.
             return {"models": []}
 
         if service == "stt":
@@ -1019,30 +1048,20 @@ def _test_twilio(creds: dict[str, str]) -> tuple[bool, str]:
 
 
 def _test_inworld(creds: dict[str, str]) -> tuple[bool, str]:
-    """Real roundtrip on /tts/v1/voice. Returns the Inworld error
-    message verbatim so the FE can show 'Unknown voice: Dennis'
-    instead of a generic 'invalid request'. The default voice id
-    below is the one Inworld uses in their own cURL sample; if your
-    account uses different voice ids, the error will name the
-    missing one and you can correct it from Settings."""
-    import json as _json
+    """Auth check via GET /voices/v1/voices. We don't POST to /tts/v1/voice
+    here because that requires picking a valid voice_id from the user's
+    workspace, and we don't know which ones they have at validation time.
+    If the key authenticates against the voices list endpoint, the key
+    is good; if it doesn't, the response body tells us exactly why."""
     import urllib.error
     import urllib.request
     key = creds.get("api_key")
     if not key:
         return False, "api_key is required"
-    body = _json.dumps({
-        "text": "hi",
-        "voiceId": "Dennis",
-        "modelId": "inworld-tts-1.5-mini",
-        "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": 8000},
-    }).encode("utf-8")
     try:
         req = urllib.request.Request(
-            "https://api.inworld.ai/tts/v1/voice",
-            data=body,
-            headers={"Authorization": f"Basic {key}", "Content-Type": "application/json"},
-            method="POST",
+            "https://api.inworld.ai/voices/v1/voices?pageSize=1",
+            headers={"Authorization": f"Basic {key}"},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200, f"HTTP {resp.status}"
