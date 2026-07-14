@@ -43,21 +43,20 @@ ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS updated_at                 TI
 
 -- ── tools_integrations ────────────────────────────────────────────────
 -- Old PK was single-column (id). New PK is composite (user_id, id).
--- Drop the old PK first if it's still single-column, then add the
--- composite. The DO block is defensive: if the PK is already
--- composite, the DROP CONSTRAINT would fail, so we only run it when
--- the old shape is detected.
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'tools_integrations_pkey'
-      AND pg_get_constraintdef(oid) LIKE 'PRIMARY KEY (id)%'
-  ) THEN
-    ALTER TABLE tools_integrations DROP CONSTRAINT tools_integrations_pkey;
-    ALTER TABLE tools_integrations ADD PRIMARY KEY (user_id, id);
-  END IF;
-END $$;
+-- The original 004 used a DO $$ ... END $$; block to detect the
+-- old shape before dropping — that broke the start.sh splitter
+-- (which cuts on `;` and didn't handle dollar-quoted strings),
+-- leaving the boot in an aborted transaction. Replaced with two
+-- unconditional statements that are individually idempotent:
+--   - DROP CONSTRAINT IF EXISTS: no-op on fresh deploys (PK
+--     doesn't exist), succeeds on upgrades (removes old PK).
+--   - ADD CONSTRAINT: succeeds on upgrades (creates new PK),
+--     fails on fresh deploys (PK from 001_schema.sql already
+--     exists). The start.sh try/except logs the error and moves
+--     on — the schema is already in the correct state on fresh
+--     deploys.
+ALTER TABLE tools_integrations DROP CONSTRAINT IF EXISTS tools_integrations_pkey;
+ALTER TABLE tools_integrations ADD CONSTRAINT tools_integrations_pkey PRIMARY KEY (user_id, id);
 ALTER TABLE tools_integrations ADD COLUMN IF NOT EXISTS display_name  TEXT;
 ALTER TABLE tools_integrations ADD COLUMN IF NOT EXISTS category      TEXT;
 ALTER TABLE tools_integrations ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ;

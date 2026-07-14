@@ -70,9 +70,19 @@ if PG_URL:
     #    leave the rest of the schema uncreated on a fresh deploy.
     #    Split the file into statements and execute each one.
     def _split_sql_statements(sql_text):
+        # ponytail: the C1 splitter cut on `;` at the top level, which
+        # broke any DO $$ ... END $$; block (it split inside the
+        # $$ ... $$ string and Postgres saw an unterminated
+        # dollar-quoted string). Track dollar-quoted regions so a
+        # `;` inside `$$ ... $$` doesn't end a statement. Also handles
+        # `$_tag_$ ... $_tag_$` with custom tags. The closing tag must
+        # match the opening tag (Postgres rule); the inner `;` is
+        # just data.
         statements = []
         current = []
-        state = "normal"  # normal | line_comment | block_comment | sq | dq
+        # states: normal | line_comment | block_comment | sq | dq | dollar
+        state = "normal"
+        dollar_tag = None  # the active dollar-quote tag (None when not in one)
         i = 0
         while i < len(sql_text):
             c = sql_text[i]
@@ -106,6 +116,26 @@ if PG_URL:
                     current.append(c)
                 else:
                     current.append(c)
+            elif state == "dollar":
+                # Inside a $$ or $tag$ block. Postgres allows the
+                # closing tag anywhere, but the only way the splitter
+                # can know is to scan ahead for the same tag.
+                if c == "$":
+                    # Look ahead for the matching tag.
+                    j = i + 1
+                    while j < len(sql_text) and (sql_text[j].isalnum() or sql_text[j] == "_"):
+                        j += 1
+                    candidate = sql_text[i:j + 1]  # includes the trailing $
+                    if candidate == dollar_tag:
+                        current.append(candidate)
+                        i = j
+                        state = "normal"
+                        dollar_tag = None
+                        continue
+                    # Not the closing tag: it's just data.
+                    current.append(c)
+                else:
+                    current.append(c)
             else:  # normal
                 if c == "-" and nxt == "-":
                     state = "line_comment"
@@ -121,6 +151,27 @@ if PG_URL:
                 elif c == '"':
                     state = "dq"
                     current.append(c)
+                elif c == "$" and nxt == "$":
+                    # $$ starts a dollar-quoted block. No custom tag
+                    # here, just two consecutive $s.
+                    current.append("$$")
+                    i += 1
+                    state = "dollar"
+                    dollar_tag = "$$"
+                elif c == "$":
+                    # $tag$ style dollar-quote.
+                    j = i + 1
+                    while j < len(sql_text) and (sql_text[j].isalnum() or sql_text[j] == "_"):
+                        j += 1
+                    if j < len(sql_text) and sql_text[j] == "$":
+                        tag = sql_text[i:j + 1]
+                        current.append(tag)
+                        i = j
+                        state = "dollar"
+                        dollar_tag = tag
+                    else:
+                        # Lone $ — not a dollar-quote, just data.
+                        current.append(c)
                 elif c == ";":
                     stmt = "".join(current).strip()
                     if stmt:
