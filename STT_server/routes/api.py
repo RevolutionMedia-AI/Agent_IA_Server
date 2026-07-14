@@ -55,7 +55,7 @@ from STT_server.db_settings import (
     get_settings as db_get_settings,
     upsert_settings as db_upsert_settings,
 )
-from STT_server.db_campaigns import list_campaigns as db_list_campaigns, upsert_campaign as db_upsert_campaign
+from STT_server.db_campaigns import list_campaigns as db_list_campaigns
 
 VALID_MODEL_SERVICES = {"stt", "tts", "llm"}
 
@@ -493,11 +493,6 @@ def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
         v = getattr(data, k)
         if v and not get_provider_spec(v):
             raise HTTPException(status_code=400, detail=f"Unknown provider '{v}'")
-    # Register the campaign globally so the next modal that opens sees
-    # this user's choice as a suggestion. The agent row stores the
-    # campaign string verbatim; the global catalog is just for UX.
-    if data.campaign:
-        db_upsert_campaign(data.campaign)
     return db_create_agent(auth["user_id"], data.dict())
 
 
@@ -527,9 +522,6 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
     updated = db_update_agent(agent_id, auth["user_id"], payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Agent not found")
-    # Register the campaign globally so it shows up in the next modal.
-    if payload.get("campaign"):
-        db_upsert_campaign(payload["campaign"])
     return updated
 
 
@@ -589,10 +581,6 @@ async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(requ
                     detail="Twilio Auth Token must be 32-64 characters",
                 )
     new_number = db_create_number(auth["user_id"], data.dict())
-    # ponytail: register the campaign globally so the next modal that
-    # opens sees this user's choice as a suggestion.
-    if data.campaign:
-        db_upsert_campaign(data.campaign)
 
     # ponytail: configure the Twilio webhook so calls actually route
     # to us. Without this the number lives in our DB but Twilio has no
@@ -644,10 +632,6 @@ def update_phone_number(number_id: str, data: PhoneNumberUpdate, auth: dict = De
     updated = db_update_number(number_id, auth["user_id"], payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Phone number not found")
-    # ponytail: register the campaign globally so the next modal that
-    # opens sees this user's choice as a suggestion.
-    if payload.get("campaign"):
-        db_upsert_campaign(payload["campaign"])
     return updated
 
 
@@ -772,7 +756,10 @@ def get_settings(auth: dict = Depends(require_auth)):
             "marketing": False,
         },
     }
-    stored = _load(_settings_path(auth["user_id"]), {})
+    # ponytail: route through db_settings on Postgres so GET and PUT
+    # read/write the same store. The JSON backend keeps _load() since
+    # db_get_settings already falls back to settings/<user_id>.json.
+    stored = db_get_settings(auth["user_id"]) or {}
     return {**defaults, **stored}
 
 

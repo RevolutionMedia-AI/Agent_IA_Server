@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Depends, Request
@@ -36,6 +37,7 @@ from STT_server.config import (
 from STT_server.domain.language import detect_language, split_tts_segments, sanitize_tts_text
 from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS, VALID_LANGUAGES
 from STT_server.domain.tenant import TenantConfig, tenant_store
+from STT_server import db_tenants
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import playback_loop
@@ -62,7 +64,24 @@ if not ELEVENLABS_API_KEY:
     log.warning("ELEVENLABS_API_KEY no configurada. El TTS no estara disponible.")
 
 
-app = FastAPI()
+# ponytail: startup hook. On Postgres deployments, backfill any tenants
+# that exist in the local JSON file but not yet in the DB (the in-memory
+# tenant_store was ephemeral, so on a greenfield this is a no-op; the
+# moment a JSON file appears the rows get picked up automatically).
+#
+# Deliberately NOT calling db_call_sessions.list_open_sessions() here:
+# session_runtime.py still uses its in-memory dict and never writes to
+# the call_sessions table, so a recovery sweep would always return [].
+# Add that hook in the same PR that migrates session_runtime to
+# db_call_sessions — keeping the two coupled avoids the false signal
+# of "we have crash recovery" when we don't.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db_tenants.backfill_from_json()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # CORS allowlist — comma-separated env var, defaults to local dev origins.
 ALLOWED_ORIGINS = [
