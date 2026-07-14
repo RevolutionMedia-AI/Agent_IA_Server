@@ -341,6 +341,16 @@ async def media_stream(ws: WebSocket) -> None:
     await ws.accept()
     session = CallSession(session_key=f"ws-{id(ws)}")
 
+    # ponytail: track errors that happen INSIDE the `start` event
+    # handler (the bulk of the call setup) so the call can be torn
+    # down cleanly. The user flagged: if a RuntimeError fires before
+    # the WebSocket starts streaming, Twilio keeps the call open
+    # charging minutes in a silent limbo. The except block below
+    # catches every exception, plays a short error audio (if a TTS
+    # provider is configured), and closes the WS. Twilio sees the
+    # close frame and tears the call down — never a silent limbo.
+    _call_setup_failed: list[Exception] = []
+
     try:
         # ponytail: process_transcripts is started exactly once, inside
         # the `start` event handler after the STT engine is wired up.
@@ -568,9 +578,38 @@ async def media_stream(ws: WebSocket) -> None:
                 log.info("Stream stop para %s", session.session_key)
                 break
 
-    except Exception:
+    except Exception as exc:
         log.exception("Error en media_stream (excepción no controlada)")
+        _call_setup_failed.append(exc)
     finally:
+        if _call_setup_failed and not session.closed:
+            # ponytail: don't drop the call silently. Play a short
+            # error TTS (when possible) so the caller hears "something
+            # went wrong" instead of dead air, then close the WS so
+            # Twilio tears the call down. play_error_and_hangup is
+            # best-effort: it never raises, it just logs and closes.
+            err = _call_setup_failed[0]
+            try:
+                from STT_server.services.playback_service import play_error_and_hangup
+                # Map common RuntimeErrors to a short caller-facing
+                # message. Everything else gets a generic "config
+                # problem" so the user isn't left guessing.
+                err_text = str(err)
+                if "system_prompt" in err_text:
+                    message = "Lo sentimos, este agente no tiene prompt configurado. Adios."
+                elif "no STT provider" in err_text or "no TTS provider" in err_text or "no LLM provider" in err_text:
+                    message = "Lo sentimos, falta una API key para esta llamada. Adios."
+                else:
+                    message = "Lo sentimos, hubo un problema de configuracion. Adios."
+                await play_error_and_hangup(session, ws, message=message)
+            except Exception as play_exc:
+                # Last-ditch fallback: just close the WS so Twilio
+                # hangs up. The call ends, no silent limbo.
+                log.exception("play_error_and_hangup failed: %s", play_exc)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
         await cleanup_session(session, ws)
 
 

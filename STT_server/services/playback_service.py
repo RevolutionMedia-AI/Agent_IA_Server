@@ -89,12 +89,25 @@ async def play_initial_greeting(session: CallSession) -> None:
     """Play the agent's welcome_message (set by media_stream at call start)
     via the TTS pipeline so the caller hears the agent greet them first.
     No-op if welcome_message is empty / not configured.
+
+    ponytail: set assistant_speaking = True BEFORE scheduling the TTS
+    so monitor_idle_silence knows the agent is about to speak and
+    doesn't count the TTFB window as user silence. The flag gets
+    cleared by playback_loop when Twilio confirms playback completion
+    via the mark event.
     """
     welcome = getattr(session, 'welcome_message', None)
     if not welcome or not welcome.strip():
         log.debug("[PLAYBACK] play_initial_greeting skipped (no welcome_message)")
         return
     log.info("[PLAYBACK] playing initial greeting (%d chars) for session=%s", len(welcome), session.session_key)
+    # Mark the agent as speaking NOW (before the TTS provider responds).
+    # Without this the idle monitor could fire during the TTFB window
+    # (some TTS providers take 1-2 s to first byte), think the user is
+    # silent, and hang up the call.
+    session.assistant_speaking = True
+    session.assistant_started_at = time.perf_counter()
+    session.last_activity_at = time.monotonic()
     # Wait a moment for the audio stream to be established.
     await asyncio.sleep(0.4)
     # Generate the TTS via the session's configured TTS provider. The
@@ -104,6 +117,50 @@ async def play_initial_greeting(session: CallSession) -> None:
         await run_tts_with_retries(session, welcome.strip(), session.active_generation)
     except Exception as exc:
         log.warning("[PLAYBACK] initial greeting TTS failed: %s", exc)
+        session.assistant_speaking = False
+        session.assistant_started_at = None
+
+
+async def play_error_and_hangup(
+    session: CallSession,
+    ws: WebSocket,
+    message: str = "Lo sentimos, hubo un problema de configuracion. Adios.",
+) -> None:
+    """Best-effort: speak a short error message via the configured TTS
+    provider, then close the WebSocket so Twilio tears the call down.
+
+    Falls back to a plain WebSocket close if no TTS provider is
+    configured (the user explicitly asked for no default fallbacks,
+    so we can't TTS without one). In either case the call ends
+    cleanly — never a silent limbo where Twilio keeps charging.
+    """
+    log.error("[HANGUP] session %s: %s", session.session_key, message)
+    tts_provider = getattr(session, 'tts_provider', None) or ""
+    if tts_provider:
+        try:
+            from STT_server.services.turn_manager import run_tts_with_retries
+            # Generation bump so the playback_loop sees this as a new
+            # turn (not a continuation of the welcome greeting).
+            session.active_generation += 1
+            await asyncio.wait_for(
+                run_tts_with_retries(session, message, session.active_generation),
+                timeout=10.0,
+            )
+        except Exception as exc:
+            log.warning("[HANGUP] error TTS failed for %s: %s", session.session_key, exc)
+    else:
+        log.error(
+            "[HANGUP] session %s: no TTS provider configured, closing WS without error audio",
+            session.session_key,
+        )
+    # Close the WS → Twilio sees the close and tears down the call. The
+    # exact same code path cleanup_session uses, but called explicitly
+    # so the operator can see this code path in a traceback if it
+    # fails.
+    try:
+        await ws.close()
+    except Exception as exc:
+        log.warning("[HANGUP] ws.close() failed for %s: %s", session.session_key, exc)
 
 
 async def playback_loop(ws: WebSocket, session: CallSession) -> None:
