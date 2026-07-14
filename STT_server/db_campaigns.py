@@ -1,4 +1,4 @@
-"""Postgres-backed implementations for the global campaigns catalog.
+"""Postgres-backed implementations for the global campaign catalog.
 
 A campaign is just a string tag — Life Insurance, After-Sales,
 Customer Care, etc. The agent modal and the phone-number modal both
@@ -28,7 +28,8 @@ def list_campaigns(limit: int = 200) -> list[str]:
 
     JSON-fallback for local dev returns the curated list + whatever
     campaign strings are stored in agents.json / phone_numbers.json.
-    Production (Postgres) reads the `campaigns` table.
+    Production (Postgres) reads the values already stored on agents and
+    phone numbers.
     """
     if not is_postgres():
         from pathlib import Path
@@ -50,31 +51,12 @@ def list_campaigns(limit: int = 200) -> list[str]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT name FROM campaigns ORDER BY lower(name) LIMIT %s",
+                "SELECT name FROM ("
+                "SELECT campaign AS name FROM agents "
+                "UNION SELECT campaign AS name FROM phone_numbers"
+                ") campaign_names "
+                "WHERE name IS NOT NULL AND btrim(name) <> '' "
+                "ORDER BY lower(name) LIMIT %s",
                 (limit,),
             )
             return [r["name"] for r in cur.fetchall()]
-
-
-def upsert_campaign(name: str) -> None:
-    """Register a campaign name the user typed. Idempotent — the
-    table's PK on name handles dedup, so this is a no-op if it exists.
-
-    Returns silently on empty / whitespace-only input. Caller is
-    responsible for trimming and stripping whitespace before passing
-    the value in.
-    """
-    name = (name or "").strip()
-    if not name:
-        return
-    if not is_postgres():
-        return  # JSON backend: nothing to persist, but the curated
-        # options plus the JSON-stored rows are still visible via
-        # list_campaigns() thanks to the local-dev fallback.
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO campaigns (name) VALUES (%s) "
-                "ON CONFLICT (name) DO NOTHING",
-                (name,),
-            )

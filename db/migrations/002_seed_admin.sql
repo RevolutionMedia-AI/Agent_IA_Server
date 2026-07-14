@@ -1,12 +1,13 @@
 -- ============================================================================
 -- RevolutionMedia-AI · Seed admin
 -- ----------------------------------------------------------------------------
--- Inserta el usuario admin inicial. El hash corresponde a la password
--- "Adminrevolutionmedia@109" (SHA-256 hex).
+-- Inserts the initial admin user. The password hash corresponds to
+-- "Adminrevolutionmedia@109" (SHA-256 hex). To rotate the password:
 --
--- Si querés cambiar la password, generá el hash nuevo:
---   python -c "import hashlib; print(hashlib.sha256(b'TuPassword').hexdigest())"
--- y reemplazá el valor de "password" en el INSERT.
+--   python -c "import hashlib; print(hashlib.sha256(b'NEW').hexdigest())"
+--
+-- then replace the literal below, or update it via the FE after the
+-- first login (PUT /settings/password).
 -- ============================================================================
 
 INSERT INTO users (id, name, email, password, role)
@@ -18,8 +19,8 @@ VALUES (
   'admin'
 )
 ON CONFLICT (id) DO UPDATE SET
-  name = EXCLUDED.name,
-  email = EXCLUDED.email,
-  password = EXCLUDED.password,
-  role = EXCLUDED.role,
-  updated_at = NOW();
+  name        = EXCLUDED.name,
+  email       = EXCLUDED.email,
+  password    = EXCLUDED.password,
+  role        = EXCLUDED.role,
+  updated_at  = NOW();
