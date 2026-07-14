@@ -492,7 +492,21 @@ async def media_stream(ws: WebSocket) -> None:
                     if session.user_id:
                         log.info("[AGENT] session %s user_id=%s (per-user keys)",
                                  session.session_key, session.user_id)
-                if session.stt_provider == 'openai_realtime':
+                if session.stt_provider in ('openai_realtime', 'openai'):
+                    # ponytail: 'openai' is the user-facing name in the
+                    # FE dropdown (matches the OpenAI STT option the FE
+                    # shows); 'openai_realtime' is the historical path
+                    # name. They route to the same adapter — the
+                    # agent's stt_model field (gpt-4o-transcribe, etc.)
+                    # is what tells the OpenAI Realtime API which model
+                    # to use. If you want a real OpenAI batch STT path
+                    # (REST /v1/audio/transcriptions), that's a separate
+                    # adapter that doesn't exist yet — TODO.
+                    if session.stt_provider == 'openai':
+                        log.info(
+                            "[STT] session %s using 'openai' alias for 'openai_realtime'",
+                            session.session_key,
+                        )
                     track_task(
                         session,
                         asyncio.create_task(run_realtime_session(session)),
