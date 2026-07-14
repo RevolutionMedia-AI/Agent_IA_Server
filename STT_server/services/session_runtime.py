@@ -50,8 +50,28 @@ def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:
     return task
 
 
-def register_session(session: CallSession) -> None:
+async def register_session(session: CallSession) -> None:
     sessions[session.session_key] = session
+    # ponytail: H2 from the call-flow audit. Mirror the in-memory
+    # registration to Postgres so a server crash doesn't orphan
+    # the CallSession forever (memory leak across restarts). Best
+    # effort: the in-memory registration already happened and the
+    # call works without the DB write. A subsequent redeploy will
+    # see the row via list_open_sessions() and can mark it closed.
+    try:
+        from STT_server import db_call_sessions
+        await db_call_sessions.register_session(
+            session.session_key,
+            tenant_id=session.tenant_id,
+            call_sid=session.call_sid,
+            preferred_language=session.preferred_language,
+            tts_provider=session.tts_provider,
+            custom_prompt=session.custom_prompt,
+            started_at=session.started_at,
+        )
+    except Exception as exc:  # noqa: BLE001 — DB write must never block a call
+        log.warning("[runtime] DB register_session failed for %s: %s",
+                    session.session_key, exc)
 
 
 async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
@@ -89,6 +109,19 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
         await asyncio.gather(*session.tasks, return_exceptions=True)
     except Exception:
         pass
+
+    # ponytail: H2 from the call-flow audit. Mark the call closed
+    # in Postgres so list_open_sessions() at startup can recover
+    # any sessions that didn't close cleanly (server crash, deploy).
+    # Best effort — if the DB write fails, the in-memory pop already
+    # ran and the call is fully torn down. The row will be recovered
+    # by a future startup sweep.
+    try:
+        from STT_server import db_call_sessions
+        await db_call_sessions.close_session(session.session_key)
+    except Exception as exc:  # noqa: BLE001 — DB write must never block cleanup
+        log.warning("[runtime] DB close_session failed for %s: %s",
+                    session.session_key, exc)
 
     try:
         await ws.close()
