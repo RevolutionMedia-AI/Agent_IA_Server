@@ -463,6 +463,34 @@ def is_provider_configured(user_id: str | None, provider_id: str) -> bool:
     return bool(resolve_provider(user_id, provider_id))
 
 
+def find_first_configured_provider(user_id: str | None, category: str) -> str | None:
+    """Auto-detect a provider for a service category by scanning the
+    per-user credentials the user has actually uploaded.
+
+    Returns the id of the first provider in PROVIDER_CATALOG that
+    matches the category and has a populated credential (per-user
+    or env). Returns None if the user has nothing configured for
+    that category — callers should treat that as a hard error
+    (no env-var fallback) and surface a clear message to the FE.
+
+    ponytail: the user asked to "leer dinámicamente qué proveedor y
+    qué credenciales tiene configuradas la cuenta/usuario actual",
+    so this is the path the BE takes when the agent row doesn't
+    pin a specific provider. No system-default fallback — if the
+    user has nothing, the call fails loud at the STT/LLM/TTS
+    adapter (it already raises on missing key), and the operator
+    sees a clear log line.
+    """
+    for spec in PROVIDER_CATALOG:
+        if spec.category != category:
+            continue
+        if spec.id == "twilio":  # telephony, not a runtime service
+            continue
+        if is_provider_configured(user_id, spec.id):
+            return spec.id
+    return None
+
+
 # ── Model discovery per provider ───────────────────────────────────────────
 # Each provider returns a static catalog (or a live-fetched one) of
 # models/voices. The Frontend calls list_provider_models(service, provider,

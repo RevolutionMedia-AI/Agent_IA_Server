@@ -53,23 +53,22 @@ class CallSession:
     # ponytail: which LLM provider the agent picked. Mirrors the FE's
     # llm_provider dropdown — read by openai_llm._client_for_session so
     # the dispatch goes to OpenAI, MiniMax (OpenAI-compat with custom
-    # base_url), Anthropic or Gemini. Defaults to openai for backwards
-    # compat with tenants / agents that predate the field.
-    llm_provider: str = "openai"
+    # base_url), Anthropic or Gemini. The 'start' event handler in
+    # STT_Server.py ALWAYS sets this from (a) the agent config or
+    # (b) the per-user credential auto-detect; no env-var default.
+    # If both are empty, the call adapter surfaces a clear error.
+    llm_provider: str = ""
     # Concrete model id to send to that provider (gpt-4o-mini,
     # claude-3-5-sonnet-20241022, gemini-1.5-pro, minimax, ...).
     # Comes from the agent config at call start.
     llm_model: str | None = None
     # ponytail: which STT provider the agent picked. Mirrors the FE's
     # stt_provider dropdown. Set by the 'start' event handler in
-    # STT_Server.py from the agent config; the dispatch in the same
-    # handler reads it. Defaults to "deepgram" so the field is always
-    # defined — without the default the dispatch raises
-    # `AttributeError: 'CallSession' object has no attribute
-    # 'stt_provider'` when no agent is linked to the phone (a
-    # legitimate config: the user might want inbound calls to land
-    # on a default STT without an agent override).
-    stt_provider: str = "deepgram"
+    # STT_Server.py from (a) the agent config or (b) the per-user
+    # credential auto-detect. The field is declared here so the
+    # dispatch below doesn't raise AttributeError on an unconfigured
+    # session; the dispatch logs a clear error if it's still empty.
+    stt_provider: str = ""
     stt_model: str | None = None
     # Tenant ID this session belongs to (set when call comes from a configured tenant)
     tenant_id: str | None = None

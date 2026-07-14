@@ -154,11 +154,12 @@ INITIAL_GREETING_TEXT = os.getenv(
     "INITIAL_GREETING_TEXT",
     "Thank you for calling Tigo Panama",
 ).strip()
-# Optional Spanish initial greeting (fallback used when TWIML_INITIAL_GREETING_LANG=es)
-INITIAL_GREETING_TEXT_ES = os.getenv(
-    "INITIAL_GREETING_TEXT_ES",
-    "Hola! Le saluda Camila de Tigo. Hemos identificado que puede optimizar su plan actual. Tendria un minuto para escuchar la oferta?",
-).strip()
+# ponytail: removed INITIAL_GREETING_TEXT_ES — hardcoded Tigo/Camila
+# greeting that the previous version shipped as the Spanish fallback
+# for TWIML_INITIAL_GREETING. The user explicitly asked for no
+# fixed greetings in code. The BE's call path doesn't use this
+# anyway (play_initial_greeting reads session.welcome_message
+# from the agent row, which is fully dynamic).
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 
 # If true, /voice will include a <Play> of a pre-generated TTS greeting file

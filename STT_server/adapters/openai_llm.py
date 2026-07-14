@@ -8,7 +8,7 @@ import urllib.request
 from openai import OpenAI
 
 from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS, OPENAI_MODEL
-from STT_server.domain.language import detect_language, get_language_instruction, get_system_prompt, pop_streaming_segments
+from STT_server.domain.language import detect_language, get_language_instruction,                  pop_streaming_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.credentials_resolver import resolve_provider
 
@@ -413,25 +413,22 @@ def _safe_body(exc: urllib.error.HTTPError) -> str:
 # ─── Message building (provider-agnostic) ──────────────────────────
 
 def build_messages(session: CallSession, user_text: str) -> list[dict]:
-    # Include structured user state, not as a memory, but as a guide for LLM
-    lang = session.preferred_language or detect_language(user_text)
+    # ponytail: the previous version fell back to a hardcoded Tigo
+    # Panama / Camila system prompt when session.custom_prompt was
+    # empty. The user explicitly asked for "ningún prompt genérico de
+    # prueba" — drop the fallback. If the agent row has no prompt,
+    # raise so the call fails loud instead of speaking as Camila.
     custom_prompt = getattr(session, 'custom_prompt', None)
-
-    if custom_prompt and custom_prompt.strip():
-        # Custom prompt replaces EVERYTHING — user has full control over
-        # the agent's behavior, rules, and language. No default prompt
-        # or language instruction is appended.
-        log.info("[LLM] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
-        messages = [
-            {"role": "system", "content": custom_prompt.strip()},
-        ]
-    else:
-        system_prompt = get_system_prompt(lang)
-        log.info("[LLM] Using default system prompt for session=%s lang=%s prompt_len=%d", session.session_key, lang, len(system_prompt))
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "system", "content": get_language_instruction(lang)},
-        ]
+    if not custom_prompt or not custom_prompt.strip():
+        raise RuntimeError(
+            f"Agent {getattr(session, 'agent_id', '<none>')} has no system_prompt "
+            f"configured. Set one in the FE (Agents → Edit → System prompt) "
+            f"and redeploy."
+        )
+    log.info("[LLM] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
+    messages = [
+        {"role": "system", "content": custom_prompt.strip()},
+    ]
 
     if session.collected_data:
         collected_items = ", ".join(f"{k}: {v}" for k, v in session.collected_data.items())

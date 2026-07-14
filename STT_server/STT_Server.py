@@ -449,45 +449,36 @@ async def media_stream(ws: WebSocket) -> None:
                     # ponytail: usage record needs to know which agent
                     # took this call so the per-agent totals are right.
                     session.agent_id = agent_cfg.get('id') or agent_id_from_params
-                    # LLM dispatch + model selection for this session.
-                    # Defaulting to "openai" keeps backwards compat with
-                    # any tenant/agent that doesn't set llm_provider.
-                    session.llm_provider = (agent_cfg.get('llm_provider') or 'openai').strip().lower()
-                    session.llm_model = (agent_cfg.get('llm_model') or None)
-                    if session.llm_model:
-                        log.info("[AGENT] session %s llm=%s model=%s",
-                                 session.session_key, session.llm_provider, session.llm_model)
-                    # ponytail: STT dispatch — per-session, not global.
-                    # Default falls back to the previous global behaviour
-                    # (openai_realtime when USE_OPENAI_REALTIME, else
-                    # deepgram) so existing deployments keep working.
-                    session.stt_provider = (
-                        (agent_cfg.get('stt_provider') or '').strip().lower()
-                        or ('openai_realtime' if USE_OPENAI_REALTIME else 'deepgram')
-                    )
+                    # user_id flows from the agent row (FK to users.id).
+                    # Used downstream by resolve_provider() to pick the
+                    # right per-user credential.
+                    session.user_id = agent_cfg.get('user_id') or session.user_id
+                    # ponytail: provider resolution is per-agent > per-user
+                    # auto-detect. The user explicitly asked for "no model
+                    # or provider por defecto" — if the agent row has a
+                    # provider pinned, we use that; otherwise we scan
+                    # the user's per-user credentials and pick the first
+                    # available one for the category. If neither, we
+                    # fail loud (no env-var fallback) — the call adapter
+                    # surfaces a clear error and the operator sees it.
+                    from STT_server.services.credentials_resolver import find_first_configured_provider
+                    _cfg_stt = (agent_cfg.get('stt_provider') or '').strip().lower() or None
+                    _cfg_tts = (agent_cfg.get('tts_provider') or '').strip().lower() or None
+                    _cfg_llm = (agent_cfg.get('llm_provider') or '').strip().lower() or None
+                    session.stt_provider = _cfg_stt or find_first_configured_provider(session.user_id, 'stt') or ''
+                    session.tts_provider = _cfg_tts or find_first_configured_provider(session.user_id, 'tts') or ''
+                    session.llm_provider = _cfg_llm or find_first_configured_provider(session.user_id, 'llm') or 'openai'
                     session.stt_model = (agent_cfg.get('stt_model') or None)
-                    log.info("[AGENT] session %s stt=%s model=%s",
-                             session.session_key, session.stt_provider, session.stt_model or '-')
-                    # ponytail: TTS dispatch — same pattern as STT. The
-                    # agent's tts_provider/tts_model flow through to the
-                    # TTS dispatcher. Without these the call would use
-                    # the system default (elevenlabs) regardless of what
-                    # the user picked in the FE.
-                    session.tts_provider = (
-                        (agent_cfg.get('tts_provider') or '').strip().lower()
-                        or DEFAULT_TTS_PROVIDER
-                    )
                     session.tts_model = (agent_cfg.get('tts_model') or None)
+                    session.llm_model = (agent_cfg.get('llm_model') or None)
                     session.voice_id = agent_cfg.get('voice_id') or None
                     session.tts_voice = agent_cfg.get('voice') or None
-                    log.info("[AGENT] session %s tts=%s model=%s voice=%s",
-                             session.session_key, session.tts_provider,
-                             session.tts_model or '-', session.tts_voice or '-')
-                    # ponytail: per-user credentials. The agent row
-                    # carries user_id, so per-user API keys are now
-                    # reachable via resolve_provider(session.user_id,
-                    # provider) inside the adapters.
-                    session.user_id = agent_cfg.get('user_id') or session.user_id
+                    log.info("[AGENT] session %s stt=%s model=%s llm=%s/%s tts=%s/%s voice=%s",
+                             session.session_key,
+                             session.stt_provider or '-', session.stt_model or '-',
+                             session.llm_provider, session.llm_model or '-',
+                             session.tts_provider or '-', session.tts_model or '-',
+                             session.tts_voice or '-')
                     if session.user_id:
                         log.info("[AGENT] session %s user_id=%s (per-user keys)",
                                  session.session_key, session.user_id)
@@ -508,12 +499,7 @@ async def media_stream(ws: WebSocket) -> None:
                         ),
                     )
                     track_task(session, asyncio.create_task(process_transcripts(session)))
-                else:
-                    # ponytail: default STT is Deepgram (the previous
-                    # legacy behaviour when the global USE_OPENAI_REALTIME
-                    # toggle was off). Future bidirectional-WS providers
-                    # (assemblyai, soniox, ...) join the elif chain above
-                    # once their adapters are in place.
+                elif session.stt_provider == 'deepgram':
                     track_task(
                         session,
                         asyncio.create_task(
@@ -525,6 +511,21 @@ async def media_stream(ws: WebSocket) -> None:
                         ),
                     )
                     track_task(session, asyncio.create_task(process_transcripts(session)))
+                elif session.stt_provider == 'assemblyai':
+                    log.error("[STT] assemblyai STT adapter not yet implemented for session %s",
+                              session.session_key)
+                else:
+                    # No provider configured → no env-var fallback (the
+                    # user explicitly asked to drop defaults). The operator
+                    # must upload a per-user key in Settings → API. The
+                    # call's STT path is a no-op without it; the user
+                    # hears silence and we log the reason clearly.
+                    log.error(
+                        "[STT] session %s has no STT provider (agent=%s, user_id=%s). "
+                        "Upload an STT key in Settings → API and either set stt_provider "
+                        "on the agent or let the system auto-detect from your credentials.",
+                        session.session_key, session.agent_id, session.user_id,
+                    )
                 # ponytail: if the agent has a welcome_message, schedule
                 # play_initial_greeting so the TTS speaks first. It's a
                 # no-op for agents without one (preserves the previous

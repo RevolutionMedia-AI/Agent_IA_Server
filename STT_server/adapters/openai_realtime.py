@@ -25,7 +25,6 @@ from STT_server.config import (
 from STT_server.domain.language import (
     extract_structured_data,
     get_language_instruction,
-    get_system_prompt,
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop
@@ -40,17 +39,22 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _build_instructions(session: CallSession) -> str:
-    """Compose the system instructions including dynamic session state."""
-    custom_prompt = getattr(session, 'custom_prompt', None)
+    """Compose the system instructions including dynamic session state.
 
-    if custom_prompt and custom_prompt.strip():
-        # Custom prompt replaces EVERYTHING — same logic as build_messages()
-        log.info("[REALTIME] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
-        parts = [custom_prompt.strip()]
-    else:
-        parts = [get_system_prompt(session.preferred_language or DEFAULT_CALL_LANGUAGE)]
-        lang = session.preferred_language or DEFAULT_CALL_LANGUAGE
-        parts.append(get_language_instruction(lang))
+    ponytail: dropped the hardcoded Tigo/Camila fallback here too
+    (same change as build_messages in openai_llm.py). If the agent
+    has no system_prompt, raise — the call shouldn't fall back to
+    a generic test prompt.
+    """
+    custom_prompt = getattr(session, 'custom_prompt', None)
+    if not custom_prompt or not custom_prompt.strip():
+        raise RuntimeError(
+            f"Agent {getattr(session, 'agent_id', '<none>')} has no system_prompt "
+            f"configured. Set one in the FE (Agents → Edit → System prompt) "
+            f"and redeploy."
+        )
+    log.info("[REALTIME] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
+    parts = [custom_prompt.strip()]
 
     if session.collected_data:
         collected = ", ".join(f"{k}: {v}" for k, v in session.collected_data.items())
