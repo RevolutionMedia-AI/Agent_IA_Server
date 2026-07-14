@@ -79,14 +79,22 @@ if _parsed.path and _parsed.path not in ("", "/"):
         _parsed.path,
     )
 
+# ponytail: the OPENAI_API_KEY / DEEPGRAM_API_KEY / ELEVENLABS_API_KEY
+# env vars are the SYSTEM-DEFAULT fallback, used only when the
+# per-user credential in tools_integrations is missing (or the user
+# hasn't set one at all). Per-user keys via Settings → API are the
+# normal path on production. These lines are info-level so they
+# show up in -v logs without making the deploy look like a warning
+# storm; the actual call site surfaces a clear error if BOTH the
+# env var and the per-user key are absent.
 if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY no configurada.")
+    log.info("[STT] OPENAI_API_KEY (system default) not configured; per-user keys via tools_integrations are the normal path.")
 
 if not DEEPGRAM_API_KEY:
-    log.warning("DEEPGRAM_API_KEY no configurada. El STT no estara disponible.")
+    log.info("[STT] DEEPGRAM_API_KEY (system default) not configured; per-user keys via tools_integrations are the normal path.")
 
 if not ELEVENLABS_API_KEY:
-    log.warning("ELEVENLABS_API_KEY no configurada. El TTS no estara disponible.")
+    log.info("[STT] ELEVENLABS_API_KEY (system default) not configured; per-user keys via tools_integrations are the normal path.")
 
 
 # ponytail: startup hook. On Postgres deployments, backfill any tenants
