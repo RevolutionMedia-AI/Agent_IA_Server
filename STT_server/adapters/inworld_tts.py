@@ -53,7 +53,28 @@ async def stream_tts_segment(
         raise RuntimeError("Inworld API key not configured.")
 
     started = time.perf_counter()
-    voice_id = getattr(session, "voice_id", None) or DEFAULT_VOICE_ID
+    # ponytail: inworld TTS needs a real voice name in voiceId
+    # (e.g. "Aarav", "Dennis"), NOT a model id. The FE was setting
+    # voice_id to the model name ("inworld-tts-2") which Inworld
+    # rejects with 404 "Unknown voice". When the value we get
+    # looks like a model id (starts with "inworld-"), fall back
+    # to the default voice. The agent's actual model is still
+    # sent in modelId — the user just has to set voice_id to a
+    # real voice name in the FE (separate field from the model
+    # dropdown).
+    _configured_voice = getattr(session, "voice_id", None) or DEFAULT_VOICE_ID
+    if _configured_voice.startswith("inworld-") and _configured_voice != DEFAULT_VOICE_ID:
+        log.warning(
+            "[INWORLD_TTS] session=%s voice_id=%r looks like a model "
+            "id, not a voice name. Falling back to %r. The FE should "
+            "send a real Inworld voice name in session.voice_id "
+            "(e.g. Aarav, Dennis, Hank).",
+            getattr(session, "session_key", "?"),
+            _configured_voice, DEFAULT_VOICE_ID,
+        )
+        voice_id = DEFAULT_VOICE_ID
+    else:
+        voice_id = _configured_voice
     # ponytail: H1 from the call-flow audit. The dataclass has
     # `tts_model` (set in STT_Server.py:401 from the agent's
     # tts_model), not `model_id`. The previous getattr returned None

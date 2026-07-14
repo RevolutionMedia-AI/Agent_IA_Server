@@ -569,6 +569,60 @@ def list_phone_numbers(auth: dict = Depends(require_auth)):
     return db_list_numbers(auth["user_id"])
 
 
+# ponytail: per-number Twilio validation. The FE's "Test Twilio"
+# button in ModalConnectNumber.jsx calls this. It validates the
+# account_sid + auth_token pair against the Twilio API
+# (fetching the account object) and returns a structured result
+# the FE can render. Sid is optional — if omitted, we validate
+# the stored key on the row.
+@api_router.post("/phone-numbers/validate-twilio")
+async def validate_phone_number_twilio(
+    data: PhoneNumberCreate,
+    auth: dict = Depends(require_auth),
+):
+    sid = (data.twilio_account_sid or "").strip()
+    tok = (data.twilio_auth_token or "").strip()
+    if not sid or not tok:
+        raise HTTPException(
+            status_code=400,
+            detail="twilio_account_sid and twilio_auth_token are required to validate",
+        )
+    from STT_server.adapters.twilio_api import validate_twilio_credentials
+    res = await validate_twilio_credentials(sid, tok)
+    log.info(
+        "[phone-numbers] twilio validate sid=%s... valid=%s msg=%s user_id=%s",
+        sid[:6], res.get("valid"), res.get("message", "")[:200], auth["user_id"],
+    )
+    # If the user supplied a number, also confirm it's owned by this
+    # sub-account. 404 means the credentials are valid for the
+    # SUB-account but don't own the line — the operator has to either
+    # move the number to this sub-account or use creds from the
+    # sub-account that owns it.
+    owned_by = None
+    if data.number:
+        from STT_server.adapters.twilio_api import _get_twilio_client
+        client = _get_twilio_client(sid, tok)
+        try:
+            import asyncio as _aio
+            def _lookup():
+                target = data.number.strip().replace(" ", "")
+                if not target.startswith("+"):
+                    target = "+" + target
+                numbers = client.incoming_phone_numbers.list(phone_number=target)
+                return numbers
+            numbers = await _aio.to_thread(_lookup)
+            owned_by = bool(numbers)
+        except Exception as exc:
+            log.warning("[phone-numbers] twilio number lookup failed: %s", exc)
+            owned_by = None
+    return {
+        "valid": res.get("valid", False),
+        "message": res.get("message", ""),
+        "account_status": res.get("account_status"),
+        "owned_by_subaccount": owned_by,
+    }
+
+
 @api_router.post("/phone-numbers")
 async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
     # ponytail: validate Twilio creds server-side too. Client should
