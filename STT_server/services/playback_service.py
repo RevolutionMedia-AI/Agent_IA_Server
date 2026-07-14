@@ -13,9 +13,6 @@ from STT_server.config import (
     INITIAL_GREETING_TEXT,
     LOG_TWILIO_PLAYBACK,
     OPENAI_API_KEY,
-    TTS_MAX_RETRIES,
-    TTS_RETRY_BACKOFF_MS,
-    TTS_TIMEOUT_SEC,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
     SAVE_TWILIO_FRAMES,
@@ -31,35 +28,6 @@ import os
 log = logging.getLogger("stt_server")
 
 
-async def run_tts_with_retries(session: CallSession, text: str, generation: int) -> tuple[float | None, float]:
-    attempts = max(0, TTS_MAX_RETRIES) + 1
-    last_timeout = False
-    for attempt in range(1, attempts + 1):
-        try:
-            return await asyncio.wait_for(
-                stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item)),
-                timeout=TTS_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            last_timeout = True
-            log.warning(
-                "TTS timeout en saludo %s (attempt %s/%s, text_len=%s)",
-                session.session_key,
-                attempt,
-                attempts,
-                len(text),
-            )
-            if attempt < attempts:
-                await asyncio.sleep(max(0, TTS_RETRY_BACKOFF_MS) / 1000.0)
-        except Exception:
-            log.exception("TTS error en saludo %s (attempt %s/%s)", session.session_key, attempt, attempts)
-            raise
-
-    if last_timeout:
-        raise asyncio.TimeoutError()
-    raise RuntimeError("TTS greeting failed without timeout detail")
-
-
 def emit_playback_item(session: CallSession, item: dict) -> bool:
     log.debug("[PLAYBACK] Enqueue playback item: session=%s type=%s gen=%s bytes=%s", getattr(session, 'session_key', '?'), item.get('type'), item.get('generation'), len(item.get('data', b'')) if 'data' in item else '-')
     ok = enqueue_nowait_with_drop(session.playback_queue, item, "playback_queue")
@@ -68,8 +36,11 @@ def emit_playback_item(session: CallSession, item: dict) -> bool:
     return ok
 
 
-async def enqueue_playback_clear(session: CallSession) -> None:
-    await enqueue_with_drop(
+def enqueue_playback_clear(session: CallSession) -> None:
+    """M2: was async with `await enqueue_with_drop`, but the body is sync
+    (enqueue_with_drop just wraps a put_nowait). The await was a no-op
+    that confused every caller. Now plain sync."""
+    enqueue_with_drop(
         session.playback_queue,
         {"type": "clear", "generation": session.active_generation},
         "playback_queue",
@@ -108,7 +79,7 @@ async def interrupt_current_turn(session: CallSession) -> None:
     # transcripts of the user's own echo. Clear instead.
     session.stt_mute_buffer.clear()
     drain_queue_nowait(session.playback_queue)
-    await enqueue_playback_clear(session)
+    enqueue_playback_clear(session)
     session.generation_changed.set()
 
 
@@ -126,7 +97,7 @@ async def play_initial_greeting(session: CallSession) -> None:
     await asyncio.sleep(0.4)
     # Generate the TTS via the session's configured TTS provider. The
     # playback_loop will pick up the queued audio and stream it to Twilio.
-    from STT_server.services.turn_manager import run_tts_with_retries, enqueue_transcript_event
+    from STT_server.services.turn_manager import run_tts_with_retries
     try:
         await run_tts_with_retries(session, welcome.strip(), session.active_generation)
     except Exception as exc:

@@ -679,8 +679,13 @@ async def launch_reply_pipeline(
 
     existing_task = session.reply_task
     if existing_task and not existing_task.done():
-        if session.reply_source_text == normalized_text and not replace_current:
-            return
+        # ponytail: M3 cleanup. The original had a second
+        # `if not replace_current: return` that was unreachable
+        # (the first if above already returns for that case).
+        # Simplified: if no replace requested AND existing reply
+        # is for a different transcript, do nothing (the existing
+        # task will finish on its own). Only interrupt when
+        # replace_current is explicitly True.
         if not replace_current:
             return
         await interrupt_current_turn(session)

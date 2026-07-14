@@ -274,9 +274,6 @@ async def voice(
     return Response(content=twiml, media_type="application/xml")
 
 
-# Greeting WAV endpoint removed — initial greeting functionality disabled.
-
-
 async def _watchdog_assistant_speaking(session: CallSession) -> None:
     """H5 from the call-flow audit: force-reset assistant_speaking if
     it's been True too long without Twilio sending a mark event.
