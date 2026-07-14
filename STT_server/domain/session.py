@@ -60,6 +60,17 @@ class CallSession:
     # claude-3-5-sonnet-20241022, gemini-1.5-pro, minimax, ...).
     # Comes from the agent config at call start.
     llm_model: str | None = None
+    # ponytail: which STT provider the agent picked. Mirrors the FE's
+    # stt_provider dropdown. Set by the 'start' event handler in
+    # STT_Server.py from the agent config; the dispatch in the same
+    # handler reads it. Defaults to "deepgram" so the field is always
+    # defined — without the default the dispatch raises
+    # `AttributeError: 'CallSession' object has no attribute
+    # 'stt_provider'` when no agent is linked to the phone (a
+    # legitimate config: the user might want inbound calls to land
+    # on a default STT without an agent override).
+    stt_provider: str = "deepgram"
+    stt_model: str | None = None
     # Tenant ID this session belongs to (set when call comes from a configured tenant)
     tenant_id: str | None = None
     # Owning user — resolved from the tenant (or set by an admin tool call).

@@ -58,9 +58,15 @@ async def register_session(session: CallSession) -> None:
     # effort: the in-memory registration already happened and the
     # call works without the DB write. A subsequent redeploy will
     # see the row via list_open_sessions() and can mark it closed.
+    #
+    # db_call_sessions.register_session is a sync function (psycopg2
+    # is sync) returning a dict on success / None on skip. We
+    # previously `await`-ed it, which raised
+    # `object dict can't be used in 'await' expression` and broke
+    # every call. Just call it.
     try:
         from STT_server import db_call_sessions
-        await db_call_sessions.register_session(
+        db_call_sessions.register_session(
             session.session_key,
             tenant_id=session.tenant_id,
             call_sid=session.call_sid,
@@ -116,9 +122,12 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
     # Best effort — if the DB write fails, the in-memory pop already
     # ran and the call is fully torn down. The row will be recovered
     # by a future startup sweep.
+    #
+    # db_call_sessions.close_session is sync (psycopg2 is sync);
+    # don't await it.
     try:
         from STT_server import db_call_sessions
-        await db_call_sessions.close_session(session.session_key)
+        db_call_sessions.close_session(session.session_key)
     except Exception as exc:  # noqa: BLE001 — DB write must never block cleanup
         log.warning("[runtime] DB close_session failed for %s: %s",
                     session.session_key, exc)
