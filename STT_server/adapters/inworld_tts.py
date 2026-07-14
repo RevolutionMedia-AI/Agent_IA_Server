@@ -60,6 +60,17 @@ async def stream_tts_segment(
     # always, silently dropping the per-agent model selection and
     # falling back to the default. Read tts_model instead.
     model_id = getattr(session, "tts_model", None) or DEFAULT_MODEL_ID
+    # ponytail: surface what the BE is actually sending to Inworld.
+    # The user hit "Unknown voice: inworld-tts-2 not found!" — the
+    # voice_id is being populated with a model name instead of a
+    # real Inworld voice name. Logged here so the next time this
+    # happens, the operator sees the exact values without having
+    # to add a breakpoint.
+    log.info(
+        "[INWORLD_TTS] session=%s voice_id=%r model_id=%r key_present=%s",
+        getattr(session, "session_key", "?"),
+        voice_id, model_id, bool(api_key),
+    )
 
     body = json.dumps({
         "text": text,

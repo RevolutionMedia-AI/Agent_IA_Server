@@ -906,12 +906,25 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
 
     cleaned, errors = validate_credentials(service_id, body.credentials)
     if errors:
+        # ponytail: the 422 was silent before — the FE only saw
+        # 'Validation failed' without the field-level reason. Log the
+        # full error list so the operator can see which field (api_key
+        # vs base_url vs voice_id) failed and why, without having to
+        # add console.log in the FE.
+        log.warning(
+            "[api-keys] upsert rejected service=%s user_id=%s errors=%s",
+            service_id, auth["user_id"], errors,
+        )
         # 422 keeps Pydantic semantics intact; the FE reads `errors` to
         # highlight the offending input.
         return JSONResponse(
             status_code=422,
             content={"detail": "Validation failed", "errors": errors},
         )
+    log.info(
+        "[api-keys] upsert accepted service=%s user_id=%s fields=%s",
+        service_id, auth["user_id"], list(cleaned.keys()),
+    )
 
     encrypted = encrypt_credentials(cleaned)
     with _data_lock():
