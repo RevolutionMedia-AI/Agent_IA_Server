@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,14 @@ from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt as run_de
 from STT_server.adapters.inworld_stt_realtime import run_realtime_stt as run_inworld_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
 from STT_server.adapters.openai_realtime import run_realtime_session
+# ponytail: M8 from the call-flow audit. Fail fast on missing critical
+# env vars BEFORE any heavy import. Without this, if a downstream import
+# (FastAPI, pydantic, etc.) fails, the operator sees a confusing
+# ImportError instead of "PUBLIC_URL is missing". The check runs
+# against os.environ directly (not the imported value) so it doesn't
+# depend on STT_server.config being importable.
+if not os.environ.get("PUBLIC_URL"):
+    sys.exit("FATAL: PUBLIC_URL environment variable is required")
 from STT_server.config import (
     DEEPGRAM_API_KEY,
     DEEPGRAM_STT_LANGUAGE_HINT,

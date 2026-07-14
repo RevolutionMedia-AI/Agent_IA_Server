@@ -13,6 +13,8 @@ from STT_server.config import (
     INITIAL_GREETING_TEXT,
     LOG_TWILIO_PLAYBACK,
     OPENAI_API_KEY,
+    STREAM_SID_WAIT_MAX_MS,
+    STREAM_SID_WAIT_POLL_MS,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
     SAVE_TWILIO_FRAMES,
@@ -125,9 +127,11 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
             if item_type == "audio":
                 if not session.stream_sid:
                     # Wait briefly for Twilio to send the stream SID.
-                    # Increased from 50 (2.5s) to 100 (5s) to avoid race conditions.
-                    for _ in range(100):  # up to 5.0 s
-                        await asyncio.sleep(0.05)
+                    # L6: was hardcoded 100 iterations * 50 ms = 5 s.
+                    # Now driven by STREAM_SID_WAIT_MAX_MS / STREAM_SID_WAIT_POLL_MS.
+                    wait_iterations = max(1, STREAM_SID_WAIT_MAX_MS // max(1, STREAM_SID_WAIT_POLL_MS))
+                    for _ in range(wait_iterations):
+                        await asyncio.sleep(STREAM_SID_WAIT_POLL_MS / 1000.0)
                         if session.stream_sid:
                             break
                 if not session.stream_sid:

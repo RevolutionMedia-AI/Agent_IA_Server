@@ -58,7 +58,14 @@ async def preview_tts(
     if voice_id:
         session.voice_id = voice_id
     if model_id:
-        session.model_id = model_id
+        # ponytail: L3 from the call-flow audit. The dataclass has
+        # `tts_model` (not `model_id`); the dispatcher and the
+        # Inworld/Rime adapters read tts_model. The preview does its
+        # own dispatch below (it doesn't go through tts_dispatcher)
+        # so this is currently dead, but keeping the field name
+        # consistent avoids future drift if the preview ever does
+        # route through the dispatcher.
+        session.tts_model = model_id
 
     chunks: list[bytes] = []
 

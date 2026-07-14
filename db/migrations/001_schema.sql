@@ -275,3 +275,42 @@ CREATE TABLE call_sessions (
 );
 CREATE INDEX idx_call_sessions_tenant       ON call_sessions (tenant_id);
 CREATE INDEX idx_call_sessions_closed_open  ON call_sessions (closed, started_at DESC);
+
+
+-- ============================================================================
+-- 9 · call_usage
+-- ----------------------------------------------------------------------------
+-- Per-call billing record. Replaces the legacy calls.json ledger that
+-- services/usage_store.py wrote to. One row per completed call, appended
+-- at cleanup_session() time.
+--
+-- user_id is the owning user (billed entity). The call may have been made
+-- on behalf of a tenant; tenant_id is set if so, but billing still flows
+-- to user_id.
+--
+-- Provider columns are flat (not JSONB) so the /usage endpoint can SUM()
+-- and FILTER in one query without JSON traversal.
+-- ============================================================================
+CREATE TABLE call_usage (
+  id                  BIGSERIAL   PRIMARY KEY,
+  user_id             TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  agent_id            TEXT,
+  tenant_id           TEXT        REFERENCES tenants(tenant_id) ON DELETE SET NULL,
+  call_sid            TEXT,
+  started_at          TIMESTAMPTZ NOT NULL,
+  ended_at            TIMESTAMPTZ NOT NULL,
+  duration_seconds    REAL        NOT NULL,
+  stt_provider        TEXT,
+  llm_provider        TEXT,
+  tts_provider        TEXT,
+  used_platform_keys  BOOLEAN     NOT NULL DEFAULT FALSE,
+  cost_usd            REAL        NOT NULL DEFAULT 0.0,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- The two queries this table serves:
+--   (a) per-user totals + per-agent breakdown (Dashboard / /usage)
+--   (b) the recent-50-calls feed on the same endpoint
+-- Both filter by user_id and sort by started_at DESC.
+CREATE INDEX idx_call_usage_user_started  ON call_usage (user_id, started_at DESC);
+CREATE INDEX idx_call_usage_agent         ON call_usage (agent_id);
+CREATE INDEX idx_call_usage_tenant        ON call_usage (tenant_id);

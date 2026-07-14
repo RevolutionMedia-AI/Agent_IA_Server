@@ -163,8 +163,8 @@ if PG_URL:
             print(f"  WARN: {exc}")
 
     # 3. Backfill JSON -> Postgres so existing local-dev data
-    #    (agents, phone numbers, API keys) survives the first
-    #    Postgres-backed deploy. Idempotent — skips rows that
+    #    (agents, phone numbers, API keys, call usage) survives the
+    #    first Postgres-backed deploy. Idempotent — skips rows that
     #    already exist.
     sys_path = '/app'
     if sys_path not in __import__('sys').path:
@@ -173,9 +173,10 @@ if PG_URL:
         from STT_server.db_agents import backfill_from_json as a_backfill
         from STT_server.db_phone_numbers import backfill_from_json as n_backfill
         from STT_server.db_tools import backfill_from_json as t_backfill
-        a = a_backfill(); n = n_backfill(); t = t_backfill()
-        if a or n or t:
-            print(f"[startup] backfilled from JSON -> Postgres: agents={a} numbers={n} tools={t}")
+        from STT_server.db_call_usage import backfill_from_json as u_backfill
+        a = a_backfill(); n = n_backfill(); t = t_backfill(); u = u_backfill()
+        if a or n or t or u:
+            print(f"[startup] backfilled from JSON -> Postgres: agents={a} numbers={n} tools={t} usage={u}")
         else:
             print("[startup] JSON backfill: nothing to copy (empty or already migrated)")
     except Exception as exc:

@@ -114,6 +114,13 @@ ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lo
 # set to true in dev for debugging.
 LOG_TRANSCRIPT_CONTENT = os.getenv("LOG_TRANSCRIPT_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
+# ponytail: L6 from the call-flow audit. How long playback_loop waits
+# for Twilio to send the stream_sid before giving up on the first
+# audio item. Bumped from a hardcoded 100 iterations at 50 ms to
+# named constants so it's tunable without code diving.
+STREAM_SID_WAIT_MAX_MS = int(os.getenv("STREAM_SID_WAIT_MAX_MS", "5000"))
+STREAM_SID_WAIT_POLL_MS = int(os.getenv("STREAM_SID_WAIT_POLL_MS", "50"))
+
 
 STT_AUDIO_QUEUE_MAXSIZE = int(os.getenv("STT_AUDIO_QUEUE_MAXSIZE", "300"))
 REALTIME_AUDIO_QUEUE_MAXSIZE = int(os.getenv("REALTIME_AUDIO_QUEUE_MAXSIZE", "300"))
