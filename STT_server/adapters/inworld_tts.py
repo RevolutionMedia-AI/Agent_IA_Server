@@ -54,7 +54,12 @@ async def stream_tts_segment(
 
     started = time.perf_counter()
     voice_id = getattr(session, "voice_id", None) or DEFAULT_VOICE_ID
-    model_id = getattr(session, "model_id", None) or DEFAULT_MODEL_ID
+    # ponytail: H1 from the call-flow audit. The dataclass has
+    # `tts_model` (set in STT_Server.py:401 from the agent's
+    # tts_model), not `model_id`. The previous getattr returned None
+    # always, silently dropping the per-agent model selection and
+    # falling back to the default. Read tts_model instead.
+    model_id = getattr(session, "tts_model", None) or DEFAULT_MODEL_ID
 
     body = json.dumps({
         "text": text,

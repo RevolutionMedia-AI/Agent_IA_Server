@@ -165,27 +165,47 @@ async def voice(
         except Exception as exc:
             log.warning("[VOICE] could not look up per-number auth token: %s", exc)
         token_to_check = per_number_token or TWILIO_AUTH_TOKEN
-        if token_to_check:
-            # ponytail: Twilio signs the URL the request hit. When the
-            # request goes through a reverse proxy (Railway, Cloudflare)
-            # the Host header reflects the public hostname but the path
-            # the signature was computed against is the original
-            # PUBLIC_URL path. We rebuild the URL from PUBLIC_URL +
-            # request.url.path so signature verification works behind a
-            # proxy.
-            signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
-            if request.url.query:
-                signature_url += f"?{request.url.query}"
-            sig = request.headers.get("X-Twilio-Signature", "")
-            if sig and not validate_twilio_signature(
-                token_to_check, signature_url, sig, form_dict
-            ):
-                log.warning(
-                    "[VOICE] invalid Twilio signature from %s (per_number=%s)",
-                    request.client.host if request.client else "?",
-                    bool(per_number_token),
-                )
-                return Response(content="invalid signature", status_code=403)
+        # ponytail: C2 from the call-flow audit. The previous
+        # `if token_to_check:` silently accepted the webhook when
+        # no token was configured — a free DoS / cost-amplification
+        # path. Fail loudly with 503 so a misconfigured deploy is
+        # impossible to miss in the logs.
+        if not token_to_check:
+            log.error(
+                "[VOICE] No Twilio auth token configured (TWILIO_AUTH_TOKEN env "
+                "+ per-number auth_token both empty). Rejecting inbound call. "
+                "Set TWILIO_AUTH_TOKEN or configure twilio_auth_token on the "
+                "phone number row."
+            )
+            return Response(
+                content="Twilio signature verification not configured",
+                status_code=503,
+            )
+        # Twilio always signs webhooks. A missing signature with a
+        # configured token is suspicious (proxy stripping the header,
+        # or someone bypassing the check).
+        sig = request.headers.get("X-Twilio-Signature", "")
+        if not sig:
+            return Response(content="missing signature", status_code=403)
+        # Twilio signs the URL the request hit. When the
+        # request goes through a reverse proxy (Railway, Cloudflare)
+        # the Host header reflects the public hostname but the path
+        # the signature was computed against is the original
+        # PUBLIC_URL path. We rebuild the URL from PUBLIC_URL +
+        # request.url.path so signature verification works behind a
+        # proxy.
+        signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
+        if request.url.query:
+            signature_url += f"?{request.url.query}"
+        if not validate_twilio_signature(
+            token_to_check, signature_url, sig, form_dict
+        ):
+            log.warning(
+                "[VOICE] invalid Twilio signature from %s (per_number=%s)",
+                request.client.host if request.client else "?",
+                bool(per_number_token),
+            )
+            return Response(content="invalid signature", status_code=403)
 
     ws_url = PUBLIC_URL.rstrip("/")
 
@@ -255,6 +275,40 @@ async def voice(
 
 
 # Greeting WAV endpoint removed — initial greeting functionality disabled.
+
+
+async def _watchdog_assistant_speaking(session: CallSession) -> None:
+    """H5 from the call-flow audit: force-reset assistant_speaking if
+    it's been True too long without Twilio sending a mark event.
+
+    Twilio sends a `mark` event when audio playback completes. If that
+    never arrives (network blip, WS timeout, mark lost in transit,
+    user mute, anything that drops the event but keeps the WS open),
+    assistant_speaking stays True forever and STT barge-in stops
+    working because the VAD treats the stuck state as "agent is
+    talking, ignore user input". This watchdog catches that case
+    and resets the flag after MAX_SPEAKING_SEC.
+    """
+    MAX_SPEAKING_SEC = 30
+    POLL_SEC = 5
+    while not session.closed:
+        try:
+            await asyncio.sleep(POLL_SEC)
+        except asyncio.CancelledError:
+            return
+        if not session.assistant_speaking:
+            continue
+        if session.assistant_started_at is None:
+            continue
+        elapsed = time.perf_counter() - session.assistant_started_at
+        if elapsed > MAX_SPEAKING_SEC:
+            log.warning(
+                "[WATCHDOG] assistant_speaking stuck for %.1fs in %s, forcing False",
+                elapsed, session.session_key,
+            )
+            session.assistant_speaking = False
+            session.assistant_started_at = None
+            session.pending_marks.clear()
 
 
 @app.websocket("/media-stream")
@@ -330,7 +384,7 @@ async def media_stream(ws: WebSocket) -> None:
                     else:
                         log.warning("[TENANT] tenant_id=%s not found, using defaults", tenant_id)
 
-                register_session(session)
+                await register_session(session)
                 log.info("callSid=%s streamSid=%s tenant_id=%s", session.call_sid, session.stream_sid, tenant_id)
 
                 # ── Apply agent config (system prompt + welcome message) ──
@@ -457,6 +511,15 @@ async def media_stream(ws: WebSocket) -> None:
                         asyncio.create_task(play_initial_greeting(session))
                     )
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
+                # ponytail: H5 from the call-flow audit. Force-reset
+                # assistant_speaking if Twilio never sends the mark
+                # event (network blip, WS timeout, mark lost in
+                # transit). Without this, assistant_speaking stays
+                # True forever and barge-in stops working.
+                track_task(
+                    session,
+                    asyncio.create_task(_watchdog_assistant_speaking(session))
+                )
                 continue
 
             if event == "media":

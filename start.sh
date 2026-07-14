@@ -62,6 +62,78 @@ if PG_URL:
     # 2. Apply migrations from /app/db/migrations/*.sql in order.
     #    Each file is idempotent (CREATE TABLE IF NOT EXISTS /
     #    ALTER TABLE ADD COLUMN IF NOT EXISTS) so re-running is safe.
+    #
+    #    ponytail: C1 from the call-flow audit. psycopg2's
+    #    cursor.execute() is single-statement by design (SQL
+    #    injection mitigation), so naively running the whole
+    #    migration file would only execute the FIRST statement and
+    #    leave the rest of the schema uncreated on a fresh deploy.
+    #    Split the file into statements and execute each one.
+    def _split_sql_statements(sql_text):
+        statements = []
+        current = []
+        state = "normal"  # normal | line_comment | block_comment | sq | dq
+        i = 0
+        while i < len(sql_text):
+            c = sql_text[i]
+            nxt = sql_text[i + 1] if i + 1 < len(sql_text) else ""
+            if state == "line_comment":
+                current.append(c)
+                if c == "\n":
+                    state = "normal"
+            elif state == "block_comment":
+                if c == "*" and nxt == "/":
+                    current.append("*/")
+                    i += 1
+                    state = "normal"
+                elif c != "\n":
+                    current.append(c)
+            elif state == "sq":
+                if c == "'" and nxt == "'":
+                    current.append("''")
+                    i += 1
+                elif c == "'":
+                    state = "normal"
+                    current.append(c)
+                else:
+                    current.append(c)
+            elif state == "dq":
+                if c == '"' and nxt == '"':
+                    current.append('""')
+                    i += 1
+                elif c == '"':
+                    state = "normal"
+                    current.append(c)
+                else:
+                    current.append(c)
+            else:  # normal
+                if c == "-" and nxt == "-":
+                    state = "line_comment"
+                    current.append("--")
+                    i += 1
+                elif c == "/" and nxt == "*":
+                    state = "block_comment"
+                    current.append("/*")
+                    i += 1
+                elif c == "'":
+                    state = "sq"
+                    current.append(c)
+                elif c == '"':
+                    state = "dq"
+                    current.append(c)
+                elif c == ";":
+                    stmt = "".join(current).strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current = []
+                else:
+                    current.append(c)
+            i += 1
+        last = "".join(current).strip()
+        if last:
+            statements.append(last)
+        return statements
+
     import glob
     for m in sorted(glob.glob('/app/db/migrations/*.sql')):
         name = os.path.basename(m)
@@ -70,11 +142,23 @@ if PG_URL:
             with open(m, 'r') as f:
                 sql = f.read()
             conn = psycopg2.connect(PG_URL)
-            with conn.cursor() as cur:
-                cur.execute(sql)
+            ok = 0
+            errors = []
+            for stmt in _split_sql_statements(sql):
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(stmt)
+                    ok += 1
+                except Exception as stmt_exc:
+                    errors.append(f"{type(stmt_exc).__name__}: {stmt_exc}")
             conn.commit()
             conn.close()
-            print(f"  OK")
+            if errors:
+                print(f"  applied {ok} statement(s), {len(errors)} error(s):")
+                for e in errors:
+                    print(f"    WARN: {e}")
+            else:
+                print(f"  OK ({ok} statements)")
         except Exception as exc:
             print(f"  WARN: {exc}")
 

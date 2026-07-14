@@ -100,6 +100,13 @@ async def interrupt_current_turn(session: CallSession) -> None:
     session.assistant_speaking = False
     session.assistant_started_at = None
     session.pending_marks.clear()
+    # ponytail: H4 from the call-flow audit. The stt_mute_buffer
+    # holds ~500ms of user audio captured while the assistant was
+    # talking. After barge-in, that audio is the user's voice
+    # bleeding into the TTS playback — NOT a fresh user turn.
+    # Draining it (the previous behaviour) caused phantom
+    # transcripts of the user's own echo. Clear instead.
+    session.stt_mute_buffer.clear()
     drain_queue_nowait(session.playback_queue)
     await enqueue_playback_clear(session)
     session.generation_changed.set()

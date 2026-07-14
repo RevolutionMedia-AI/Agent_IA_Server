@@ -99,7 +99,7 @@ async def _stream_openai(
     import time
     started = time.perf_counter()
     body = json.dumps({
-        "model": getattr(session, "model_id", None) or "tts-1",
+        "model": getattr(session, "tts_model", None) or "tts-1",
         "input": text,
         "voice": getattr(session, "voice_id", None) or "alloy",
         "response_format": "pcm",  # raw PCM16 LE 24 kHz mono
