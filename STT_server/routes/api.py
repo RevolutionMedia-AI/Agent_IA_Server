@@ -21,6 +21,12 @@ from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+# ponytail: log was referenced in 8 places (lines 223, 228, 610, 615, 793,
+# 1001, 1021, ...) but never defined. Every endpoint that touched
+# one of those lines crashed with NameError -> 500 -> no CORS
+# headers. Defined once here, used by all handlers.
+log = logging.getLogger("stt_server.routes.api")
+
 from STT_server.security.credentials import (
     encrypt_credentials, decrypt_credentials, decrypt_value,
 )
