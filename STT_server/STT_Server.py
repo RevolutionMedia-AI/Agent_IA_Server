@@ -444,6 +444,26 @@ async def media_stream(ws: WebSocket) -> None:
                         agent_cfg = _get_agent_db(agent_id_from_params)
                     except Exception as exc:
                         log.warning("[AGENT] db lookup failed for %s: %s", agent_id_from_params, exc)
+                else:
+                    # ponytail: this is the exact failure mode the user
+                    # hit — phone was linked, TwiML included agent_id,
+                    # but the WebSocket 'start' event didn't carry it
+                    # (or the lookup silently failed). Make it loud so
+                    # the next time this happens the operator sees the
+                    # exact gap without having to grep the TwiML.
+                    log.warning(
+                        "[AGENT] session %s has no agent_id in customParameters "
+                        "(tenant_id=%s, stream_sid=%s). The phone number may not "
+                        "be linked to an agent in the agents table.",
+                        session.session_key, tenant_id, session.stream_sid,
+                    )
+                    # returns the same shape the route layer sees, so
+                    # the fields below don't need to change.
+                    try:
+                        from STT_server.db_agents import get_agent as _get_agent_db
+                        agent_cfg = _get_agent_db(agent_id_from_params)
+                    except Exception as exc:
+                        log.warning("[AGENT] db lookup failed for %s: %s", agent_id_from_params, exc)
 
                 if agent_cfg:
                     # Agent's system_prompt overrides the tenant's.
