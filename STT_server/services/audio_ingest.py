@@ -1,3 +1,4 @@
+import asyncio
 import audioop
 import base64
 import logging
@@ -33,9 +34,18 @@ def get_frame_rms(frame: bytes) -> int:
     return audioop.rms(frame, 2)
 
 
-def is_probable_voice(frame: bytes) -> tuple[bool, int]:
+def _is_probable_voice_sync(frame: bytes) -> tuple[bool, int]:
     rms = get_frame_rms(frame)
     return vad.is_speech(frame, TWILIO_SR) and rms >= MIN_VOICE_RMS, rms
+
+
+async def is_probable_voice(frame: bytes) -> tuple[bool, int]:
+    """M4: VAD + RMS are CPU-bound (audioop + webrtcvad). At 50 fps per call
+    and 10 concurrent calls that's ~1.5 ms of CPU per frame x 500 fps = 750 ms
+    of CPU per second on one core, blocking the event loop. Offload to
+    the default thread pool so the WebSocket handler stays responsive.
+    """
+    return await asyncio.to_thread(_is_probable_voice_sync, frame)
 
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
@@ -90,7 +100,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         frame = bytes(buf[offset:offset + FRAME_BYTES])
         offset += FRAME_BYTES
 
-        is_voice, rms = is_probable_voice(frame)
+        is_voice, rms = await is_probable_voice(frame)
         log.debug(f"[VAD] Frame: offset={offset}, rms={rms}, is_voice={is_voice}")
         session.pre_speech_frames.append(frame)
 

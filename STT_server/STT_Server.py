@@ -53,6 +53,22 @@ log = logging.getLogger("stt_server")
 
 if not PUBLIC_URL:
     raise RuntimeError("Define PUBLIC_URL en las variables de entorno")
+# ponytail: M6 from the call-flow audit. Twilio signs the URL it
+# calls, and the verifier rebuilds the URL as PUBLIC_URL + path. A
+# path on PUBLIC_URL ("https://host/be") would create a mismatch
+# when Twilio hit "/be/voice" — the signature is computed against
+# the path Twilio sees, not against the path on PUBLIC_URL. Force
+# the operator to set PUBLIC_URL to scheme://host only.
+from urllib.parse import urlparse
+_parsed = urlparse(PUBLIC_URL)
+if _parsed.path and _parsed.path not in ("", "/"):
+    log.warning(
+        "[VOICE] PUBLIC_URL has a path component (%r). Twilio signature "
+        "verification will fail unless the proxy preserves that exact "
+        "path on the way to this service. Recommended: set PUBLIC_URL "
+        "to scheme://host (no path).",
+        _parsed.path,
+    )
 
 if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY no configurada.")
@@ -130,10 +146,13 @@ async def voice(
     and consume our TTS/LLM quota. Set TWILIO_AUTH_TOKEN to enable;
     leaving it unset keeps the endpoint open for local dev.
     """
-    # ponytail: Twilio signature verification. We accept form twice
-    # here because Twilio sends it as application/x-www-form-urlencoded
-    # and the verifier needs the same dict. Reading the body once and
-    # caching it avoids the parser being called twice on the wire.
+    # ponytail: read the form once. Twilio sends it as
+    # application/x-www-form-urlencoded; the signature verifier and
+    # the agent-lookup both need the same dict. Caching it here
+    # means the second consumer (the agent lookup later in this
+    # function) just reuses form_dict instead of re-parsing the
+    # body. FastAPI caches the body, so the second .form() would
+    # work, but it's wasteful and confusing.
     form_dict: dict = {}
     if request is not None:
         try:
@@ -227,19 +246,18 @@ async def voice(
 
     agent_id = None
     try:
-        if request is not None:
-            form = await request.form()
-            called_to = form.get('To') or form.get('to')
-            if called_to:
-                e164 = str(called_to).strip()
-                from STT_server.db_phone_numbers import find_by_number as find_num
-                num_row = find_num(e164)
-                if num_row:
-                    agent_id = num_row.get("agent") or None
-                    log.info(
-                        "[VOICE] matched phone %s -> agent_id=%s (db=%s)",
-                        e164, agent_id, "postgres" if is_postgres() else "json",
-                    )
+        # M5: reuse form_dict instead of re-parsing the body.
+        called_to = form_dict.get("To") or form_dict.get("to")
+        if called_to:
+            e164 = str(called_to).strip()
+            from STT_server.db_phone_numbers import find_by_number as find_num
+            num_row = find_num(e164)
+            if num_row:
+                agent_id = num_row.get("agent") or None
+                log.info(
+                    "[VOICE] matched phone %s -> agent_id=%s (db=%s)",
+                    e164, agent_id, "postgres" if is_postgres() else "json",
+                )
     except Exception as exc:
         log.warning("[VOICE] failed to look up phone number for agent: %s", exc)
 

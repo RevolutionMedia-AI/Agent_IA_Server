@@ -44,11 +44,22 @@ async def stream_tts_segment(
     if not api_key:
         raise RuntimeError("ELEVENLABS_API_KEY no configurada. Define la env var o sube tu key en Settings → API.")
 
-    # Per-user voice_id and model_id override the system defaults. The
-    # adapter layer was already dispatching on session.tts_provider; the
-    # provider-specific knobs now come from the same per-user store.
-    voice_id = creds.get("voice_id") or ELEVENLABS_TTS_VOICE_ID
-    model_id = creds.get("model_id") or ELEVENLABS_TTS_MODEL_ID
+    # ponytail: M9 from the call-flow audit. The dataclass has
+    # session.voice_id and session.tts_model (set in STT_Server.py
+    # from the agent's per-agent voice + model). The previous
+    # code skipped those and read only the per-user credential's
+    # voice_id, so the agent's voice selection was ignored.
+    # Per-agent > per-user > system default.
+    voice_id = (
+        getattr(session, "voice_id", None)
+        or creds.get("voice_id")
+        or ELEVENLABS_TTS_VOICE_ID
+    )
+    model_id = (
+        getattr(session, "tts_model", None)
+        or creds.get("model_id")
+        or ELEVENLABS_TTS_MODEL_ID
+    )
 
     ttfb_ms: float | None = None
     started_at = time.perf_counter()

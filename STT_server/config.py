@@ -109,6 +109,10 @@ LOG_TWILIO_PLAYBACK = os.getenv("LOG_TWILIO_PLAYBACK", "false").strip().lower() 
 SAVE_TWILIO_FRAMES = os.getenv("SAVE_TWILIO_FRAMES", "false").strip().lower() in {"1", "true", "yes", "on"}
 FILLER_TTS_ENABLED = os.getenv("FILLER_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+# ponytail: L2 from the call-flow audit. User transcripts can carry
+# PII (DNI, credit card, address, name). Default off in production;
+# set to true in dev for debugging.
+LOG_TRANSCRIPT_CONTENT = os.getenv("LOG_TRANSCRIPT_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 STT_AUDIO_QUEUE_MAXSIZE = int(os.getenv("STT_AUDIO_QUEUE_MAXSIZE", "300"))

@@ -13,6 +13,7 @@ from STT_server.config import (
     FINAL_TRANSCRIPT_GRACE_MS,
     FINAL_RESTART_DELTA_CHARS,
     LLM_TIMEOUT_SEC,
+    LOG_TRANSCRIPT_CONTENT,
     MAX_HISTORY_MESSAGES,
     PARTIAL_PREFETCH_MAX_DELTA_CHARS,
     PARTIAL_TRANSCRIPT_DEBOUNCE_MS,
@@ -625,8 +626,27 @@ async def handle_agent_reply(
     prepared_reply: str | None = None,
 ) -> None:
     started_at = time.perf_counter()
-    # Registro esencial: lo que el usuario dijo al agente
-    log.warning("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
+    # ponytail: M10 from the call-flow audit. Set assistant_speaking
+    # here (BEFORE the TTS provider starts streaming) so the VAD
+    # ignores user input during the TTFB window. The previous
+    # behaviour set it in playback_loop on the first audio item,
+    # leaving a ~200-500 ms window where the user could speak and
+    # trigger a competing TTS turn. Setting it here also marks
+    # assistant_started_at so the H5 watchdog can time it.
+    session.assistant_speaking = True
+    session.assistant_started_at = time.perf_counter()
+    session.last_activity_at = time.monotonic()
+    # ponytail: L2 from the call-flow audit. Transcript logging is
+    # gated on LOG_TRANSCRIPT_CONTENT (default off). Production logs
+    # get a length summary + session_key, never the raw text.
+    if LOG_TRANSCRIPT_CONTENT:
+        log.warning("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
+    else:
+        log.warning(
+            "Usuario (%s) [%s]: len=%d key=%s",
+            session.session_key, trigger, len(user_text),
+            (user_text[:40] + "...") if len(user_text) > 40 else user_text,
+        )
 
     if prepared_reply:
         reply = prepared_reply.strip()
@@ -649,7 +669,14 @@ async def handle_agent_reply(
     trim_history(session)
 
     # Registro esencial: lo que dice el asistente (TTS)
-    log.warning("Agente (%s): %s", session.session_key, reply)
+    if LOG_TRANSCRIPT_CONTENT:
+        log.warning("Agente (%s): %s", session.session_key, reply)
+    else:
+        log.warning(
+            "Agente (%s): len=%d %s",
+            session.session_key, len(reply),
+            (reply[:40] + "...") if len(reply) > 40 else reply,
+        )
 
     total_ms = (time.perf_counter() - started_at) * 1000
     first_tts_ms = next((metric[0] for metric in tts_metrics if metric[0] is not None), None)

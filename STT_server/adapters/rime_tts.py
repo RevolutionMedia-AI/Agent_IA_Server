@@ -192,17 +192,25 @@ async def stream_tts_segment(
         if session.preferred_language
         else infer_supported_language_from_text(text, fallback="en")
     )
-    # Per-user speaker override beats the system speaker map. The catalog
-    # exposes two fields (speaker_en / speaker_es) so bilingual users can
-    # pick a different voice for each language.
+    # ponytail: M9 from the call-flow audit. Per-agent voice
+    # (session.voice_id) wins over the per-user speaker_en/speaker_es
+    # which wins over the system default. The agent's voice selection
+    # was previously ignored by Rime.
     lang_norm = normalize_supported_language(tts_language)
-    if lang_norm == "en" and creds.get("speaker_en"):
+    session_voice = getattr(session, "voice_id", None)
+    if session_voice:
+        speaker = session_voice
+    elif lang_norm == "en" and creds.get("speaker_en"):
         speaker = creds["speaker_en"]
     elif lang_norm == "es" and creds.get("speaker_es"):
         speaker = creds["speaker_es"]
     else:
         speaker = get_tts_model(tts_language)
-    model_id = creds.get("model_id") or RIME_TTS_MODEL_ID
+    model_id = (
+        getattr(session, "tts_model", None)
+        or creds.get("model_id")
+        or RIME_TTS_MODEL_ID
+    )
     lang_code = "eng" if lang_norm == "en" else "spa"
 
     # Request 8 kHz directly so we avoid downsampling most of the time.
