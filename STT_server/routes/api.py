@@ -54,6 +54,7 @@ from STT_server.db_phone_numbers import (
 )
 from STT_server.db_tools import (
     list_tools as db_list_tools,
+    get_tool as db_get_tool,
     upsert_tool as db_upsert_tool,
     delete_tool as db_delete_tool,
 )
@@ -942,22 +943,17 @@ def list_api_keys(auth: dict = Depends(require_auth)):
     Does NOT return the actual credentials — only whether each one is
     connected. The user can fetch the values explicitly via
     GET /settings/api-keys/{service_id}/value.
+
+    ponytail: `connected` is now derived from the per-user resolver
+    (Postgres-backed via db_tools), not from a JSON file. The previous
+    override `item["connected"] = spec.id in configured_ids` used to
+    shadow the resolver's view with a stale JSON snapshot — which was
+    right after a save and wrong after every redeploy on Railway.
     """
     user_id = auth["user_id"]
-    with _data_lock():
-        tools = _load(TOOLS_FILE, [])
-    configured_ids = {
-        t["id"] for t in tools
-        if t.get("user_id") == user_id and t.get("connected")
-    }
     services = []
     for spec in PROVIDER_CATALOG:
-        item = _serialize_provider(spec, user_id)
-        # "connected" = the user has saved a per-user key for this service.
-        # System defaults don't count as "connected" — the FE renders those
-        # as "Using system default" instead of "Connected".
-        item["connected"] = spec.id in configured_ids
-        services.append(item)
+        services.append(_serialize_provider(spec, user_id))
     return {"services": services}
 
 
@@ -968,25 +964,24 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
     Values are validated against the per-field regex/length in the
     provider catalog before encryption, so a typo returns a clean 400
     instead of a confusing 401 from the upstream provider on the next call.
+
+    ponytail: storage moved from data/tools_integrations.json (volatile
+    on Railway) to the `tools_integrations` Postgres table via
+    db_upsert_tool. The encrypt-then-store pattern is preserved so a
+    leaked DB row still doesn't leak plaintext keys.
     """
-    if get_provider_spec(service_id) is None:
+    spec = get_provider_spec(service_id)
+    if spec is None:
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
     if not body.credentials or not isinstance(body.credentials, dict):
         raise HTTPException(status_code=400, detail="credentials object is required")
 
     cleaned, errors = validate_credentials(service_id, body.credentials)
     if errors:
-        # ponytail: the 422 was silent before — the FE only saw
-        # 'Validation failed' without the field-level reason. Log the
-        # full error list so the operator can see which field (api_key
-        # vs base_url vs voice_id) failed and why, without having to
-        # add console.log in the FE.
         log.warning(
             "[api-keys] upsert rejected service=%s user_id=%s errors=%s",
             service_id, auth["user_id"], errors,
         )
-        # 422 keeps Pydantic semantics intact; the FE reads `errors` to
-        # highlight the offending input.
         return JSONResponse(
             status_code=422,
             content={"detail": "Validation failed", "errors": errors},
@@ -997,42 +992,24 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
     )
 
     encrypted = encrypt_credentials(cleaned)
-    with _data_lock():
-        tools = _load(TOOLS_FILE, [])
-        existing = next(
-            (t for t in tools
-             if t["id"] == service_id and t.get("user_id") == auth["user_id"]),
-            None,
-        )
-        if existing:
-            existing["credentials"] = encrypted
-            existing["connected"] = bool(encrypted)
-            existing["connected_at"] = _now_iso() if encrypted else None
-        else:
-            tools.append({
-                "id": service_id,
-                "user_id": auth["user_id"],
-                "connected": bool(encrypted),
-                "credentials": encrypted,
-                "connected_at": _now_iso() if encrypted else None,
-            })
-        _save(TOOLS_FILE, tools)
+    db_upsert_tool(
+        auth["user_id"],
+        service_id,
+        {
+            "credentials": encrypted,
+            "connected": bool(encrypted),
+            "display_name": spec.name,
+            "category": spec.category,
+        },
+    )
     return {"success": True}
 
 
 @api_router.delete("/settings/api-keys/{service_id}")
 def delete_api_key(service_id: str, auth: dict = Depends(require_auth)):
     """Disconnects a service for the user (falls back to env var default)."""
-    with _data_lock():
-        tools = _load(TOOLS_FILE, [])
-        before = len(tools)
-        tools = [
-            t for t in tools
-            if not (t["id"] == service_id and t.get("user_id") == auth["user_id"])
-        ]
-        if len(tools) == before:
-            raise HTTPException(status_code=404, detail="Key not configured")
-        _save(TOOLS_FILE, tools)
+    if not db_delete_tool(auth["user_id"], service_id):
+        raise HTTPException(status_code=404, detail="Key not configured")
     return {"success": True}
 
 
@@ -1047,17 +1024,11 @@ def reveal_api_key(service_id: str, auth: dict = Depends(require_auth)):
     """
     if get_provider_spec(service_id) is None:
         raise HTTPException(status_code=404, detail=f"Unknown service '{service_id}'")
-    # Read directly from per-user storage (NOT the resolver — we don't
-    # want to leak system env-var values through the reveal endpoint).
-    with _data_lock():
-        tools = _load(TOOLS_FILE, [])
-    row = next(
-        (t for t in tools
-         if t["id"] == service_id and t.get("user_id") == auth["user_id"]
-         and t.get("connected") and t.get("credentials")),
-        None,
-    )
-    if not row:
+    # ponytail: read directly from per-user Postgres storage (NOT the
+    # resolver — we don't want to leak system env-var values through
+    # the reveal endpoint).
+    row = db_get_tool(auth["user_id"], service_id)
+    if not row or not row.get("connected") or not row.get("credentials"):
         raise HTTPException(status_code=404, detail="Key not configured")
     creds = decrypt_credentials(row["credentials"])
     return {"service": service_id, "credentials": creds}

@@ -405,31 +405,29 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     """Read per-user encrypted credentials and decrypt them. Returns
     empty dict when the user has nothing stored or decryption fails.
     Never raises — the caller falls back to env vars.
+
+    ponytail: reads from Postgres (`tools_integrations`) via db_tools.
+    The earlier JSON-file path is gone — Railway containers are
+    ephemeral so any file write under STT_server/data/ vanishes on
+    redeploy, which silently broke every per-user key. The FE still
+    POSTs to the same endpoints; only the storage backend moved.
     """
     if not user_id:
         return {}
     try:
-        from STT_server.routes.api import _load  # local import: avoid cycle
-        tools = _load(_tools_path(), [])
+        from STT_server.db_tools import list_tools as db_list_tools
+        rows = db_list_tools(user_id)
     except Exception:
         return {}
     row = next(
-        (t for t in tools
-         if t.get("id") == provider_id and t.get("user_id") == user_id and t.get("connected")),
+        (r for r in rows
+         if r.get("id") == provider_id and r.get("connected")),
         None,
     )
     if not row or not row.get("credentials"):
         return {}
     decrypted = decrypt_credentials(row["credentials"]) or {}
     return {k: v for k, v in decrypted.items() if isinstance(v, str) and v}
-
-
-def _tools_path() -> str:
-    return os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),  # STT_server/
-        "data",
-        "tools_integrations.json",
-    )
 
 
 def resolve_provider(user_id: str | None, provider_id: str) -> dict[str, str]:
