@@ -204,7 +204,18 @@ def update_number(number_id: str, user_id: str, payload: dict) -> dict | None:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 return n
         return None
-    allowed = {"agent", "status", "label", "campaign"}
+    # ponytail: mirrors PhoneNumberCreate's credential fields so the
+    # FE can rotate per-number Twilio/SIP/WhatsApp creds without
+    # having to delete + recreate. Both this list AND the
+    # PhoneNumberUpdate Pydantic schema have to allow the field —
+    # Pydantic drops undeclared fields silently, and this whitelist
+    # drops anything not listed. Keep both in sync.
+    allowed = {
+        "agent", "status", "label", "campaign",
+        "twilio_account_sid", "twilio_auth_token",
+        "sip_host", "sip_username", "sip_password",
+        "whatsapp_phone_number_id", "whatsapp_access_token",
+    }
     set_clauses, values = [], []
     for k, v in payload.items():
         if v is None or k not in allowed:

@@ -384,6 +384,22 @@ class PhoneNumberUpdate(BaseModel):
     status: Optional[str] = None
     label: Optional[str] = None
     campaign: Optional[str] = None
+    # ponytail: bug history. This schema only declared the routing
+    # fields (agent/status/label/campaign) so Pydantic silently
+    # dropped every credential the FE sent on edit. Operators kept
+    # seeing "old creds still in use" because the original CREATE
+    # path stored the values (PhoneNumberCreate has these fields)
+    # but every subsequent PUT stripped them. Mirror the CREATE
+    # schema's credential fields here so PUT can actually update
+    # them. The DB-layer allowed set in db_phone_numbers.update_number
+    # also has to include these — both layers have to agree.
+    twilio_account_sid: Optional[str] = None
+    twilio_auth_token: Optional[str] = None
+    sip_host: Optional[str] = None
+    sip_username: Optional[str] = None
+    sip_password: Optional[str] = None
+    whatsapp_phone_number_id: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
 
 
 class ToolConnect(BaseModel):
