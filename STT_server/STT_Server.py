@@ -578,14 +578,19 @@ async def media_stream(ws: WebSocket) -> None:
                               session.session_key)
                 else:
                     # No provider configured → no env-var fallback (the
-                    # user explicitly asked to drop defaults). The operator
-                    # must upload a per-user key in Settings → API. The
-                    # call's STT path is a no-op without it; the user
-                    # hears silence and we log the reason clearly.
+                    # user explicitly asked to drop defaults). The call's
+                    # STT path is a no-op without it; the user hears
+                    # silence and we log the reason clearly. The most
+                    # common cause after my Postgres migration is a
+                    # broken agent→phone link (user_id=None cascades
+                    # into "no per-user key resolved"), so lead with
+                    # that — "Settings → API" alone was misleading
+                    # because the agent modal also persists keys now.
                     log.error(
                         "[STT] session %s has no STT provider (agent=%s, user_id=%s). "
-                        "Upload an STT key in Settings → API and either set stt_provider "
-                        "on the agent or let the system auto-detect from your credentials.",
+                        "Either link this phone number to an agent, set stt_provider on the "
+                        "agent, or upload a per-user STT key (ModalAgents inline field or "
+                        "Settings → API).",
                         session.session_key, session.agent_id, session.user_id,
                     )
                 # ponytail: if the agent has a welcome_message, schedule
