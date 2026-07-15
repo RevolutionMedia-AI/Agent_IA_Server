@@ -108,7 +108,34 @@ async def lifespan(app: FastAPI):
         db_tools.backfill_from_json()
     except Exception as exc:
         log.warning("[startup] db_tools backfill failed (non-fatal): %s", exc)
-    yield
+
+    # ponytail: emit a heartbeat log every 60s so Railway's container
+    # cycles (if any) are visible — every "container alive Ns" line is a
+    # proof the worker is up. If you see two of these in a row without
+    # any other logs in between, the container just restarted.
+    import asyncio
+
+    async def _heartbeat():
+        counter = {"n": 0}
+        while True:
+            await asyncio.sleep(60)
+            counter["n"] += 1
+            try:
+                log.info("[heartbeat] container alive t+%ds", counter["n"] * 60)
+            except Exception:
+                # Log handler itself blew up — don't let the heartbeat
+                # itself crash the worker.
+                pass
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        yield
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
