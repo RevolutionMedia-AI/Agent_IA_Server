@@ -280,13 +280,22 @@ async def voice(
     # include a <Play> so Twilio plays the pre-recorded greeting before
     # connecting the media stream. Otherwise connect directly.
     static_local = os.path.join(os.path.dirname(__file__), "static", "greeting.wav")
+    # ponytail: bug history. This template used {stream_params} (a
+    # Python list), which rendered as ['<Parameter .../>', ...] inside
+    # the <Stream> element. Twilio's TwiML parser treated that literal
+    # text as a child text node, NOT as <Parameter> elements, and
+    # silently dropped them. Net effect: the WebSocket 'start' event
+    # arrived with customParameters={} and the call ran without an
+    # agent_id (see [AGENT] has no agent_id in customParameters log).
+    # stream_params_str was already joined above for exactly this
+    # purpose; use it.
     if TWIML_INITIAL_GREETING_ENABLED or os.path.exists(static_local):
         play_url = f"{PUBLIC_URL.rstrip('/')}/static/greeting.wav"
         twiml = f"""
     <Response>
         <Play>{play_url}</Play>
         <Connect>
-            <Stream url="{ws_url}/media-stream">{stream_params}</Stream>
+            <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
         </Connect>
     </Response>
     """
@@ -294,7 +303,7 @@ async def voice(
         twiml = f"""
     <Response>
         <Connect>
-            <Stream url="{ws_url}/media-stream">{stream_params}</Stream>
+            <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
         </Connect>
     </Response>
     """

@@ -32,7 +32,11 @@ from STT_server.services.credentials_resolver import resolve_provider
 
 log = logging.getLogger("stt_server")
 
-DEFAULT_MODEL_ID = "inworld-tts-2"
+# ponytail: inworld-tts-2 was deprecated by Inworld. The docstring
+# above already listed inworld-tts-1.5-mini as the intended default
+# (low-latency, 15 langs); the constant was just never updated to
+# match. Use 1.5-mini.
+DEFAULT_MODEL_ID = "inworld-tts-1.5-mini"
 DEFAULT_VOICE_ID = "Dennis"
 
 

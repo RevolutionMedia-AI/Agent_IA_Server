@@ -77,7 +77,12 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
             FieldSpec(
                 name="api_key", label="API Key", type="password",
                 required=True,
-                pattern=r"^sk-(proj-)?[A-Za-z0-9_\-]{20,}$",
+                # ponytail: project keys are ~180 chars of base64 (can
+                # contain '+', '/', '='); the previous regex only
+                # accepted [A-Za-z0-9_-] so any base64 char broke it.
+                # Test endpoint hit OpenAI's real API and passed; save
+                # was 422 from this regex. Allow the base64 alphabet.
+                pattern=r"^sk-[A-Za-z0-9+/=_\-]{20,}$",
                 min_length=20,
                 placeholder="sk-...",
                 help="Starts with 'sk-' (or 'sk-proj-' for project keys).",
