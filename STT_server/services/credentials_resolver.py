@@ -661,6 +661,151 @@ def _fetch_openai_models(api_key: str) -> list[dict]:
     return keep[:50]  # safety cap
 
 
+def _fetch_anthropic_models(api_key: str, base_url: str = "https://api.anthropic.com") -> list[dict]:
+    """GET /v1/models from Anthropic. Requires x-api-key + anthropic-version
+    headers. Returns the live catalog so the FE dropdown shows models
+    Anthropic actually serves today, not a hardcoded snapshot that
+    goes stale on every release.
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        base = base_url.rstrip("/")
+        req = urllib.request.Request(
+            f"{base}/v1/models?limit=200",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = __import__("json").loads(resp.read().decode("utf-8"))
+        keep = []
+        for m in payload.get("data", []):
+            mid = m.get("id", "")
+            if mid:
+                keep.append({
+                    "id": mid,
+                    "name": m.get("display_name", mid),
+                    "description": m.get("type", "Anthropic model"),
+                })
+        return keep
+    except Exception as exc:
+        log.info("[anthropic-models] fetch failed: %s", _sanitize_error(str(exc))[:200])
+        return []
+
+
+def _fetch_minimax_models(api_key: str, base_url: str | None = None) -> list[dict]:
+    """GET /v1/models from MiniMax. The endpoint accepts both the
+    canonical api.minimax.io and a custom base_url (token plan /
+    coding plan / subscription) the user picked in Settings → API.
+    Returns the live catalog so the FE dropdown reflects whatever
+    MiniMax actually serves the user's account.
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        base = (base_url or "https://api.minimax.io/v1").rstrip("/")
+        req = urllib.request.Request(
+            f"{base}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = __import__("json").loads(resp.read().decode("utf-8"))
+        keep = []
+        for m in payload.get("data", []):
+            mid = m.get("id", "")
+            if mid:
+                keep.append({
+                    "id": mid,
+                    "name": mid,
+                    "description": m.get("owned_by", "MiniMax model"),
+                })
+        return keep
+    except Exception as exc:
+        log.info("[minimax-models] fetch failed: %s", _sanitize_error(str(exc))[:200])
+        return []
+
+
+def _fetch_rime_models() -> list[dict]:
+    """GET /v1/models from Rime. Rime's REST API is public — no auth
+    header required for the model list. Used for both STT and TTS
+    catalog fetches (the same endpoint lists both).
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        req = urllib.request.Request("https://users-ws.rime.ai/v1/models")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = __import__("json").loads(resp.read().decode("utf-8"))
+        keep = []
+        for m in payload.get("data", []) or []:
+            mid = m.get("id", "")
+            if mid:
+                keep.append({
+                    "id": mid,
+                    "name": m.get("name", mid),
+                    "description": m.get("description", "Rime model"),
+                })
+        return keep
+    except Exception as exc:
+        log.info("[rime-models] fetch failed: %s", _sanitize_error(str(exc))[:200])
+        return []
+
+
+def _fetch_rime_voices() -> list[dict]:
+    """GET /v1/voices from Rime. Same endpoint family as models;
+    no auth required for the public list.
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        req = urllib.request.Request("https://users-ws.rime.ai/v1/voices")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = __import__("json").loads(resp.read().decode("utf-8"))
+        keep = []
+        for v in payload.get("data", []) or []:
+            vid = v.get("id", "")
+            if vid:
+                keep.append({
+                    "id": vid,
+                    "name": v.get("name", vid),
+                    "description": v.get("description", "Rime voice"),
+                })
+        return keep
+    except Exception as exc:
+        log.info("[rime-voices] fetch failed: %s", _sanitize_error(str(exc))[:200])
+        return []
+
+
+def _fetch_assemblyai_models(api_key: str) -> list[dict]:
+    """GET /v2/models from AssemblyAI. The api_key IS the Authorization
+    header value (no "Bearer" prefix — AssemblyAI uses the raw key).
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://api.assemblyai.com/v2/models",
+            headers={"Authorization": api_key},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = __import__("json").loads(resp.read().decode("utf-8"))
+        keep = []
+        for m in payload.get("models", []) or []:
+            mid = m.get("id", "")
+            if mid and m.get("available", True):
+                keep.append({
+                    "id": mid,
+                    "name": m.get("name", mid),
+                    "description": m.get("description", "AssemblyAI model"),
+                })
+        return keep
+    except Exception as exc:
+        log.info("[assemblyai-models] fetch failed: %s", _sanitize_error(str(exc))[:200])
+        return []
+
+
 def _fetch_gemini_models(api_key: str) -> list[dict]:
     """GET https://generativelanguage.googleapis.com/v1beta/models?key=..."""
     import urllib.error
@@ -738,6 +883,16 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                             return {"models": models}
                     return {"models": _HARDCODED_LLM_MODELS.get("openai", [])}
                 if provider_id == "anthropic":
+                    if creds:
+                        # honor custom base_url for token-plan / custom
+                        # tenant endpoints; default to api.anthropic.com
+                        try:
+                            base = (creds.get("base_url") or "https://api.anthropic.com").rstrip("/")
+                        except Exception:
+                            base = "https://api.anthropic.com"
+                        models = _fetch_anthropic_models(creds, base)
+                        if models:
+                            return {"models": models}
                     return {"models": _HARDCODED_LLM_MODELS["anthropic"]}
                 if provider_id == "gemini":
                     if creds:
@@ -749,6 +904,15 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                     # rationale as the OpenAI branch above.
                     return {"models": _HARDCODED_LLM_MODELS.get("gemini", [])}
                 if provider_id == "minimax":
+                    if creds:
+                        # honor custom base_url the user picked in
+                        # Settings → API (token plan / coding plan / etc.)
+                        models = _fetch_minimax_models(
+                            creds,
+                            creds.get("base_url"),
+                        )
+                        if models:
+                            return {"models": models}
                     return {"models": _HARDCODED_LLM_MODELS["minimax"]}
                 return {"models": []}
 
@@ -764,6 +928,17 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         return {"models": tts_models}
                 return {"models": _HARDCODED_TTS_VOICES["openai"]}
             if provider_id == "rime":
+                # Rime REST API is public (no auth) — always try the
+                # live fetch. Rime's voices endpoint is separate from
+                # models, so we run both and dedupe by id.
+                try:
+                    live = list({v["id"]: v for v in (
+                        _fetch_rime_voices() + _fetch_rime_models()
+                    )}.values())
+                except Exception:
+                    live = []
+                if live:
+                    return {"models": live}
                 return {"models": _HARDCODED_TTS_VOICES["rime"]}
             if provider_id == "elevenlabs":
                 if creds:
@@ -876,6 +1051,10 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_STT_MODELS["deepgram"]}
             if provider_id == "assemblyai":
+                if creds:
+                    models = _fetch_assemblyai_models(creds)
+                    if models:
+                        return {"models": models}
                 return {"models": _HARDCODED_STT_MODELS["assemblyai"]}
             if provider_id == "openai":
                 # ponytail: fetch /v1/models live y filtrar transcribe/realtime
@@ -894,6 +1073,15 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_STT_MODELS["openai"]}
             if provider_id == "rime":
+                # Rime REST API is public — always try the live fetch.
+                try:
+                    live = list({m["id"]: m for m in (
+                        _fetch_rime_models() + _fetch_rime_voices()
+                    )}.values())
+                except Exception:
+                    live = []
+                if live:
+                    return {"models": live}
                 return {"models": _HARDCODED_STT_MODELS["rime"]}
             if provider_id == "inworld":
                 return {"models": _HARDCODED_STT_MODELS["inworld"]}
