@@ -285,6 +285,13 @@ def health() -> dict:
 class AgentCreate(BaseModel):
     name: str = Field(..., min_length=1)
     voice: Optional[str] = None
+    # ponytail: separate from `voice` — `voice` is the high-level agent
+    # voice descriptor; `voice_id` is the actual provider-side id
+    # (e.g. Inworld's "Dennis", ElevenLabs' voice id). The TTS
+    # dispatcher reads session.voice_id at runtime. Without this
+    # field on the schema, Pydantic drops it and the runtime falls
+    # back to the provider's hardcoded default on every save.
+    voice_id: Optional[str] = None
     language: Optional[str] = "English"
     campaign: Optional[str] = None
     status: Optional[str] = "Active"
@@ -310,6 +317,13 @@ class AgentCreate(BaseModel):
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
     voice: Optional[str] = None
+    # ponytail: was missing from the schema — the FE was sending
+    # payload.voice_id but Pydantic was silently dropping the field
+    # because the schema didn't declare it. Result: agents with
+    # custom TTS voices (e.g. Inworld's voice catalog) always
+    # reverted to "Dennis" on save because voice_id never made it to
+    # the DB row. Added here so the field actually round-trips.
+    voice_id: Optional[str] = None
     language: Optional[str] = None
     campaign: Optional[str] = None
     status: Optional[str] = None
