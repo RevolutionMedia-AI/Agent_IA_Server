@@ -103,17 +103,21 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 help="Starts with 'sk-' (or 'sk-proj-' for project keys).",
             ),
             FieldSpec(
+                name="tts_model", label="TTS model", type="text",
+                required=False,
+                pattern=r"^tts-1$|^tts-1-hd$|^gpt-4o-mini-tts$",
+                placeholder="tts-1",
+                help="OpenAI TTS model. tts-1 = standard, tts-1-hd = higher quality, gpt-4o-mini-tts = cheapest streaming.",
+            ),
+            FieldSpec(
                 name="realtime_model", label="Realtime model", type="text",
                 required=False,
                 pattern=r"^gpt-4o(-[A-Za-z0-9.\-]+)?-realtime(-preview)?(-[0-9]{4}-\d{2}-\d{2})?$|^gpt-realtime(-[0-9]{4}-\d{2}-\d{2})?$",
                 placeholder="gpt-4o-mini-realtime-preview",
-                help="Optional. Defaults to OPENAI_REALTIME_MODEL on the backend.",
+                help="Optional. Per-user Realtime model override; falls back to the agent's stt_model when stt_provider is openai.",
             ),
         ),
-        env_fallbacks=(
-            ("OPENAI_API_KEY", "api_key"),
-            ("OPENAI_REALTIME_MODEL", "realtime_model"),
-        ),
+        env_fallbacks=(),  # ponytail: env_fallbacks deprecated; per-user only.
         test_fn="STT_server.services.credentials_resolver._test_openai",
     ),
     ProviderSpec(
@@ -258,13 +262,9 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="rime",
         name="Rime",
         category="tts",
-        # ponytail: Rime ships both a TTS adapter (rime_tts.py) and an
-        # STT adapter (rime_stt_realtime.py). Same API key covers both.
-        # The TTS-specific fields below (model_id/speaker_*) are
-        # ignored by the STT path; only api_key + the model selector
-        # in the agent's STT slot matter there.
-        categories=("tts", "stt"),
-        description="Text-to-speech and speech-to-text via Rime's WebSocket API. Same api_key covers both slots.",
+        # ponytail: Rime STT was removed from the spec; the adapter
+        # was deleted in this commit batch. Rime remains TTS-only.
+        description="Text-to-speech via Rime's WebSocket API (Astra, Celestino, etc.).",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -292,10 +292,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 placeholder="celestino",
             ),
         ),
-        env_fallbacks=(
-            ("RIME_API_KEY", "api_key"),
-            ("RIME_TTS_MODEL_ID", "model_id"),
-        ),
+        env_fallbacks=(),  # ponytail: env_fallbacks deprecated; per-user only.
         test_fn=None,
     ),
     ProviderSpec(
@@ -592,7 +589,6 @@ _HARDCODED_STT_MODELS = {
     "assemblyai": [
         {"id": "best",  "name": "Best",  "description": "Highest accuracy, multilingual"},
         {"id": "nano",  "name": "Nano",  "description": "Lowest latency, lower accuracy"},
-        {"id": "slam-1", "name": "SLAM-1", "description": "Streaming speech LM"},
         # ponytail: Universal-Streaming family. Listed so the FE can
         # attach per-model pricing; these names also match what the
         # AssemblyAI docs publish today.
@@ -600,14 +596,18 @@ _HARDCODED_STT_MODELS = {
         {"id": "universal-streaming-multilingual",   "name": "Universal-Streaming Multilingual",   "description": "Multilingual streaming"},
         {"id": "universal-3.5-pro-realtime",         "name": "Universal-3.5 Pro Realtime",         "description": "Highest accuracy, realtime"},
     ],
+    # ponytail: STT catalog now strictly streaming-only. OpenAI's
+    # Whisper / gpt-4o-transcribe / gpt-4o-mini-transcribe are
+    # batch REST endpoints — they don't satisfy the "low-latency
+    # via WebSockets or HTTP chunked" rule in the realtime spec, so
+    # they were removed. The agent's stt_model must be one of these
+    # Realtime IDs for the openai_realtime adapter to work.
     "openai": [
-        {"id": "gpt-4o-transcribe",      "name": "GPT-4o Transcribe",      "description": "Latest OpenAI STT via Realtime API"},
-        {"id": "gpt-4o-mini-transcribe", "name": "GPT-4o Mini Transcribe", "description": "Lower-latency variant"},
-        {"id": "whisper-1",             "name": "Whisper-1",             "description": "Original Whisper model"},
+        {"id": "gpt-realtime",                 "name": "GPT Realtime",                  "description": "OpenAI's latest GA realtime model (audio + text, low latency)"},
+        {"id": "gpt-4o-realtime-preview",     "name": "GPT-4o Realtime Preview",       "description": "gpt-4o class audio + text Realtime API (preview)"},
+        {"id": "gpt-4o-mini-realtime-preview", "name": "GPT-4o-mini Realtime Preview", "description": "Smaller / cheaper Realtime preview"},
     ],
-    "rime": [
-        {"id": "mist-v2", "name": "Mist v2", "description": "Rime STT default"},
-    ],
+    # ponytail: Rime STT removed entirely. Out of spec.
     "inworld": [
         # ponytail: real Inworld model id per
         # https://docs.inworld.ai/stt/overview. The placeholder
@@ -630,10 +630,15 @@ _HARDCODED_LLM_MODELS = {
         {"id": "MiniMax-M2.7", "name": "MiniMax-M2.7", "description": "Mid-tier MiniMax model"},
         {"id": "MiniMax-M2.5", "name": "MiniMax-M2.5", "description": "Smaller / cheaper MiniMax model"},
     ],
+    # ponytail: Anthropic catalog trimmed to real Anthropic models
+    # only (the previous pricing file carried several fictional
+    # future-model names like `claude-fable-5`, `claude-mythos-5`,
+    # `claude-opus-4-8` that never shipped; the kept entries below
+    # are the ones Anthropic actually publishes today).
     "anthropic": [
-        {"id": "claude-3-5-sonnet-20241022", "name": "Claude 3.5 Sonnet", "description": "Latest balanced model"},
-        {"id": "claude-3-5-haiku-20241022",  "name": "Claude 3.5 Haiku",  "description": "Fast, lower-cost"},
-        {"id": "claude-3-opus-20240229",     "name": "Claude 3 Opus",     "description": "Highest capability, slower"},
+        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "description": "Latest balanced model, streaming"},
+        {"id": "claude-haiku-3-5",  "name": "Claude Haiku 3.5",  "description": "Fast, lower-cost, streaming"},
+        {"id": "claude-haiku-3",    "name": "Claude Haiku 3",    "description": "Smallest / cheapest, streaming"},
     ],
     # ponytail: OpenAI / Gemini / MiniMax fallback catalogs so the
     # dropdown is never empty when the user hasn't validated a key
@@ -642,34 +647,21 @@ _HARDCODED_LLM_MODELS = {
     # canonical model list and pick one). Mirrored from the FE pricing
     # table so the two stay in sync.
     "openai": [
-        {"id": "gpt-5.6",       "name": "gpt-5.6",       "description": "Flagship preview"},
-        {"id": "gpt-5.6-terra", "name": "gpt-5.6-terra", "description": "Mid-tier preview"},
-        {"id": "gpt-5.6-luna",  "name": "gpt-5.6-luna",  "description": "Smaller preview"},
-        {"id": "gpt-5.5",       "name": "gpt-5.5",       "description": "GA flagship"},
-        {"id": "gpt-5.5-pro",   "name": "gpt-5.5-pro",   "description": "GA premium"},
-        {"id": "gpt-5.4",       "name": "gpt-5.4",       "description": "Standard"},
-        {"id": "gpt-5.4-mini",  "name": "gpt-5.4-mini",  "description": "Cheap, fast"},
-        {"id": "gpt-5.4-nano",  "name": "gpt-5.4-nano",  "description": "Cheapest"},
-        {"id": "gpt-4.1",       "name": "gpt-4.1",       "description": "Legacy 4.1"},
-        {"id": "gpt-4.1-mini",  "name": "gpt-4.1-mini",  "description": "Legacy cheap"},
-        {"id": "gpt-4.1-nano",  "name": "gpt-4.1-nano",  "description": "Legacy cheapest"},
-        {"id": "gpt-4o",        "name": "gpt-4o",        "description": "Legacy 4o"},
-        {"id": "gpt-4o-mini",   "name": "gpt-4o-mini",   "description": "Legacy cheap"},
-        {"id": "o3",            "name": "o3",            "description": "Reasoning"},
-        {"id": "o3-pro",        "name": "o3-pro",        "description": "Reasoning premium"},
-        {"id": "o4-mini",       "name": "o4-mini",       "description": "Reasoning cheap"},
-        {"id": "o4-mini-high",  "name": "o4-mini-high",  "description": "Reasoning higher"},
+        {"id": "gpt-4o",      "name": "gpt-4o",      "description": "Streaming-optimized flagship, multimodal"},
+        {"id": "gpt-4o-mini", "name": "gpt-4o-mini", "description": "Cheap / fast streaming variant"},
+        {"id": "o4-mini",     "name": "o4-mini",     "description": "Reasoning, streaming"},
     ],
     "gemini": [
-        {"id": "gemini-3-1-pro",        "name": "gemini-3-1-pro",        "description": "Flagship ≤200K"},
-        {"id": "gemini-3-1-pro-long",   "name": "gemini-3-1-pro-long",   "description": "Flagship >200K"},
-        {"id": "gemini-3-5-flash",      "name": "gemini-3-5-flash",      "description": "Standard"},
-        {"id": "gemini-3-flash",        "name": "gemini-3-flash",        "description": "Fast, cheap"},
+        {"id": "gemini-1-5-flash",       "name": "gemini-1.5-flash",       "description": "Fast / cheap, streaming"},
+        {"id": "gemini-2-5-flash",       "name": "gemini-2.5-flash",       "description": "Fast / cheap, streaming"},
+        {"id": "gemini-3-1-pro",         "name": "gemini-3-1-pro",         "description": "Flagship ≤200K"},
+        {"id": "gemini-3-1-pro-long",    "name": "gemini-3-1-pro-long",    "description": "Flagship >200K"},
+        {"id": "gemini-3-5-flash",       "name": "gemini-3-5-flash",       "description": "Standard"},
+        {"id": "gemini-3-flash",         "name": "gemini-3-flash",         "description": "Fast, cheap"},
         {"id": "gemini-3-1-flash-lite", "name": "gemini-3-1-flash-lite", "description": "Cheapest fast"},
-        {"id": "gemini-2-5-pro",        "name": "gemini-2-5-pro",        "description": "Legacy pro"},
-        {"id": "gemini-2-5-pro-long",   "name": "gemini-2-5-pro-long",   "description": "Legacy pro long"},
-        {"id": "gemini-2-5-flash",      "name": "gemini-2-5-flash",      "description": "Legacy flash"},
-        {"id": "gemini-2-5-flash-lite", "name": "gemini-2-5-flash-lite", "description": "Legacy cheap"},
+        {"id": "gemini-2-5-pro",         "name": "gemini-2.5-pro",         "description": "Legacy pro"},
+        {"id": "gemini-2-5-pro-long",    "name": "gemini-2.5-pro-long",    "description": "Legacy pro long"},
+        {"id": "gemini-2-5-flash-lite",  "name": "gemini-2.5-flash-lite",  "description": "Legacy cheap"},
         {"id": "gemini-embeddings",      "name": "gemini-embeddings",      "description": "Embeddings"},
     ],
 }
