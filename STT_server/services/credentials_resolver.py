@@ -80,13 +80,14 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="openai",
         name="OpenAI",
         category="llm",
-        # ponytail: OpenAI's Realtime API powers both LLM and STT.
-        # The DB row stores category='llm' (primary); the resolver and
-        # the FE badge use this tuple so the same credential lights up
-        # both slots. Without this, find_first_configured_provider
-        # skips OpenAI when scanning for an STT provider.
-        categories=("llm", "stt"),
-        description="Powers the language model in voice calls and admin tools. Used for both Chat Completions and Realtime STT+LLM.",
+        # ponytail: OpenAI powers three slots. Realtime API = STT+LLM,
+        # /v1/audio/speech = TTS. One DB row, three categories — the
+        # resolver scans by `categories` so the same credential lights
+        # up all three. Without 'tts' here, OpenAI would be invisible
+        # to find_first_configured_provider(user_id, 'tts') even
+        # though tts_dispatcher._stream_openai is wired and works.
+        categories=("llm", "stt", "tts"),
+        description="Powers the language model in voice calls and admin tools. Used for Chat Completions, Realtime STT+LLM, and /v1/audio/speech TTS.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -295,6 +296,10 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="deepgram",
         name="Deepgram",
         category="stt",
+        # ponytail: Deepgram ships both a real-time STT adapter and a
+        # TTS adapter (/v1/speak with mulaw/8000). The FE offers it in
+        # both dropdowns; the catalog needs to advertise both.
+        categories=("stt", "tts"),
         description="Speech-to-text provider. Used for both realtime transcription and the alternative TTS voice.",
         fields=(
             FieldSpec(
@@ -337,7 +342,12 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="inworld",
         name="Inworld",
         category="tts",
-        description="Voice synthesis with character personas. Reserved for future use.",
+        # ponytail: Inworld ships a real-time STT adapter
+        # (inworld_stt_realtime.py) in addition to the TTS one. The FE
+        # shows it in both dropdowns; advertise both so the resolver
+        # finds it when scanning for STT providers.
+        categories=("tts", "stt"),
+        description="Voice synthesis with character personas. Also powers real-time STT.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
