@@ -35,7 +35,6 @@ from STT_server.config import (
     DEEPGRAM_STT_LANGUAGE_HINT,
     PORT,
     PUBLIC_URL,
-    TWILIO_AUTH_TOKEN,
     TWILIO_SR,
     TWIML_INITIAL_GREETING_ENABLED,
 )
@@ -156,11 +155,11 @@ async def voice(
     custom parameters so media_stream can pick it up at call start.
 
     When TWILIO_AUTH_TOKEN is set in the environment, we verify the
-    X-Twilio-Signature header against the incoming form params. Any
-    request without a valid signature is rejected with 403. This
-    blocks attackers who could otherwise POST audio frames to /voice
-    and consume our TTS/LLM quota. Set TWILIO_AUTH_TOKEN to enable;
-    leaving it unset keeps the endpoint open for local dev.
+    X-Twilio-Signature header against the per-number Twilio auth token.
+    Reject any request whose signature doesn't match. No env fallback —
+    the user enters their Twilio subaccount credentials when they
+    connect a number (ModalConnectNumber → phone_numbers.twilio_auth_token),
+    and that's the only source of truth.
     """
     # ponytail: read the form once. Twilio sends it as
     # application/x-www-form-urlencoded; the signature verifier and
@@ -196,38 +195,40 @@ async def voice(
 
     # ponytail: per-number Twilio auth token. Twilio signs each webhook
     # with the auth token of the Twilio account that owns the phone
-    # number that's calling - not the deployer's account. We resolve
-    # the called number first, then verify against THAT account's
-    # auth token. The TWILIO_AUTH_TOKEN env var is only a fallback for
-    # deployments where the operator and the phone-number owner are
-    # the same entity (e.g. internal use).
+    # number that's calling. The user enters that token via
+    # ModalConnectNumber; if missing, REJECT the call — there's no
+    # fallback to a global credential (removed per the spec).
+    per_number_token = None
+    per_number_row_id = None
     if form_dict:
         from STT_server.adapters.twilio_api import validate_twilio_signature
         from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
-        per_number_token = None
         try:
             called_to = form_dict.get("To") or form_dict.get("to")
             if called_to:
                 row = _find_num_for_sig(called_to)
                 if row:
+                    per_number_row_id = row.get("id")
                     per_number_token = row.get("twilio_auth_token") or None
         except Exception as exc:
             log.warning("[VOICE] could not look up per-number auth token: %s", exc)
-        token_to_check = per_number_token or TWILIO_AUTH_TOKEN
-        # ponytail: C2 from the call-flow audit. The previous
-        # `if token_to_check:` silently accepted the webhook when
-        # no token was configured — a free DoS / cost-amplification
-        # path. Fail loudly with 503 so a misconfigured deploy is
-        # impossible to miss in the logs.
+        token_to_check = per_number_token
+        # ponytail: env fallback gone. If the phone number row has no
+        # twilio_auth_token, we refuse the call with 503 — the operator
+        # must edit the number and save the Twilio credentials before
+        # the webhook can route. No silent global-key acceptance.
         if not token_to_check:
             log.error(
-                "[VOICE] No Twilio auth token configured (TWILIO_AUTH_TOKEN env "
-                "+ per-number auth_token both empty). Rejecting inbound call. "
-                "Set TWILIO_AUTH_TOKEN or configure twilio_auth_token on the "
-                "phone number row."
+                "[VOICE] phone row %s has no twilio_auth_token — refusing "
+                "inbound call to To=%s. The user must save the Twilio "
+                "subaccount credentials via the Edit-number modal before "
+                "the number can route.",
+                per_number_row_id or "(unresolved)",
+                called_to or "(missing)",
             )
             return Response(
-                content="Twilio signature verification not configured",
+                content="Phone number has no Twilio auth token configured. "
+                       "Edit the number and save the Twilio credentials.",
                 status_code=503,
             )
         # Twilio always signs webhooks. A missing signature with a

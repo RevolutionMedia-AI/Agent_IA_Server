@@ -22,11 +22,6 @@ PUBLIC_URL = os.getenv("PUBLIC_URL")
 
 TWILIO_SR = 8000
 TWILIO_CHANNELS = 1
-# ponytail: Twilio auth token for inbound signature validation is now
-# per-number (phone_numbers.twilio_auth_token), entered by the user
-# when they connect the number. The env var is gone — no global
-# credential that would let a misconfigured deploy accidentally
-# accept forged webhooks.
 FRAME_DURATION_MS = 20
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
 
