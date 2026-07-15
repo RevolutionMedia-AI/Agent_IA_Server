@@ -174,7 +174,16 @@ async def run_realtime_session(session: CallSession) -> None:
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "modalities": ["text"],
+                    # ponytail: OpenAI Realtime API graduated to GA in
+                    # 2025; the session.update payload now requires an
+                    # explicit `session.type` field. Sending without it
+                    # returns `missing_required_parameter: 'session.type'`
+                    # and the server closes the socket.
+                    "type": "realtime",
+                    # ponytail: `modalities` was renamed to
+                    # `output_modalities` in the GA schema. Old name is
+                    # silently dropped, so we send only the new field.
+                    "output_modalities": ["text"],
                     "instructions": _build_instructions(session),
                     "input_audio_format": "g711_ulaw",
                     "input_audio_transcription": {"model": "whisper-1"},
