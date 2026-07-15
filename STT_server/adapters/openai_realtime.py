@@ -18,7 +18,6 @@ from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     MAX_HISTORY_MESSAGES,
     MAX_RESPONSE_TOKENS,
-    OPENAI_REALTIME_MODEL,
     REALTIME_TTS_STREAMING,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
 )
@@ -87,13 +86,50 @@ async def run_realtime_session(session: CallSession) -> None:
     creds = resolve_provider(user_id, "openai")
     api_key = creds.get("api_key")
     if not api_key:
-        log.error("OpenAI API key not configured (per-user or system) — cannot start Realtime session")
+        log.error(
+            "[REALTIME] session %s has no OpenAI API key. User must "
+            "upload via Settings → API or ModalAgents inline.",
+            session.session_key,
+        )
         return
 
-    # Per-user realtime_model overrides the env-var default. The FE
-    # never sets a model that the OpenAI Realtime API doesn't accept —
-    # validated against the regex in the provider catalog.
-    model = creds.get("realtime_model") or OPENAI_REALTIME_MODEL
+    # ponytail: per-agent model only. The agent row's stt_model is the
+    # single source of truth — the FE dropdown now lists exactly the
+    # three Realtime-capable IDs (gpt-realtime, gpt-4o-realtime-preview,
+    # gpt-4o-mini-realtime-preview). If the agent picked something else,
+    # fail loud here so the operator sees which row is misconfigured.
+    realtime_per_user = creds.get("realtime_model")
+    model = (
+        realtime_per_user
+        or getattr(session, "stt_model", None)
+    )
+    if not model:
+        log.error(
+            "[REALTIME] session %s has no realtime model. agent.stt_model "
+            "must be one of gpt-realtime / gpt-4o-realtime-preview / "
+            "gpt-4o-mini-realtime-preview (set when editing the agent).",
+            session.session_key,
+        )
+        return
+    if realtime_per_user and model != getattr(session, "stt_model", None):
+        # ponytail: per-user realtime_model override (set via Settings → API
+        # / ModalAgents inline) takes precedence over the agent's stt_model.
+        pass  # already handled by the chained or above
+    # Validate against the known Realtime catalog. If the agent picked
+    # something invalid (legacy field, typo), we don't auto-substitute;
+    # we let OpenAI 4004 it and the operator sees the model id in the log.
+    _VALID_REALTIME_MODELS = {
+        "gpt-realtime",
+        "gpt-4o-realtime-preview",
+        "gpt-4o-mini-realtime-preview",
+    }
+    if model not in _VALID_REALTIME_MODELS:
+        log.warning(
+            "[REALTIME] session %s using non-catalog model=%r — OpenAI "
+            "will likely reject it. Update the agent's stt_model or the "
+            "user's realtime_model field.",
+            session.session_key, model,
+        )
 
     url = f"{REALTIME_WS_URL}?model={model}"
     headers = {
