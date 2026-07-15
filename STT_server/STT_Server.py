@@ -45,11 +45,17 @@ from STT_server.db import is_postgres
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import playback_loop
-from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, register_session, track_task
+from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, monitor_max_call_duration, register_session, track_task
 from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_transcripts
 
 
-logging.basicConfig(level=logging.WARNING)
+# ponytail: was WARNING — the user reported "no more logs after matched
+# phone" because every key step after that was at INFO and got
+# suppressed. Bumped to INFO so the call lifecycle (WS connect,
+# STT dispatch, agent config load, session.update, transcripts,
+# LLM responses) is visible. Production log volume is fine on Railway
+# at INFO; the third-party noise is still quieted below.
+logging.basicConfig(level=logging.INFO)
 # Reduce verbosity of commonly noisy third-party loggers (uvicorn/access, websockets)
 for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error", "websockets", "asyncio"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -684,6 +690,10 @@ async def media_stream(ws: WebSocket) -> None:
                         asyncio.create_task(play_initial_greeting(session))
                     )
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
+                # Guardrail: hard-timeout to prevent phantom calls.
+                # If the call runs longer than MAX_CALL_DURATION_SEC, we
+                # force-close even if audio is still flowing.
+                track_task(session, asyncio.create_task(monitor_max_call_duration(session, ws)))
                 # ponytail: H5 from the call-flow audit. Force-reset
                 # assistant_speaking if Twilio never sends the mark
                 # event (network blip, WS timeout, mark lost in
