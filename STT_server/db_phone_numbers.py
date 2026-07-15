@@ -268,10 +268,26 @@ def delete_number(number_id: str, user_id: str) -> bool:
 def find_by_number(to_number: str, user_id: str | None = None) -> dict | None:
     """Lookup a phone number by its E.164-style 'number' field. Used by
     the inbound Twilio webhook to find which agent handles the call.
-    The number is matched as a suffix (so "+521551234567' matches the
-    '21551234567' stored row).
+
+    ponytail: the previous query used
+    ``regexp_replace(number, '\\D', '', 'g')`` to strip non-digits
+    before LIKE-matching. ``\\D`` is PCRE syntax — Postgres POSIX
+    regex doesn't recognize it and silently treats it as a literal,
+    so the function returned the input unchanged. That left only one
+    of the two LIKE patterns capable of matching, and on some
+    Postgres versions even that one round-tripped wrong. The runtime
+    then logged "no agent_id in customParameters" with the row
+    sitting right there in the DB.
+
+    Replace with ``replace()`` — portable, dead-obvious, and fast
+    enough for a row count that fits on one screen. Two patterns:
+    an exact digit match against the stored number with its ``+``
+    stripped, plus the original ``to_number`` literal as a fallback
+    for rows where the stored value already includes the ``+``.
     """
     digits = re.sub(r"\D", "", to_number)
+    if not digits:
+        return None
     if not is_postgres():
         if not NUMBERS_FILE.exists():
             return None
@@ -282,35 +298,32 @@ def find_by_number(to_number: str, user_id: str | None = None) -> dict | None:
             return None
         for n in data:
             stored = re.sub(r"\D", "", n.get("number", ""))
-            if stored and stored.endswith(digits) or digits.endswith(stored):
+            if stored and (stored == digits or stored.endswith(digits) or digits.endswith(stored)):
                 if user_id is None or n.get("user_id") == user_id:
                     return n
         return None
     with get_conn() as conn:
         with conn.cursor() as cur:
-            if user_id is None:
-                cur.execute(
-                    "SELECT id, user_id, provider, country, number, display, label, agent, "
-                    "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                    "sip_username, sip_password, whatsapp_phone_number_id, "
-                    "whatsapp_access_token, created_at, updated_at "
-                    "FROM phone_numbers WHERE %s LIKE '%%' || regexp_replace(number, '\\D', '', 'g') "
-                    "OR regexp_replace(number, '\\D', '', 'g') LIKE '%%' || %s "
-                    "ORDER BY length(number) DESC LIMIT 1",
-                    (digits, digits),
-                )
-            else:
-                cur.execute(
-                    "SELECT id, user_id, provider, country, number, display, label, agent, "
-                    "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                    "sip_username, sip_password, whatsapp_phone_number_id, "
-                    "whatsapp_access_token, created_at, updated_at "
-                    "FROM phone_numbers WHERE user_id = %s AND "
-                    "(%s LIKE '%%' || regexp_replace(number, '\\D', '', 'g') "
-                    "OR regexp_replace(number, '\\D', '', 'g') LIKE '%%' || %s) "
-                    "ORDER BY length(number) DESC LIMIT 1",
-                    (user_id, digits, digits),
-                )
+            base_cols = (
+                "id, user_id, provider, country, number, display, label, campaign, agent, "
+                "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
+                "sip_username, sip_password, whatsapp_phone_number_id, "
+                "whatsapp_access_token, created_at, updated_at"
+            )
+            # Exact match (with + stripped) wins; falls back to the
+            # original literal so rows stored with `+` also resolve.
+            where_user = " AND " if user_id is not None else " WHERE "
+            sql = (
+                f"SELECT {base_cols} FROM phone_numbers"
+                f"{' WHERE user_id = %s' if user_id is not None else ''}"
+                f"{where_user}(replace(number, '+', '') = %s OR number = %s) "
+                "ORDER BY length(number) DESC LIMIT 1"
+            )
+            params: list = []
+            if user_id is not None:
+                params.append(user_id)
+            params.extend([digits, to_number])
+            cur.execute(sql, params)
             row = cur.fetchone()
             return _row_to_number(row) if row else None
 

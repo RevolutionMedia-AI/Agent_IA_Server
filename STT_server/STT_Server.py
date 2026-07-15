@@ -275,9 +275,26 @@ async def voice(
             num_row = find_num(e164)
             if num_row:
                 agent_id = num_row.get("agent") or None
-                log.info(
-                    "[VOICE] matched phone %s -> agent_id=%s (db=%s)",
+                # ponytail: log at WARNING so it shows up in the same
+                # stream the user reads for errors. INFO was being
+                # filtered out and the operator couldn't tell whether
+                # the lookup matched or just returned an empty row.
+                log.warning(
+                    "[VOICE] matched phone %s -> agent_id=%s (db=%s, row_id=%s)",
                     e164, agent_id, "postgres" if is_postgres() else "json",
+                    num_row.get("id"),
+                )
+            else:
+                # ponytail: loud "no match" log. Before this, a None
+                # return silently dropped the call into the no-agent
+                # branch and the user had no way to know whether the
+                # lookup ran or failed. Same WARNING level so it sits
+                # next to the AGENT/STT warnings they'll grep for.
+                log.warning(
+                    "[VOICE] no phone_numbers row matched 'To=%s' (digits=%s). "
+                    "Either the number isn't in the table or its stored value "
+                    "isn't comparable to the E.164 Twilio sent.",
+                    called_to, re.sub(r"\D", "", e164),
                 )
     except Exception as exc:
         log.warning("[VOICE] failed to look up phone number for agent: %s", exc)
