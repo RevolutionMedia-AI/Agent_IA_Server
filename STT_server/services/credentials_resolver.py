@@ -258,7 +258,13 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="rime",
         name="Rime",
         category="tts",
-        description="Text-to-speech via WebSocket streaming. PCM -> mu-law conversion handled in the adapter.",
+        # ponytail: Rime ships both a TTS adapter (rime_tts.py) and an
+        # STT adapter (rime_stt_realtime.py). Same API key covers both.
+        # The TTS-specific fields below (model_id/speaker_*) are
+        # ignored by the STT path; only api_key + the model selector
+        # in the agent's STT slot matter there.
+        categories=("tts", "stt"),
+        description="Text-to-speech and speech-to-text via Rime's WebSocket API. Same api_key covers both slots.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -327,12 +333,20 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="assemblyai",
         name="AssemblyAI",
         category="stt",
-        description="Speech-to-text provider (alternative to Deepgram). Reserved for future use.",
+        description="Speech-to-text provider via AssemblyAI's realtime WS. Universal model auto-detects language; per-user model selector overrides the default.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
                 required=True,
                 min_length=20,
+                help="Raw API key, no Bearer prefix. Shipped verbatim in the Authorization header.",
+            ),
+            FieldSpec(
+                name="model", label="STT model", type="text",
+                required=False,
+                pattern=r"^[a-z0-9.\-]{1,40}$",
+                placeholder="best",
+                help="Optional. Defaults to 'best'. Examples: 'best', 'universal', 'universal-streaming'.",
             ),
         ),
         env_fallbacks=(("ASSEMBLYAI_API_KEY", "api_key"),),
