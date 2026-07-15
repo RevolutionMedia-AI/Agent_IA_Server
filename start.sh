@@ -201,6 +201,19 @@ if PG_URL:
                         cur.execute(stmt)
                     ok += 1
                 except Exception as stmt_exc:
+                    # ponytail: bug history. The previous version
+                    # only appended to `errors` and kept going. Once
+                    # any statement fails, Postgres aborts the
+                    # transaction; every subsequent statement on the
+                    # same connection returns
+                    # `InFailedSqlTransaction: current transaction
+                    # is aborted, commands ignored until end of
+                    # transaction block` — so a single real failure
+                    # (e.g. duplicate ADD CONSTRAINT) was masked as
+                    # a cascade of phantom failures, and the final
+                    # `conn.commit()` was a no-op on an aborted tx.
+                    # Rollback so the next statement actually runs.
+                    conn.rollback()
                     errors.append(f"{type(stmt_exc).__name__}: {stmt_exc}")
             conn.commit()
             conn.close()
