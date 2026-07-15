@@ -27,38 +27,36 @@ def validate_twilio_signature(
     """Verify that an inbound request came from Twilio.
 
     Twilio signs every webhook call with HMAC-SHA1 over the URL + sorted
-    form params (each value URL-encoded). The signature arrives as the
-    `X-Twilio-Signature` header. We recompute it and compare in
-    constant time.
+    form params. The signature arrives as the `X-Twilio-Signature` header.
+    We recompute it and compare in constant time.
 
-    Algorithm (from Twilio's docs):
-      1. Sort form_params by key.
-      2. Concatenate key + URL-encoded value for each pair.
-      3. Append the result to the full URL.
-      4. HMAC-SHA1 with the auth token as key.
-      5. Base64-encode and compare with X-Twilio-Signature.
+    Algorithm (matching twilio-python RequestValidator.compute_signature
+    byte-for-byte; verified against the SDK in
+    STT_server/tests/test_signature_validator.py):
+      1. Start with the full URL.
+      2. For each form param, sorted alphabetically by key, append
+         ``key + str(value)`` — RAW concatenation, NO URL encoding.
+         The Twilio docs claim values are URL-encoded, but the official
+         SDKs (Python, Node.js, PHP, Java) all concatenate the raw
+         value. Encoding the value with quote_plus diverges from what
+         Twilio's servers sign.
+      3. HMAC-SHA1 with the auth token as key.
+      4. Base64-encode and compare with X-Twilio-Signature.
 
     See: https://www.twilio.com/docs/usage/webhooks/webhooks-security
-
-    ponytail: Twilio's "safe" set for the URL-encoded value is
-    exactly `.`, `-`, `*`, `_`. Python's `quote_plus` defaults to
-    keeping `-_.~` (RFC 3986 unreserved chars). The previous
-    `safe='-_.~'` encoded `*` as `%2A` AND kept `~` literal — both
-    diverge from Twilio's signer. `CallToken` (and other Twilio auth
-    values) routinely contain `*`, so every call with that field
-    had its HMAC computed over a different byte sequence than Twilio
-    signed, and the verification silently failed with the user
-    wondering why their number doesn't work.
     """
     import base64
     if not auth_token or not received_signature or not full_url:
         return False
     pieces = [full_url]
     for k in sorted(form_params.keys()):
-        # quote_plus matches Twilio's URL encoding (spaces -> '+').
-        # Safe set = . - * _ per Twilio docs (NOT ~, NOT anything else).
         v = form_params[k] if form_params[k] is not None else ""
-        pieces.append(f"{k}{quote_plus(str(v), safe='-_.*')}")
+        # ponytail: raw concatenation. Twilio's signer does NOT URL-encode
+        # the values despite what the prose docs imply — verified by
+        # comparing HMAC output against twilio-python's RequestValidator
+        # on a representative inbound form. Any URL encoding (quote_plus,
+        # quote, etc.) shifts the bytes and the HMAC diverges.
+        pieces.append(f"{k}{str(v)}")
     data = "".join(pieces).encode("utf-8")
     expected = hmac.new(
         auth_token.encode("utf-8"),
