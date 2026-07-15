@@ -13,3 +13,13 @@ setuptools<81
 scipy>=1.17.1
 cryptography  # Fernet encryption for per-user provider credentials at rest
 psycopg2-binary  # Postgres driver. Optional — BE falls back to JSON files if DATABASE_URL is unset (local dev).
+# ponytail: Starlette's `Request.form()` raises AssertionError if this
+# isn't installed. Twilio's voice webhook sends
+# application/x-www-form-urlencoded and we hit that path on every
+# inbound call — without python-multipart the body silently dropped
+# to {} and the signature check + agent lookup both ran empty, so
+# /voice returned TwiML without <Parameter name="agent_id"/> and
+# every call fell into the no-agent branch. Used to ship as a
+# transitive dep of python-jose/passlib back when auth used those —
+# the auth refactor dropped them and the form parser went with them.
+python-multipart
