@@ -251,13 +251,23 @@ async def voice(
         signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
         if request.url.query:
             signature_url += f"?{request.url.query}"
+        # ponytail: log the ingredients so the next "invalid signature"
+        # doesn't need a redeploy cycle to triage. Twilio signs the
+        # URL exactly as it sent the webhook; if PUBLIC_URL diverges
+        # (typo in env, trailing slash, http vs https) the signature
+        # mismatch is silent.
         if not validate_twilio_signature(
             token_to_check, signature_url, sig, form_dict
         ):
             log.warning(
-                "[VOICE] invalid Twilio signature from %s (per_number=%s)",
+                "[VOICE] invalid Twilio signature from %s (per_number=%s) "
+                "public_url=%r sig_url=%r tok_prefix=%s... recv_sig_prefix=%s...",
                 request.client.host if request.client else "?",
                 bool(per_number_token),
+                PUBLIC_URL,
+                signature_url,
+                token_to_check[:8],
+                sig[:8],
             )
             return Response(content="invalid signature", status_code=403)
 
