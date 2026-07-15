@@ -39,6 +39,16 @@ def validate_twilio_signature(
       5. Base64-encode and compare with X-Twilio-Signature.
 
     See: https://www.twilio.com/docs/usage/webhooks/webhooks-security
+
+    ponytail: Twilio's "safe" set for the URL-encoded value is
+    exactly `.`, `-`, `*`, `_`. Python's `quote_plus` defaults to
+    keeping `-_.~` (RFC 3986 unreserved chars). The previous
+    `safe='-_.~'` encoded `*` as `%2A` AND kept `~` literal — both
+    diverge from Twilio's signer. `CallToken` (and other Twilio auth
+    values) routinely contain `*`, so every call with that field
+    had its HMAC computed over a different byte sequence than Twilio
+    signed, and the verification silently failed with the user
+    wondering why their number doesn't work.
     """
     import base64
     if not auth_token or not received_signature or not full_url:
@@ -46,8 +56,9 @@ def validate_twilio_signature(
     pieces = [full_url]
     for k in sorted(form_params.keys()):
         # quote_plus matches Twilio's URL encoding (spaces -> '+').
+        # Safe set = . - * _ per Twilio docs (NOT ~, NOT anything else).
         v = form_params[k] if form_params[k] is not None else ""
-        pieces.append(f"{k}{quote_plus(str(v), safe='-_.~')}")
+        pieces.append(f"{k}{quote_plus(str(v), safe='-_.*')}")
     data = "".join(pieces).encode("utf-8")
     expected = hmac.new(
         auth_token.encode("utf-8"),
