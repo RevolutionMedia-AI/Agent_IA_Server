@@ -199,10 +199,13 @@ async def run_realtime_session(session: CallSession) -> None:
                     "instructions": _build_instructions(session),
                     "audio": {
                         "input": {
-                            # ponytail: g711_ulaw is the mu-law encoding
-                            # Twilio Media Streams sends (8 kHz mono mu-law).
-                            # OpenAI accepts this format at 8000 Hz.
-                            "format": {"type": "g711_ulaw", "sample_rate": 8000},
+                            # ponytail: OpenAI Realtime GA expects MIME
+                            # types for audio format, not the old short
+                            # names. Supported values are 'audio/pcm' (16-bit
+                            # linear), 'audio/pcmu' (mu-law), and
+                            # 'audio/pcma' (A-law). Twilio Media Streams
+                            # sends mu-law so we want 'audio/pcmu'.
+                            "format": {"type": "audio/pcmu", "sample_rate": 8000},
                             "transcription": {"model": "whisper-1"},
                             "turn_detection": {
                                 "type": "server_vad",
