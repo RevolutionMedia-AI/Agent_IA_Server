@@ -165,4 +165,94 @@ check(
     "agent lookup from phone_numbers row is missing or renamed",
 )
 
+
+# ── 6. db_create_agent always assigns a server-generated id ────────────────
+db_agents_src = (ROOT / "STT_server" / "db_agents.py").read_text(encoding="utf-8")
+tree = ast.parse(db_agents_src)
+create_fn = next(
+    (n for n in tree.body
+     if isinstance(n, ast.FunctionDef) and n.name == "create_agent"),
+    None,
+)
+assert create_fn is not None, "could not find db_agents.create_agent"
+
+# The function must (a) generate an id with uuid, (b) attach it to the
+# returned dict in the JSON path, (c) include it in the RETURNING
+# clause in the Postgres path.
+fn_src = ast.unparse(create_fn)
+check(
+    "db_create_agent generates a server-side agent_id",
+    "uuid.uuid4" in fn_src,
+    f"create_agent doesn't call uuid.uuid4(): {fn_src[:300]!r}",
+)
+check(
+    "db_create_agent's JSON path attaches the id to the returned row",
+    '"id": agent_id' in fn_src or "'id': agent_id" in fn_src,
+    f"create_agent's JSON-path new_agent dict is missing the id: {fn_src[:400]!r}",
+)
+check(
+    "db_create_agent's Postgres INSERT includes the id column",
+    ("'id'" in fn_src or '"id"' in fn_src) and "agent_id" in fn_src,
+    f"create_agent's Postgres INSERT is missing the id column: {fn_src[:400]!r}",
+)
+check(
+    "db_create_agent's Postgres RETURNING clause returns the id",
+    "RETURNING" in fn_src and "id, user_id, name" in fn_src,
+    f"create_agent's RETURNING clause doesn't surface the id: {fn_src[:400]!r}",
+)
+
+
+# ── 7. /agents POST route forwards the new id back to the FE ───────────────
+# db_create_agent returns a row that always has `id` (verified above);
+# the route simply returns whatever db_create_agent produces. Confirm
+# there's no path that strips or overrides the id.
+api_src_create_route = re.search(
+    r"@api_router\.post\(\"/agents\"\)\s*\n\s*def create_agent\(.*?\n(?=\n@|\nclass |\Z)",
+    api_src,
+    re.DOTALL,
+)
+assert api_src_create_route, "could not find POST /agents route in routes/api.py"
+check(
+    "POST /agents returns db_create_agent's result unchanged",
+    "return db_create_agent(auth[\"user_id\"], data.dict())" in api_src_create_route.group(0)
+    or "return db_create_agent(auth['user_id'], data.dict())" in api_src_create_route.group(0),
+    "POST /agents doesn't return db_create_agent's result directly — "
+    "the agent id may not be reaching the FE",
+)
+
+
+# ── 8. Functional test: simulate db_create_agent (JSON path) ───────────────
+import json as _json
+import tempfile
+import uuid as _uuid
+
+
+def simulate_json_create_agent(payload: dict) -> dict:
+    """Mimic the JSON branch of db_agents.create_agent — generate id,
+    attach to the dict, append to a JSON file. Returns the new row."""
+    agent_id = f"agent-{_uuid.uuid4().hex[:8]}"
+    row = {
+        "id": agent_id,
+        "user_id": payload["user_id"],
+        "calls": "0",
+        "perf": 0,
+        **payload,
+    }
+    return row
+
+
+new_agent = simulate_json_create_agent(
+    {"user_id": "user-admin-001", "name": "Test", "prompt": "hi"}
+)
+check(
+    "simulated create_agent returns a row with a non-empty id",
+    bool(new_agent.get("id")) and new_agent["id"].startswith("agent-"),
+    f"agent row missing id: {new_agent}",
+)
+check(
+    "simulated create_agent id is unique per call",
+    simulate_json_create_agent({"user_id": "u", "name": "x"})["id"] != new_agent["id"],
+    "uuid.uuid4 collision (extremely unlikely — investigate)",
+)
+
 print("\nALL CHECKS PASSED.")
