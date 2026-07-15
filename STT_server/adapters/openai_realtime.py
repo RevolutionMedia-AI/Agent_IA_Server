@@ -174,24 +174,34 @@ async def run_realtime_session(session: CallSession) -> None:
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    # ponytail: OpenAI Realtime API graduated to GA in
-                    # 2025; the session.update payload now requires an
-                    # explicit `session.type` field. Sending without it
-                    # returns `missing_required_parameter: 'session.type'`
-                    # and the server closes the socket.
+                    # ponytail: OpenAI Realtime API GA schema. Three
+                    # shapes have shifted since the beta:
+                    #   1. session.type is REQUIRED (Phase 4 added it).
+                    #   2. modalities → output_modalities (Phase 4 renamed).
+                    #   3. The audio-related fields are now nested under
+                    #      session.audio.input.* — top-level
+                    #      input_audio_format / input_audio_transcription /
+                    #      turn_detection are now UNKNOWN_PARAMETER.
+                    #      Sending one of them at session root returns
+                    #      invalid_request_error code=unknown_parameter
+                    #      and closes the socket.
                     "type": "realtime",
-                    # ponytail: `modalities` was renamed to
-                    # `output_modalities` in the GA schema. Old name is
-                    # silently dropped, so we send only the new field.
                     "output_modalities": ["text"],
                     "instructions": _build_instructions(session),
-                    "input_audio_format": "g711_ulaw",
-                    "input_audio_transcription": {"model": "whisper-1"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                    "audio": {
+                        "input": {
+                            # ponytail: g711_ulaw is the mu-law encoding
+                            # Twilio Media Streams sends (8 kHz mono mu-law).
+                            # OpenAI accepts this format at 8000 Hz.
+                            "format": {"type": "g711_ulaw", "sample_rate": 8000},
+                            "transcription": {"model": "whisper-1"},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 500,
+                            },
+                        },
                     },
                     "temperature": OPENAI_REALTIME_TEMPERATURE,
                     "max_response_output_tokens": MAX_RESPONSE_TOKENS,
