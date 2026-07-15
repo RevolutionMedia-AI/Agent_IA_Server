@@ -922,11 +922,17 @@ def _serialize_provider(spec, user_id: str) -> dict:
         }
         for f in spec.fields
     ]
+    # ponytail: a provider can serve multiple slots (OpenAI = llm + stt).
+    # Always emit `categories` as a list so the FE badge filter doesn't
+    # have to special-case single-vs-multi. Falls back to (category,)
+    # when the spec didn't opt in.
+    categories = list(spec.categories) if spec.categories else [spec.category]
     return {
         "id": spec.id,
         "name": spec.name,
         "description": spec.description,
         "category": spec.category,
+        "categories": categories,
         "fields": fields,
         # True if the user has a saved per-user key for this provider.
         "connected": is_provider_configured(user_id, spec.id)

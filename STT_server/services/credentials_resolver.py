@@ -52,7 +52,7 @@ class ProviderSpec:
     id: str                       # "openai" | "deepgram" | ...
     name: str                     # human label
     description: str
-    category: str                 # "llm" | "stt" | "tts" | "telephony"
+    category: str                 # "llm" | "stt" | "tts" | "telephony" (primary; used for the tools_integrations row)
     fields: tuple[FieldSpec, ...]
     # env vars the resolver falls back to when no per-user key is set.
     # Each value is mapped to the field name it should populate.
@@ -60,6 +60,14 @@ class ProviderSpec:
     # If set, the /test endpoint runs this function (sync) with the
     # resolved plain dict and returns (ok, message).
     test_fn: Optional[str] = None  # dotted path, lazy-imported by the route
+    # ponytail: a provider can serve multiple slots. OpenAI powers LLM
+    # AND realtime STT — we don't want two provider rows for one key.
+    # `category` stays the primary for DB storage (tools_integrations
+    # has a single category column with a CHECK constraint); `categories`
+    # is the full set used by the runtime resolver and the FE badge so
+    # OpenAI lights up in both the LLM and STT slots. Empty tuple
+    # defaults to (category,) — every existing spec keeps working.
+    categories: tuple[str, ...] = ()
 
 
 # Each pattern is intentionally permissive — the provider's own API
@@ -72,6 +80,12 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="openai",
         name="OpenAI",
         category="llm",
+        # ponytail: OpenAI's Realtime API powers both LLM and STT.
+        # The DB row stores category='llm' (primary); the resolver and
+        # the FE badge use this tuple so the same credential lights up
+        # both slots. Without this, find_first_configured_provider
+        # skips OpenAI when scanning for an STT provider.
+        categories=("llm", "stt"),
         description="Powers the language model in voice calls and admin tools. Used for both Chat Completions and Realtime STT+LLM.",
         fields=(
             FieldSpec(
@@ -476,16 +490,14 @@ def find_first_configured_provider(user_id: str | None, category: str) -> str | 
     that category — callers should treat that as a hard error
     (no env-var fallback) and surface a clear message to the FE.
 
-    ponytail: the user asked to "leer dinámicamente qué proveedor y
-    qué credenciales tiene configuradas la cuenta/usuario actual",
-    so this is the path the BE takes when the agent row doesn't
-    pin a specific provider. No system-default fallback — if the
-    user has nothing, the call fails loud at the STT/LLM/TTS
-    adapter (it already raises on missing key), and the operator
-    sees a clear log line.
+    ponytail: a spec may serve multiple slots (OpenAI = llm + stt).
+    The match checks `spec.categories` if non-empty, falling back to
+    `(spec.category,)`. The single-category table column on the DB
+    row doesn't matter here — only the catalog view does.
     """
     for spec in PROVIDER_CATALOG:
-        if spec.category != category:
+        all_categories = spec.categories if spec.categories else (spec.category,)
+        if category not in all_categories:
             continue
         if spec.id == "twilio":  # telephony, not a runtime service
             continue
