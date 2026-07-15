@@ -98,7 +98,13 @@ async def run_realtime_session(session: CallSession) -> None:
     url = f"{REALTIME_WS_URL}?model={model}"
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "OpenAI-Beta": "realtime=v1",
+        # ponytail: removed `OpenAI-Beta: realtime=v1`. OpenAI graduated
+        # the Realtime API to GA in 2024-Q4; the beta header now flips
+        # the server into a beta path that's been disabled
+        # (`invalid_request_error.beta_api_shape_disabled` → ws close
+        # 4000). Dropping the header sends the request to the GA
+        # endpoint with the same session.update payload it already
+        # accepts.
     }
 
     try:

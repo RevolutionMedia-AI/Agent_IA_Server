@@ -49,6 +49,7 @@ from STT_server.domain.language import detect_language, split_tts_segments, sani
 from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS, VALID_LANGUAGES
 from STT_server.domain.tenant import TenantConfig, tenant_store
 from STT_server import db_tenants
+from STT_server.db import is_postgres
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
 from STT_server.services.playback_service import playback_loop
@@ -328,20 +329,17 @@ async def voice(
 
     stream_params_str = ''.join(stream_params)
 
-    # If a static greeting file exists or the TWIML flag is enabled,
-    # include a <Play> so Twilio plays the pre-recorded greeting before
-    # connecting the media stream. Otherwise connect directly.
-    static_local = os.path.join(os.path.dirname(__file__), "static", "greeting.wav")
-    # ponytail: bug history. This template used {stream_params} (a
-    # Python list), which rendered as ['<Parameter .../>', ...] inside
-    # the <Stream> element. Twilio's TwiML parser treated that literal
-    # text as a child text node, NOT as <Parameter> elements, and
-    # silently dropped them. Net effect: the WebSocket 'start' event
-    # arrived with customParameters={} and the call ran without an
-    # agent_id (see [AGENT] has no agent_id in customParameters log).
-    # stream_params_str was already joined above for exactly this
-    # purpose; use it.
-    if TWIML_INITIAL_GREETING_ENABLED or os.path.exists(static_local):
+    # ponytail: dropped the <Play> of static/greeting.wav that fired
+    # whenever the file existed on disk. The user explicitly asked
+    # for no fixed greetings in code (the .wav carried the old
+    # Tigo/Camila script), and the agent's `welcome_message` already
+    # plays via `play_initial_greeting` once the media stream opens
+    # with a real voice and the correct prompt. Keep the env-var
+    # opt-in path in case an operator wants to insert their own
+    # pre-recorded file later — it just no longer falls back to
+    # "the file happens to be on disk".
+    if TWIML_INITIAL_GREETING_ENABLED:
+        static_local = os.path.join(os.path.dirname(__file__), "static", "greeting.wav")
         play_url = f"{PUBLIC_URL.rstrip('/')}/static/greeting.wav"
         twiml = f"""
     <Response>
@@ -352,6 +350,15 @@ async def voice(
     </Response>
     """
     else:
+        # ponytail: bug history. This template used {stream_params} (a
+        # Python list), which rendered as ['<Parameter .../>', ...] inside
+        # the <Stream> element. Twilio's TwiML parser treated that literal
+        # text as a child text node, NOT as <Parameter> elements, and
+        # silently dropped them. Net effect: the WebSocket 'start' event
+        # arrived with customParameters={} and the call ran without an
+        # agent_id (see [AGENT] has no agent_id in customParameters log).
+        # stream_params_str was already joined above for exactly this
+        # purpose; use it.
         twiml = f"""
     <Response>
         <Connect>
