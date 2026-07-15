@@ -17,7 +17,6 @@ import websockets
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     MAX_HISTORY_MESSAGES,
-    MAX_RESPONSE_TOKENS,
     REALTIME_TTS_STREAMING,
     TEXT_SEGMENT_QUEUE_MAXSIZE,
 )
@@ -170,21 +169,31 @@ async def run_realtime_session(session: CallSession) -> None:
             )
 
             # ── Configure session ──
-            from STT_server.config import OPENAI_REALTIME_TEMPERATURE
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    # ponytail: OpenAI Realtime API GA schema. Three
-                    # shapes have shifted since the beta:
-                    #   1. session.type is REQUIRED (Phase 4 added it).
-                    #   2. modalities → output_modalities (Phase 4 renamed).
-                    #   3. The audio-related fields are now nested under
-                    #      session.audio.input.* — top-level
-                    #      input_audio_format / input_audio_transcription /
-                    #      turn_detection are now UNKNOWN_PARAMETER.
-                    #      Sending one of them at session root returns
-                    #      invalid_request_error code=unknown_parameter
-                    #      and closes the socket.
+                    # ponytail: OpenAI Realtime API GA schema. The fields
+                    # that worked in beta no longer all live at the
+                    # session root. The current accepted top-level keys
+                    # are: type, output_modalities, instructions, audio,
+                    # tools, tool_choice, prompt. Anything else returns
+                    # invalid_request_error code=unknown_parameter and
+                    # closes the socket.
+                    #
+                    # Removed in this revision:
+                    #   - temperature              (was session.temperature)
+                    #     Realtime GA controls temperature per-message
+                    #     via the create-response event. The session-level
+                    #     field was removed.
+                    #   - max_response_output_tokens (was session.max_...)
+                    #     Same — set per-response via the create-response
+                    #     event payload, not session config.
+                    #   - input_audio_format / input_audio_transcription /
+                    #     turn_detection (moved under session.audio.input)
+                    #
+                    # If OpenAI renames again, the server returns
+                    # unknown_parameter in the WS error event with a clear
+                    # `param` field — the dispatcher log below captures it.
                     "type": "realtime",
                     "output_modalities": ["text"],
                     "instructions": _build_instructions(session),
@@ -203,8 +212,6 @@ async def run_realtime_session(session: CallSession) -> None:
                             },
                         },
                     },
-                    "temperature": OPENAI_REALTIME_TEMPERATURE,
-                    "max_response_output_tokens": MAX_RESPONSE_TOKENS,
                 },
             }))
 
