@@ -21,7 +21,6 @@ from STT_server.routes.api import api_router, require_auth
 from STT_server.adapters.deepgram_stt_realtime import run_realtime_stt as run_deepgram_realtime_stt
 from STT_server.adapters.inworld_stt_realtime import run_realtime_stt as run_inworld_realtime_stt
 from STT_server.adapters.assemblyai_stt_realtime import run_realtime_stt as run_assemblyai_realtime_stt
-from STT_server.adapters.rime_stt_realtime import run_realtime_stt as run_rime_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
 from STT_server.adapters.openai_realtime import run_realtime_session
 # ponytail: M8 from the call-flow audit. Fail fast on missing critical
@@ -628,18 +627,6 @@ async def media_stream(ws: WebSocket) -> None:
                         session,
                         asyncio.create_task(
                             run_assemblyai_realtime_stt(
-                                session,
-                                lambda item: enqueue_transcript_event(session, item),
-                                announce_stt_failure_once,
-                            )
-                        ),
-                    )
-                    track_task(session, asyncio.create_task(process_transcripts(session)))
-                elif session.stt_provider == 'rime':
-                    track_task(
-                        session,
-                        asyncio.create_task(
-                            run_rime_realtime_stt(
                                 session,
                                 lambda item: enqueue_transcript_event(session, item),
                                 announce_stt_failure_once,

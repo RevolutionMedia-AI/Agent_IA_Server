@@ -1103,17 +1103,6 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                     except Exception:
                         pass
                 return {"models": _HARDCODED_STT_MODELS["openai"]}
-            if provider_id == "rime":
-                # Rime REST API is public — always try the live fetch.
-                try:
-                    live = list({m["id"]: m for m in (
-                        _fetch_rime_models() + _fetch_rime_voices()
-                    )}.values())
-                except Exception:
-                    live = []
-                if live:
-                    return {"models": live}
-                return {"models": _HARDCODED_STT_MODELS["rime"]}
             if provider_id == "inworld":
                 return {"models": _HARDCODED_STT_MODELS["inworld"]}
             return {"models": []}
