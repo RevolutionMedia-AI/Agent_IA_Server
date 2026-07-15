@@ -20,7 +20,7 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
     creds = resolve_provider(user_id, "deepgram")
     api_key = creds.get("api_key")
     if not api_key:
-        raise RuntimeError("Deepgram no configurado. Define DEEPGRAM_API_KEY o sube tu key en Settings → API.")
+        raise RuntimeError("Deepgram no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")
 
     loop = asyncio.get_running_loop()
     ttfb_ms: float | None = None

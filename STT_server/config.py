@@ -8,97 +8,40 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / "entornoLocal.env")
 
 
+# ponytail: the only env vars that remain are deployment infrastructure
+# (PORT, PUBLIC_URL, ALLOWED_ORIGINS) and security primitives
+# (DATABASE_URL, CREDENTIAL_ENCRYPTION_KEY). Every provider API key,
+# model name, and tunable was an env fallback that masked the user's
+# actual config — moved to per-user (tools_integrations) or per-agent
+# (agents row) tables. If a value isn't set anywhere in the DB, the
+# call fails explicitly with a clear log line.
+
 PORT = int(os.environ.get("PORT", 8080))
 PUBLIC_URL = os.getenv("PUBLIC_URL")
 
 
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
-OPENAI_REALTIME_TEMPERATURE = float(os.getenv("OPENAI_REALTIME_TEMPERATURE", "0.7"))  # API minimum is 0.6
-USE_OPENAI_REALTIME = os.getenv("USE_OPENAI_REALTIME", "true").strip().lower() in {"1", "true", "yes", "on"}
-
-
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3")
-DEEPGRAM_STT_PUNCTUATE = os.getenv("DEEPGRAM_STT_PUNCTUATE", "true").strip().lower() in {"1", "true", "yes", "on"}
-DEEPGRAM_STT_SMART_FORMAT = os.getenv("DEEPGRAM_STT_SMART_FORMAT", "true").strip().lower() in {"1", "true", "yes", "on"}
-# Language detection re-enabled — full Spanish mode.
-DEEPGRAM_STT_DETECT_LANGUAGE = os.getenv("DEEPGRAM_STT_DETECT_LANGUAGE", "true").strip().lower() in {"1", "true", "yes", "on"}
-# Force Spanish language hint for Deepgram STT.
-DEEPGRAM_STT_LANGUAGE_HINT = os.getenv("DEEPGRAM_STT_LANGUAGE_HINT", "es").strip().lower() or None
-DEEPGRAM_STT_ENDPOINTING_MS = int(os.getenv("DEEPGRAM_STT_ENDPOINTING_MS", "500"))
-DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000"))
-DEEPGRAM_STT_NUMERALS = os.getenv("DEEPGRAM_STT_NUMERALS", "true").strip().lower() in {"1", "true", "yes", "on"}
-DEEPGRAM_STT_KEYWORDS: list[str] = [
-    kw.strip()
-    for kw in os.getenv(
-        "DEEPGRAM_STT_KEYWORDS",
-        "zero:2,one:2,two:2,three:2,four:2,five:2,six:2,seven:2,eight:2,nine:2,oh:1,order number:2"
-    ).split(",")
-    if kw.strip()
-]
-
-
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_TTS_MODEL_ID = os.getenv("ELEVENLABS_TTS_MODEL_ID", "eleven_flash_v2_5")
-ELEVENLABS_TTS_VOICE_ID = os.getenv("ELEVENLABS_TTS_VOICE_ID", "r8iaJkwUpytwsK5jNHRG")
-
-# Deepgram TTS — defaults match the mu-law 8 kHz format Twilio expects.
-DEEPGRAM_TTS_ENCODING = os.getenv("DEEPGRAM_TTS_ENCODING", "mulaw").strip().lower()
-DEEPGRAM_TTS_SAMPLE_RATE = int(os.getenv("DEEPGRAM_TTS_SAMPLE_RATE", "8000"))
-
-RIME_API_KEY = os.getenv("RIME_API_KEY")
-RIME_TTS_MODEL_ID = os.getenv("RIME_TTS_MODEL_ID", "mist-v2")
-RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
-
-# Default TTS provider: "elevenlabs" or "rime"
-DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "elevenlabs").strip().lower()
-
-
 TWILIO_SR = 8000
 TWILIO_CHANNELS = 1
-# ponytail: Twilio auth token for inbound signature validation. When set,
-# /voice rejects any request whose X-Twilio-Signature doesn't match the
-# HMAC-SHA1 of (URL + form params). Leave unset to skip the check
-# (local dev only - production should always set this).
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+# ponytail: Twilio auth token for inbound signature validation is now
+# per-number (phone_numbers.twilio_auth_token), entered by the user
+# when they connect the number. The env var is gone — no global
+# credential that would let a misconfigured deploy accidentally
+# accept forged webhooks.
 FRAME_DURATION_MS = 20
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
-TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 
 
-MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "180"))
-MIN_SPEECH_FRAMES = int(os.getenv("MIN_SPEECH_FRAMES", "5"))
-END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "14"))
-SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "1"))
-MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "12"))
-PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
-TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "6"))
-MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
-BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "900"))
-ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
-ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "3000"))
-
-# webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive). Can be tuned via env.
+# webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive). Tunable
+# per-deploy but not per-user; this stays in env so an operator can
+# dial it without a code change.
 WEBRTC_VAD_MODE = int(os.getenv("WEBRTC_VAD_MODE", "1"))
 
 
-STT_TIMEOUT_SEC = float(os.getenv("STT_TIMEOUT_SEC", "0"))
-LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5.0"))
-# TTS timeouts:
-# - TTS_TTFB_TIMEOUT_SEC: max wait for first audio chunk (TTFB)
-# - TTS_IDLE_TIMEOUT_SEC: max silence between frames once audio started
-# - TTS_TIMEOUT_SEC: max total time per segment (kept for compatibility)
-TTS_TTFB_TIMEOUT_SEC = float(os.getenv("TTS_TTFB_TIMEOUT_SEC", "15.0"))
-TTS_IDLE_TIMEOUT_SEC = float(os.getenv("TTS_IDLE_TIMEOUT_SEC", "3.0"))
-TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "45.0"))
-TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "1"))
-TTS_RETRY_BACKOFF_MS = int(os.getenv("TTS_RETRY_BACKOFF_MS", "250"))
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
-MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
+# ponytail: defaults to "es" so a freshly-deployed instance behaves
+# like the platform's primary locale. Per-call language still comes
+# from the agent's row (session.preferred_language).
 DEFAULT_CALL_LANGUAGE = os.getenv("DEFAULT_CALL_LANGUAGE", "es").strip().lower()
+
 
 # If false, we buffer the full assistant reply and run TTS once per reply.
 # This avoids ultra-short TTS segments and reduces the chance of "first words only" failures.
@@ -132,11 +75,12 @@ PLAYBACK_QUEUE_MAXSIZE = int(os.getenv("PLAYBACK_QUEUE_MAXSIZE", "1024"))
 TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "16"))
 
 
+# ponytail: FILLER_TEXT_* and INITIAL_GREETING_TEXT were removed. They
+# were hardcoded English/Spanish strings that masked the agent's
+# welcome_message + dynamic prompts. Filler is now generated by
+# the LLM adapter from session state; greeting comes from the agent row.
 STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "200"))
 STREAMING_FIRST_SEGMENT_CHARS = int(os.getenv("STREAMING_FIRST_SEGMENT_CHARS", "200"))
-FILLER_TEXT_EN = os.getenv("FILLER_TEXT_EN", "").strip()
-FILLER_TEXT_ES = os.getenv("FILLER_TEXT_ES", "").strip()
-FILLER_DELAY_MS = int(os.getenv("FILLER_DELAY_MS", "1200"))
 PARTIAL_TRANSCRIPT_START_CHARS = int(os.getenv("PARTIAL_TRANSCRIPT_START_CHARS", "20"))
 PARTIAL_TRANSCRIPT_DEBOUNCE_MS = int(os.getenv("PARTIAL_TRANSCRIPT_DEBOUNCE_MS", "200"))
 FINAL_RESTART_DELTA_CHARS = int(os.getenv("FINAL_RESTART_DELTA_CHARS", "12"))
@@ -149,24 +93,15 @@ STT_RECONNECT_BASE_DELAY_MS = int(os.getenv("STT_RECONNECT_BASE_DELAY_MS", "250"
 STT_RECONNECT_MAX_DELAY_MS = int(os.getenv("STT_RECONNECT_MAX_DELAY_MS", "2000"))
 STT_FAILURE_PROMPT_EN = os.getenv("STT_FAILURE_PROMPT_EN", "I'm having trouble hearing you right now.").strip()
 STT_FAILURE_PROMPT_ES = os.getenv("STT_FAILURE_PROMPT_ES", "Estoy teniendo problemas para escucharte en este momento.").strip()
-INITIAL_GREETING_ENABLED = os.getenv("INITIAL_GREETING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-INITIAL_GREETING_TEXT = os.getenv(
-    "INITIAL_GREETING_TEXT",
-    "Thank you for calling Tigo Panama",
-).strip()
-# ponytail: removed INITIAL_GREETING_TEXT_ES — hardcoded Tigo/Camila
-# greeting that the previous version shipped as the Spanish fallback
-# for TWIML_INITIAL_GREETING. The user explicitly asked for no
-# fixed greetings in code. The BE's call path doesn't use this
-# anyway (play_initial_greeting reads session.welcome_message
-# from the agent row, which is fully dynamic).
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 
-# If true, /voice will include a <Play> of a pre-generated TTS greeting file
-# before connecting the media stream. This guarantees playback through Twilio
-# before the websocket stream is opened.
-TWIML_INITIAL_GREETING_ENABLED = os.getenv("TWIML_INITIAL_GREETING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "es").strip().lower()
+# ponytail: TWIML_INITIAL_GREETING_ENABLED/LANG removed entirely.
+# Twilio's <Play> of a static greeting.wav was the root cause of the
+# "two greetings on every call" bug — the static file played alongside
+# the agent's welcome_message. Now the agent's welcome_message is the
+# single source; if you want a pre-recorded greeting you can build it
+# into the agent's welcome text and the TTS adapter will speak it.
+
 
 # ponytail: per-minute pricing in USD. Two tiers:
 # - own_key: the user is bringing their own provider credential, we just
@@ -176,4 +111,3 @@ TWIML_INITIAL_GREETING_LANG = os.getenv("TWIML_INITIAL_GREETING_LANG", "es").str
 # Defaults are illustrative; tune via env when real billing lands.
 PRICE_OWN_KEY_PER_MIN = float(os.getenv("PRICE_OWN_KEY_PER_MIN", "0.07"))
 PRICE_PLATFORM_KEY_PER_MIN = float(os.getenv("PRICE_PLATFORM_KEY_PER_MIN", "0.14"))
-

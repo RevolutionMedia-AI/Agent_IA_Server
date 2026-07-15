@@ -42,7 +42,7 @@ async def stream_tts_segment(
     creds = resolve_provider(user_id, "elevenlabs")
     api_key = creds.get("api_key")
     if not api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY no configurada. Define la env var o sube tu key en Settings → API.")
+        raise RuntimeError("ElevenLabs no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")
 
     # ponytail: M9 from the call-flow audit. The dataclass has
     # session.voice_id and session.tts_model (set in STT_Server.py

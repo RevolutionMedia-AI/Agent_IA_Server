@@ -76,12 +76,13 @@ def transcribe_sync(
     language_hint: str | None = None,
     user_id: str | None = None,
 ) -> tuple[list[str], str]:
-    # Per-user Deepgram key. Falls back to the DEEPGRAM_API_KEY env var
+    # Per-user Deepgram key. No env fallback — the user must upload
+    # their key via Settings → API or ModalAgents inline.
     # when no user_id is provided (test endpoints, admin tools).
     creds = resolve_provider(user_id, "deepgram")
     api_key = creds.get("api_key")
     if not api_key:
-        raise RuntimeError("Deepgram no configurado. Define DEEPGRAM_API_KEY o sube tu key en Settings → API.")
+        raise RuntimeError("Deepgram no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")
 
     fallback_language = normalize_supported_language(language_hint or DEFAULT_CALL_LANGUAGE)
     if not pcm16_audio:

@@ -54,9 +54,6 @@ class ProviderSpec:
     description: str
     category: str                 # "llm" | "stt" | "tts" | "telephony" (primary; used for the tools_integrations row)
     fields: tuple[FieldSpec, ...]
-    # env vars the resolver falls back to when no per-user key is set.
-    # Each value is mapped to the field name it should populate.
-    env_fallbacks: tuple[tuple[str, str], ...] = ()   # [(env_var, field_name), ...]
     # If set, the /test endpoint runs this function (sync) with the
     # resolved plain dict and returns (ok, message).
     test_fn: Optional[str] = None  # dotted path, lazy-imported by the route
@@ -140,14 +137,15 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 help="Required for custom-tenant / proxy endpoints. Leave empty to use the canonical api.anthropic.com.",
             ),
         ),
-        env_fallbacks=(("ANTHROPIC_API_KEY", "api_key"), ("ANTHROPIC_BASE_URL", "base_url")),
+        # ponytail: env_fallbacks removed. The user enters their
+        # Anthropic key via Settings → API or ModalAgents inline.
         test_fn="STT_server.services.credentials_resolver._test_anthropic",
     ),
     ProviderSpec(
         id="gemini",
         name="Google Gemini",
         category="llm",
-        description="Google Gemini (gemini-1.5-pro, gemini-1.5-flash, etc.) via the Gemini API. Picked as the agent's LLM in Settings → New Agent.",
+        description="Google Gemini (gemini-1.5-flash, gemini-2.5-flash, gemini-3.1-pro, etc.) via the Gemini API.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -164,14 +162,14 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 help="Required for custom-tenant / proxy endpoints.",
             ),
         ),
-        env_fallbacks=(("GEMINI_API_KEY", "api_key"), ("GEMINI_BASE_URL", "base_url")),
+        # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_gemini",
     ),
     ProviderSpec(
         id="minimax",
         name="MiniMax",
         category="llm",
-        description="MiniMax chat completions (MiniMax-M3, MiniMax-M2.7, MiniMax-M2.5). OpenAI-compatible API at api.minimax.io.",
+        description="MiniMax chat completions (MiniMax-M3, MiniMax-M2.7). OpenAI-compatible API at api.minimax.io.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -192,7 +190,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 help="Required for token-plan / coding-plan / custom-tenant endpoints. Leave empty to use the standard candidates.",
             ),
         ),
-        env_fallbacks=(("MINIMAX_API_KEY", "api_key"), ("MINIMAX_BASE_URL", "base_url")),
+        # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_minimax",
     ),
     ProviderSpec(
@@ -241,21 +239,17 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 required=False,
                 pattern=r"^[A-Za-z0-9]{10,40}$",
                 placeholder="r8iaJkwUpytwsK5jNHRG",
-                help="Optional. Defaults to ELEVENLABS_TTS_VOICE_ID on the backend.",
+                help="Optional voice id; per-user storage only.",
             ),
             FieldSpec(
                 name="model_id", label="Model ID", type="text",
                 required=False,
                 pattern=r"^eleven_[A-Za-z0-9_]+$",
                 placeholder="eleven_flash_v2_5",
-                help="Optional. Defaults to ELEVENLABS_TTS_MODEL_ID.",
+                help="Optional model id; per-user storage only.",
             ),
         ),
-        env_fallbacks=(
-            ("ELEVENLABS_API_KEY", "api_key"),
-            ("ELEVENLABS_TTS_VOICE_ID", "voice_id"),
-            ("ELEVENLABS_TTS_MODEL_ID", "model_id"),
-        ),
+        # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_elevenlabs",
     ),
     ProviderSpec(
@@ -277,7 +271,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 required=False,
                 pattern=r"^[A-Za-z0-9_\-]{1,40}$",
                 placeholder="mist-v2",
-                help="Optional. Defaults to RIME_TTS_MODEL_ID.",
+                help="Optional model id; per-user storage only.",
             ),
             FieldSpec(
                 name="speaker_en", label="English speaker", type="text",
@@ -292,7 +286,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 placeholder="celestino",
             ),
         ),
-        env_fallbacks=(),  # ponytail: env_fallbacks deprecated; per-user only.
+        # ponytail: env_fallbacks removed.
         test_fn=None,
     ),
     ProviderSpec(
@@ -317,13 +311,10 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 required=False,
                 pattern=r"^[a-z0-9\-]{1,40}$",
                 placeholder="nova-3",
-                help="Optional. Defaults to DEEPGRAM_STT_MODEL on the backend.",
+                help="Optional model id; per-user storage only.",
             ),
         ),
-        env_fallbacks=(
-            ("DEEPGRAM_API_KEY", "api_key"),
-            ("DEEPGRAM_STT_MODEL", "model"),
-        ),
+        # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_deepgram",
     ),
     ProviderSpec(
@@ -343,10 +334,10 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 required=False,
                 pattern=r"^[a-z0-9.\-]{1,40}$",
                 placeholder="best",
-                help="Optional. Defaults to 'best'. Examples: 'best', 'universal', 'universal-streaming'.",
+                help="Optional model id; per-user storage only.",
             ),
         ),
-        env_fallbacks=(("ASSEMBLYAI_API_KEY", "api_key"),),
+        # ponytail: env_fallbacks removed.
         test_fn=None,
     ),
     ProviderSpec(
@@ -366,7 +357,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 min_length=20,
             ),
         ),
-        env_fallbacks=(("INWORLD_API_KEY", "api_key"),),
+        # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_inworld",
     ),
 )
@@ -468,9 +459,12 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
 def resolve_provider(user_id: str | None, provider_id: str) -> dict[str, str]:
     """Resolve the active credentials for a provider, for the current user.
 
-    Resolution order:
-      1. Per-user encrypted storage (Settings → API).
-      2. System env-var defaults (Railway).
+    ponytail: env-var fallback removed in this commit batch. The
+    user enters their provider API keys via the FE (Settings → API
+    or ModalAgents inline fields) and they live in the encrypted
+    tools_integrations row. If the row is missing the field, the
+    resolver returns empty and the adapter fails explicitly. There
+    is no longer a global "system key" hidden in the env.
 
     Returns a flat dict of field -> value. Missing fields are absent
     from the dict, not set to None — callers should use ``.get()``.
@@ -486,18 +480,11 @@ def resolve_provider(user_id: str | None, provider_id: str) -> dict[str, str]:
         if f.name in per_user and per_user[f.name]:
             out[f.name] = per_user[f.name]
 
-    for env_var, field_name in spec.env_fallbacks:
-        if field_name in out:
-            continue
-        val = os.environ.get(env_var, "").strip()
-        if val:
-            out[field_name] = val
-
     return out
 
 
 def is_provider_configured(user_id: str | None, provider_id: str) -> bool:
-    """True when the provider has at least one field populated (per-user or env)."""
+    """True when the provider has at least one field populated (per-user only)."""
     return bool(resolve_provider(user_id, provider_id))
 
 

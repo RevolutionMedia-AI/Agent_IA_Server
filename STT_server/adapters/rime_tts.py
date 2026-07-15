@@ -181,7 +181,7 @@ async def stream_tts_segment(
     creds = resolve_provider(user_id, "rime")
     api_key = creds.get("api_key")
     if not api_key:
-        raise RuntimeError("RIME_API_KEY no configurada. Define la env var o sube tu key en Settings → API.")
+        raise RuntimeError("Rime no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")
 
     ttfb_ms: float | None = None
     started_at = time.perf_counter()

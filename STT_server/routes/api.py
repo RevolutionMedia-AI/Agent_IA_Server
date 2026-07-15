@@ -272,25 +272,11 @@ def health() -> dict:
     else:
         out["ok"] = False
         out["checks"]["public_url"] = "FAIL: PUBLIC_URL env not set"
-    # 3. At least one TTS provider reachable?
-    from STT_server.config import (
-        ELEVENLABS_API_KEY, OPENAI_API_KEY, DEEPGRAM_API_KEY, INWORLD_API_KEY,
-    )
-    from STT_server.adapters.tts_dispatcher import VALID_TTS_PROVIDERS
-    keys = {
-        "elevenlabs": bool(ELEVENLABS_API_KEY),
-        "openai": bool(OPENAI_API_KEY),
-        "deepgram": bool(DEEPGRAM_API_KEY),
-        "inworld": bool(INWORLD_API_KEY),
-    }
-    out["checks"]["tts_env_keys"] = keys
-    if not any(keys.values()):
-        # Not fatal — users can bring their own per-provider keys via
-        # Settings → API. Flag it but don't fail the healthcheck.
-        out["checks"]["tts_env_keys_warning"] = "no system-level TTS keys; users must configure their own"
-    # 4. Rime and AssemblyAI live under credentials_resolver env names
-    from STT_server.config import RIME_API_KEY
-    keys["rime"] = bool(RIME_API_KEY)
+    # 3. ponytail: env-fallback TTS keys removed. Each user brings
+    # their own via Settings → API or ModalAgents inline. The healthcheck
+    # now reports only the system infrastructure (PUBLIC_URL, DATABASE_URL,
+    # CREDENTIAL_ENCRYPTION_KEY), not provider credentials.
+    out["checks"]["tts_env_keys"] = "removed — per-user only"
     return out
 
 

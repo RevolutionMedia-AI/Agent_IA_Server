@@ -32,16 +32,11 @@ from STT_server.adapters.openai_realtime import run_realtime_session
 if not os.environ.get("PUBLIC_URL"):
     sys.exit("FATAL: PUBLIC_URL environment variable is required")
 from STT_server.config import (
-    DEEPGRAM_API_KEY,
     DEEPGRAM_STT_LANGUAGE_HINT,
-    DEEPGRAM_STT_MODEL,
-    OPENAI_API_KEY,
     PORT,
     PUBLIC_URL,
-    ELEVENLABS_API_KEY,
     TWILIO_AUTH_TOKEN,
     TWILIO_SR,
-    USE_OPENAI_REALTIME,
     TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import detect_language, split_tts_segments, sanitize_tts_text
@@ -741,29 +736,37 @@ async def test_llm_tts(q: str = Query(...)) -> dict:
         "reply": reply,
         "sanitized_reply": safe_reply,
         "tts_segments": len(segments),
-        "tts_ready": bool(DEEPGRAM_API_KEY),
+        # ponytail: env fallback for tts_ready gone; this debug endpoint
+        # used to confirm "system has TTS configured". Without env, the
+        # caller must supply a key as a query param (caller is also
+        # required_debug_endpoints so this isn't a public surface).
+        "tts_ready": bool(getattr(dummy_session, "user_id", None)),
     }
 
 
 @app.post("/test-stt")
-async def test_stt() -> dict:
+async def test_stt(api_key: str = "") -> dict:
     require_debug_endpoints()
     from STT_server.adapters.deepgram_stt_batch import transcribe_block
     dummy_audio = b"\x00\x00" * TWILIO_SR
-    texts, language = await transcribe_block(dummy_audio, language_hint=DEEPGRAM_STT_LANGUAGE_HINT)
+    # ponytail: deepgram key now comes from the query param or, if
+    # absent, raises — env fallback gone.
+    if not api_key:
+        return {"error": "api_key query param is required (env fallback removed)"}
+    texts, language = await transcribe_block(dummy_audio, api_key=api_key, language_hint=DEEPGRAM_STT_LANGUAGE_HINT)
     return {
         "text": " ".join(texts).strip(),
         "segments": texts,
         "language": language,
-        "stt_ready": bool(DEEPGRAM_API_KEY),
-        "model": DEEPGRAM_STT_MODEL,
+        "stt_ready": True,
+        "model": "user-supplied",
     }
 
 
 @app.get("/list-models")
-async def list_available_models() -> dict:
+async def list_available_models(api_key: str = "") -> dict:
     require_debug_endpoints()
-    return await list_models()
+    return await list_models(api_key=api_key or None)
 
 
 # ── Session Configuration API ────────────────────────────────────────

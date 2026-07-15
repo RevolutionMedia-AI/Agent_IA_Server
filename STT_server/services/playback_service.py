@@ -9,16 +9,12 @@ from fastapi import WebSocket
 from STT_server.adapters.tts_dispatcher import stream_tts_segment
 from STT_server.adapters.twilio_media import send_twilio_clear, send_twilio_mark, send_twilio_media
 from STT_server.config import (
-    INITIAL_GREETING_ENABLED,
-    INITIAL_GREETING_TEXT,
     LOG_TWILIO_PLAYBACK,
-    OPENAI_API_KEY,
     STREAM_SID_WAIT_MAX_MS,
     STREAM_SID_WAIT_POLL_MS,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
     SAVE_TWILIO_FRAMES,
-    TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession

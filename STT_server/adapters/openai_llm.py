@@ -7,7 +7,7 @@ import urllib.request
 
 from openai import OpenAI
 
-from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS, OPENAI_MODEL
+from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS
 from STT_server.domain.language import detect_language, get_language_instruction,                  pop_streaming_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.credentials_resolver import resolve_provider
@@ -29,11 +29,15 @@ _DEFAULT_BASE_URLS = {
     "anthropic": "https://api.anthropic.com",
     "gemini":    "https://generativelanguage.googleapis.com/v1beta",
 }
+# ponytail: _DEFAULT_MODELS is the absolute last-resort fallback for
+# sessions where the agent row has llm_model=NULL (which the backfill
+# in migration 005 should never produce again). Kept here so legacy
+# sessions don't crash; new sessions must have llm_model from the
+# agent row.
 _DEFAULT_MODELS = {
-    "openai":    None,                          # fall back to OPENAI_MODEL env
-    "minimax":   "minimax",
-    "anthropic": "claude-3-5-sonnet-20241022",
-    "gemini":    "gemini-1.5-pro",
+    "minimax":   "MiniMax-M3",
+    "anthropic": "claude-sonnet-4-5",
+    "gemini":    "gemini-2-5-flash",
 }
 
 
@@ -53,8 +57,12 @@ def _session_provider(session: CallSession) -> str:
 def _resolve_model(session: CallSession, provider: str) -> str:
     """Pick the model id to send to the provider API.
 
-    Priority: session.llm_model (set by media_stream from agent config)
-    > provider default > OPENAI_MODEL env (only relevant for openai).
+    ponytail: per-agent only. The agent row's llm_model is the single
+    source of truth. The per-provider defaults in _DEFAULT_MODELS are
+    only consulted if llm_model is empty/null, which the backfill
+    migration guarantees won't happen for any new agent. If both are
+    missing, raise — fail loud, never silently fall back to a
+    system-wide default that would mask user config errors.
     """
     explicit = getattr(session, "llm_model", None)
     if explicit and str(explicit).strip():
@@ -62,7 +70,10 @@ def _resolve_model(session: CallSession, provider: str) -> str:
     fallback = _DEFAULT_MODELS.get(provider)
     if fallback:
         return fallback
-    return OPENAI_MODEL
+    raise RuntimeError(
+        f"LLM provider '{provider}' has no model configured for this "
+        f"session. Agent row must set llm_model."
+    )
 
 
 # ─── OpenAI ────────────────────────────────────────────────────────
@@ -71,19 +82,20 @@ def _openai_client(session: CallSession) -> OpenAI:
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "openai")
     key = creds.get("api_key")
+    # ponytail: per-user key only. No more `_default_openai_client`
+    # that silently fell back to a system env var — if the user didn't
+    # upload their key, the caller has to handle None and bail loudly.
     if not key:
-        return _default_openai_client()
+        raise RuntimeError(
+            "OpenAI API key not configured for this user. Upload your "
+            "OpenAI key via Settings → API or the inline field in ModalAgents."
+        )
     cached = _client_cache.get(("openai", key, ""))
     if cached is not None:
         return cached
     client = OpenAI(api_key=key)
     _client_cache[("openai", key, "")] = client
     return client
-
-
-def _default_openai_client() -> OpenAI:
-    key = resolve_provider(None, "openai").get("api_key")
-    return OpenAI(api_key=key) if key else None
 
 
 # ─── MiniMax (OpenAI-compatible, custom base_url) ────────────────
@@ -93,9 +105,9 @@ def _minimax_client(session: CallSession) -> OpenAI:
     creds = resolve_provider(user_id, "minimax")
     key = creds.get("api_key")
     if not key:
-        raise RuntimeError(
-            "MiniMax not configured. Define MINIMAX_API_KEY or upload your key in Settings → API."
-        )
+            raise RuntimeError(
+                "MiniMax not configured. Upload your key via Settings → API or the ModalAgents inline field."
+            )
     base_url = (creds.get("base_url") or _DEFAULT_BASE_URLS["minimax"]).rstrip("/")
     cache_key = ("minimax", key, base_url)
     cached = _client_cache.get(cache_key)
@@ -118,7 +130,7 @@ def _anthropic_config(session: CallSession) -> tuple[str, str, str]:
     base = (creds.get("base_url") or _DEFAULT_BASE_URLS["anthropic"]).rstrip("/")
     if not key:
         raise RuntimeError(
-            "Anthropic not configured. Define ANTHROPIC_API_KEY or upload your key in Settings → API."
+            "Anthropic not configured. Upload your key via Settings → API or the ModalAgents inline field."
         )
     return key, base, _resolve_model(session, "anthropic")
 
@@ -271,7 +283,7 @@ def _gemini_config(session: CallSession) -> tuple[str, str, str]:
     base = (creds.get("base_url") or _DEFAULT_BASE_URLS["gemini"]).rstrip("/")
     if not key:
         raise RuntimeError(
-            "Gemini not configured. Define GEMINI_API_KEY or upload your key in Settings → API."
+            "Gemini not configured. Upload your key via Settings → API or the ModalAgents inline field."
         )
     return key, base, _resolve_model(session, "gemini")
 
@@ -626,11 +638,13 @@ def _gemini_config_from_user_id(user_id):
 
 
 def _model_from_client(client) -> str:
-    # Best-effort: if the client is a stashed config tuple (Anthropic /
-    # Gemini) we still want the openai-compat branches to work for the
-    # openai and MiniMax providers. Caller passes the right client for
-    # their provider.
-    return OPENAI_MODEL
+    # ponytail: was OPENAI_MODEL env fallback. Caller passes the right
+    # session-derived model via _resolve_model(); this helper is only
+    # called when the openai_compat branch needs a string from a
+    # client that pre-stashed a config tuple. In practice the openai /
+    # MiniMax branches get the model from _resolve_model directly.
+    # Returning empty here is fine — those branches ignore it.
+    return ""
 
 
 # ─── Backwards-compat shims used by turn_manager.prefetch_agent_reply
@@ -659,18 +673,16 @@ def client_for_session(session: CallSession):
 
 
 # ponytail: /list-models is a debug endpoint (only behind
-# ENABLE_DEBUG_ENDPOINTS) that returns the catalog of OpenAI models
-# the system key can see. Was here in the previous version of this
-# file; the rewrite accidentally dropped it and the BE crashed on
-# import. Re-added as a thin async wrapper around the OpenAI SDK
-# list() call so STT_Server.py can keep its existing import.
-async def list_models() -> dict:
-    client = _default_openai_client()
-    if client is None:
-        return {"error": "OpenAI not configured"}
+# ENABLE_DEBUG_ENDPOINTS). It requires the caller to pass the OpenAI
+# key as a query param — the env fallback that used to feed this is
+# gone, so we don't have any other source for the key.
+async def list_models(api_key: str | None = None) -> dict:
+    if not api_key:
+        return {"error": "api_key query param is required (env fallback removed)"}
 
     def sync_list() -> dict:
         try:
+            client = OpenAI(api_key=api_key)
             models_page = client.models.list()
             if hasattr(models_page, "data"):
                 models = [model.id for model in models_page.data]
