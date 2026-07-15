@@ -191,10 +191,12 @@ async def voice(
     # silent. The earlier INFO log was being filtered out and the
     # operator couldn't tell whether /voice was even being called.
     log.warning(
-        "[VOICE] hit form_keys=%s parse_ok=%s to=%s",
+        "[VOICE] hit form_keys=%s parse_ok=%s to=%s ct=%s parse_exc=%s",
         sorted(form_dict.keys()),
         parse_exc is None,
         form_dict.get("To") or form_dict.get("to") or "(missing)",
+        request.headers.get("content-type", "(missing)") if request else "(no-request)",
+        f"{type(parse_exc).__name__}: {parse_exc}" if parse_exc else "(none)",
     )
 
     # ponytail: per-number Twilio auth token. Twilio signs each webhook
