@@ -114,7 +114,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 help="Optional. Per-user Realtime model override; falls back to the agent's stt_model when stt_provider is openai.",
             ),
         ),
-        env_fallbacks=(),  # ponytail: env_fallbacks deprecated; per-user only.
+        # ponytail: env_fallbacks removed. Per-user only.
         test_fn="STT_server.services.credentials_resolver._test_openai",
     ),
     ProviderSpec(
@@ -219,7 +219,8 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 help="E.164 format with leading + and country code.",
             ),
         ),
-        env_fallbacks=(),
+        # ponytail: env_fallbacks removed. Per-number twilio_auth_token
+        # is collected at phone-number create/edit time.
         test_fn="STT_server.services.credentials_resolver._test_twilio",
     ),
     ProviderSpec(
