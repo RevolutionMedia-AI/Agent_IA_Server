@@ -36,7 +36,6 @@ from STT_server.config import (
     PORT,
     PUBLIC_URL,
     TWILIO_SR,
-    TWIML_INITIAL_GREETING_ENABLED,
 )
 from STT_server.domain.language import detect_language, split_tts_segments, sanitize_tts_text
 from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS, VALID_LANGUAGES
@@ -333,7 +332,7 @@ async def voice(
     # opt-in path in case an operator wants to insert their own
     # pre-recorded file later — it just no longer falls back to
     # "the file happens to be on disk".
-    if TWIML_INITIAL_GREETING_ENABLED:
+    if False:  # TWIML_INITIAL_GREETING_ENABLED: removed per spec, see config.py
         static_local = os.path.join(os.path.dirname(__file__), "static", "greeting.wav")
         play_url = f"{PUBLIC_URL.rstrip('/')}/static/greeting.wav"
         twiml = f"""
