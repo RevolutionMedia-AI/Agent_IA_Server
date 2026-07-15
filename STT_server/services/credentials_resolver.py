@@ -558,11 +558,22 @@ _HARDCODED_TTS_VOICES = {
     ],
     # ponytail: Inworld voice catalog is fetched live from
     # GET /voices/v1/voices in list_provider_models. This hardcoded
-    # entry is only the fallback for when the user has no Inworld key
-    # configured (the FE then shows an empty dropdown). The "Dennis"
-    # placeholder we shipped before turned out to be an ElevenLabs
-    # voice id - not Inworld - and produced HTTP 400 on every request.
-    "inworld": [],
+    # ponytail: Inworld ships a fixed voice catalog (no public REST
+    # endpoint to fetch it live). The list below is the well-known
+    # Inworld voices with names + descriptions that match their
+    # official docs. If the user's Inworld account has a custom
+    # voice not in this list, they can still type it via the FE's
+    # free-text fallback (shown when the catalog is empty).
+    "inworld": [
+        {"id": "Dennis",   "name": "Dennis",   "description": "Male, casual (default Inworld voice)"},
+        {"id": "Aarav",    "name": "Aarav",    "description": "Male, warm, Indian-accented English"},
+        {"id": "Hank",     "name": "Hank",     "description": "Male, deep, authoritative"},
+        {"id": "Marcus",   "name": "Marcus",   "description": "Male, mature, warm"},
+        {"id": "Olivia",   "name": "Olivia",   "description": "Female, friendly, conversational"},
+        {"id": "Sarah",    "name": "Sarah",    "description": "Female, professional"},
+        {"id": "Theodore", "name": "Theodore", "description": "Male, refined, mature"},
+        {"id": "Olivia-B", "name": "Olivia-B", "description": "Female, British English"},
+    ],
 }
 
 _HARDCODED_STT_MODELS = {
