@@ -175,6 +175,7 @@ async def voice(
     # body. FastAPI caches the body, so the second .form() would
     # work, but it's wasteful and confusing.
     form_dict: dict = {}
+    parse_exc: Exception | None = None
     if request is not None:
         try:
             form = await request.form()
@@ -182,8 +183,19 @@ async def voice(
             # but Twilio sends each key once). Convert values to str so
             # the signature helper sees the same shape Twilio signed.
             form_dict = {k: str(v) if v is not None else "" for k, v in form.items()}
-        except Exception:
+        except Exception as exc:
+            parse_exc = exc
             form_dict = {}
+    # ponytail: always log the inbound request at WARNING level so the
+    # next "no agent_id in customParameters" regression doesn't go
+    # silent. The earlier INFO log was being filtered out and the
+    # operator couldn't tell whether /voice was even being called.
+    log.warning(
+        "[VOICE] hit form_keys=%s parse_ok=%s to=%s",
+        sorted(form_dict.keys()),
+        parse_exc is None,
+        form_dict.get("To") or form_dict.get("to") or "(missing)",
+    )
 
     # ponytail: per-number Twilio auth token. Twilio signs each webhook
     # with the auth token of the Twilio account that owns the phone
