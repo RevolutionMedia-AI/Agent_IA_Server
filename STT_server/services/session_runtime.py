@@ -7,7 +7,7 @@ import time
 
 from fastapi import WebSocket
 
-from STT_server.config import IDLE_SILENCE_TIMEOUT_SEC
+from STT_server.config import IDLE_SILENCE_TIMEOUT_SEC, MAX_CALL_DURATION_SEC
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_with_drop
 from STT_server.services.usage_store import has_user_stored_key, record_call
@@ -195,3 +195,40 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
         return
     except Exception:
         log.exception("Error en monitor_idle_silence")
+
+
+async def monitor_max_call_duration(session: CallSession, ws: WebSocket) -> None:
+    """Hard-timeout: close the call if it exceeds MAX_CALL_DURATION_SEC.
+
+    This prevents phantom calls that consume infinite STT/LLM units when
+    the idle-silence monitor cannot fire (e.g. one party is always speaking,
+    or the audio stream stays active without meaningful conversation).
+    """
+    if MAX_CALL_DURATION_SEC <= 0:
+        return
+    try:
+        while not session.closed:
+            await asyncio.sleep(10)
+            if session.closed:
+                return
+            if session.started_at is None:
+                continue
+            elapsed = time.time() - session.started_at
+            if elapsed >= MAX_CALL_DURATION_SEC:
+                log.warning(
+                    "Max call duration (%.0fs) exceeded in %s, force-closing. "
+                    "started_at=%.1f elapsed=%.1f",
+                    MAX_CALL_DURATION_SEC,
+                    session.session_key,
+                    session.started_at,
+                    elapsed,
+                )
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                break
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Error en monitor_max_call_duration")

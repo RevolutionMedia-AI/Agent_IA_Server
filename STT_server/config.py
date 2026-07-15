@@ -66,6 +66,7 @@ STT_MUTE_BUFFER_CHUNKS = int(os.getenv("STT_MUTE_BUFFER_CHUNKS", "25"))
 TRANSCRIPT_QUEUE_MAXSIZE = int(os.getenv("TRANSCRIPT_QUEUE_MAXSIZE", "32"))
 PLAYBACK_QUEUE_MAXSIZE = int(os.getenv("PLAYBACK_QUEUE_MAXSIZE", "1024"))
 TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "16"))
+UTTERANCE_QUEUE_MAXSIZE = int(os.getenv("UTTERANCE_QUEUE_MAXSIZE", "256"))
 
 # Streaming segmentation (LLM token-stream → TTS chunk boundaries).
 STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "200"))
@@ -90,6 +91,10 @@ STT_FAILURE_PROMPT_EN = os.getenv("STT_FAILURE_PROMPT_EN", "I'm having trouble h
 STT_FAILURE_PROMPT_ES = os.getenv("STT_FAILURE_PROMPT_ES", "Estoy teniendo problemas para escucharte en este momento.").strip()
 
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
+
+# Max call duration guardrail: hard-timeout to prevent phantom calls
+# consuming infinite STT/LLM units. Defaults to 30 minutes.
+MAX_CALL_DURATION_SEC = float(os.getenv("MAX_CALL_DURATION_SEC", "1800"))
 
 # ── Deepgram STT tunables (operational, NOT credentials) ────────────
 # These tune the WebSocket URL that Deepgram sees. Per-user override

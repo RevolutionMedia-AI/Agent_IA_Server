@@ -12,6 +12,7 @@ from STT_server.config import (
     STT_AUDIO_QUEUE_MAXSIZE,
     STT_MUTE_BUFFER_CHUNKS,
     TRANSCRIPT_QUEUE_MAXSIZE,
+    UTTERANCE_QUEUE_MAXSIZE,
 )
 
 # Valid TTS providers and languages
@@ -85,7 +86,7 @@ class CallSession:
     active_generation: int = 0
     response_active: bool = False
     history: list[dict[str, str]] = field(default_factory=list)
-    utterance_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)
+    utterance_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=lambda: asyncio.Queue(maxsize=UTTERANCE_QUEUE_MAXSIZE))
     playback_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE))
     stt_audio_queue: asyncio.Queue[bytes | None] = field(default_factory=lambda: asyncio.Queue(maxsize=STT_AUDIO_QUEUE_MAXSIZE))
     stt_mute_buffer: deque[bytes] = field(default_factory=lambda: deque(maxlen=STT_MUTE_BUFFER_CHUNKS))
