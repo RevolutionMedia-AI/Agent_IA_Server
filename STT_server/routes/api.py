@@ -933,6 +933,68 @@ def change_password(data: PasswordChange, auth: dict = Depends(require_auth)):
     return {"success": True, "message": "Password updated. Please log in again."}
 
 
+# ---------- /agents/{id}/pricing-overrides (Enterprise / custom rates) ---
+# ----------------------------------------------------------------------------
+# Per-agent per-model price overrides for cases the public catalog
+# doesn't cover (Enterprise contracts, custom negotiated rates). The FE
+# fills these in when the operator picks a tier the catalog flags as
+# null; the runtime cost summary merges them with the public catalog at
+# resolve time. agent_id is required (no user-level overrides) so that
+# the same Enterprise rate can differ across agents under one tenant.
+@api_router.get("/agents/{agent_id}/pricing-overrides")
+def list_pricing_overrides(agent_id: str, auth: dict = Depends(require_auth)):
+    from STT_server import db_agents
+    from STT_server import db_pricing_overrides
+    agent = db_agents.get_agent(agent_id, auth["user_id"])
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return db_pricing_overrides.list_overrides(agent_id)
+
+
+class PricingOverrideUpsert(BaseModel):
+    unit: Optional[str] = "minute"
+    price: Optional[float] = None
+    input_price: Optional[float] = None
+    output_price: Optional[float] = None
+    source: Optional[str] = "manual"
+
+
+@api_router.put("/agents/{agent_id}/pricing-overrides/{service}/{provider}/{model_id}")
+def upsert_pricing_override(
+    agent_id: str, service: str, provider: str, model_id: str,
+    data: PricingOverrideUpsert, auth: dict = Depends(require_auth),
+):
+    from STT_server import db_agents
+    from STT_server import db_pricing_overrides
+    agent = db_agents.get_agent(agent_id, auth["user_id"])
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if service not in ("stt", "tts", "llm"):
+        raise HTTPException(status_code=400, detail="service must be stt|tts|llm")
+    if data.price is None and data.input_price is None and data.output_price is None:
+        raise HTTPException(
+            status_code=400,
+            detail="at least one of price, input_price, output_price must be set",
+        )
+    return db_pricing_overrides.upsert_override(
+        agent_id, service, provider, model_id, data.model_dump()
+    )
+
+
+@api_router.delete("/agents/{agent_id}/pricing-overrides/{service}/{provider}/{model_id}")
+def delete_pricing_override(
+    agent_id: str, service: str, provider: str, model_id: str,
+    auth: dict = Depends(require_auth),
+):
+    from STT_server import db_agents
+    from STT_server import db_pricing_overrides
+    agent = db_agents.get_agent(agent_id, auth["user_id"])
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    ok = db_pricing_overrides.delete_override(agent_id, service, provider, model_id)
+    return {"success": ok}
+
+
 # ---------- /settings/api-keys (per-user provider credentials) ----------
 # ----------------------------------------------------------------------------
 # El deployer pone OPENAI_API_KEY / ELEVENLABS_API_KEY / etc. en Railway como
