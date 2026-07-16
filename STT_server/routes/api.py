@@ -812,6 +812,80 @@ def disconnect_tool(tool_id: str, auth: dict = Depends(require_auth)):
     return {"success": True}
 
 
+@api_router.post("/tools/twilio/list-numbers")
+async def list_twilio_numbers(data: dict, auth: dict = Depends(require_auth)):
+    """List phone numbers from a Twilio account.
+
+    Requires twilio_account_sid and twilio_auth_token in the request body.
+    """
+    account_sid = (data.get("twilio_account_sid") or "").strip()
+    auth_token = (data.get("twilio_auth_token") or "").strip()
+
+    if not account_sid or not auth_token:
+        raise HTTPException(status_code=400, detail="twilio_account_sid and twilio_auth_token are required")
+
+    from STT_server.adapters.twilio_api import list_phone_numbers
+    result = await list_phone_numbers(account_sid, auth_token)
+    return result
+
+
+@api_router.post("/tools/webhooks/test")
+async def test_webhook(data: dict, auth: dict = Depends(require_auth)):
+    """Send a test webhook to the provided URL to verify connectivity."""
+    webhook_url = (data.get("webhook_url") or "").strip()
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="webhook_url is required")
+
+    test_payload = {
+        "event": "webhook.test",
+        "message": "This is a test webhook from your RevolutionMedia.AI account",
+        "timestamp": _now_iso(),
+        "webhook_version": "1.0",
+    }
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(webhook_url, json=test_payload)
+            if response.status_code >= 200 and response.status_code < 300:
+                return {"success": True, "message": f"Webhook test successful (HTTP {response.status_code})"}
+            else:
+                return {"success": False, "message": f"Webhook returned HTTP {response.status_code}"}
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=408, detail="Webhook URL timed out")
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=400, detail=f"Webhook request failed: {exc}")
+
+
+@api_router.post("/tools/n8n/test")
+async def test_n8n_workflow(data: dict, auth: dict = Depends(require_auth)):
+    """Send a test webhook to the n8n workflow URL to verify connectivity."""
+    webhook_url = (data.get("workflow_url") or "").strip()
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="workflow_url is required")
+
+    test_payload = {
+        "event": "workflow.test",
+        "message": "This is a test webhook from your RevolutionMedia.AI account",
+        "timestamp": _now_iso(),
+        "integration": "n8n",
+        "webhook_version": "1.0",
+    }
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(webhook_url, json=test_payload)
+            if response.status_code >= 200 and response.status_code < 300:
+                return {"success": True, "message": f"Workflow test successful (HTTP {response.status_code})"}
+            else:
+                return {"success": False, "message": f"Workflow returned HTTP {response.status_code}"}
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=408, detail="Workflow URL timed out")
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=400, detail=f"Workflow request failed: {exc}")
+
+
 # ---------- /settings ----------
 
 def _settings_path(user_id: str) -> str:
