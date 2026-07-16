@@ -530,7 +530,9 @@ def stream_llm_reply_sync(
     client,
     *,
     provider: str = "openai",
-) -> tuple[str, str | None]:
+    tools: list[dict] | None = None,
+    execute_tool_callback=None,
+) -> tuple[str, str | None, list[dict] | None]:
     """Streaming LLM call.
 
     `client` is passed in by the wrapper (turn_manager.stream_llm_reply_with_tts)
@@ -541,13 +543,22 @@ def stream_llm_reply_sync(
     `provider` lets the caller (which knows the session.llm_provider) tell
     us whether to route through Anthropic/Gemini SSE instead of the
     OpenAI streaming endpoint.
+
+    `tools` is a list of OpenAI-style function definitions that the LLM
+    can call during the conversation.
+
+    `execute_tool_callback` is an async function that executes a tool and
+    returns the result. If provided and the LLM calls a tool, the third
+    return value will be the list of tool calls instead of None.
     """
     if provider == "anthropic":
         config = _anthropic_config_from_client(client)
-        return _anthropic_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done)
+        result = _anthropic_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done)
+        return result[0], result[1], None
     if provider == "gemini":
         config = _gemini_config_from_client(client)
-        return _gemini_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done)
+        result = _gemini_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done)
+        return result[0], result[1], None
     if provider == "minimax":
         # The client passed in might be an OpenAI-compat one — fall through
         # to the standard chat.completions.create path.
@@ -558,15 +569,20 @@ def stream_llm_reply_sync(
 
     full_reply = ""
     pending = ""
+    tool_calls = []
 
     try:
-        stream = client.chat.completions.create(
-            model=_model_from_client(client),
-            messages=messages,
-            temperature=0.2,
-            max_tokens=MAX_RESPONSE_TOKENS,
-            stream=True,
-        )
+        kwargs = {
+            "model": _model_from_client(client),
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": MAX_RESPONSE_TOKENS,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        stream = client.chat.completions.create(**kwargs)
 
         for chunk in stream:
             if should_stop():
@@ -574,16 +590,32 @@ def stream_llm_reply_sync(
             if not getattr(chunk, "choices", None):
                 continue
 
-            delta = chunk.choices[0].delta.content or ""
+            delta = chunk.choices[0].delta
             if not delta:
                 continue
 
-            full_reply += delta
-            pending += delta
-            ready_segments, pending = pop_streaming_segments(pending)
-            for segment in ready_segments:
-                on_first_segment()
-                emit_segment(segment)
+            # Handle content
+            content = delta.content or ""
+            if content:
+                full_reply += content
+                pending += content
+                ready_segments, pending = pop_streaming_segments(pending)
+                for segment in ready_segments:
+                    on_first_segment()
+                    emit_segment(segment)
+
+            # Handle tool calls (OpenAI / MiniMax)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.index >= len(tool_calls):
+                        tool_calls.append({"id": "", "name": "", "arguments": ""})
+                    if tc.id:
+                        tool_calls[tc.index]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls[tc.index]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_calls[tc.index]["arguments"] += tc.function.arguments
 
         if not should_stop():
             final_segments, _ = pop_streaming_segments(pending, force=True)
@@ -591,10 +623,21 @@ def stream_llm_reply_sync(
                 on_first_segment()
                 emit_segment(segment)
 
-        return full_reply.strip(), None
+        # If we have tool calls, return them for processing
+        if tool_calls and execute_tool_callback:
+            parsed_calls = []
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                parsed_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+            return full_reply.strip(), None, parsed_calls
+
+        return full_reply.strip(), None, None
     except Exception as exc:
         log.exception("LLM STREAM ERROR")
-        return full_reply.strip(), str(exc)
+        return full_reply.strip(), str(exc), None
 
 
 # ponytail: stream_llm_reply_sync was originally called with the OpenAI

@@ -44,6 +44,23 @@ def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]
     return (None, None)
 
 
+def _load_agent_tools(agent_id: str | None) -> list[dict]:
+    """Load tools for an agent from agent_tools.json."""
+    if not agent_id:
+        return []
+    tools_file = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "data",
+        "agent_tools.json",
+    )
+    try:
+        with open(tools_file, "r", encoding="utf-8") as f:
+            all_tools = json.load(f) or []
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        return []
+    return [t for t in all_tools if isinstance(t, dict) and t.get("agent_id") == agent_id]
+
+
 def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:
     session.tasks.add(task)
     task.add_done_callback(session.tasks.discard)

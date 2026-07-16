@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
@@ -41,6 +42,7 @@ from STT_server.domain.language import (
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
+from STT_server.services.tool_executor import execute_tool
 
 
 log = logging.getLogger("stt_server")
@@ -251,6 +253,33 @@ async def stream_llm_reply_with_tts(
     user_text: str,
     generation: int,
 ) -> tuple[str, float, list[tuple[float | None, float]], str | None]:
+    # Get tools from session and convert to OpenAI format
+    agent_tools = getattr(session, "agent_tools", []) or []
+    if agent_tools:
+        # Convert tools to OpenAI function calling format
+        tools = []
+        for t in agent_tools:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+                },
+            })
+        log.info("[TOOLS] Passing %d tools to LLM for session %s", len(tools), session.session_key)
+    else:
+        tools = None
+    return await _stream_llm_with_tools(session, user_text, generation, tools=tools)
+
+
+async def _stream_llm_with_tools(
+    session: CallSession,
+    user_text: str,
+    generation: int,
+    tools: list[dict] | None,
+) -> tuple[str, float, list[tuple[float | None, float]], str | None]:
+    """Internal version that supports tool calling."""
     lang = session.preferred_language or detect_language(user_text)
     filler_text = get_filler_text(lang)
     loop = asyncio.get_running_loop()
@@ -265,12 +294,7 @@ async def stream_llm_reply_with_tts(
         except Exception:
             safe_seg = segment
         if not safe_seg:
-            # If LLM segment sanitizes to empty, enqueue the original so TTS still
-            # attempts to speak it rather than dropping silently.
-            log.warning(
-                "[TTS] Sanitized LLM segment empty; enqueueing original segment for session=%s",
-                session.session_key,
-            )
+            log.warning("[TTS] Sanitized LLM segment empty; enqueueing original segment for session=%s", session.session_key)
             safe_seg = segment
         if safe_seg != segment:
             log.info("[TTS] Sanitized streaming LLM segment for %s: %.120r -> %.120r", session.session_key, segment[:120], safe_seg[:120])
@@ -280,35 +304,38 @@ async def stream_llm_reply_with_tts(
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, None, "text_segment_queue")
 
     llm_started = time.perf_counter()
-    # ponytail: resolve a handle for whatever LLM provider the agent
-    # picked. client_for_session returns either an OpenAI SDK client
-    # (for openai / MiniMax) or a (key, base, model) tuple (for
-    # Anthropic / Gemini) — stream_llm_reply_sync knows how to drive
-    # each. Two concurrent calls in the same process each see the
-    # right key because we resolve per-call, not per-process.
     from STT_server.adapters.openai_llm import client_for_session
     llm_client = client_for_session(session)
     provider = getattr(session, "llm_provider", None) or "openai"
+
+    messages = build_messages(session, user_text)
     producer_task = asyncio.create_task(
         asyncio.to_thread(
             stream_llm_reply_sync,
-            build_messages(session, user_text),
+            messages,
             lambda: generation != session.active_generation or session.closed,
             emit_segment,
             emit_done,
             first_segment_event.set,
             llm_client,
             provider=str(provider).strip().lower(),
+            tools=tools,
         )
     )
 
     llm_error: str | None = None
     reply = ""
+    tool_calls = None
     try:
         if LLM_TIMEOUT_SEC > 0:
-            reply, llm_error = await asyncio.wait_for(producer_task, timeout=LLM_TIMEOUT_SEC)
+            result = await asyncio.wait_for(producer_task, timeout=LLM_TIMEOUT_SEC)
         else:
-            reply, llm_error = await producer_task
+            result = await producer_task
+        # Handle 3-tuple return (reply, error, tool_calls)
+        if len(result) == 3:
+            reply, llm_error, tool_calls = result
+        else:
+            reply, llm_error = result[0], result[1]
     except asyncio.TimeoutError:
         llm_error = "timeout"
         await enqueue_with_drop(text_queue, None, "text_segment_queue")
@@ -316,6 +343,45 @@ async def stream_llm_reply_with_tts(
         filler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await filler_task
+
+    # Handle tool calls
+    if tool_calls and generation == session.active_generation:
+        log.info("[Tools] Detected %d tool call(s) for session=%s", len(tool_calls), session.session_key)
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            tool_args = tc.get("arguments", {})
+            log.info("[Tools] Executing tool '%s' with args=%s", tool_name, tool_args)
+            # Find the tool definition to get webhook_url and filler_phrase
+            agent_tools = getattr(session, "agent_tools", []) or []
+            tool_def = next((t for t in agent_tools if t.get("name") == tool_name), None)
+            if tool_def:
+                filler = tool_def.get("filler_phrase", "Déjeme revisar el sistema...")
+                webhook_url = tool_def.get("webhook_url", "")
+                # Play filler phrase immediately
+                if filler:
+                    try:
+                        await run_tts_with_retries(session, filler, generation)
+                    except Exception:
+                        log.warning("[Tools] Failed to play filler phrase for tool '%s'", tool_name)
+                # Execute tool
+                if webhook_url:
+                    try:
+                        tool_result = await execute_tool(webhook_url, tool_args, tool_name)
+                        log.info("[Tools] Tool '%s' result: %s", tool_name, str(tool_result)[:200])
+                        # Add tool result to session history for context
+                        tool_result_text = json.dumps(tool_result) if isinstance(tool_result, dict) else str(tool_result)
+                        session.history.append({
+                            "role": "tool",
+                            "content": f"Tool '{tool_name}' result: {tool_result_text}",
+                        })
+                    except Exception as exc:
+                        log.error("[Tools] Tool '%s' execution failed: %s", tool_name, exc)
+                        session.history.append({
+                            "role": "tool",
+                            "content": f"Tool '{tool_name}' error: {str(exc)}",
+                        })
+            else:
+                log.warning("[Tools] No tool definition found for '%s'", tool_name)
 
     llm_ms = (time.perf_counter() - llm_started) * 1000
     tts_metrics = await playback_task

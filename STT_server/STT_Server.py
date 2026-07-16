@@ -607,6 +607,11 @@ async def media_stream(ws: WebSocket) -> None:
                     if session.user_id:
                         log.info("[AGENT] session %s user_id=%s (per-user keys)",
                                  session.session_key, session.user_id)
+                    # Load agent tools for function calling
+                    from STT_server.services.session_runtime import _load_agent_tools
+                    session.agent_tools = _load_agent_tools(session.agent_id)
+                    if session.agent_tools:
+                        log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
                 if session.stt_provider in ('openai_realtime', 'openai'):
                     # ponytail: 'openai' is the user-facing name in the
                     # FE dropdown (matches the OpenAI STT option the FE

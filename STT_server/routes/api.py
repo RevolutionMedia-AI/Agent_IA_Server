@@ -564,6 +564,117 @@ def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
     return {"success": True}
 
 
+# ---------- /agents/{agent_id}/tools CRUD ----------
+
+TOOLS_FILE = DATA_DIR / "agent_tools.json"
+
+
+def _load_tools():
+    try:
+        with open(TOOLS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or []
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _save_tools(tools):
+    with open(TOOLS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tools, f, indent=2, ensure_ascii=False)
+
+
+@api_router.get("/agents/{agent_id}/tools")
+def list_agent_tools(agent_id: str, auth: dict = Depends(require_auth)):
+    """List all tools for an agent."""
+    tools = _load_tools()
+    return [t for t in tools if t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]]
+
+
+class ToolCreate(BaseModel):
+    name: str
+    description: str
+    webhook_url: str
+    filler_phrase: str = "Déjeme revisar el sistema..."
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
+
+
+@api_router.post("/agents/{agent_id}/tools")
+def create_agent_tool(agent_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
+    """Create a new tool for an agent."""
+    from STT_server.domain.tool import AgentTool, validate_json_schema
+    tool = AgentTool(
+        agent_id=agent_id,
+        name=data.name,
+        description=data.description,
+        webhook_url=data.webhook_url,
+        filler_phrase=data.filler_phrase,
+        parameters=data.parameters,
+    )
+    errors = tool.validate()
+    if errors:
+        raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
+    is_valid, err = validate_json_schema(data.parameters)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
+    tools = _load_tools()
+    tool_dict = tool.to_dict()
+    tool_dict["user_id"] = auth["user_id"]
+    tools.append(tool_dict)
+    _save_tools(tools)
+    return tool_dict
+
+
+@api_router.put("/agents/{agent_id}/tools/{tool_id}")
+def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
+    """Update an existing tool."""
+    from STT_server.domain.tool import AgentTool, validate_json_schema
+    tools = _load_tools()
+    for t in tools:
+        if t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]:
+            t["name"] = data.name
+            t["description"] = data.description
+            t["webhook_url"] = data.webhook_url
+            t["filler_phrase"] = data.filler_phrase
+            t["parameters"] = data.parameters
+            from datetime import datetime, timezone
+            t["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            is_valid, err = validate_json_schema(data.parameters)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
+            _save_tools(tools)
+            return t
+    raise HTTPException(status_code=404, detail="Tool not found")
+
+
+@api_router.delete("/agents/{agent_id}/tools/{tool_id}")
+def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
+    """Delete a tool from an agent."""
+    tools = _load_tools()
+    before = len(tools)
+    tools = [t for t in tools if not (t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"])]
+    if len(tools) == before:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    _save_tools(tools)
+    return {"success": True}
+
+
+@api_router.post("/agents/{agent_id}/tools/test")
+async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
+    """Test a tool by executing its webhook with sample data."""
+    tools = _load_tools()
+    tool = next((t for t in tools if t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]), None)
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    from STT_server.services.tool_executor import execute_tool, ToolExecutionError
+    try:
+        sample_args = {}
+        for param_name in tool.get("parameters", {}).get("required", []):
+            sample_args[param_name] = f"sample_{param_name}"
+        result = await execute_tool(tool["webhook_url"], sample_args, tool["name"])
+        return {"success": True, "result": result}
+    except ToolExecutionError as exc:
+        return {"success": False, "error": str(exc)}
+
+
 # ---------- /campaigns (global suggestions catalog) ----------
 
 @api_router.get("/campaigns")
