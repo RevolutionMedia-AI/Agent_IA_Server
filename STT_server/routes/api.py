@@ -566,7 +566,7 @@ def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
 
 # ---------- /agents/{agent_id}/tools CRUD ----------
 
-TOOLS_FILE = DATA_DIR / "agent_tools.json"
+    TOOLS_FILE = os.path.join(DATA_DIR, "agent_tools.json")
 
 
 def _load_tools():
