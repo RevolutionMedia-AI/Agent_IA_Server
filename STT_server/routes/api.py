@@ -593,7 +593,7 @@ class ToolCreate(BaseModel):
     name: str
     description: str
     webhook_url: str
-    filler_phrase: str = "Déjeme revisar el sistema..."
+    filler_phrase: str = "Let me check the system..."
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
 
 

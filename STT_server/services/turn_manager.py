@@ -355,7 +355,7 @@ async def _stream_llm_with_tools(
             agent_tools = getattr(session, "agent_tools", []) or []
             tool_def = next((t for t in agent_tools if t.get("name") == tool_name), None)
             if tool_def:
-                filler = tool_def.get("filler_phrase", "Déjeme revisar el sistema...")
+                filler = tool_def.get("filler_phrase", "Let me check the system...")
                 webhook_url = tool_def.get("webhook_url", "")
                 # Play filler phrase immediately
                 if filler:
