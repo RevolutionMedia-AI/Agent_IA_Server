@@ -63,7 +63,19 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
     # stt_audio_queue and the per-adapter conversion happens inside
     # the adapter (mulaw -> LINEAR16 for Inworld, mulaw passthrough
     # for Deepgram).
-    if getattr(session, "stt_provider", "openai_realtime") == "openai_realtime":
+    # ponytail: the agent row stores the FE-facing label 'openai' for
+    # the OpenAI Realtime STT (the canonical id 'openai_realtime' is
+    # only an internal alias). The STT dispatch in STT_Server.py
+    # accepts BOTH ('openai_realtime', 'openai'). audio_ingest had a
+    # strict equality check that only matched 'openai_realtime' — so
+    # every agent with stt_provider='openai' had its audio misrouted
+    # to stt_audio_queue (where Deepgram/Inworld adapters consume),
+    # NOT to realtime_audio_queue (where the OpenAI Realtime adapter
+    # consumes). OpenAI got silence → no transcripts → no LLM
+    # response → caller heard silence after the greeting. The fix is
+    # to mirror the dispatch check verbatim.
+    stt_provider = getattr(session, "stt_provider", "")
+    if stt_provider in ("openai_realtime", "openai"):
         target_queue = session.realtime_audio_queue
         queue_name = "realtime_audio_queue"
     else:
