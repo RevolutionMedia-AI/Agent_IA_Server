@@ -105,15 +105,6 @@ if _parsed.path and _parsed.path not in ("", "/"):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db_tenants.backfill_from_json()
-    # ponytail: migrate any per-user API keys that the legacy JSON path
-    # had persisted before /settings/api-keys moved to Postgres. One-shot
-    # migration; subsequent restarts see nothing in the JSON file and
-    # backfill is a no-op.
-    try:
-        from STT_server import db_tools
-        db_tools.backfill_from_json()
-    except Exception as exc:
-        log.warning("[startup] db_tools backfill failed (non-fatal): %s", exc)
 
     # ponytail: emit a heartbeat log every 60s so Railway's container
     # cycles (if any) are visible — every "container alive Ns" line is a

@@ -53,8 +53,6 @@ from STT_server.db_phone_numbers import (
     delete_number as db_delete_number,
 )
 from STT_server.db_tools import (
-    list_tools as db_list_tools,
-    get_tool as db_get_tool,
     upsert_tool as db_upsert_tool,
     delete_tool as db_delete_tool,
 )
@@ -72,7 +70,6 @@ USERS_FILE = os.path.join(DATA_DIR, "users.json")
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
 AGENTS_FILE = os.path.join(DATA_DIR, "agents.json")
 NUMBERS_FILE = os.path.join(DATA_DIR, "phone_numbers.json")
-TOOLS_FILE = os.path.join(DATA_DIR, "tools_integrations.json")
 SETTINGS_DIR = os.path.join(DATA_DIR, "settings")
 
 
@@ -401,10 +398,6 @@ class PhoneNumberUpdate(BaseModel):
     sip_password: Optional[str] = None
     whatsapp_phone_number_id: Optional[str] = None
     whatsapp_access_token: Optional[str] = None
-
-
-class ToolConnect(BaseModel):
-    credentials: Optional[dict] = None
 
 
 class SettingsUpdate(BaseModel):
@@ -857,144 +850,6 @@ def _format_phone_number(country: str, digits: str) -> str:
     if country == "+1":
         return f"+1 {d[:3]} {d[3:6]} {d[6:]}" if len(d) >= 10 else f"+1 {d}"
     return f"{country}{d}"
-
-
-# ---------- /tools CRUD ----------
-
-@api_router.get("/tools")
-def list_tools(auth: dict = Depends(require_auth)):
-    return db_list_tools(auth["user_id"])
-
-
-@api_router.post("/tools/{tool_id}/connect")
-def connect_tool(tool_id: str, data: ToolConnect, auth: dict = Depends(require_auth)):
-    payload = {"credentials": data.credentials or {}, "connected": True}
-    if not is_postgres():
-        # JSON path - keep creating on first connect.
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(TOOLS_FILE, "r", encoding="utf-8") as f:
-                data_all = json.load(f) or []
-        except (json.JSONDecodeError, IOError):
-            data_all = []
-        with _data_lock():
-            existing = None
-            for t in data_all:
-                if t.get("id") == tool_id and t.get("user_id") == auth["user_id"]:
-                    existing = t
-                    break
-            if existing:
-                existing["connected"] = True
-                existing["credentials"] = payload["credentials"]
-                existing["connected_at"] = _now_iso()
-            else:
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                data_all.append({
-                    "user_id": auth["user_id"], "id": tool_id, "connected": True,
-                    "credentials": payload["credentials"], "connected_at": now,
-                })
-            with open(TOOLS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data_all, f, indent=2, ensure_ascii=False)
-        return db_get_tool(auth["user_id"], tool_id) or {
-            "user_id": auth["user_id"], "id": tool_id, "connected": True,
-            "credentials": payload["credentials"],
-        }
-    return db_upsert_tool(auth["user_id"], tool_id, payload)
-
-
-@api_router.delete("/tools/{tool_id}")
-def disconnect_tool(tool_id: str, auth: dict = Depends(require_auth)):
-    if not is_postgres():
-        with _data_lock():
-            tools = _load(TOOLS_FILE, [])
-            for t in tools:
-                if t["id"] == tool_id and t.get("user_id") == auth["user_id"]:
-                    t["connected"] = False
-                    t["credentials"] = {}
-                    _save(TOOLS_FILE, tools)
-                    return {"success": True}
-        raise HTTPException(status_code=404, detail="Tool not found")
-    # ponytail: on Postgres the row may not exist (the user never
-    # connected it). We accept that and return success - the FE
-    # interprets DELETE on a non-existent tool as "it's not
-    # connected anymore", which is the correct end state.
-    db_upsert_tool(auth["user_id"], tool_id, {"connected": False, "credentials": {}})
-    return {"success": True}
-
-
-@api_router.post("/tools/twilio/list-numbers")
-async def list_twilio_numbers(data: dict, auth: dict = Depends(require_auth)):
-    """List phone numbers from a Twilio account.
-
-    Requires twilio_account_sid and twilio_auth_token in the request body.
-    """
-    account_sid = (data.get("twilio_account_sid") or "").strip()
-    auth_token = (data.get("twilio_auth_token") or "").strip()
-
-    if not account_sid or not auth_token:
-        raise HTTPException(status_code=400, detail="twilio_account_sid and twilio_auth_token are required")
-
-    from STT_server.adapters.twilio_api import list_phone_numbers
-    result = await list_phone_numbers(account_sid, auth_token)
-    return result
-
-
-@api_router.post("/tools/webhooks/test")
-async def test_webhook(data: dict, auth: dict = Depends(require_auth)):
-    """Send a test webhook to the provided URL to verify connectivity."""
-    webhook_url = (data.get("webhook_url") or "").strip()
-    if not webhook_url:
-        raise HTTPException(status_code=400, detail="webhook_url is required")
-
-    test_payload = {
-        "event": "webhook.test",
-        "message": "This is a test webhook from your RevolutionMedia.AI account",
-        "timestamp": _now_iso(),
-        "webhook_version": "1.0",
-    }
-
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(webhook_url, json=test_payload)
-            if response.status_code >= 200 and response.status_code < 300:
-                return {"success": True, "message": f"Webhook test successful (HTTP {response.status_code})"}
-            else:
-                return {"success": False, "message": f"Webhook returned HTTP {response.status_code}"}
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=408, detail="Webhook URL timed out")
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=400, detail=f"Webhook request failed: {exc}")
-
-
-@api_router.post("/tools/n8n/test")
-async def test_n8n_workflow(data: dict, auth: dict = Depends(require_auth)):
-    """Send a test webhook to the n8n workflow URL to verify connectivity."""
-    webhook_url = (data.get("workflow_url") or "").strip()
-    if not webhook_url:
-        raise HTTPException(status_code=400, detail="workflow_url is required")
-
-    test_payload = {
-        "event": "workflow.test",
-        "message": "This is a test webhook from your RevolutionMedia.AI account",
-        "timestamp": _now_iso(),
-        "integration": "n8n",
-        "webhook_version": "1.0",
-    }
-
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(webhook_url, json=test_payload)
-            if response.status_code >= 200 and response.status_code < 300:
-                return {"success": True, "message": f"Workflow test successful (HTTP {response.status_code})"}
-            else:
-                return {"success": False, "message": f"Workflow returned HTTP {response.status_code}"}
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=408, detail="Workflow URL timed out")
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=400, detail=f"Workflow request failed: {exc}")
 
 
 # ---------- /settings ----------
