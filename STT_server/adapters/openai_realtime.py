@@ -399,6 +399,44 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 playback_task.add_done_callback(session.tasks.discard)
                 continue
 
+            if etype == "response.output_text.delta":
+                # ponytail: OpenAI Realtime GA renamed the text output
+                # events from "response.text.delta" to
+                # "response.output_text.delta". The old event name is
+                # never sent in GA — when output_modalities=["text"],
+                # every incremental token arrives as
+                # "response.output_text.delta". Without matching this
+                # event the TTS pipeline never fires after the initial
+                # greeting and the caller hears silence even though
+                # transcripts are coming in. Accept BOTH names so a
+                # regression to the old shape doesn't break us again.
+                delta = event.get("delta", "")
+                tq = session.realtime_text_queue
+                if not delta or tq is None:
+                    continue
+                current_response_text += delta
+                if REALTIME_TTS_STREAMING:
+                    pending += delta
+                    from STT_server.domain.language import pop_streaming_segments
+                    segments, pending = pop_streaming_segments(pending)
+                    for seg in segments:
+                        enqueue_nowait_with_drop(tq, seg, "text_segment_queue")
+                continue
+
+            if etype == "response.output_text.done":
+                tq = session.realtime_text_queue
+                if REALTIME_TTS_STREAMING and tq is not None and pending.strip():
+                    from STT_server.domain.language import pop_streaming_segments
+                    segments, _ = pop_streaming_segments(pending, force=True)
+                    for seg in segments:
+                        enqueue_nowait_with_drop(tq, seg, "text_segment_queue")
+                    pending = ""
+                continue
+
+            # ponytail: keep the legacy event names as fallbacks. If
+            # OpenAI rolls back to the old shape (some intermediaries
+            # still emit "response.text.delta"), keep TTS alive instead
+            # of going silent again.
             if etype == "response.text.delta":
                 delta = event.get("delta", "")
                 tq = session.realtime_text_queue
