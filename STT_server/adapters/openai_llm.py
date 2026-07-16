@@ -152,16 +152,22 @@ def _anthropic_messages(messages: list[dict]) -> tuple[str | None, list[dict]]:
     return system_text, out
 
 
-def _anthropic_call_sync(messages: list[dict], config: tuple[str, str, str]) -> str:
+def _anthropic_call_sync(messages: list[dict], config: tuple[str, str, str],
+                         session: CallSession | None = None) -> str:
     """One-shot Anthropic POST to /v1/messages. Returns the assistant
     text or a friendly fallback on any error.
     """
     key, base, model = config
     system_text, msgs = _anthropic_messages(messages)
+    # ponytail: per-agent knobs override the platform defaults.
+    # None (legacy agents, no override) → keep the 0.2 / MAX_RESPONSE_TOKENS
+    # we've been shipping for months. The exact numbers are in the
+    # 006_agent_runtime_params.sql migration + AGENTS / Settings UI.
     body = {
         "model": model,
-        "max_tokens": MAX_RESPONSE_TOKENS,
-        "temperature": 0.2,
+        "max_tokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
+        "temperature": getattr(session, "llm_temperature", None)
+            if getattr(session, "llm_temperature", None) is not None else 0.2,
         "messages": msgs,
     }
     if system_text:
@@ -197,17 +203,19 @@ def _anthropic_stream_sync(
     on_first_segment,
     emit_segment,
     emit_done,
+    session: CallSession | None = None,
 ):
     """Anthropic streams via SSE on /v1/messages with stream=true. Each
-    event line starts with `event: <type>\\ndata: <json>\\n\\n`. We only
+    event line starts with `event: <type>\ndata: <json>\n\n`. We only
     care about content_block_delta (text deltas) and message_stop.
     """
     key, base, model = config
     system_text, msgs = _anthropic_messages(messages)
     body = {
         "model": model,
-        "max_tokens": MAX_RESPONSE_TOKENS,
-        "temperature": 0.2,
+        "max_tokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
+        "temperature": getattr(session, "llm_temperature", None)
+            if getattr(session, "llm_temperature", None) is not None else 0.2,
         "messages": msgs,
         "stream": True,
     }
@@ -307,14 +315,16 @@ def _gemini_contents(messages: list[dict]) -> tuple[list[dict], str | None]:
     return contents, system_text
 
 
-def _gemini_call_sync(messages: list[dict], config: tuple[str, str, str]) -> str:
+def _gemini_call_sync(messages: list[dict], config: tuple[str, str, str],
+                      session: CallSession | None = None) -> str:
     key, base, model = config
     contents, system_text = _gemini_contents(messages)
     body: dict = {
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": MAX_RESPONSE_TOKENS,
+            "temperature": getattr(session, "llm_temperature", None)
+                if getattr(session, "llm_temperature", None) is not None else 0.2,
+            "maxOutputTokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
         },
     }
     if system_text:
@@ -350,6 +360,7 @@ def _gemini_stream_sync(
     on_first_segment,
     emit_segment,
     emit_done,
+    session: CallSession | None = None,
 ):
     """Gemini streams via streamGenerateContent?alt=sse. Same SSE shape
     as Anthropic but the JSON envelope differs (candidates[0].content.parts).
@@ -359,8 +370,9 @@ def _gemini_stream_sync(
     body: dict = {
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": MAX_RESPONSE_TOKENS,
+            "temperature": getattr(session, "llm_temperature", None)
+                if getattr(session, "llm_temperature", None) is not None else 0.2,
+            "maxOutputTokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
         },
     }
     if system_text:
@@ -488,10 +500,10 @@ async def call_llm(session: CallSession, user_text: str) -> str:
     provider = _session_provider(session)
     if provider == "anthropic":
         config = _anthropic_config(session)
-        return await asyncio.to_thread(_anthropic_call_sync, messages, config)
+        return await asyncio.to_thread(_anthropic_call_sync, messages, config, session)
     if provider == "gemini":
         config = _gemini_config(session)
-        return await asyncio.to_thread(_gemini_call_sync, messages, config)
+        return await asyncio.to_thread(_gemini_call_sync, messages, config, session)
     # OpenAI-compatible: openai or MiniMax.
     try:
         client = _openai_client(session) if provider == "openai" else _minimax_client(session)
@@ -509,8 +521,9 @@ async def call_llm(session: CallSession, user_text: str) -> str:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.2,
-                max_tokens=MAX_RESPONSE_TOKENS,
+                temperature=getattr(session, "llm_temperature", None)
+                    if getattr(session, "llm_temperature", None) is not None else 0.2,
+                max_tokens=getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
             )
             content = response.choices[0].message.content
             return (content or "").strip()
@@ -532,6 +545,7 @@ def stream_llm_reply_sync(
     provider: str = "openai",
     tools: list[dict] | None = None,
     execute_tool_callback=None,
+    session: CallSession | None = None,
 ) -> tuple[str, str | None, list[dict] | None]:
     """Streaming LLM call.
 
@@ -550,14 +564,18 @@ def stream_llm_reply_sync(
     `execute_tool_callback` is an async function that executes a tool and
     returns the result. If provided and the LLM calls a tool, the third
     return value will be the list of tool calls instead of None.
+
+    `session` is optional but, when passed, lets the per-agent runtime
+    knobs (llm_temperature, llm_max_tokens) reach the outbound request.
+    When None, we use the platform defaults (0.2 / MAX_RESPONSE_TOKENS).
     """
     if provider == "anthropic":
         config = _anthropic_config_from_client(client)
-        result = _anthropic_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done)
+        result = _anthropic_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done, session)
         return result[0], result[1], None
     if provider == "gemini":
         config = _gemini_config_from_client(client)
-        result = _gemini_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done)
+        result = _gemini_stream_sync(messages, config, should_stop, on_first_segment, emit_segment, emit_done, session)
         return result[0], result[1], None
     if provider == "minimax":
         # The client passed in might be an OpenAI-compat one — fall through
@@ -575,8 +593,9 @@ def stream_llm_reply_sync(
         kwargs = {
             "model": _model_from_client(client),
             "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": MAX_RESPONSE_TOKENS,
+            "temperature": getattr(session, "llm_temperature", None)
+                if getattr(session, "llm_temperature", None) is not None else 0.2,
+            "max_tokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
             "stream": True,
         }
         if tools:

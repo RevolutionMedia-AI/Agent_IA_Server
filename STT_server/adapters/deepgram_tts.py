@@ -26,7 +26,10 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
     ttfb_ms: float | None = None
     started_at = time.perf_counter()
     tts_language = session.preferred_language if session.preferred_language else infer_supported_language_from_text(text, fallback="en")
-    model = get_tts_model(tts_language)
+    # ponytail: pass the provider so get_tts_model() returns the right
+    # default (was hardcoded to ElevenLabs' voice id regardless of
+    # provider; see 006_agent_runtime_params.sql commit message).
+    model = get_tts_model(tts_language, provider="deepgram")
     params = urllib.parse.urlencode(
         {
             "model": model,

@@ -3,7 +3,7 @@
 Mirrors the JSON-file shape returned by routes/api.py today so the
 route layer can swap one import without changing call sites.
 
-Schema (001_schema.sql + 004_extend_business_tables.sql):
+Schema (001_schema.sql + 006_agent_runtime_params.sql):
   agents(
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -23,6 +23,10 @@ Schema (001_schema.sql + 004_extend_business_tables.sql):
     tts_model TEXT,
     llm_provider TEXT,
     llm_model TEXT,
+    -- runtime knobs added by 006_agent_runtime_params.sql
+    llm_temperature REAL,     -- 0.0..2.0 (NULL = adapter default 0.2)
+    llm_max_tokens  INTEGER,  -- >0..4096  (NULL = config.MAX_RESPONSE_TOKENS)
+    tts_speed      REAL,     -- 0.5..2.0  (NULL = provider default)
     calls TEXT NOT NULL DEFAULT '0',
     perf INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -82,7 +86,9 @@ def list_agents(user_id: str) -> list[dict]:
                 "SELECT id, user_id, name, voice, voice_id, language, campaign, status, "
                 "description, tone, prompt, welcome_message, "
                 "stt_provider, stt_model, tts_provider, tts_model, "
-                "llm_provider, llm_model, calls, perf, created_at, updated_at "
+                "llm_provider, llm_model, "
+                "llm_temperature, llm_max_tokens, tts_speed, "
+                "calls, perf, created_at, updated_at "
                 "FROM agents WHERE user_id = %s ORDER BY created_at DESC",
                 (user_id,),
             )
@@ -98,7 +104,7 @@ def get_agent(agent_id: str, user_id: str | None = None) -> dict | None:
         try:
             with open(AGENTS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f) or []
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, TypeError):
             return None
         for a in data:
             if a.get("id") == agent_id:
@@ -112,7 +118,9 @@ def get_agent(agent_id: str, user_id: str | None = None) -> dict | None:
                     "SELECT id, user_id, name, voice, voice_id, language, campaign, status, "
                     "description, tone, prompt, welcome_message, "
                     "stt_provider, stt_model, tts_provider, tts_model, "
-                    "llm_provider, llm_model, calls, perf, created_at, updated_at "
+                    "llm_provider, llm_model, "
+                    "llm_temperature, llm_max_tokens, tts_speed, "
+                    "calls, perf, created_at, updated_at "
                     "FROM agents WHERE id = %s",
                     (agent_id,),
                 )
@@ -121,7 +129,9 @@ def get_agent(agent_id: str, user_id: str | None = None) -> dict | None:
                     "SELECT id, user_id, name, voice, voice_id, language, campaign, status, "
                     "description, tone, prompt, welcome_message, "
                     "stt_provider, stt_model, tts_provider, tts_model, "
-                    "llm_provider, llm_model, calls, perf, created_at, updated_at "
+                    "llm_provider, llm_model, "
+                    "llm_temperature, llm_max_tokens, tts_speed, "
+                    "calls, perf, created_at, updated_at "
                     "FROM agents WHERE id = %s AND user_id = %s",
                     (agent_id, user_id),
                 )
@@ -153,7 +163,8 @@ def create_agent(user_id: str, payload: dict) -> dict:
     cols = ["id", "user_id", "name", "calls", "perf", "voice", "voice_id", "language",
             "campaign", "status", "description", "tone", "prompt", "welcome_message",
             "stt_provider", "stt_model", "tts_provider", "tts_model",
-            "llm_provider", "llm_model"]
+            "llm_provider", "llm_model",
+            "llm_temperature", "llm_max_tokens", "tts_speed"]
     placeholders = ", ".join(["%s"] * len(cols))
     insert_cols = ", ".join(cols)
     values = [agent_id, user_id, payload.get("name", "Untitled"),
@@ -165,7 +176,9 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("welcome_message"),
               payload.get("stt_provider"), payload.get("stt_model"),
               payload.get("tts_provider"), payload.get("tts_model"),
-              payload.get("llm_provider"), payload.get("llm_model")]
+              payload.get("llm_provider"), payload.get("llm_model"),
+              payload.get("llm_temperature"), payload.get("llm_max_tokens"),
+              payload.get("tts_speed")]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -173,7 +186,9 @@ def create_agent(user_id: str, payload: dict) -> dict:
                 "RETURNING id, user_id, name, voice, voice_id, language, campaign, status, "
                 "description, tone, prompt, welcome_message, "
                 "stt_provider, stt_model, tts_provider, tts_model, "
-                "llm_provider, llm_model, calls, perf, created_at, updated_at",
+                "llm_provider, llm_model, "
+                "llm_temperature, llm_max_tokens, tts_speed, "
+                "calls, perf, created_at, updated_at",
                 values,
             )
             row = cur.fetchone()
@@ -199,7 +214,10 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                 return a
         return None
     # ponytail: only update fields the caller passed (exclude_none), so a
-    # PUT with {"name": "X"} doesn't blank out tts_provider.
+    # PUT with {"name": "X"} doesn't blank out tts_provider. The set
+    # below also matches columns added in 006_agent_runtime_params.sql
+    # so the FE can PATCH temperature / max_tokens / tts_speed without
+    # the BE silently dropping them.
     set_clauses = []
     values = []
     for k, v in payload.items():
@@ -208,7 +226,8 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
         if k not in {"name", "voice", "voice_id", "language", "campaign", "status",
                      "description", "tone", "prompt", "welcome_message",
                      "stt_provider", "stt_model", "tts_provider", "tts_model",
-                     "llm_provider", "llm_model"}:
+                     "llm_provider", "llm_model",
+                     "llm_temperature", "llm_max_tokens", "tts_speed"}:
             continue
         set_clauses.append(f"{k} = %s")
         values.append(v)
@@ -224,7 +243,9 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                 "RETURNING id, user_id, name, voice, voice_id, language, campaign, status, "
                 "description, tone, prompt, welcome_message, "
                 "stt_provider, stt_model, tts_provider, tts_model, "
-                "llm_provider, llm_model, calls, perf, created_at, updated_at",
+                "llm_provider, llm_model, "
+                "llm_temperature, llm_max_tokens, tts_speed, "
+                "calls, perf, created_at, updated_at",
                 values,
             )
             row = cur.fetchone()

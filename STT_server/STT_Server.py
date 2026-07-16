@@ -90,6 +90,29 @@ if _parsed.path and _parsed.path not in ("", "/"):
 # surfaced clearly by credentials_resolver.
 
 
+def _safe_float(v) -> float | None:
+    """Coerce agent-config JSON values to float, returning None on
+    empty / non-numeric / out-of-band inputs. The agent row may store
+    these as null (no override), a number, or — if the FE ever sends
+    a string — something we can't trust. The DB CHECK constraints are
+    the real safety net; this is just belt + suspenders."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(v) -> int | None:
+    """See _safe_float. Same coercion for integers (llm_max_tokens)."""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
 
 # ponytail: startup hook. On Postgres deployments, backfill any tenants
 # that exist in the local JSON file but not yet in the DB (the in-memory
@@ -589,12 +612,22 @@ async def media_stream(ws: WebSocket) -> None:
                     session.llm_model = (agent_cfg.get('llm_model') or None)
                     session.voice_id = agent_cfg.get('voice_id') or None
                     session.tts_voice = agent_cfg.get('voice') or None
-                    log.info("[AGENT] session %s stt=%s model=%s llm=%s/%s tts=%s/%s voice=%s",
+                    # ponytail: agent-level runtime knobs. None means "use
+                    # the adapter default" — we don't substitute 0.2 / 150
+                    # here so the adapter's existing fallback chain keeps
+                    # working unchanged for legacy agents.
+                    session.llm_temperature = _safe_float(agent_cfg.get('llm_temperature'))
+                    session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
+                    session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
+                    log.info("[AGENT] session %s stt=%s model=%s llm=%s/%s T=%.2f MT=%s tts=%s/%s voice=%s speed=%.2f",
                              session.session_key,
                              session.stt_provider or '-', session.stt_model or '-',
                              session.llm_provider, session.llm_model or '-',
+                             session.llm_temperature if session.llm_temperature is not None else -1.0,
+                             session.llm_max_tokens if session.llm_max_tokens is not None else -1,
                              session.tts_provider or '-', session.tts_model or '-',
-                             session.tts_voice or '-')
+                             session.tts_voice or '-',
+                             session.tts_speed if session.tts_speed is not None else -1.0)
                     if session.user_id:
                         log.info("[AGENT] session %s user_id=%s (per-user keys)",
                                  session.session_key, session.user_id)

@@ -319,8 +319,35 @@ def is_duplicate_collected_data(session, structured_data: dict[str, str]) -> boo
     return False
 
 
-def get_tts_model(lang: str) -> str:
-    # Returns the configured ElevenLabs voice ID.
+def get_tts_model(lang: str, provider: str = "elevenlabs") -> str:
+    # ponytail: previous version hardcoded `ELEVENLABS_TTS_VOICE_ID` here,
+    # which meant a Deepgram / Rime agent with no per-agent voice_id would
+    # land on the WebSocket with an ElevenLabs voice ID — the provider
+    # accepted the WS but returned silence / a 4xx because the voice id
+    # doesn't exist in their catalog. Now we ask for the actual default
+    # of the provider that will consume the text. Callers that haven't
+    # been updated default to ElevenLabs so legacy behavior survives.
+    p = (provider or "").strip().lower()
+    if p == "deepgram":
+        # Aura voices are language-tagged. Default to English for any
+        # unmatched language; callers can pin a different aura via
+        # session.tts_model.
+        return "aura-asteria-en"
+    if p == "openai":
+        return "tts-1"
+    if p == "rime":
+        # Rime picks the speaker via `lang`; mist-v2 is the current
+        # production model and matches config.RIME_TTS_MODEL_ID.
+        from STT_server.config import RIME_TTS_MODEL_ID
+        return RIME_TTS_MODEL_ID
+    if p == "inworld":
+        # Inworld's voice id default lives on the agent row; this is
+        # the absolute last-resort fallback if neither agent nor
+        # session has one. Matches the DEFAULT_MODEL_ID in
+        # adapters/inworld_tts.py.
+        return "Dennis"
+    # elevenlabs (and unknown providers): keep the legacy behavior.
+    from STT_server.config import ELEVENLABS_TTS_VOICE_ID
     return ELEVENLABS_TTS_VOICE_ID
 
 

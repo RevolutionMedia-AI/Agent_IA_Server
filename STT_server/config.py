@@ -150,6 +150,11 @@ MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
 
 # OpenAI Realtime temperature (API minimum 0.6).
+# ponytail: DEAD CODE — no adapter reads this. The Realtime GA migration
+# removed session-level temperature; we never send it. Kept here so the
+# env var still parses (some ops dashboards watch it), but don't expect
+# changing it to do anything. Add per-call override support when GA
+# exposes response.create events.
 OPENAI_REALTIME_TEMPERATURE = float(os.getenv("OPENAI_REALTIME_TEMPERATURE", "0.7"))
 
 # Filler text the LLM emits during pause (operational content, not

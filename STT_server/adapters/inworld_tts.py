@@ -137,6 +137,13 @@ async def stream_tts_segment(
         voice_id, model_id, bool(api_key),
     )
 
+    # ponytail: per-agent speed override (006_agent_runtime_params.sql).
+    # Inworld accepts `speakingRate` in audioConfig (0.5..2.0). The schema
+    # CHECK constraint in the migration mirrors that range, but the
+    # adapter clamps as a second line of defense in case a future code
+    # path writes a bad value (e.g. defaults reset).
+    _speed = getattr(session, "tts_speed", None)
+    speaking_rate = max(0.5, min(2.0, _speed if _speed is not None else 1.0))
     body = json.dumps({
         "text": text,
         "voiceId": voice_id,
@@ -144,6 +151,7 @@ async def stream_tts_segment(
         "audioConfig": {
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
+            "speakingRate": speaking_rate,
         },
     }).encode("utf-8")
 

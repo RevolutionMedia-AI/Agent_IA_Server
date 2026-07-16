@@ -63,6 +63,14 @@ class CallSession:
     # claude-3-5-sonnet-20241022, gemini-1.5-pro, minimax, ...).
     # Comes from the agent config at call start.
     llm_model: str | None = None
+    # ponytail: per-agent runtime knobs (006_agent_runtime_params.sql).
+    # None = use the adapter's default (0.2 / MAX_RESPONSE_TOKENS / 1.0).
+    # The LLM adapter reads these on every chat-completions call; the
+    # TTS adapter reads tts_speed where the provider supports it
+    # (OpenAI / ElevenLabs / Inworld; Deepgram & Rime ignore).
+    llm_temperature: float | None = None
+    llm_max_tokens: int | None = None
+    tts_speed: float | None = None
     # ponytail: which STT provider the agent picked. Mirrors the FE's
     # stt_provider dropdown. Set by the 'start' event handler in
     # STT_Server.py from (a) the agent config or (b) the per-user

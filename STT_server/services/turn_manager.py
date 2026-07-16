@@ -320,6 +320,7 @@ async def _stream_llm_with_tools(
             llm_client,
             provider=str(provider).strip().lower(),
             tools=tools,
+            session=session,
         )
     )
 

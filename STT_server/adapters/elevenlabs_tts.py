@@ -105,12 +105,18 @@ async def stream_tts_segment(
             close_timeout=5,
             open_timeout=10,
         ) as ws:
-            # Send the text as a single message with flush=True
+            # ponytail: per-agent speed override (006_agent_runtime_params.sql).
+            # ElevenLabs accepts `speed` in voice_settings (0.7..1.2 per
+            # their docs; outside that range the API rejects). Clamp so a
+            # typo doesn't break the WS connection.
+            _speed = getattr(session, "tts_speed", None)
+            speed = max(0.7, min(1.2, _speed if _speed is not None else 1.0))
             message = json.dumps({
                 "text": safe_text,
                 "voice_settings": {
                     "stability": 0.5,
                     "similarity_boost": 0.75,
+                    "speed": speed,
                 },
                 "flush": True,
             })

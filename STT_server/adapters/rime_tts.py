@@ -205,7 +205,7 @@ async def stream_tts_segment(
     elif lang_norm == "es" and creds.get("speaker_es"):
         speaker = creds["speaker_es"]
     else:
-        speaker = get_tts_model(tts_language)
+        speaker = get_tts_model(tts_language, provider="rime")
     model_id = (
         getattr(session, "tts_model", None)
         or creds.get("model_id")

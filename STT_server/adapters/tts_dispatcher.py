@@ -98,12 +98,17 @@ async def _stream_openai(
 ) -> tuple[float | None, float]:
     import time
     started = time.perf_counter()
+    # ponytail: per-agent speed override (006_agent_runtime_params.sql).
+    # OpenAI TTS accepts 0.25..4.0; we clamp to the adapter's safe
+    # range so a typo doesn't trip an HTTP 400.
+    _speed = getattr(session, "tts_speed", None)
+    speed = max(0.25, min(4.0, _speed if _speed is not None else 1.0))
     body = json.dumps({
         "model": getattr(session, "tts_model", None) or "tts-1",
         "input": text,
         "voice": getattr(session, "voice_id", None) or "alloy",
         "response_format": "pcm",  # raw PCM16 LE 24 kHz mono
-        "speed": 1.0,
+        "speed": speed,
     }).encode("utf-8")
 
     def _fetch() -> bytes:
