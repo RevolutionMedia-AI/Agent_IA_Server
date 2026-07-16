@@ -217,12 +217,17 @@ if PG_URL:
                     errors.append(f"{type(stmt_exc).__name__}: {stmt_exc}")
             conn.commit()
             conn.close()
-            if errors:
-                print(f"  applied {ok} statement(s), {len(errors)} error(s):")
-                for e in errors:
+            # ponytail: collapse the DuplicateTable / already-exists
+            # noise into a single one-line summary. Every restart
+            # re-applies every migration; the per-statement WARN
+            # listing added no value past the first deploy.
+            non_noop = [e for e in errors if "already exists" not in e]
+            if non_noop:
+                print(f"  applied {ok} statements ({len(non_noop)} unexpected error(s))")
+                for e in non_noop:
                     print(f"    WARN: {e}")
             else:
-                print(f"  OK ({ok} statements)")
+                print(f"  applied {ok} statements (idempotent)")
         except Exception as exc:
             print(f"  WARN: {exc}")
 

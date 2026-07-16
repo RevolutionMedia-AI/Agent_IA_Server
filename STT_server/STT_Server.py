@@ -163,7 +163,7 @@ app.add_middleware(
 # ponytail: log the active CORS allowlist at startup so a missing
 # origin shows up immediately in the deploy logs instead of as a
 # cryptic "No Access-Control-Allow-Origin" error in the browser.
-log.info("[CORS] allowed origins: %s", ALLOWED_ORIGINS)
+log.debug("[CORS] allowed origins: %s", ALLOWED_ORIGINS)
 
 # Serve static files (e.g. static/greeting.wav) at /static
 static_dir = os.path.join(os.path.dirname(__file__), "static")

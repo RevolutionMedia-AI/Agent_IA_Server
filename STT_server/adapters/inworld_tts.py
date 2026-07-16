@@ -40,6 +40,46 @@ DEFAULT_MODEL_ID = "inworld-tts-1.5-mini"
 DEFAULT_VOICE_ID = "Dennis"
 
 
+def _summarize_mulaw_chunk(audio: bytes) -> dict:
+    """Cheap shape check on a mu-law 8 kHz byte stream.
+
+    - bytes: raw length (8 kHz mu-law = 1 byte/ms, so bytes/8 = ms)
+    - peak: max absolute value of decoded samples (255 = saturation)
+    - dc: sum of decoded samples over chunk size; non-zero DC =
+      net positive/negative bias, often the cause of a constant
+      hiss on the caller's line
+    - zc: zero-crossings (sign flips). For real speech we expect
+      hundreds per second; a near-zero count = digital noise / clip
+    """
+    if not audio:
+        return {"bytes": 0, "peak": 0, "dc": 0, "zc": 0}
+    # ponytail: G.711 mu-law decodes to signed 16-bit linear with
+    # audioop.ulaw2lin. Doing it over thousands of bytes per chunk
+    # would be slow in pure Python — audioop is C-backed and fast
+    # enough at 8 kHz that we can afford it for the first-chunk
+    # diagnostic.
+    import audioop
+    try:
+        pcm = audioop.ulaw2lin(audio, 2)
+    except Exception:
+        return {"bytes": len(audio), "peak": 0, "dc": 0, "zc": 0}
+    n = len(pcm) // 2
+    if n == 0:
+        return {"bytes": len(audio), "peak": 0, "dc": 0, "zc": 0}
+    samples = pcm[:n * 2]
+    # Quick stats via struct
+    import struct
+    fmt = "<" + "h" * n
+    try:
+        vals = struct.unpack(fmt, samples)
+    except Exception:
+        return {"bytes": len(audio), "peak": 0, "dc": 0, "zc": 0}
+    peak = max(abs(v) for v in vals) if vals else 0
+    dc = sum(vals)
+    zc = sum(1 for a, b in zip(vals, vals[1:]) if (a >= 0) != (b >= 0))
+    return {"bytes": len(audio), "peak": peak, "dc": dc, "zc": zc}
+
+
 def _resolve_api_key(session: CallSession) -> str:
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "inworld") if user_id else {}
@@ -149,6 +189,28 @@ async def stream_tts_segment(
                         continue
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started) * 1000
+                    # ponytail: one-shot diagnostic on the FIRST chunk
+                    # of each turn. Verifies the format Inworld actually
+                    # returns against what we requested (mu-law 8 kHz).
+                    # A wrong sample rate (e.g. 16 kHz delivered as 8 kHz
+                    # mu-law) produces the "constant hiss" the user
+                    # reported — half the audible bandwidth, half the
+                    # playback speed, plus aliased artifacts.
+                    audio_stats = _summarize_mulaw_chunk(audio)
+                    if not getattr(stream_tts_segment, "_logged_format", False):
+                        stream_tts_segment._logged_format = True
+                        log.warning(
+                            "[INWORLD_TTS] first chunk session=%s gen=%s "
+                            "bytes=%d duration_ms=%.1f peak_amplitude=%d "
+                            "dc_offset_estimate=%d zero_crossings=%d",
+                            getattr(session, "session_key", "?"),
+                            generation,
+                            audio_stats["bytes"],
+                            audio_stats["bytes"] / 8.0,  # 8 kHz mu-law = 1 byte/ms
+                            audio_stats["peak"],
+                            audio_stats["dc"],
+                            audio_stats["zc"],
+                        )
                     loop.call_soon_threadsafe(
                         emit_item,
                         {"type": "audio", "generation": generation, "data": audio},

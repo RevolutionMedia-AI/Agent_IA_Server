@@ -227,11 +227,13 @@ async def get_me(authorization: str = Header(None)):
         token = authorization
 
     sessions = load_sessions()
-    log.warning("/me: token_prefix=%r session_count=%d has_token=%s",
-                token[:8] + '...', len(sessions), token in sessions)
+    # ponytail: was log.warning on every /me hit - moved to DEBUG.
+    # The user reported noisy logs; this fires on every FE page load.
+    log.debug("/me: token_prefix=%r session_count=%d has_token=%s",
+              token[:8] + '...', len(sessions), token in sessions)
 
     if token not in sessions:
-        log.warning("/me: token NOT in sessions")
+        log.debug("/me: token NOT in sessions")
         raise HTTPException(
             status_code=401,
             detail="Token inválido o expirado"

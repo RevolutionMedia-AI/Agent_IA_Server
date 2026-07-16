@@ -196,16 +196,25 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     session.last_activity_at = time.monotonic()
                 session.assistant_speaking = True
                 chunk = item["data"]
-                # Direct pass-through of mu-law frames; no denoising applied.
+                # ponytail: removed per-frame log.debug - one chunk can
+                # contain 50+ frames, and at INFO that's a flood. The
+                # one-line summary at the bottom covers the same info.
+                # ponytail: validate Twilio's 20ms alignment. Inworld
+                # sends mu-law at 8000 Hz where each byte is exactly
+                # 0.125 ms - so 160 bytes = 20 ms, which is the size
+                # Twilio expects for one media packet. If Inworld
+                # ever returns a stream at a different rate (or a
+                # chunk that doesn't end on a frame boundary), the
+                # leftover gets emitted as a short final packet with
+                # a "pacing_ms" that doesn't match Twilio's clock -
+                # the user perceives that as a tiny click/pop at the
+                # boundary. Log a one-line summary if any non-aligned
+                # chunk comes in so we can see it once per turn
+                # instead of once per frame.
                 sent_frames = 0
-                timings = []
                 for start in range(0, len(chunk), TWILIO_OUTBOUND_CHUNK_BYTES):
                     frame = chunk[start : start + TWILIO_OUTBOUND_CHUNK_BYTES]
-                    log.debug("[PLAYBACK] Sending Twilio frame: session=%s gen=%s frame_bytes=%d", session.session_key, generation, len(frame))
                     if frame:
-                        if sent_frames == 0:
-                            log.debug("[PLAYBACK] Sending first Twilio frame: session=%s gen=%s bytes=%d", session.session_key, generation, len(frame))
-                        # Optionally save frames to disk for diagnostics
                         if SAVE_TWILIO_FRAMES:
                             try:
                                 fname = f"twilio_out_{session.session_key}_{generation}.mulaw"
@@ -213,8 +222,6 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                                     f.write(frame)
                             except Exception:
                                 log.exception("Error escribiendo frame Twilio para %s", session.session_key)
-
-                        # No denoiser: send frame directly to Twilio.
 
                         send_start = time.perf_counter()
                         await send_twilio_media(ws, session.stream_sid, frame)
@@ -230,32 +237,26 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         wait = (pacing_ms / 1000.0) - elapsed if pacing_ms > 0 else 0.0
                         if wait > 0:
                             await asyncio.sleep(wait)
-
-                        # Record timing diagnostic for this frame when saving frames
-                        timings.append({"idx": sent_frames - 1, "bytes": len(frame), "send_elapsed": elapsed, "pacing_ms": pacing_ms, "wait_applied_s": max(wait, 0.0)})
-                        if SAVE_TWILIO_FRAMES:
-                            try:
-                                tname = f"twilio_out_{session.session_key}_{generation}.timings.jsonl"
-                                with open(tname, "a", encoding="utf-8") as tf:
-                                    tf.write(json.dumps(timings[-1]) + "\n")
-                            except Exception:
-                                log.exception("Error escribiendo timings Twilio para %s", session.session_key)
-                if LOG_TWILIO_PLAYBACK and sent_frames:
-                    log.debug(
-                        "[PLAYBACK] Playback audio %s gen=%s bytes=%s frames=%s",
-                        session.session_key,
-                        generation,
-                        len(chunk),
-                        sent_frames,
+                # ponytail: collapsed the previous "Playback audio / Timing
+                # stats / per-frame debug" stack into a single INFO line.
+                # Old logging fired 2-3 messages per audio chunk; with
+                # 20ms frames at 8 kHz the original code emitted ~50
+                # debug lines per turn. One summary line per turn.
+                tail = len(chunk) % TWILIO_OUTBOUND_CHUNK_BYTES
+                if tail:
+                    log.info(
+                        "[PLAYBACK] session=%s gen=%s bytes=%d frames=%d "
+                        "tail_bytes=%d (non-aligned remainder - possible "
+                        "boundary click; Inworld may be returning non-"
+                        "20ms-aligned chunks)",
+                        session.session_key, generation, len(chunk),
+                        sent_frames, tail,
                     )
-                # If we collected timings, compute simple stats and log
-                if timings:
-                    try:
-                        avg_send = sum(t["send_elapsed"] for t in timings) / len(timings)
-                        avg_wait = sum(t["wait_applied_s"] for t in timings) / len(timings)
-                        log.debug("[PLAYBACK] Timing stats session=%s gen=%s frames=%s avg_send_s=%.5f avg_wait_s=%.5f", session.session_key, generation, len(timings), avg_send, avg_wait)
-                    except Exception:
-                        log.exception("Error computing timing stats for playback")
+                elif LOG_TWILIO_PLAYBACK:
+                    log.debug(
+                        "[PLAYBACK] session=%s gen=%s bytes=%d frames=%d",
+                        session.session_key, generation, len(chunk), sent_frames,
+                    )
                 continue
 
             if item_type == "segment_end":
