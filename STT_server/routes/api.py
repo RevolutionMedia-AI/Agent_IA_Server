@@ -559,14 +559,32 @@ def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
 
 # ---------- /agents/{agent_id}/tools CRUD ----------
 
-    TOOLS_FILE = os.path.join(DATA_DIR, "agent_tools.json")
+# ponytail: this path used to be defined as a stray indented
+# assignment that ran at module load time and was easy to miss
+# when scanning the file. It's now a normal module-level
+# constant alongside the helper functions that use it.
+TOOLS_FILE = os.path.join(DATA_DIR, "agent_tools.json")
 
 
 def _load_tools():
+    # ponytail: on Railway the data/ volume is ephemeral so the
+    # agent_tools.json file frequently doesn't exist (every fresh
+    # deploy or restart). The previous IOError catch returned an
+    # empty list silently — but any other exception class (custom
+    # subclasses, OSError subclasses we didn't enumerate) would
+    # propagate as a 500 with no log. We now catch the broader
+    # Exception family and log the stack so the deploy logs surface
+    # the real cause the next time we get a 500 here.
     try:
         with open(TOOLS_FILE, "r", encoding="utf-8") as f:
             return json.load(f) or []
-    except (json.JSONDecodeError, IOError):
+    except FileNotFoundError:
+        return []
+    except (json.JSONDecodeError, IOError, OSError) as exc:
+        log.warning("[tools] load failed (%s): %s", type(exc).__name__, exc)
+        return []
+    except Exception as exc:
+        log.exception("[tools] unexpected load error: %s", exc)
         return []
 
 
