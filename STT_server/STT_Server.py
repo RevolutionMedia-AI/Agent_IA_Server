@@ -160,11 +160,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# CORS allowlist — comma-separated env var, defaults to local dev origins.
+# CORS allowlist — comma-separated env var. Defaults include both
+# the local dev origins AND the production Railway frontend
+# (agentiafrontend-production.up.railway.app) so the deploy works
+# out of the box without an explicit env var. Operators can override
+# the list by setting ALLOWED_ORIGINS to a comma-separated list.
+# ponytail: when this list doesn't include the FE origin, the
+# browser reports a CORS error on every response (4xx and 5xx) even
+# though the BE itself is fine — the symptom looks like a 500 even
+# when it's just 401. Defaulting to the live Railway origin is the
+# practical fix; security still rests on bearer-token auth.
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173,"
+    "http://localhost:3000,"
+    "http://127.0.0.1:5173,"
+    "https://agentiafrontend-production.up.railway.app"
+)
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get(
         "ALLOWED_ORIGINS",
-        "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
+        _DEFAULT_CORS_ORIGINS,
     ).split(",") if o.strip()
 ]
 app.add_middleware(
