@@ -144,6 +144,16 @@ async def stream_tts_segment(
     # path writes a bad value (e.g. defaults reset).
     _speed = getattr(session, "tts_speed", None)
     speaking_rate = max(0.5, min(2.0, _speed if _speed is not None else 1.0))
+    # ponytail: Steering=True tells Inworld to react to inline
+    # non-verbal tags in the text (laughs, sighs, whispers, etc.)
+    # that the LLM emits. Without this, the voice comes out flat and
+    # robotic — the user explicitly asked for this. The LLM is
+    # told to use these tags via the per-provider hint block appended
+    # to `session.custom_prompt` in STT_Server.py (see
+    # STT_server/domain/tts_hints.py for the tag vocabulary).
+    # Default for Inworld is reportedly True on most models, but
+    # we set it explicitly so the behavior is consistent across
+    # model versions and so a future FE flag can override it.
     body = json.dumps({
         "text": text,
         "voiceId": voice_id,
@@ -152,6 +162,7 @@ async def stream_tts_segment(
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
             "speakingRate": speaking_rate,
+            "Steering": True,
         },
     }).encode("utf-8")
 
@@ -261,11 +272,19 @@ def fetch_preview(
     wraps them via tts_preview._wrap_mulaw_as_wav_pcm16 so the FE
     <audio> element can decode them).
     """
+    # Steering: True mirrors the streaming path so the preview FE
+    # button (in ModalNewAgent) is representative of the live
+    # call. Without it, the preview sounds neutral and the user
+    # thinks the steering is broken in production.
     body = json.dumps({
         "text": text,
         "voiceId": voice_id or DEFAULT_VOICE_ID,
         "modelId": model_id or DEFAULT_MODEL_ID,
-        "audioConfig": {"audioEncoding": "MULAW", "sampleRateHertz": 8000},
+        "audioConfig": {
+            "audioEncoding": "MULAW",
+            "sampleRateHertz": 8000,
+            "Steering": True,
+        },
     }).encode("utf-8")
     req = urllib.request.Request(
         "https://api.inworld.ai/tts/v1/voice",

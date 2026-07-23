@@ -634,6 +634,26 @@ async def media_stream(ws: WebSocket) -> None:
                     session.llm_temperature = _safe_float(agent_cfg.get('llm_temperature'))
                     session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
                     session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
+                    # ponytail: append a per-TTS-provider hint to the
+                    # system prompt so the LLM emits the right inline
+                    # non-verbal tags (e.g. Inworld's steering). Without
+                    # this the voice comes out flat. Idempotent: a
+                    # double append on WS reconnect is prevented by the
+                    # has_tts_hint() check. Only runs when tts_provider
+                    # is set; the in-memory session.custom_prompt is
+                    # mutated in-place (not persisted to DB).
+                    if session.custom_prompt and session.tts_provider:
+                        from STT_server.domain.tts_hints import get_tts_hint, has_tts_hint
+                        if not has_tts_hint(session.custom_prompt):
+                            hint = get_tts_hint(session.tts_provider)
+                            if hint:
+                                session.custom_prompt = session.custom_prompt + hint
+                                log.info(
+                                    "[AGENT] Appended TTS hint to custom_prompt for session %s "
+                                    "(provider=%s, hint_len=%d, total_len=%d)",
+                                    session.session_key, session.tts_provider,
+                                    len(hint), len(session.custom_prompt),
+                                )
                     log.info("[AGENT] session %s stt=%s model=%s llm=%s/%s T=%.2f MT=%s tts=%s/%s voice=%s speed=%.2f",
                              session.session_key,
                              session.stt_provider or '-', session.stt_model or '-',
