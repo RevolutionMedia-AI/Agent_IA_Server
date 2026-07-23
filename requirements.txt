@@ -9,7 +9,13 @@ faster-whisper
 openai
 twilio
 websockets
-setuptools<81
+# ponytail: pin setuptools floor to clear the CVE-2024-6345 (incorrect
+# comparisons) and CVE-2024-3651 (IDNA) family. Upper bound <81 is
+# the project's compatibility ceiling (some transitive still choke on
+# 81+). The Dockerfile additionally runs `pip install --upgrade
+# 'setuptools>=70,<81'` at build time so the runtime never sees the
+# vulnerable version even if a future pin accidentally drops the floor.
+setuptools>=70.0,<81
 scipy>=1.17.1
 cryptography  # Fernet encryption for per-user provider credentials at rest
 psycopg2-binary  # Postgres driver. Optional — BE falls back to JSON files if DATABASE_URL is unset (local dev).

@@ -6,11 +6,23 @@ import logging
 from pathlib import Path
 
 from STT_server.db import get_conn, is_postgres
+from STT_server.utils.safe_path import UnsafePathError, sanitize_id
 
 log = logging.getLogger("stt_server.db_settings")
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SETTINGS_DIR = DATA_DIR / "settings"
+
+
+def _safe_user_filename(user_id: str) -> str:
+    """Sanitize user_id before it lands in a settings/<filename> path.
+
+    The auth layer already rejects exotic user_id values, but the
+    file-inclusion scanner flags every f"{user_id}.json" pattern.
+    Funneling through sanitize_id kills traversal chars and gives the
+    scanner a single allowlist to check.
+    """
+    return sanitize_id(user_id, field="user_id") + ".json"
 
 
 def _row_to_settings(row: dict) -> dict:
@@ -32,7 +44,7 @@ def _row_to_settings(row: dict) -> dict:
 
 def get_settings(user_id: str) -> dict | None:
     if not is_postgres():
-        path = SETTINGS_DIR / f"{user_id}.json"
+        path = SETTINGS_DIR / _safe_user_filename(user_id)
         if not path.exists():
             return None
         try:
@@ -60,7 +72,7 @@ def upsert_settings(user_id: str, payload: dict) -> dict:
         notifications = {"calls": True, "qa": True, "weekly": False, "marketing": False}
     if not is_postgres():
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        path = SETTINGS_DIR / f"{user_id}.json"
+        path = SETTINGS_DIR / _safe_user_filename(user_id)
         existing = {}
         if path.exists():
             try:

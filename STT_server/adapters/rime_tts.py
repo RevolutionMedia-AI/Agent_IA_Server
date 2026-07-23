@@ -406,10 +406,20 @@ async def stream_tts_segment(
         # Guardar el audio acumulado si corresponde
         if save_audio and audio_accum:
             try:
-                fname = f"rime_tts_{getattr(session, 'session_key', 'unknown')}_{generation}.mulaw"
+                # ponytail: sanitize session_key before it lands in a
+                # filesystem path. Closes the "file inclusion via
+                # reading file" scanner finding.
+                from STT_server.utils.safe_path import UnsafePathError, sanitize_id
+                safe_key = sanitize_id(
+                    str(getattr(session, "session_key", "unknown")),
+                    field="session_key",
+                )
+                fname = f"rime_tts_{safe_key}_{generation}.mulaw"
                 with open(fname, "wb") as f:
                     f.write(audio_accum)
                     log.debug(f"[TTS] Audio guardado en {fname} ({len(audio_accum)} bytes)")
+            except (UnsafePathError, OSError) as exc:
+                log.warning(f"[TTS] Skipping rime audio dump: {exc}")
             except Exception as e:
                 log.error(f"[TTS] Error guardando audio: {e}")
 

@@ -28,11 +28,28 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from STT_server.security.credentials import decrypt_credentials
+from STT_server.utils.safe_http import UnsafeURLError, validate_public_url
 
 log = logging.getLogger("stt_server.security.resolver")
 
 
 # ── Provider catalog ────────────────────────────────────────────────────────
+
+# SSRF guard. Every provider base_url read from user-supplied credentials
+# is funneled through _safe_base() so a malicious user can't point it at
+# loopback, link-local (cloud metadata), or private VPC ranges.
+def _safe_base(creds: dict | None, default: str) -> str:
+    """Read `creds['base_url']`, fall back to `default`, validate the
+    result against the SSRF allowlist, and return the URL stripped of
+    trailing slash.
+
+    Raises UnsafeURLError on rejection — caller should map that to a
+    friendly HTTP error so the FE can show "blocked unsafe base_url".
+    """
+    raw = (creds or {}).get("base_url")
+    candidate = (raw.strip().rstrip("/") if raw else default.rstrip("/"))
+    validate_public_url(candidate)
+    return candidate
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -860,11 +877,19 @@ def _fetch_anthropic_models(api_key: str, base_url: str = "https://api.anthropic
     headers. Returns the live catalog so the FE dropdown shows models
     Anthropic actually serves today, not a hardcoded snapshot that
     goes stale on every release.
+
+    SSRF: base_url is validated against the public-IP allowlist before
+    we hand it to urlopen. A user-supplied override pointing at loopback
+    or cloud metadata raises UnsafeURLError and we fall back to [].
     """
     import urllib.error
     import urllib.request
     try:
-        base = base_url.rstrip("/")
+        try:
+            base = _safe_base({"base_url": base_url}, "https://api.anthropic.com")
+        except UnsafeURLError as exc:
+            log.warning("[anthropic-models] blocked base_url: %s", exc)
+            return []
         req = urllib.request.Request(
             f"{base}/v1/models?limit=200",
             headers={
@@ -895,11 +920,17 @@ def _fetch_minimax_models(api_key: str, base_url: str | None = None) -> list[dic
     coding plan / subscription) the user picked in Settings → API.
     Returns the live catalog so the FE dropdown reflects whatever
     MiniMax actually serves the user's account.
+
+    SSRF: base_url validated via _safe_base().
     """
     import urllib.error
     import urllib.request
     try:
-        base = (base_url or "https://api.minimax.io/v1").rstrip("/")
+        try:
+            base = _safe_base({"base_url": base_url}, "https://api.minimax.io/v1")
+        except UnsafeURLError as exc:
+            log.warning("[minimax-models] blocked base_url: %s", exc)
+            return []
         req = urllib.request.Request(
             f"{base}/models",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -1109,14 +1140,17 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 if provider_id == "anthropic":
                     if creds:
                         # honor custom base_url for token-plan / custom
-                        # tenant endpoints; default to api.anthropic.com
+                        # tenant endpoints; default to api.anthropic.com.
+                        # SSRF: validate via _safe_base before fetch.
                         try:
-                            base = (creds.get("base_url") or "https://api.anthropic.com").rstrip("/")
-                        except Exception:
-                            base = "https://api.anthropic.com"
-                        models = _fetch_anthropic_models(creds, base)
-                        if models:
-                            return {"models": models}
+                            base = _safe_base(creds, "https://api.anthropic.com")
+                        except UnsafeURLError as exc:
+                            log.warning("[llm-models anthropic] blocked base_url: %s", exc)
+                            base = None
+                        if base:
+                            models = _fetch_anthropic_models(creds, base)
+                            if models:
+                                return {"models": models}
                     return {"models": _HARDCODED_LLM_MODELS["anthropic"]}
                 if provider_id == "gemini":
                     if creds:
@@ -1130,13 +1164,17 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 if provider_id == "minimax":
                     if creds:
                         # honor custom base_url the user picked in
-                        # Settings → API (token plan / coding plan / etc.)
-                        models = _fetch_minimax_models(
-                            creds,
-                            creds.get("base_url"),
-                        )
-                        if models:
-                            return {"models": models}
+                        # Settings → API (token plan / coding plan / etc.).
+                        # SSRF: validate via _safe_base before fetch.
+                        try:
+                            base = _safe_base(creds, "https://api.minimax.io/v1")
+                        except UnsafeURLError as exc:
+                            log.warning("[llm-models minimax] blocked base_url: %s", exc)
+                            base = None
+                        if base:
+                            models = _fetch_minimax_models(creds, base)
+                            if models:
+                                return {"models": models}
                     return {"models": _HARDCODED_LLM_MODELS["minimax"]}
                 return {"models": []}
 
@@ -1383,6 +1421,11 @@ def _test_gemini(creds: dict[str, str]) -> tuple[bool, str]:
 def _test_anthropic(creds: dict[str, str]) -> tuple[bool, str]:
     """Hit Anthropic's /v1/messages with a 1-token reply request. Cheap
     (≤ 50 input tokens) and proves the key can authenticate.
+
+    SSRF: creds["base_url"] is validated via _safe_base() before the
+    request is made. A user-supplied override pointing at loopback /
+    cloud metadata raises UnsafeURLError and we report that as the
+    failure cause instead of attempting the request.
     """
     import urllib.error
     import urllib.request
@@ -1390,7 +1433,10 @@ def _test_anthropic(creds: dict[str, str]) -> tuple[bool, str]:
     key = creds.get("api_key")
     if not key:
         return False, "api_key is required"
-    base = (creds.get("base_url") or "https://api.anthropic.com").rstrip("/")
+    try:
+        base = _safe_base(creds, "https://api.anthropic.com")
+    except UnsafeURLError as exc:
+        return False, f"base_url rejected by SSRF guard: {exc}"
     try:
         req = urllib.request.Request(
             f"{base}/v1/messages",
@@ -1426,12 +1472,11 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
       2. MINIMAX_BASE_URL env (server-wide override)
       3. The single canonical candidate: api.minimax.io/v1
 
-    ponytail: previous versions carried placeholder hostnames
-    (`api.MiniMax.com`, `MiniMax.com/v1/api`, etc.) that never
-    resolved from production. The real MiniMax API is at
-    api.minimax.io (OpenAI-compatible, all lowercase). If your
-    tenant needs a custom endpoint, set the URL explicitly via
-    Settings → API or the env var.
+    SSRF: every candidate (creds + env + default) is run through
+    _safe_base() before the request. Unsafe URLs (loopback / private /
+    cloud metadata) are silently dropped from the candidate list and
+    reported as "rejected by SSRF guard" so the FE can show a clear
+    error to the user.
 
     DNS failures (`Name or service not known`, errno -2) are reported
     distinctly from HTTP failures so the FE can tell the user "this
@@ -1452,6 +1497,23 @@ def _test_minimax(creds: dict[str, str]) -> tuple[bool, str]:
     if env_base and env_base != creds_base:
         candidate_bases.append(env_base)
     candidate_bases.append("https://api.minimax.io/v1")
+
+    # Validate every candidate up-front. Rejected ones are reported and
+    # skipped — never used to build a URL.
+    safe_candidates: list[str] = []
+    rejected: list[str] = []
+    for base in candidate_bases:
+        try:
+            validate_public_url(base)
+            safe_candidates.append(base)
+        except UnsafeURLError as exc:
+            rejected.append(f"{base} ({exc})")
+    if not safe_candidates:
+        return False, (
+            "All base_url candidates were rejected by the SSRF guard: "
+            + "; ".join(rejected)
+        )
+    candidate_bases = safe_candidates
 
     last_status = None
     last_body = ""

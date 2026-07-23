@@ -19,6 +19,7 @@ from STT_server.config import (
 from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.common import drain_queue_nowait, enqueue_nowait_with_drop, enqueue_with_drop
+from STT_server.utils.safe_path import UnsafePathError, sanitize_id
 import os
 # RNNoise removed: playback sends mu-law frames directly to Twilio.
 
@@ -217,9 +218,26 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     if frame:
                         if SAVE_TWILIO_FRAMES:
                             try:
-                                fname = f"twilio_out_{session.session_key}_{generation}.mulaw"
+                                # ponytail: sanitize_id kills any path-
+                                # traversal chars in session_key before
+                                # it goes into a filesystem path. The
+                                # server-issued values (id(ws), Twilio
+                                # call_sid) already match, but defending
+                                # at the write site is the cheapest
+                                # place to neutralise the file-include
+                                # scanner finding.
+                                safe_key = sanitize_id(
+                                    str(getattr(session, "session_key", "unknown")),
+                                    field="session_key",
+                                )
+                                fname = f"twilio_out_{safe_key}_{generation}.mulaw"
                                 with open(fname, "ab") as f:
                                     f.write(frame)
+                            except (UnsafePathError, OSError) as exc:
+                                log.warning(
+                                    "Skipping twilio_out frame for %s: %s",
+                                    session.session_key, exc,
+                                )
                             except Exception:
                                 log.exception("Error escribiendo frame Twilio para %s", session.session_key)
 

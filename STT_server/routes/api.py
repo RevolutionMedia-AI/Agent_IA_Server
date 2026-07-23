@@ -873,7 +873,14 @@ def _format_phone_number(country: str, digits: str) -> str:
 # ---------- /settings ----------
 
 def _settings_path(user_id: str) -> str:
-    return os.path.join(SETTINGS_DIR, f"{user_id}.json")
+    # ponytail: sanitize_id enforces a conservative charset on user_id
+    # so a value like "../../etc/passwd" can't escape SETTINGS_DIR.
+    # The auth layer already constrains user_id to a server-issued
+    # value, but the file-inclusion scanner flags this pattern and
+    # the helper is the cheapest place to neutralise it.
+    from STT_server.utils.safe_path import sanitize_id
+    safe_id = sanitize_id(user_id, field="user_id")
+    return os.path.join(SETTINGS_DIR, f"{safe_id}.json")
 
 
 @api_router.get("/settings")

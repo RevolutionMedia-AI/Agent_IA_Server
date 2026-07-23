@@ -11,9 +11,21 @@ from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS
 from STT_server.domain.language import detect_language, get_language_instruction,                  pop_streaming_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.utils.safe_http import UnsafeURLError, validate_public_url
 
 
 log = logging.getLogger("stt_server")
+
+
+# SSRF guard. Every per-user base_url (anthropic / gemini / minimax
+# custom-tenant endpoints) is funneled through _safe_base() so a
+# malicious user can't point the SDK at loopback / cloud metadata /
+# internal VPC IPs. Raises UnsafeURLError on rejection.
+def _safe_base(creds: dict | None, default: str) -> str:
+    raw = (creds or {}).get("base_url")
+    candidate = (raw.strip().rstrip("/") if raw else default.rstrip("/"))
+    validate_public_url(candidate)
+    return candidate
 
 
 # ponytail: per-user client cache. Keyed by (provider, key, base_url)
@@ -108,7 +120,12 @@ def _minimax_client(session: CallSession) -> OpenAI:
             raise RuntimeError(
                 "MiniMax not configured. Upload your key via Settings → API or the ModalAgents inline field."
             )
-    base_url = (creds.get("base_url") or _DEFAULT_BASE_URLS["minimax"]).rstrip("/")
+    try:
+        base_url = _safe_base(creds, _DEFAULT_BASE_URLS["minimax"])
+    except UnsafeURLError as exc:
+        raise RuntimeError(
+            f"MiniMax base_url rejected by SSRF guard: {exc}"
+        )
     cache_key = ("minimax", key, base_url)
     cached = _client_cache.get(cache_key)
     if cached is not None:
@@ -127,11 +144,14 @@ def _anthropic_config(session: CallSession) -> tuple[str, str, str]:
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "anthropic")
     key = creds.get("api_key")
-    base = (creds.get("base_url") or _DEFAULT_BASE_URLS["anthropic"]).rstrip("/")
     if not key:
         raise RuntimeError(
             "Anthropic not configured. Upload your key via Settings → API or the ModalAgents inline field."
         )
+    try:
+        base = _safe_base(creds, _DEFAULT_BASE_URLS["anthropic"])
+    except UnsafeURLError as exc:
+        raise RuntimeError(f"Anthropic base_url rejected by SSRF guard: {exc}")
     return key, base, _resolve_model(session, "anthropic")
 
 
@@ -288,11 +308,14 @@ def _gemini_config(session: CallSession) -> tuple[str, str, str]:
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "gemini")
     key = creds.get("api_key")
-    base = (creds.get("base_url") or _DEFAULT_BASE_URLS["gemini"]).rstrip("/")
     if not key:
         raise RuntimeError(
             "Gemini not configured. Upload your key via Settings → API or the ModalAgents inline field."
         )
+    try:
+        base = _safe_base(creds, _DEFAULT_BASE_URLS["gemini"])
+    except UnsafeURLError as exc:
+        raise RuntimeError(f"Gemini base_url rejected by SSRF guard: {exc}")
     return key, base, _resolve_model(session, "gemini")
 
 
@@ -684,18 +707,24 @@ def _gemini_config_from_client(client) -> tuple[str, str, str]:
 def _anthropic_config_from_user_id(user_id):
     creds = resolve_provider(user_id, "anthropic")
     key = creds.get("api_key")
-    base = (creds.get("base_url") or _DEFAULT_BASE_URLS["anthropic"]).rstrip("/")
     if not key:
         raise RuntimeError("Anthropic not configured.")
+    try:
+        base = _safe_base(creds, _DEFAULT_BASE_URLS["anthropic"])
+    except UnsafeURLError as exc:
+        raise RuntimeError(f"Anthropic base_url rejected by SSRF guard: {exc}")
     return key, base, _DEFAULT_MODELS["anthropic"]
 
 
 def _gemini_config_from_user_id(user_id):
     creds = resolve_provider(user_id, "gemini")
     key = creds.get("api_key")
-    base = (creds.get("base_url") or _DEFAULT_BASE_URLS["gemini"]).rstrip("/")
     if not key:
         raise RuntimeError("Gemini not configured.")
+    try:
+        base = _safe_base(creds, _DEFAULT_BASE_URLS["gemini"])
+    except UnsafeURLError as exc:
+        raise RuntimeError(f"Gemini base_url rejected by SSRF guard: {exc}")
     return key, base, _DEFAULT_MODELS["gemini"]
 
 
