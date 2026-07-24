@@ -573,187 +573,48 @@ _HARDCODED_TTS_VOICES = {
         {"id": "aura-orion-en",   "name": "Orion (en)",   "description": "Male, narrative"},
         {"id": "aura-athena-en",  "name": "Athena (en)",  "description": "Female, professional"},
     ],
-    # ponytail: Inworld voice catalog is fetched live from
-    # GET /voices/v1/voices in list_provider_models. This hardcoded
-    # ponytail: Inworld voice catalog. The list below is the hardcoded
-    # fallback — used when the user hasn't uploaded an Inworld key yet
-    # (so we can't hit GET /voices/v1/voices for the live list) or when
-    # the live fetch fails. When a key IS uploaded, the live fetch
-    # returns the user's account-scoped voices (which may include
-    # custom ones not in this list); the dropdown merges live + hardcoded
-    # with the live ones winning.
+    # ponytail: voices curated for THIS deployment's Inworld account.
+    # English by default; only Camila, Mayte, Cuauhtemoc ship
+    # Mexican Spanish. Hardcoded so the dropdown can show
+    # `Spanish (Mexico)` vs default even when the live fetch
+    # (GET /voices/v1/voices) is unavailable (no key uploaded yet,
+    # network down, or account key rejected). When the live fetch
+    # DOES return a voice, we merge it in with the live entry winning
+    # on id collisions, so the FE shows the user's account-scoped
+    # voices plus this baseline.
+    #
+    # To add a new voice, drop a {id, name, language, description}
+    # tuple below. The live merge will only override by id, so
+    # anything we hardcode that Inworld does not return stays
+    # available.
     "inworld": [
-        {"id": "Aaron",    "name": "Aaron",    "description": "Male, friendly, mid-range"},
-        {"id": "Aarav",    "name": "Aarav",    "description": "Male, warm, Indian-accented English"},
-        {"id": "Adam",     "name": "Adam",     "description": "Male, neutral, clear"},
-        {"id": "Adrian",   "name": "Adrian",   "description": "Male, calm, professional"},
-        {"id": "Alex",     "name": "Alex",     "description": "Male, energetic, casual"},
-        {"id": "Alice",    "name": "Alice",    "description": "Female, friendly, conversational"},
-        {"id": "Allison",  "name": "Allison",  "description": "Female, professional, warm"},
-        {"id": "Amanda",   "name": "Amanda",   "description": "Female, friendly, bright"},
-        {"id": "Amber",    "name": "Amber",    "description": "Female, warm, expressive"},
-        {"id": "Amelia",   "name": "Amelia",   "description": "Female, refined, mature"},
-        {"id": "Amy",      "name": "Amy",      "description": "Female, friendly, casual"},
-        {"id": "Andrew",   "name": "Andrew",   "description": "Male, professional, authoritative"},
-        {"id": "Anna",     "name": "Anna",     "description": "Female, friendly, mid-range"},
-        {"id": "Ashley",   "name": "Ashley",   "description": "Female, warm, conversational"},
-        {"id": "Audrey",   "name": "Audrey",   "description": "Female, refined, professional"},
-        {"id": "Ava",      "name": "Ava",      "description": "Female, bright, energetic"},
-        {"id": "Barbara",  "name": "Barbara",  "description": "Female, professional, authoritative"},
-        {"id": "Beth",     "name": "Beth",     "description": "Female, warm, conversational"},
-        {"id": "Brian",    "name": "Brian",    "description": "Male, professional, clear"},
-        {"id": "Bruno",    "name": "Bruno",    "description": "Male, warm, deep"},
-        {"id": "Carl",     "name": "Carl",     "description": "Male, professional, authoritative"},
-        {"id": "Carlos",   "name": "Carlos",   "description": "Male, energetic, casual"},
-        {"id": "Caroline", "name": "Caroline", "description": "Female, refined, professional"},
-        {"id": "Catherine","name": "Catherine","description": "Female, mature, professional"},
-        {"id": "Charles",  "name": "Charles",  "description": "Male, mature, refined"},
-        {"id": "Charlie",  "name": "Charlie",  "description": "Male, energetic, casual"},
-        {"id": "Chris",    "name": "Chris",    "description": "Male, friendly, casual"},
-        {"id": "Claire",   "name": "Claire",   "description": "Female, professional, warm"},
-        {"id": "Cynthia",  "name": "Cynthia",  "description": "Female, professional, mature"},
-        {"id": "Daniel",   "name": "Daniel",   "description": "Male, professional, clear"},
-        {"id": "Danielle", "name": "Danielle", "description": "Female, warm, conversational"},
-        {"id": "David",    "name": "David",    "description": "Male, professional, authoritative"},
-        {"id": "Dawn",     "name": "Dawn",     "description": "Female, friendly, conversational"},
-        {"id": "Debbie",   "name": "Debbie",   "description": "Female, friendly, casual"},
-        {"id": "Deborah",  "name": "Deborah",  "description": "Female, professional, mature"},
-        {"id": "Dennis",   "name": "Dennis",   "description": "Male, casual (default Inworld voice)"},
-        {"id": "Diana",    "name": "Diana",    "description": "Female, refined, professional"},
-        {"id": "Diane",    "name": "Diane",    "description": "Female, warm, professional"},
-        {"id": "Donald",   "name": "Donald",   "description": "Male, mature, professional"},
-        {"id": "Donna",    "name": "Donna",    "description": "Female, friendly, warm"},
-        {"id": "Dorothy",  "name": "Dorothy",  "description": "Female, warm, mature"},
-        {"id": "Edward",   "name": "Edward",   "description": "Male, refined, professional"},
-        {"id": "Elizabeth","name": "Elizabeth","description": "Female, refined, mature"},
-        {"id": "Emily",    "name": "Emily",    "description": "Female, friendly, conversational"},
-        {"id": "Emma",     "name": "Emma",     "description": "Female, warm, professional"},
-        {"id": "Eric",     "name": "Eric",     "description": "Male, professional, clear"},
-        {"id": "Ernest",   "name": "Ernest",   "description": "Male, mature, refined"},
-        {"id": "Gary",     "name": "Gary",     "description": "Male, friendly, casual"},
-        {"id": "George",   "name": "George",   "description": "Male, mature, authoritative"},
-        {"id": "Gerald",   "name": "Gerald",   "description": "Male, mature, refined"},
-        {"id": "Gloria",   "name": "Gloria",   "description": "Female, warm, professional"},
-        {"id": "Greg",     "name": "Greg",     "description": "Male, friendly, casual"},
-        {"id": "Hannah",   "name": "Hannah",   "description": "Female, warm, conversational"},
-        {"id": "Hank",     "name": "Hank",     "description": "Male, deep, authoritative"},
-        {"id": "Harold",   "name": "Harold",   "description": "Male, mature, professional"},
-        {"id": "Harry",    "name": "Harry",    "description": "Male, mature, refined"},
-        {"id": "Helen",    "name": "Helen",    "description": "Female, mature, refined"},
-        {"id": "Henry",    "name": "Henry",    "description": "Male, mature, authoritative"},
-        {"id": "Howard",   "name": "Howard",   "description": "Male, mature, refined"},
-        {"id": "Isabella", "name": "Isabella", "description": "Female, warm, refined"},
-        {"id": "Jack",     "name": "Jack",     "description": "Male, friendly, casual"},
-        {"id": "Jacob",    "name": "Jacob",    "description": "Male, friendly, conversational"},
-        {"id": "James",    "name": "James",    "description": "Male, professional, authoritative"},
-        {"id": "Jane",     "name": "Jane",     "description": "Female, professional, warm"},
-        {"id": "Jason",    "name": "Jason",    "description": "Male, friendly, casual"},
-        {"id": "Jean",     "name": "Jean",     "description": "Female, refined, professional"},
-        {"id": "Jeffrey",  "name": "Jeffrey",  "description": "Male, professional, mature"},
-        {"id": "Jennifer", "name": "Jennifer", "description": "Female, warm, professional"},
-        {"id": "Jerry",    "name": "Jerry",    "description": "Male, friendly, casual"},
-        {"id": "Jesse",    "name": "Jesse",    "description": "Male, energetic, casual"},
-        {"id": "Jessica",  "name": "Jessica",  "description": "Female, friendly, bright"},
-        {"id": "Jill",     "name": "Jill",     "description": "Female, friendly, conversational"},
-        {"id": "Joan",     "name": "Joan",     "description": "Female, warm, professional"},
-        {"id": "John",     "name": "John",     "description": "Male, professional, authoritative"},
-        {"id": "Joseph",   "name": "Joseph",   "description": "Male, mature, professional"},
-        {"id": "Joshua",   "name": "Joshua",   "description": "Male, friendly, casual"},
-        {"id": "Karen",    "name": "Karen",    "description": "Female, professional, warm"},
-        {"id": "Katherine","name": "Katherine","description": "Female, refined, mature"},
-        {"id": "Keith",    "name": "Keith",    "description": "Male, professional, clear"},
-        {"id": "Kelly",    "name": "Kelly",    "description": "Female, warm, conversational"},
-        {"id": "Kenneth",  "name": "Kenneth",  "description": "Male, mature, professional"},
-        {"id": "Kevin",    "name": "Kevin",    "description": "Male, friendly, casual"},
-        {"id": "Larry",    "name": "Larry",    "description": "Male, friendly, conversational"},
-        {"id": "Laura",    "name": "Laura",    "description": "Female, professional, warm"},
-        {"id": "Lauren",   "name": "Lauren",   "description": "Female, friendly, bright"},
-        {"id": "Linda",    "name": "Linda",    "description": "Female, warm, conversational"},
-        {"id": "Lisa",     "name": "Lisa",     "description": "Female, professional, friendly"},
-        {"id": "Logan",    "name": "Logan",    "description": "Male, friendly, casual"},
-        {"id": "Lori",     "name": "Lori",     "description": "Female, friendly, conversational"},
-        {"id": "Louis",    "name": "Louis",    "description": "Male, professional, authoritative"},
-        {"id": "Lucy",     "name": "Lucy",     "description": "Female, friendly, casual"},
-        {"id": "Marcus",   "name": "Marcus",   "description": "Male, mature, warm"},
-        {"id": "Margaret", "name": "Margaret", "description": "Female, mature, professional"},
-        {"id": "Maria",    "name": "Maria",    "description": "Female, warm, professional"},
-        {"id": "Marie",    "name": "Marie",    "description": "Female, refined, warm"},
-        {"id": "Mark",     "name": "Mark",     "description": "Male, professional, clear"},
-        {"id": "Martha",   "name": "Martha",   "description": "Female, warm, mature"},
-        {"id": "Martin",   "name": "Martin",   "description": "Male, professional, authoritative"},
-        {"id": "Mary",     "name": "Mary",     "description": "Female, warm, conversational"},
-        {"id": "Matthew",  "name": "Matthew",  "description": "Male, friendly, casual"},
-        {"id": "Megan",    "name": "Megan",    "description": "Female, friendly, bright"},
-        {"id": "Melissa",  "name": "Melissa",  "description": "Female, friendly, conversational"},
-        {"id": "Michael",  "name": "Michael",  "description": "Male, professional, authoritative"},
-        {"id": "Michelle", "name": "Michelle", "description": "Female, warm, professional"},
-        {"id": "Mike",     "name": "Mike",     "description": "Male, friendly, casual"},
-        {"id": "Nancy",    "name": "Nancy",    "description": "Female, warm, conversational"},
-        {"id": "Natalie",  "name": "Natalie",  "description": "Female, friendly, bright"},
-        {"id": "Nicholas", "name": "Nicholas", "description": "Male, professional, mature"},
-        {"id": "Nicole",   "name": "Nicole",   "description": "Female, friendly, casual"},
-        {"id": "Olivia",   "name": "Olivia",   "description": "Female, friendly, conversational"},
-        {"id": "Olivia-B", "name": "Olivia-B", "description": "Female, British English"},
-        {"id": "Oscar",    "name": "Oscar",    "description": "Male, professional, refined"},
-        {"id": "Pamela",   "name": "Pamela",   "description": "Female, professional, warm"},
-        {"id": "Patricia", "name": "Patricia", "description": "Female, professional, mature"},
-        {"id": "Patrick",  "name": "Patrick",  "description": "Male, friendly, casual"},
-        {"id": "Paul",     "name": "Paul",     "description": "Male, professional, clear"},
-        {"id": "Paula",    "name": "Paula",    "description": "Female, friendly, warm"},
-        {"id": "Peter",    "name": "Peter",    "description": "Male, professional, mature"},
-        {"id": "Philip",   "name": "Philip",   "description": "Male, mature, refined"},
-        {"id": "Phillip",  "name": "Phillip",  "description": "Male, mature, professional"},
-        {"id": "Rachel",   "name": "Rachel",   "description": "Female, warm, professional"},
-        {"id": "Ralph",    "name": "Ralph",    "description": "Male, mature, friendly"},
-        {"id": "Randy",    "name": "Randy",    "description": "Male, friendly, casual"},
-        {"id": "Raymond",  "name": "Raymond",  "description": "Male, mature, professional"},
-        {"id": "Rebecca",  "name": "Rebecca",  "description": "Female, warm, professional"},
-        {"id": "Richard",  "name": "Richard",  "description": "Male, professional, mature"},
-        {"id": "Robert",   "name": "Robert",   "description": "Male, mature, professional"},
-        {"id": "Robin",    "name": "Robin",    "description": "Female, friendly, conversational"},
-        {"id": "Roger",    "name": "Roger",    "description": "Male, friendly, casual"},
-        {"id": "Ronald",   "name": "Ronald",   "description": "Male, mature, refined"},
-        {"id": "Rose",     "name": "Rose",     "description": "Female, warm, conversational"},
-        {"id": "Ruby",     "name": "Ruby",     "description": "Female, friendly, casual"},
-        {"id": "Russell",  "name": "Russell",  "description": "Male, mature, professional"},
-        {"id": "Ruth",     "name": "Ruth",     "description": "Female, warm, mature"},
-        {"id": "Ryan",     "name": "Ryan",     "description": "Male, friendly, casual"},
-        {"id": "Samuel",   "name": "Samuel",   "description": "Male, mature, professional"},
-        {"id": "Sandra",   "name": "Sandra",   "description": "Female, warm, professional"},
-        {"id": "Sara",     "name": "Sara",     "description": "Female, friendly, conversational"},
-        {"id": "Sarah",    "name": "Sarah",    "description": "Female, professional, warm"},
-        {"id": "Scott",    "name": "Scott",    "description": "Male, friendly, casual"},
-        {"id": "Sean",     "name": "Sean",     "description": "Male, friendly, conversational"},
-        {"id": "Sharon",   "name": "Sharon",   "description": "Female, professional, warm"},
-        {"id": "Shawn",    "name": "Shawn",    "description": "Male, friendly, casual"},
-        {"id": "Shirley",  "name": "Shirley",  "description": "Female, warm, mature"},
-        {"id": "Smith",    "name": "Smith",    "description": "Male, professional, neutral"},
-        {"id": "Sofia",    "name": "Sofia",    "description": "Female, refined, warm"},
-        {"id": "Sophia",   "name": "Sophia",   "description": "Female, friendly, bright"},
-        {"id": "Stephanie","name": "Stephanie","description": "Female, warm, professional"},
-        {"id": "Stephen",  "name": "Stephen",  "description": "Male, professional, mature"},
-        {"id": "Steve",    "name": "Steve",    "description": "Male, friendly, casual"},
-        {"id": "Susan",    "name": "Susan",    "description": "Female, warm, professional"},
-        {"id": "Taylor",   "name": "Taylor",   "description": "Female, friendly, bright"},
-        {"id": "Terry",    "name": "Terry",    "description": "Male, friendly, conversational"},
-        {"id": "Theodore", "name": "Theodore", "description": "Male, refined, mature"},
-        {"id": "Theresa",  "name": "Theresa",  "description": "Female, warm, professional"},
-        {"id": "Thomas",   "name": "Thomas",   "description": "Male, mature, professional"},
-        {"id": "Timothy",  "name": "Timothy",  "description": "Male, professional, mature"},
-        {"id": "Tina",     "name": "Tina",     "description": "Female, friendly, conversational"},
-        {"id": "Todd",     "name": "Todd",     "description": "Male, friendly, casual"},
-        {"id": "Tracy",    "name": "Tracy",    "description": "Female, friendly, conversational"},
-        {"id": "Tyler",    "name": "Tyler",    "description": "Male, friendly, energetic"},
-        {"id": "Victoria", "name": "Victoria", "description": "Female, refined, professional"},
-        {"id": "Vincent",  "name": "Vincent",  "description": "Male, mature, refined"},
-        {"id": "Virginia", "name": "Virginia", "description": "Female, mature, professional"},
-        {"id": "Walter",   "name": "Walter",   "description": "Male, mature, professional"},
-        {"id": "Wanda",    "name": "Wanda",    "description": "Female, warm, mature"},
-        {"id": "Wayne",    "name": "Wayne",    "description": "Male, mature, professional"},
-        {"id": "William",  "name": "William",  "description": "Male, mature, refined"},
-        {"id": "Willie",   "name": "Willie",   "description": "Male, friendly, casual"},
-        {"id": "Yvonne",   "name": "Yvonne",   "description": "Female, warm, professional"},
-        {"id": "Zachary",  "name": "Zachary",  "description": "Male, friendly, energetic"},
+        {"id": "Blake",       "name": "Blake",       "language": "en-US", "description": "English voice"},
+        {"id": "Sarah",       "name": "Sarah",       "language": "en-US", "description": "English voice"},
+        {"id": "Jason",       "name": "Jason",       "language": "en-US", "description": "English voice"},
+        {"id": "Nate",        "name": "Nate",        "language": "en-US", "description": "English voice"},
+        {"id": "Luna",        "name": "Luna",        "language": "en-US", "description": "English voice"},
+        {"id": "Simon",       "name": "Simon",       "language": "en-US", "description": "English voice"},
+        {"id": "Hades",       "name": "Hades",       "language": "en-US", "description": "English voice"},
+        {"id": "Reed",        "name": "Reed",        "language": "en-US", "description": "English voice"},
+        {"id": "Hana",        "name": "Hana",        "language": "en-US", "description": "English voice"},
+        {"id": "Olivia",      "name": "Olivia",      "language": "en-US", "description": "English voice"},
+        {"id": "Tyles",       "name": "Tyles",       "language": "en-US", "description": "English voice"},
+        {"id": "Mark",        "name": "Mark",        "language": "en-US", "description": "English voice"},
+        {"id": "Clive",       "name": "Clive",       "language": "en-US", "description": "English voice"},
+        {"id": "Ashley",      "name": "Ashley",      "language": "en-US", "description": "English voice"},
+        {"id": "Aarav",       "name": "Aarav",       "language": "en-US", "description": "English voice"},
+        {"id": "Theodore",    "name": "Theodore",    "language": "en-US", "description": "English voice"},
+        {"id": "Eleanor",     "name": "Eleanor",     "language": "en-US", "description": "English voice"},
+        {"id": "Sophie",      "name": "Sophie",      "language": "en-US", "description": "English voice"},
+        {"id": "Alain",       "name": "Alain",       "language": "en-US", "description": "English voice"},
+        {"id": "Wei",         "name": "Wei",         "language": "en-US", "description": "English voice"},
+        # Mexican Spanish (the only three Inworld ships for es-MX
+        # on this account). The FE surfaces these with a
+        # `Spanish (Mexico)` label so the operator can find them
+        # when the agent prompt is bilingual or pure Spanish.
+        {"id": "Camila",      "name": "Camila",      "language": "es-MX", "description": "Mexican Spanish voice"},
+        {"id": "Mayte",       "name": "Mayte",       "language": "es-MX", "description": "Mexican Spanish voice"},
+        {"id": "Cuauhtemoc",  "name": "Cuauhtemoc",  "language": "es-MX", "description": "Mexican Spanish voice"},
     ],
 }
 
@@ -1236,22 +1097,41 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 return {"models": _HARDCODED_TTS_VOICES["deepgram"]}
             if provider_id == "inworld":
                 # ponytail: try the live catalog from GET /voices/v1/voices
-                # (account-scoped voices the user has access to). Merge
-                # the result with the hardcoded fallback so the dropdown
-                # always has SOMETHING even if the live fetch fails or
-                # the user has no key saved yet.
+                # (account-scoped voices the user has access to), but
+                # FILTER against the hardcoded _HARDCODED_TTS_VOICES
+                # list. The hardcoded list is the authoritative source
+                # of truth for this deployment — it carries the language
+                # tag the FE uses to label `Spanish (Mexico)` and drops
+                # any voice Inworld returns that we don't know about
+                # (prevents the dropdown from growing with preview
+                # voices or accidental custom uploads the operator
+                # didn't intend to expose).
                 if creds:
                     live = _fetch_inworld_voices(creds)
                     if live:
-                        # Live wins on id collisions (custom voices take
-                        # precedence over generic hardcoded entries).
-                        merged = {v["id"]: v for v in live}
-                        for v in _HARDCODED_TTS_VOICES["inworld"]:
-                            merged.setdefault(v["id"], v)
-                        return {"models": list(merged.values())}
+                        live_by_id = {v["id"]: v for v in live}
+                        merged = []
+                        for catalog_v in _HARDCODED_TTS_VOICES["inworld"]:
+                            live_v = live_by_id.get(catalog_v["id"])
+                            if live_v is None:
+                                # Inworld account doesn't have this
+                                # voice. Skip — keeps the dropdown
+                                # aligned with the curated list.
+                                log.info(
+                                    "[inworld-voices] catalog voice %r "
+                                    "not on account, hiding.",
+                                    catalog_v["id"],
+                                )
+                                continue
+                            # Catalog carries the language tag; live
+                            # carries the most current display name.
+                            # Catalog wins on language (the FE label
+                            # depends on it), live wins on name.
+                            merged.append({**catalog_v, "name": live_v.get("name") or catalog_v["name"]})
+                        return {"models": merged}
                 # No key or fetch failed — fall back to the hardcoded
-                # catalog (200+ voices, enough to populate the dropdown
-                # while the user is uploading their key).
+                # catalog (23 voices, the FE shows them all with the
+                # `language` tag for grouping).
                 return {"models": _HARDCODED_TTS_VOICES["inworld"]}
             return {"models": []}
 
