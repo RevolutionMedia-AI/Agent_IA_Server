@@ -77,6 +77,53 @@ def _build_instructions(session: CallSession) -> str:
     return "\n\n".join(parts)
 
 
+def _build_session_update_payload(session: CallSession) -> str:
+    """Serialize the session.update JSON once. Same payload across
+    every fallback attempt in the connection loop below.
+    """
+    return json.dumps({
+        "type": "session.update",
+        "session": {
+            # ponytail: OpenAI Realtime API GA schema. The fields
+            # that worked in beta no longer all live at the
+            # session root. The current accepted top-level keys
+            # are: type, output_modalities, instructions, audio,
+            # tools, tool_choice, prompt. Anything else returns
+            # invalid_request_error code=unknown_parameter and
+            # closes the socket.
+            #
+            # If OpenAI renames again, the server returns
+            # unknown_parameter in the WS error event with a clear
+            # `param` field — the dispatcher log below captures it.
+            "type": "realtime",
+            "output_modalities": ["text"],
+            "instructions": _build_instructions(session),
+            "audio": {
+                "input": {
+                    # ponytail: OpenAI Realtime GA expects MIME
+                    # types for audio format. Supported values:
+                    # 'audio/pcm' (16-bit linear), 'audio/pcmu'
+                    # (mu-law), 'audio/pcma' (A-law). Twilio Media
+                    # Streams sends mu-law so we want 'audio/pcmu'.
+                    #
+                    # sample_rate is NOT accepted at format.* in
+                    # GA — it would be unknown_parameter. The
+                    # server infers the rate from the type (audio/pcmu
+                    # → 8000 Hz). Don't try to send it explicitly.
+                    "format": {"type": "audio/pcmu"},
+                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                    },
+                },
+            },
+        },
+    })
+
+
 # ── Main entry ───────────────────────────────────────────────────────
 
 async def run_realtime_session(session: CallSession) -> None:
@@ -130,7 +177,24 @@ async def run_realtime_session(session: CallSession) -> None:
             session.session_key, model,
         )
 
-    url = f"{REALTIME_WS_URL}?model={model}"
+    # ponytail: OpenAI has been retiring the `*-preview` Realtime models
+    # without bumping the FE. If a saved agent row points at one that
+    # OpenAI no longer serves, we transparently fall back to `gpt-realtime`
+    # (the GA model). The first attempt uses the picked id; on a 4004
+    # model_not_found we reopen the WS with the fallback and re-send the
+    # session.update. The picked id is preserved in the agent row so a
+    # future OpenAI re-release of the same id will resume using it.
+    _FALLBACK_MODEL = "gpt-realtime"
+    _attempt_chain = [model]
+    if model != _FALLBACK_MODEL and model not in _VALID_REALTIME_MODELS:
+        # Unknown id — fall back immediately instead of round-tripping
+        # an error to OpenAI.
+        _attempt_chain = [_FALLBACK_MODEL]
+    elif model != _FALLBACK_MODEL:
+        # Known id but OpenAI may have retired it. Save the fallback
+        # for after a 4004.
+        _attempt_chain.append(_FALLBACK_MODEL)
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         # ponytail: removed `OpenAI-Beta: realtime=v1`. OpenAI graduated
@@ -143,100 +207,146 @@ async def run_realtime_session(session: CallSession) -> None:
     }
 
     try:
-        try:
-            ws_connect = websockets.connect(
-                url,
-                additional_headers=headers,
-                open_timeout=10,
-                close_timeout=5,
-                max_size=2**24,
-            )
-        except TypeError:
-            ws_connect = websockets.connect(
-                url,
-                extra_headers=headers,
-                open_timeout=10,
-                close_timeout=5,
-                max_size=2**24,
-            )
+        # The session.update payload is identical across attempts — we
+        # just rebuild the WS connection. Build it once outside the loop.
+        _session_update_payload = _build_session_update_payload(session)
 
-        async with ws_connect as ws:
-            log.info(
-                "OpenAI Realtime connected for %s model=%s user_id=%s",
-                session.session_key,
-                model,
-                user_id,
-            )
+        # Run the fallback chain. Each attempt opens a fresh WS,
+        # sends session.update, and either succeeds (we break into
+        # the live event loop) or fails with a 4004 model_not_found
+        # (we close the WS and retry with the next candidate).
+        ws = None
+        ws_cm = None
+        effective_model = None
+        last_rc: int | None = None
+        for attempt_model in _attempt_chain:
+            url = f"{REALTIME_WS_URL}?model={attempt_model}"
+            try:
+                try:
+                    ws_connect = websockets.connect(
+                        url,
+                        additional_headers=headers,
+                        open_timeout=10,
+                        close_timeout=5,
+                        max_size=2**24,
+                    )
+                except TypeError:
+                    ws_connect = websockets.connect(
+                        url,
+                        extra_headers=headers,
+                        open_timeout=10,
+                        close_timeout=5,
+                        max_size=2**24,
+                    )
 
-            # ── Configure session ──
-            await ws.send(json.dumps({
-                "type": "session.update",
-                "session": {
-                    # ponytail: OpenAI Realtime API GA schema. The fields
-                    # that worked in beta no longer all live at the
-                    # session root. The current accepted top-level keys
-                    # are: type, output_modalities, instructions, audio,
-                    # tools, tool_choice, prompt. Anything else returns
-                    # invalid_request_error code=unknown_parameter and
-                    # closes the socket.
-                    #
-                    # Removed in this revision:
-                    #   - temperature              (was session.temperature)
-                    #     Realtime GA controls temperature per-message
-                    #     via the create-response event. The session-level
-                    #     field was removed.
-                    #   - max_response_output_tokens (was session.max_...)
-                    #     Same — set per-response via the create-response
-                    #     event payload, not session config.
-                    #   - input_audio_format / input_audio_transcription /
-                    #     turn_detection (moved under session.audio.input)
-                    #
-                    # If OpenAI renames again, the server returns
-                    # unknown_parameter in the WS error event with a clear
-                    # `param` field — the dispatcher log below captures it.
-                    "type": "realtime",
-                    "output_modalities": ["text"],
-                    "instructions": _build_instructions(session),
-                    "audio": {
-                        "input": {
-                            # ponytail: OpenAI Realtime GA expects MIME
-                            # types for audio format. Supported values:
-                            # 'audio/pcm' (16-bit linear), 'audio/pcmu'
-                            # (mu-law), 'audio/pcma' (A-law). Twilio Media
-                            # Streams sends mu-law so we want 'audio/pcmu'.
-                            #
-                            # sample_rate is NOT accepted at format.* in
-                            # GA — it would be unknown_parameter. The
-                            # server infers the rate from the type (audio/pcmu
-                            # → 8000 Hz). Don't try to send it explicitly.
-                            "format": {"type": "audio/pcmu"},
-                            "transcription": {"model": "whisper-1"},
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 500,
-                            },
-                        },
-                    },
-                },
-            }))
-
-            # Initial greeting injection removed — no assistant message pre-seeded.
-
-            sender_task = asyncio.create_task(_audio_sender(ws, session))
-            watcher_task = asyncio.create_task(_barge_in_watcher(ws, session))
+                ws_cm = ws_connect
+                ws = await ws_cm.__aenter__()
+            except (OSError, Exception) as exc:
+                log.warning(
+                    "[REALTIME] session %s WS open failed for model=%r: %s",
+                    session.session_key, attempt_model, exc,
+                )
+                continue
 
             try:
-                await _event_receiver(ws, session)
-            finally:
-                sender_task.cancel()
-                watcher_task.cancel()
-                for t in (sender_task, watcher_task):
+                await ws.send(_session_update_payload)
+                # ponytail: OpenAI closes the WS synchronously on schema
+                # errors. Drain any pending close frame so we can read
+                # the close code; if it's 4004 (model_not_found) we
+                # retry with the next model.
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    pass  # No error frame yet — assume accepted.
+                except websockets.exceptions.ConnectionClosed as cc:
+                    last_rc = getattr(cc, "rc", None)
+                    if last_rc == 4004 and attempt_model != _attempt_chain[-1]:
+                        log.warning(
+                            "[REALTIME] session %s model=%r returned 4004 "
+                            "(model_not_found). Retrying with fallback %r.",
+                            session.session_key, attempt_model,
+                            _attempt_chain[-1],
+                        )
+                        try:
+                            await ws_cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        ws = None
+                        ws_cm = None
+                        continue
+                    # Non-4004 close — let it propagate.
+                    raise
+                effective_model = attempt_model
+                break
+            except websockets.exceptions.ConnectionClosed as cc:
+                last_rc = getattr(cc, "rc", None)
+                if last_rc == 4004 and attempt_model != _attempt_chain[-1]:
+                    log.warning(
+                        "[REALTIME] session %s model=%r returned 4004 "
+                        "(model_not_found). Retrying with fallback %r.",
+                        session.session_key, attempt_model,
+                        _attempt_chain[-1],
+                    )
                     try:
-                        await t
-                    except asyncio.CancelledError:
+                        await ws_cm.__aexit__(None, None, None)
+                    except Exception:
                         pass
+                    ws = None
+                    ws_cm = None
+                    continue
+                raise
+            except Exception:
+                # Any other failure — close this WS and try next.
+                try:
+                    await ws_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                ws = None
+                ws_cm = None
+                continue
+
+        if ws is None or effective_model is None:
+            log.error(
+                "[REALTIME] session %s all model attempts failed "
+                "(last rc=%s). Giving up.",
+                session.session_key, last_rc,
+            )
+            return
+
+        log.info(
+            "OpenAI Realtime connected for %s model=%s user_id=%s",
+            session.session_key,
+            effective_model,
+            user_id,
+        )
+        # ponytail: surface the effective model in the session dict
+        # so downstream code (latency report, billing) sees what was
+        # actually used after the fallback chain.
+        try:
+            session.stt_model = effective_model
+        except Exception:
+            pass
+
+        # Initial greeting injection removed — no assistant message pre-seeded.
+
+        sender_task = asyncio.create_task(_audio_sender(ws, session))
+        watcher_task = asyncio.create_task(_barge_in_watcher(ws, session))
+
+        try:
+            await _event_receiver(ws, session)
+        finally:
+            sender_task.cancel()
+            watcher_task.cancel()
+            for t in (sender_task, watcher_task):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            try:
+                if ws_cm is not None:
+                    await ws_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
         raise
