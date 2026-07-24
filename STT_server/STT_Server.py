@@ -634,22 +634,37 @@ async def media_stream(ws: WebSocket) -> None:
                     session.llm_temperature = _safe_float(agent_cfg.get('llm_temperature'))
                     session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
                     session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
-                    # ponytail: append a per-TTS-provider hint to the
+                    # ponytail: prepend a per-TTS-provider hint to the
                     # system prompt so the LLM emits the right inline
-                    # non-verbal tags (e.g. Inworld's steering). Without
-                    # this the voice comes out flat. Idempotent: a
-                    # double append on WS reconnect is prevented by the
+                    # non-verbal tags (e.g. Inworld's steering). The
+                    # previous version appended at the end; gpt-4o-mini
+                    # treated end-of-prompt additions as low-priority
+                    # context and rarely emitted the tags — the caller
+                    # heard a flat delivery. Prepending puts the voice
+                    # direction at the top of the system message where
+                    # the LLM pays attention. Idempotent: a double
+                    # prepend on WS reconnect is prevented by the
                     # has_tts_hint() check. Only runs when tts_provider
-                    # is set; the in-memory session.custom_prompt is
-                    # mutated in-place (not persisted to DB).
+                    # is set and the agent has a non-empty custom_prompt;
+                    # the in-memory session.custom_prompt is mutated
+                    # in-place (not persisted to DB).
                     if session.custom_prompt and session.tts_provider:
                         from STT_server.domain.tts_hints import get_tts_hint, has_tts_hint
                         if not has_tts_hint(session.custom_prompt):
                             hint = get_tts_hint(session.tts_provider)
                             if hint:
-                                session.custom_prompt = session.custom_prompt + hint
+                                # NOTE: the order is `hint + custom_prompt`,
+                                # not `custom_prompt + hint`. The hint
+                                # teaches the LLM that the voice
+                                # supports steering and gives a worked
+                                # example; placing it at the top of the
+                                # system message makes the model
+                                # consistently emit the tags. The
+                                # agent's instructions stay in the
+                                # dominant middle position.
+                                session.custom_prompt = hint + session.custom_prompt
                                 log.info(
-                                    "[AGENT] Appended TTS hint to custom_prompt for session %s "
+                                    "[AGENT] Prepended TTS hint to custom_prompt for session %s "
                                     "(provider=%s, hint_len=%d, total_len=%d)",
                                     session.session_key, session.tts_provider,
                                     len(hint), len(session.custom_prompt),

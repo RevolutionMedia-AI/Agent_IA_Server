@@ -175,7 +175,60 @@ async def stream_tts_segment(
     loop = asyncio.get_running_loop()
     ttfb_ms: float | None = None
 
+    # ponytail: re-frame the Inworld audio stream into exact 160-byte
+    # (20ms @ 8kHz mu-law) chunks before pushing to the playback queue.
+    # Inworld streams mu-law directly but the chunk sizes are NOT
+    # 20ms-aligned — the operator's logs show the typical tail chunk
+    # at 158 bytes (= 19.75ms). Twilio's Media Stream pacing assumes
+    # 20ms per frame; emitting 19.75ms throws the timing off by 0.25ms
+    # per chunk and the user hears a subtle click at the end of every
+    # turn. Buffering + re-framing keeps Twilio happy and the audio
+    # sounds clean. Last chunk is padded with 0xFF (mu-law silence)
+    # to round up to 160 bytes.
+    _FRAME_BYTES = 160  # 20 ms @ 8 kHz mu-law
+    _MULAW_SILENCE = b"\xff"  # mu-law zero sample
+
+    def _flush_frame(buf: bytearray) -> None:
+        """Emit `buf` as one or more 160-byte frames, padding the
+        last frame with mu-law silence if needed. The buffered audio
+        may be >= 160 bytes (after several Inworld chunks) or < 160
+        (the final partial chunk at the end of the stream).
+        """
+        while len(buf) >= _FRAME_BYTES:
+            loop.call_soon_threadsafe(
+                emit_item,
+                {"type": "audio", "generation": generation,
+                 "data": bytes(buf[:_FRAME_BYTES])},
+            )
+            del buf[:_FRAME_BYTES]
+        if buf:
+            # Pad the leftover with mu-law silence to a full frame.
+            tail = bytes(buf) + _MULAW_SILENCE * (_FRAME_BYTES - len(buf))
+            loop.call_soon_threadsafe(
+                emit_item,
+                {"type": "audio", "generation": generation, "data": tail},
+            )
+            buf.clear()
+
+    def _feed(audio: bytes, buf: bytearray) -> None:
+        """Append a chunk to the re-framing buffer and emit as many
+        full 160-byte frames as the buffer now contains.
+        """
+        buf.extend(audio)
+        while len(buf) >= _FRAME_BYTES:
+            loop.call_soon_threadsafe(
+                emit_item,
+                {"type": "audio", "generation": generation,
+                 "data": bytes(buf[:_FRAME_BYTES])},
+            )
+            del buf[:_FRAME_BYTES]
+
     def producer() -> None:
+        nonlocal ttfb_ms
+        # Closure-scoped re-framing buffer. Holds the leftover from
+        # the previous Inworld chunk until we have a full 160 bytes
+        # to emit.
+        reframe_buf = bytearray()
         nonlocal ttfb_ms
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
@@ -230,10 +283,10 @@ async def stream_tts_segment(
                             audio_stats["dc"],
                             audio_stats["zc"],
                         )
-                    loop.call_soon_threadsafe(
-                        emit_item,
-                        {"type": "audio", "generation": generation, "data": audio},
-                    )
+                    # Re-frame: append the new bytes to the buffer and
+                    # emit as many full 160-byte frames as we can. The
+                    # leftover stays in the buffer for the next chunk.
+                    _feed(audio, reframe_buf)
         except urllib.error.HTTPError as exc:
             err_body = ""
             try:
@@ -269,6 +322,11 @@ async def stream_tts_segment(
                     }).encode("utf-8")
                     req2 = urllib.request.Request(url, data=fallback_body, headers=headers, method="POST")
                     with urllib.request.urlopen(req2, timeout=45) as resp2:
+                        # ponytail: re-framing also applies to the 404
+                        # fallback path — same Inworld, same 19.75ms
+                        # chunks. Local buffer so the final flush below
+                        # pads the last partial frame to 160 bytes.
+                        fb_buf = bytearray()
                         for raw_line in resp2:
                             line = raw_line.strip() if isinstance(raw_line, bytes) else raw_line.encode().strip()
                             if not line:
@@ -287,10 +345,11 @@ async def stream_tts_segment(
                                 continue
                             if not audio:
                                 continue
-                            loop.call_soon_threadsafe(
-                                emit_item,
-                                {"type": "audio", "generation": generation, "data": audio},
-                            )
+                            _feed(audio, fb_buf)
+                        # Flush whatever the 158-byte tail left in the
+                        # buffer. Critical — without this the last frame
+                        # of the fallback is also 158 bytes.
+                        _flush_frame(fb_buf)
                     return  # success with fallback, skip the error emit
                 except Exception as fb_exc:
                     log.warning(
@@ -308,6 +367,13 @@ async def stream_tts_segment(
                 {"type": "error", "generation": generation, "message": f"Inworld TTS connection error: {exc}"},
             )
         finally:
+            # Flush the re-framing buffer one last time so the
+            # last partial chunk (typically 158 bytes = 19.75ms
+            # from Inworld) becomes a full 160-byte frame padded
+            # with mu-law silence. Without this, the playback loop
+            # would receive a 158-byte frame and Twilio's 20ms
+            # pacing would drift on the very last frame.
+            _flush_frame(reframe_buf)
             loop.call_soon_threadsafe(
                 emit_item,
                 {"type": "segment_end", "generation": generation},
