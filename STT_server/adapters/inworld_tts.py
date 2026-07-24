@@ -240,6 +240,64 @@ async def stream_tts_segment(
                 err_body = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
+            # ponytail: 404 means the voice id doesn't exist on this
+            # Inworld account. Common when an agent row was authored
+            # against a different account, or the user typed a guess
+            # ("Anna") that Inworld doesn't ship. Fall back to Dennis
+            # so the call keeps producing audio; surface a clear
+            # warning so the operator fixes the voice in the agent
+            # config when they notice.
+            if exc.code == 404 and _configured_voice != DEFAULT_VOICE_ID:
+                log.warning(
+                    "[INWORLD_TTS] session=%s voice=%r returned 404. "
+                    "Falling back to %r for this turn. Update the agent's "
+                    "voice_id to a name that exists on this Inworld account.",
+                    getattr(session, "session_key", "?"),
+                    _configured_voice, DEFAULT_VOICE_ID,
+                )
+                try:
+                    fallback_body = json.dumps({
+                        "text": text,
+                        "voiceId": DEFAULT_VOICE_ID,
+                        "modelId": model_id,
+                        "audioConfig": {
+                            "audioEncoding": "MULAW",
+                            "sampleRateHertz": 8000,
+                            "speakingRate": speaking_rate,
+                            "Steering": True,
+                        },
+                    }).encode("utf-8")
+                    req2 = urllib.request.Request(url, data=fallback_body, headers=headers, method="POST")
+                    with urllib.request.urlopen(req2, timeout=45) as resp2:
+                        for raw_line in resp2:
+                            line = raw_line.strip() if isinstance(raw_line, bytes) else raw_line.encode().strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            result = obj.get("result") or {}
+                            b64_audio = result.get("audioContent")
+                            if not b64_audio:
+                                continue
+                            try:
+                                audio = base64.b64decode(b64_audio, validate=False)
+                            except Exception:
+                                continue
+                            if not audio:
+                                continue
+                            loop.call_soon_threadsafe(
+                                emit_item,
+                                {"type": "audio", "generation": generation, "data": audio},
+                            )
+                    return  # success with fallback, skip the error emit
+                except Exception as fb_exc:
+                    log.warning(
+                        "[INWORLD_TTS] session=%s fallback voice=%r also failed: %s",
+                        getattr(session, "session_key", "?"),
+                        DEFAULT_VOICE_ID, fb_exc,
+                    )
             loop.call_soon_threadsafe(
                 emit_item,
                 {"type": "error", "generation": generation, "message": f"Inworld TTS error {exc.code}: {err_body}"},
