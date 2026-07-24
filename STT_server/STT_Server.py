@@ -669,6 +669,24 @@ async def media_stream(ws: WebSocket) -> None:
                                     session.session_key, session.tts_provider,
                                     len(hint), len(session.custom_prompt),
                                 )
+                                # ponytail: dump the first 200 chars of the
+                                # final custom_prompt so the operator can
+                                # confirm in production that the hint is
+                                # at the top of the system message (not
+                                # buried after 10KB of Tessa's prompt).
+                                # The "gesture vocabulary" line is the
+                                # canonical marker; if you grep the
+                                # session init log and don't see it in
+                                # the first 200 chars, the prepend
+                                # didn't run (likely tts_provider !=
+                                # 'inworld' or has_tts_hint() detected a
+                                # double-prepend).
+                                log.info(
+                                    "[AGENT] custom_prompt HEAD session=%s len=%d preview=%r",
+                                    session.session_key,
+                                    len(session.custom_prompt),
+                                    session.custom_prompt[:200],
+                                )
                     log.info("[AGENT] session %s stt=%s model=%s llm=%s/%s T=%.2f MT=%s tts=%s/%s voice=%s speed=%.2f",
                              session.session_key,
                              session.stt_provider or '-', session.stt_model or '-',

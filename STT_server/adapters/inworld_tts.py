@@ -165,6 +165,20 @@ async def stream_tts_segment(
             "Steering": True,
         },
     }).encode("utf-8")
+    # ponytail: one-shot INFO log of the request body so the operator
+    # can confirm Steering: True is actually being sent. If the LLM
+    # is generating "(sighs)" / "(pause)" / etc. in its reply but
+    # Inworld is not applying them, the body log will show
+    # `"Steering": true` — the bug then is on Inworld's side, not ours.
+    log.info(
+        "[INWORLD_TTS] request session=%s gen=%s text_len=%d voice=%r model=%r body=%s",
+        getattr(session, "session_key", "?"),
+        generation,
+        len(text),
+        voice_id,
+        model_id,
+        body.decode("utf-8"),
+    )
 
     url = "https://api.inworld.ai/tts/v1/voice:stream"
     headers = {

@@ -296,6 +296,18 @@ def _anthropic_stream_sync(
                 on_first_segment()
                 emit_segment(seg)
         emit_done(full_reply.strip())
+        # ponytail: log the LLM's full reply so the operator can
+        # confirm the steering tags are actually being emitted.
+        # If you see "(sighs)" / "(pause)" / etc. in this log,
+        # the LLM is generating tags and the TTS should render
+        # them. If you see plain prose, the prepend didn't work
+        # or the model isn't following the hint.
+        log.info(
+            "[LLM] anthropic reply session=%s len=%d preview=%r",
+            session.session_key,
+            len(full_reply),
+            full_reply[:300],
+        )
         return full_reply.strip(), None
     except Exception as exc:
         log.exception("[LLM] anthropic stream error")
@@ -473,6 +485,17 @@ def build_messages(session: CallSession, user_text: str) -> list[dict]:
             f"and redeploy."
         )
     log.info("[LLM] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
+    # ponytail: detect whether the TTS steering hint is at the top of
+    # the system message. If you see "False" in this log, the prepend
+    # in STT_Server.py didn't run and the LLM will produce flat
+    # prose without steering tags.
+    _hint_marker = "[TTS Steering"
+    log.info(
+        "[LLM] custom_prompt HEAD session=%s tts_hint_present=%s preview=%r",
+        session.session_key,
+        _hint_marker in custom_prompt,
+        custom_prompt[:160],
+    )
     messages = [
         {"role": "system", "content": custom_prompt.strip()},
     ]
@@ -676,6 +699,18 @@ def stream_llm_reply_sync(
                 parsed_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
             return full_reply.strip(), None, parsed_calls
 
+        # ponytail: log the LLM's full reply so the operator can
+        # confirm the steering tags are actually being emitted.
+        # Same as the anthropic path: "(sighs)" / "(pause)" etc.
+        # in this log means the LLM is generating tags and the
+        # TTS should render them. Plain prose means the prepend
+        # didn't work or the model isn't following the hint.
+        log.info(
+            "[LLM] openai reply session=%s len=%d preview=%r",
+            session.session_key,
+            len(full_reply),
+            full_reply[:300],
+        )
         return full_reply.strip(), None, None
     except Exception as exc:
         log.exception("LLM STREAM ERROR")
