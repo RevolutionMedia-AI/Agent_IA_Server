@@ -249,21 +249,66 @@ async def run_realtime_session(session: CallSession) -> None:
                 continue
 
             try:
-                await ws.send(_session_update_payload)
                 # ponytail: OpenAI closes the WS synchronously on schema
-                # errors. Drain any pending close frame so we can read
-                # the close code; if it's 4004 (model_not_found) we
-                # retry with the next model.
+                # errors (rc=4004 model_not_found, rc=4001 unsupported
+                # protocol, etc). The close code surfaces on the next
+                # `send()` or `recv()`. We use a single broad except
+                # (Exception) and inspect the connection state via
+                # the protocol's close reason — this is more reliable
+                # than relying on the exception class hierarchy across
+                # websockets versions.
+                try:
+                    await asyncio.wait_for(
+                        ws.send(_session_update_payload),
+                        timeout=5.0,
+                    )
+                except Exception as send_exc:
+                    # Try to read the close code off the connection.
+                    last_rc = None
+                    try:
+                        proto = getattr(ws, "protocol", None) or getattr(ws, "writer", None)
+                        if proto is not None:
+                            # websockets >= 10: ws.protocol.close_code
+                            # websockets <  10: ws.close_code
+                            last_rc = getattr(proto, "close_code", None)
+                            if last_rc is None:
+                                last_rc = getattr(ws, "close_code", None)
+                    except Exception:
+                        pass
+                    # Fallback: re-raise's rc attr.
+                    if last_rc is None:
+                        last_rc = getattr(send_exc, "rc", None)
+                    log.warning(
+                        "[REALTIME] session %s send to model=%r failed "
+                        "(rc=%s, exc=%s). %s",
+                        session.session_key, attempt_model, last_rc,
+                        type(send_exc).__name__,
+                        "Retrying with fallback."
+                        if last_rc == 4004 and attempt_model != _attempt_chain[-1]
+                        else "Propagating."
+                    )
+                    try:
+                        await ws_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    ws = None
+                    ws_cm = None
+                    if last_rc == 4004 and attempt_model != _attempt_chain[-1]:
+                        continue  # try the fallback model
+                    raise  # non-4004 — let the outer except handle it
+                # Give the server a beat to send any error frame so we
+                # can detect a 4004 that arrives AFTER the session.update
+                # is accepted (rare but seen).
                 try:
                     await asyncio.wait_for(ws.recv(), timeout=0.2)
                 except asyncio.TimeoutError:
                     pass  # No error frame yet — assume accepted.
                 except websockets.exceptions.ConnectionClosed as cc:
-                    last_rc = getattr(cc, "rc", None)
-                    if last_rc == 4004 and attempt_model != _attempt_chain[-1]:
+                    rc = getattr(cc, "rc", None)
+                    if rc == 4004 and attempt_model != _attempt_chain[-1]:
                         log.warning(
-                            "[REALTIME] session %s model=%r returned 4004 "
-                            "(model_not_found). Retrying with fallback %r.",
+                            "[REALTIME] session %s model=%r post-send 4004. "
+                            "Retrying with fallback %r.",
                             session.session_key, attempt_model,
                             _attempt_chain[-1],
                         )
@@ -274,29 +319,13 @@ async def run_realtime_session(session: CallSession) -> None:
                         ws = None
                         ws_cm = None
                         continue
-                    # Non-4004 close — let it propagate.
                     raise
                 effective_model = attempt_model
                 break
-            except websockets.exceptions.ConnectionClosed as cc:
-                last_rc = getattr(cc, "rc", None)
-                if last_rc == 4004 and attempt_model != _attempt_chain[-1]:
-                    log.warning(
-                        "[REALTIME] session %s model=%r returned 4004 "
-                        "(model_not_found). Retrying with fallback %r.",
-                        session.session_key, attempt_model,
-                        _attempt_chain[-1],
-                    )
-                    try:
-                        await ws_cm.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                    ws = None
-                    ws_cm = None
-                    continue
-                raise
             except Exception:
-                # Any other failure — close this WS and try next.
+                # Any other failure during send/receive — close this WS
+                # and try next. The outer loop will give up after the
+                # fallback also fails.
                 try:
                     await ws_cm.__aexit__(None, None, None)
                 except Exception:
