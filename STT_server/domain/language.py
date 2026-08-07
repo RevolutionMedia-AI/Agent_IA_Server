@@ -503,9 +503,17 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
 
     while remainder:
         cut_index: int | None = None
-        # First segment uses a lower threshold for faster TTFT
+        # ponytail: previous defaults were min_punct=5/15 and
+        # max_chars=200/200. A typical 194-char reply was being cut
+        # into 3 segments because every ".!?" past the 15-char prefix
+        # triggered a cut — each segment became a sequential Inworld
+        # TTS round-trip (~700ms each, ~2.1s total per turn). The new
+        # thresholds let the segmenter wait until ~80 chars of real
+        # sentence before cutting, so most customer-service replies
+        # (< 280 chars) ship as a single TTS call. Inworld handles
+        # 400-char inputs without breaking a sweat.
         is_first = len(segments) == 0
-        min_punct = 5 if is_first else 15
+        min_punct = 30 if is_first else 60
         max_chars = STREAMING_FIRST_SEGMENT_CHARS if is_first else STREAMING_SEGMENT_MAX_CHARS
 
         for index, char in enumerate(remainder):

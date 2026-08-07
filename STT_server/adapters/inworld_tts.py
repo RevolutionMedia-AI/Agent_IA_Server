@@ -138,31 +138,42 @@ async def stream_tts_segment(
     )
 
     # ponytail: per-agent speed override (006_agent_runtime_params.sql).
-    # Inworld accepts `speakingRate` in audioConfig (0.5..2.0). The schema
-    # CHECK constraint in the migration mirrors that range, but the
-    # adapter clamps as a second line of defense in case a future code
-    # path writes a bad value (e.g. defaults reset).
+    # Inworld accepts `speakingRate` in audioConfig (0.5..1.5 per the
+    # official doc; we clamp to 1.5 here so a future code path that
+    # writes 1.8 doesn't silently degrade the audio).
     _speed = getattr(session, "tts_speed", None)
-    speaking_rate = max(0.5, min(2.0, _speed if _speed is not None else 1.0))
-    # ponytail: Steering=True tells Inworld to react to inline
-    # non-verbal tags in the text (laughs, sighs, whispers, etc.)
-    # that the LLM emits. Without this, the voice comes out flat and
-    # robotic — the user explicitly asked for this. The LLM is
-    # told to use these tags via the per-provider hint block appended
-    # to `session.custom_prompt` in STT_Server.py (see
-    # STT_server/domain/tts_hints.py for the tag vocabulary).
-    # Default for Inworld is reportedly True on most models, but
-    # we set it explicitly so the behavior is consistent across
-    # model versions and so a future FE flag can override it.
+    speaking_rate = max(0.5, min(1.5, _speed if _speed is not None else 1.0))
+    # ponytail: Steering is only honored by inworld-tts-2 (full
+    # support). On 1.5-mini / 1.5-max the tags are silently ignored
+    # or rendered inconsistently, so we gate the flag to tts-2. The
+    # agent's per-provider TTS hint (STT_server/domain/tts_hints.py)
+    # matches this — the LLM is told to only emit square-bracket
+    # tags ([laugh], [sigh]) and to expect them to work only on
+    # tts-2.
+    steering_enabled = model_id == "inworld-tts-2"
+    # ponytail: the previous body only had audioConfig. Inworld's
+    # TTS also accepts top-level fields:
+    # - language (BCP-47) → drives pronunciation normalization for
+    #   numbers / dates / order IDs. Default 'es' matches the agent
+    #   prompt's expected locale.
+    # - applyTextNormalization=ON → Inworld expands "order 451086"
+    #   into speakable words instead of letter-by-letter.
+    # - enhanceGeneration=true → server-side denoise pass before
+    #   returning audio. Marginal (~5-10ms) but cleaner output for
+    #   the telephone codec.
+    language_code = (getattr(session, "preferred_language", None) or "es").strip().lower()
     body = json.dumps({
         "text": text,
         "voiceId": voice_id,
         "modelId": model_id,
+        "language": language_code,
+        "applyTextNormalization": "ON",
+        "enhanceGeneration": True,
         "audioConfig": {
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
             "speakingRate": speaking_rate,
-            "Steering": True,
+            "Steering": steering_enabled,
         },
     }).encode("utf-8")
     # ponytail: one-shot INFO log of the request body so the operator
@@ -327,11 +338,14 @@ async def stream_tts_segment(
                         "text": text,
                         "voiceId": DEFAULT_VOICE_ID,
                         "modelId": model_id,
+                        "language": language_code,
+                        "applyTextNormalization": "ON",
+                        "enhanceGeneration": True,
                         "audioConfig": {
                             "audioEncoding": "MULAW",
                             "sampleRateHertz": 8000,
                             "speakingRate": speaking_rate,
-                            "Steering": True,
+                            "Steering": steering_enabled,
                         },
                     }).encode("utf-8")
                     req2 = urllib.request.Request(url, data=fallback_body, headers=headers, method="POST")
@@ -410,18 +424,21 @@ def fetch_preview(
     wraps them via tts_preview._wrap_mulaw_as_wav_pcm16 so the FE
     <audio> element can decode them).
     """
-    # Steering: True mirrors the streaming path so the preview FE
-    # button (in ModalNewAgent) is representative of the live
-    # call. Without it, the preview sounds neutral and the user
-    # thinks the steering is broken in production.
+    # Steering is only honored by inworld-tts-2 — gate the flag so
+    # the preview doesn't lie about what production does on
+    # 1.5-mini / 1.5-max.
+    _model_id_for_preview = model_id or DEFAULT_MODEL_ID
+    _steering_for_preview = _model_id_for_preview == "inworld-tts-2"
     body = json.dumps({
         "text": text,
         "voiceId": voice_id or DEFAULT_VOICE_ID,
-        "modelId": model_id or DEFAULT_MODEL_ID,
+        "modelId": _model_id_for_preview,
+        "applyTextNormalization": "ON",
+        "enhanceGeneration": True,
         "audioConfig": {
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
-            "Steering": True,
+            "Steering": _steering_for_preview,
         },
     }).encode("utf-8")
     req = urllib.request.Request(

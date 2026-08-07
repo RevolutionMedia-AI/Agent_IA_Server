@@ -69,8 +69,14 @@ TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "16"))
 UTTERANCE_QUEUE_MAXSIZE = int(os.getenv("UTTERANCE_QUEUE_MAXSIZE", "256"))
 
 # Streaming segmentation (LLM token-stream → TTS chunk boundaries).
-STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "200"))
-STREAMING_FIRST_SEGMENT_CHARS = int(os.getenv("STREAMING_FIRST_SEGMENT_CHARS", "200"))
+# ponytail: previous defaults (200) plus the old min_punct (5/15) cut a
+# typical 194-char reply into 3 segments → 3 sequential Inworld TTS
+# round-trips → ~2.1s of pure overhead per turn. Bumping these to 400
+# (and the min_punct in pop_streaming_segments to 30/60) lets most
+# customer-service replies ship as one TTS call. Inworld handles
+# 400-char inputs fine. Override with the env var if needed.
+STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "400"))
+STREAMING_FIRST_SEGMENT_CHARS = int(os.getenv("STREAMING_FIRST_SEGMENT_CHARS", "400"))
 PARTIAL_TRANSCRIPT_START_CHARS = int(os.getenv("PARTIAL_TRANSCRIPT_START_CHARS", "20"))
 PARTIAL_TRANSCRIPT_DEBOUNCE_MS = int(os.getenv("PARTIAL_TRANSCRIPT_DEBOUNCE_MS", "200"))
 FINAL_RESTART_DELTA_CHARS = int(os.getenv("FINAL_RESTART_DELTA_CHARS", "12"))

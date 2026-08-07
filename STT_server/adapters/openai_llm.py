@@ -709,7 +709,7 @@ def stream_llm_reply_sync(
 
         # ponytail: log the LLM's full reply so the operator can
         # confirm the steering tags are actually being emitted.
-        # Same as the anthropic path: "(sighs)" / "(pause)" etc.
+        # Same as the anthropic path: "[sighs]" / "[pause]" etc.
         # in this log means the LLM is generating tags and the
         # TTS should render them. Plain prose means the prepend
         # didn't work or the model isn't following the hint.
@@ -719,9 +719,23 @@ def stream_llm_reply_sync(
             len(full_reply),
             full_reply[:300],
         )
+        # ponytail: emit_done(None) is the sentinel that ends the
+        # segmenting loop in play_tts_from_text_queue. The Anthropic
+        # path emits it (line 298); the Gemini path emits it (line 458);
+        # the openai/minimax path WAS NOT, which left the consumer
+        # blocked forever after the last segment — so reply_task
+        # never completed and every subsequent launch_reply_pipeline
+        # silent-returned at line 784 of turn_manager.py. The hang
+        # after 3 turns was this exact bug.
+        emit_done(full_reply.strip())
         return full_reply.strip(), None, None
     except Exception as exc:
         log.exception("LLM STREAM ERROR")
+        # ponytail: same bug as above on the error path. If the
+        # LLM crashes mid-stream the consumer still needs the None
+        # sentinel to wake up and play the failure TTS, otherwise
+        # the call hangs on silence until Twilio cuts the stream.
+        emit_done(full_reply.strip())
         return full_reply.strip(), str(exc), None
 
 
