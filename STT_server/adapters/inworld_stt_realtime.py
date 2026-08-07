@@ -33,9 +33,22 @@ from STT_server.services.credentials_resolver import resolve_provider
 
 log = logging.getLogger("stt_server")
 
-INWORLD_WS_URL = "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"
+INWORLD_WS_URL = (
+    "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"
+    "?inactivityTimeoutSeconds=300"
+)
 INWORLD_STT_SAMPLE_RATE = 16000  # raw PCM requires >=8000; 16k matches the doc default
 INWORLD_DEFAULT_MODEL = "inworld/inworld-stt-1"
+# ponytail: ceiling on how long we'll wait for the FIRST transcript
+# after the WS connects. The "result envelope" bug went undetected for
+# the entire call because nothing logged the silence. This watchdog
+# closes the WS after STT_INACTIVITY_TIMEOUT_S seconds without
+# receiving any transcript, which triggers the existing reconnect
+# loop and (after MAX_ATTEMPTS) the announce_stt_failure_once TTS
+# fallback. Only active while received_any_result is False — once
+# we have at least one transcript, normal silence (caller thinking)
+# is allowed and the watchdog stays out of the way.
+STT_INACTIVITY_TIMEOUT_S = 25
 
 
 def _mulaw_8k_to_pcm16_16k(mulaw: bytes) -> bytes:
@@ -170,6 +183,39 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                     session.session_key, model_id, language,
                 )
 
+                # ponytail: inactivity watchdog. Inworld may have
+                # accepted the WS but never send anything back
+                # (the "result envelope" bug had this exact shape:
+                # WS connected, no transcripts ever). Without this,
+                # the receive loop waits forever and the operator
+                # only finds out from "Stream stop" minutes later.
+                # Only active until the FIRST transcript arrives —
+                # after that we trust the normal silence pattern.
+                async def _inactivity_watchdog() -> None:
+                    try:
+                        await asyncio.sleep(STT_INACTIVITY_TIMEOUT_S)
+                        if not received_any_result and not session.closed:
+                            log.warning(
+                                "[INWORLD_STT] no transcripts in %ss for %s "
+                                "(model=%s lang=%s) — closing WS to trigger "
+                                "reconnect / announce_stt_failure_once",
+                                STT_INACTIVITY_TIMEOUT_S,
+                                session.session_key, model_id, language,
+                            )
+                            await ws.close(
+                                code=1000,
+                                reason="inactivity-timeout-no-transcripts",
+                            )
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        log.exception(
+                            "[INWORLD_STT] watchdog error in %s",
+                            session.session_key,
+                        )
+
+                watchdog_task = asyncio.create_task(_inactivity_watchdog())
+
                 while not session.closed:
                     try:
                         raw = await ws.recv()
@@ -209,6 +255,13 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                         is_final = bool(p.get("isFinal"))
                         if text:
                             received_any_result = True
+                            # ponytail: cancel the inactivity watchdog
+                            # the moment the first transcript lands.
+                            # From here on, normal silences (caller
+                            # thinking) are allowed and the WS sits
+                            # idle on purpose.
+                            if not watchdog_task.done():
+                                watchdog_task.cancel()
                             attempt = 0
                             await on_transcript({
                                 "text": text,
@@ -264,6 +317,12 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                         except asyncio.CancelledError:
                             pass
                         sender_task = None
+                    if not watchdog_task.done():
+                        watchdog_task.cancel()
+                        try:
+                            await watchdog_task
+                        except asyncio.CancelledError:
+                            pass
                     log.info(
                         "[INWORLD_STT] dropped without results for %s, retrying",
                         session.session_key,
@@ -281,6 +340,12 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
         except Exception:
             log.exception("[INWORLD_STT] error in %s", session.session_key)
         finally:
+            if not watchdog_task.done():
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
             if sender_task is not None:
                 sender_task.cancel()
                 try:

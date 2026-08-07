@@ -704,6 +704,15 @@ async def media_stream(ws: WebSocket) -> None:
                     session.agent_tools = _load_agent_tools(session.agent_id)
                     if session.agent_tools:
                         log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
+                # ponytail: helper that closes over `session` so the
+                # caller can `await _enqueue_transcript(item)` instead
+                # of `await lambda item: enqueue_transcript_event(session, item)`.
+                # The async-def makes it self-documenting (the IDE flags
+                # missing await) and survives a refactor that drops the
+                # outer `await` — the previous lambda silently lost the
+                # transcript in that case.
+                async def _enqueue_transcript(item: dict) -> None:
+                    await enqueue_transcript_event(session, item)
                 if session.stt_provider in ('openai_realtime', 'openai'):
                     # ponytail: 'openai' is the user-facing name in the
                     # FE dropdown (matches the OpenAI STT option the FE
@@ -729,7 +738,7 @@ async def media_stream(ws: WebSocket) -> None:
                         asyncio.create_task(
                             run_inworld_realtime_stt(
                                 session,
-                                lambda item: enqueue_transcript_event(session, item),
+                                _enqueue_transcript,
                                 announce_stt_failure_once,
                             )
                         ),
@@ -741,7 +750,7 @@ async def media_stream(ws: WebSocket) -> None:
                         asyncio.create_task(
                             run_deepgram_realtime_stt(
                                 session,
-                                lambda item: enqueue_transcript_event(session, item),
+                                _enqueue_transcript,
                                 announce_stt_failure_once,
                             )
                         ),
@@ -753,7 +762,7 @@ async def media_stream(ws: WebSocket) -> None:
                         asyncio.create_task(
                             run_assemblyai_realtime_stt(
                                 session,
-                                lambda item: enqueue_transcript_event(session, item),
+                                _enqueue_transcript,
                                 announce_stt_failure_once,
                             )
                         ),
