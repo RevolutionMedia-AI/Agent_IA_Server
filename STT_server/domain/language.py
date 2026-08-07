@@ -451,10 +451,27 @@ def looks_like_incomplete_utterance(text: str) -> bool:
     return False
 
 
-def split_tts_segments(text: str, max_chars: int = 300) -> list[str]:
+def split_tts_segments(text: str, max_chars: int = 300, short_text_threshold: int = 220) -> list[str]:
+    """Split a reply into segments safe to send to TTS one at a time.
+
+    ponytail: the previous version split on every `.!?` followed by a
+    space, which turned a typical 169-char 3-sentence reply into 4
+    TTS requests — each round-trip adds its own connect/auth/first-
+    chunk latency, so the caller heard the agent pause mid-sentence
+    for no real reason. The early-exit below sends any reply that
+    fits in `short_text_threshold` as ONE TTS request. Inworld TTS
+    handles up to ~10k chars per call, so the cap isn't a concern for
+    normal replies. The split-on-punctuation path stays for the long
+    ones where one TTS call would be too slow to stream.
+    """
     stripped = text.strip()
     if not stripped:
         return []
+
+    # ponytail: short replies go in one TTS call — no per-segment
+    # round-trip latency. Most customer-service turns land here.
+    if len(stripped) <= short_text_threshold:
+        return [stripped]
 
     segments: list[str] = []
     current: list[str] = []

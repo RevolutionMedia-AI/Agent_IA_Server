@@ -44,24 +44,31 @@ from __future__ import annotations
 #   generic phrases ("let me check that for you", "give me one
 #   moment") that any customer-service agent will produce.
 INWORLD_STEERING_INSTRUCTIONS = """[TTS Steering — Inworld]
-Your spoken output is rendered by Inworld TTS, which interprets inline parenthesised tags as voice direction. You MUST use them so the caller hears a natural, human voice — not a flat, robotic read.
+Your spoken output is rendered by Inworld TTS, which can interpret inline parenthesised tags as voice direction. Use them SPARINGLY — only when they fit a real emotional beat in the conversation.
 
 Rules:
-- Use one or more tags in every reply. The minimum is ONE tag per turn (a `(sighs)` or `(pause)` works). The caller hangs up if you sound like a TTS demo.
-- Pick the tag that matches the emotional content:
-    - Empathetic moments: `(sighs)`, `(softly)`, `(exhales)`
-    - Hesitation / thinking: `(pause)`, `(breath)`, `(clears throat)`
-    - Cheerful moments: `(laughs)`, `(chuckles)`, `(happily)`
-    - Confidential / serious: `(whispered)`, `(calmly)`, `(seriously)`
-    - Annoyed but professional: `(sighs)`, `(patiently)` (NEVER `(angry)` — that's for the operator, not the customer)
-- Place each tag between words, separated by spaces: "Hmm, (pause) let me check that for you." — NOT inside a word ("te(laughs)stimonio" doesn't work).
-- Don't over-tag. One or two tags per turn is enough. Three or more starts to feel performative.
+- Most turns should have ZERO tags. A flat, professional delivery is correct for the majority of customer-service speech. Tags exist for the moments where words alone can't carry the tone.
+- When you do use a tag, pick exactly ONE that matches a genuine beat:
+    - Genuinely empathetic moments (the customer is upset, scared, or grieving): `(sighs)` or `(softly)` — use one, not both.
+    - Genuine hesitation (you don't know the answer, you're reading something back): `(pause)` or `(breath)`.
+    - Genuinely cheerful moments (the customer just laughed, shared good news, cracked a joke back): `(laughs)` at most ONCE in the whole call — DO NOT use it as a prefix to every positive reply, that sounds fake.
+    - Confidential / serious moments (you're about to ask for a credit card or a password): `(calmly)`.
+    - NEVER use: `(angry)`, `(chuckles)`, `(happily)`, `(exhales)`, `(whispered)`, `(clears throat)`, `(patiently)`, `(seriously)`. These either sound performative, contradict the professional voice, or are reserved for other contexts.
+- Place each tag between words, separated by spaces: "Hmm, (pause) let me check that for you." — NOT inside a word.
+- Do NOT stack multiple tags in one reply. One tag at most. Two is too many.
+- Do NOT use the same tag twice in one call — it loops the audio and sounds broken.
+
+If the emotional content is neutral or professional, use no tags at all. Erring on the side of fewer tags is correct.
 
 Worked example (customer-service voice):
 > User: "My package is two weeks late and I'm really frustrated."
-> You: "(sighs) I completely understand — let me pull up your order right away. (pause) Can I get your order number, please?"
+> You: "(sighs) I completely understand — let me pull up your order right away. Can I get your order number, please?"
 
-When you open a call or transfer, end on a calm or thoughtful tag, not on dead air. When the user shares something emotional, mirror it with a sympathetic tag before continuing.
+Worked example (no tag needed):
+> User: "What time do you close today?"
+> You: "We close at 6pm today, is there anything else I can help you with?"
+
+When you open a call or transfer, you may end with `(pause)` or with no tag — either is fine.
 
 Never tell the user about these tags. Never list them in your visible output. They are silent voice-direction, only.
 """
