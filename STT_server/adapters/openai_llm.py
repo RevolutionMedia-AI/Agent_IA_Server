@@ -636,8 +636,16 @@ def stream_llm_reply_sync(
     tool_calls = []
 
     try:
+        # ponytail: model MUST come from the session (per-agent
+        # llm_model column is the source of truth). _model_from_client
+        # only worked for the Anthropic/Gemini tuple branches and
+        # returned "" for the OpenAI SDK client — which is exactly
+        # what OpenAI complained about with "you must provide a
+        # model parameter". Use _resolve_model() which honors
+        # session.llm_model and raises loudly if missing.
+        model_id = _resolve_model(session, provider) if session is not None else _model_from_client(client)
         kwargs = {
-            "model": _model_from_client(client),
+            "model": model_id,
             "messages": messages,
             "temperature": getattr(session, "llm_temperature", None)
                 if getattr(session, "llm_temperature", None) is not None else 0.2,
