@@ -1014,19 +1014,38 @@ def _fetch_deepgram_models(api_key: str) -> list[dict]:
     return keep
 
 
-def list_provider_models(service: str, provider_id: str, api_key: str | None = None) -> dict:
+def list_provider_models(service: str, provider_id: str, api_key: str | None = None,
+                          user_id: str | None = None) -> dict:
     """Returns the catalog of models/voices for a provider+service.
 
-    If `api_key` is None, falls back to the user's stored credential for
-    the provider. The hardcoded catalogs don't require a key. Live
-    fetchers will raise if no key is available, so the caller must
-    pass one explicitly.
+    Credential resolution order:
+      1. `api_key` passed by the FE (the user's inline value from the
+         modal's API-key input, if any).
+      2. The user's per-user stored credential, decrypted from
+         tools_integrations using `user_id` (the auth context from the
+         route). This is the key the operator typed in Settings → API
+         for this account.
+      3. The system env-var fallback for the provider.
+
+    The docstring previously claimed `api_key=None` falls back to the
+    user's stored credential, but the implementation only fell back to
+    env-var (`resolve_provider(None, ...)`). That meant the Edit modal's
+    catalog lookup used the deployer's key (lower plan, fewer voices)
+    instead of the operator's saved key — exactly the regression that
+    hid Bruno, Marie, etc. from the dropdown. Now the per-user
+    credential is the second fallback.
 
     Returns:
         {"models": [{"id": "...", "name": "...", "description": "..."}, ...]}
         or {"models": [], "error": "..."} on failure.
     """
     creds = api_key
+    if not creds and user_id:
+        try:
+            from STT_server.services.credentials_resolver import resolve_provider as _rp
+            creds = _rp(user_id, provider_id).get("api_key")
+        except Exception:
+            creds = None
     if not creds:
         try:
             from STT_server.services.credentials_resolver import resolve_provider as _rp

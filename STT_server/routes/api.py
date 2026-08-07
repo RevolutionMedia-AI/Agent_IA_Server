@@ -1249,8 +1249,15 @@ async def list_models(body: ListModelsRequest, auth: dict = Depends(require_auth
     if get_provider_spec(body.provider) is None:
         raise HTTPException(status_code=404, detail=f"Unknown provider '{body.provider}'")
     import asyncio as _aio
+    # ponytail: pass the authenticated user_id so list_provider_models
+    # can resolve the per-user stored credential from tools_integrations
+    # before falling back to the system env-var. Without this the Edit
+    # modal's catalog lookup uses the deployer's key (often a lower
+    # plan with fewer voices) instead of the operator's saved key.
     result = await _aio.to_thread(
-        list_provider_models, body.service, body.provider, body.api_key
+        list_provider_models,
+        body.service, body.provider, body.api_key,
+        auth.get("user_id"),
     )
     return result
 
