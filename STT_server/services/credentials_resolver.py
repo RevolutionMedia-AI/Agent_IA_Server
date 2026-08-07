@@ -867,27 +867,77 @@ def _fetch_rime_voices() -> list[dict]:
 def _fetch_inworld_voices(api_key: str) -> list[dict]:
     """GET https://api.inworld.ai/voices/v1/voices — Inworld's public
     voice list endpoint. Auth is Basic with the user's Inworld key.
-    Returns the user's accessible voices (account-scoped). Falls back
-    to the hardcoded catalog on network / auth failure.
+    Returns the user's accessible voices (account-scoped) with the
+    metadata the FE surfaces in the agent modal:
+      id, name, description, displayName,
+      gender (male|female|neutral|''),
+      languageCode (BCP-47, e.g. "en-US") and langCode (legacy enum
+        like "EN_US"),
+      categories (e.g. ["companions", "enterprise"]),
+      tags, source (SYSTEM|IVC|PVC), ageGroup.
+    Walks every page so the curated hardcoded catalog gets a complete
+    view (the unpaginated call is capped at 2000; realistic accounts
+    never hit that, but the loop is cheap).
+    Falls back to the hardcoded catalog on network / auth failure.
     """
     import urllib.error
     import urllib.request
+    base = "https://api.inworld.ai/voices/v1/voices"
+    headers = {"Authorization": f"Basic {api_key}"}
+    keep: list[dict] = []
+    seen: set[str] = set()
     try:
-        req = urllib.request.Request(
-            "https://api.inworld.ai/voices/v1/voices?pageSize=100",
-            headers={"Authorization": f"Basic {api_key}"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            payload = __import__("json").loads(resp.read().decode("utf-8"))
-        keep = []
-        for v in payload.get("voices", []) or []:
-            vid = v.get("voiceId") or v.get("id", "")
-            if vid:
+        page_token = ""
+        # ponytail: pagination loop. Hard cap at 50 pages × 100 = 5000
+        # voices (well above Inworld's 2000 ceiling). Bail out when the
+        # response carries an empty nextPageToken.
+        for _ in range(50):
+            url = base + ("?pageSize=100" if not page_token else f"?pageSize=100&pageToken={page_token}")
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            for v in payload.get("voices", []) or []:
+                vid = v.get("voiceId") or v.get("id", "")
+                if not vid or vid in seen:
+                    continue
+                seen.add(vid)
+                # ponytail: languageCode is the canonical wire form
+                # (BCP-47 like "en-US"). langCode is Inworld's legacy
+                # enum (upper-snake like "EN_US"). We forward both so
+                # the FE can prefer whichever matches its format.
+                language_code = v.get("languageCode") or ""
+                if not language_code:
+                    legacy = v.get("langCode") or ""
+                    # Convert "EN_US" → "en-US" so the FE label is
+                    # consistent with what the live catalog returns
+                    # for non-legacy entries.
+                    if "_" in legacy:
+                        try:
+                            lang, region = legacy.split("_", 1)
+                            language_code = f"{lang.lower()}-{region.upper()}"
+                        except Exception:
+                            language_code = legacy
                 keep.append({
                     "id": vid,
                     "name": v.get("displayName") or v.get("name") or vid,
+                    "displayName": v.get("displayName") or v.get("name") or vid,
                     "description": v.get("description", "Inworld voice"),
+                    "gender": v.get("gender", "") or "",
+                    "languageCode": language_code,
+                    "langCode": v.get("langCode", "") or "",
+                    "categories": list(v.get("categories") or []),
+                    "tags": list(v.get("tags") or []),
+                    "source": v.get("source", "") or "",
+                    "ageGroup": v.get("ageGroup", "") or "",
+                    # ponytail: promptLanguages carries the locales the
+                    # voice can synthesise (may differ from languageCode
+                    # for multilingual voices). Forward it so the FE can
+                    # show "multilingual: en-US, es-MX" if it wants.
+                    "promptLanguages": list(v.get("promptLanguages") or []),
                 })
+            page_token = payload.get("nextPageToken") or ""
+            if not page_token:
+                break
         return keep
     except Exception as exc:
         log.info("[inworld-voices] fetch failed: %s", _sanitize_error(str(exc))[:200])
@@ -1123,15 +1173,35 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                                     catalog_v["id"],
                                 )
                                 continue
-                            # Catalog carries the language tag; live
-                            # carries the most current display name.
-                            # Catalog wins on language (the FE label
-                            # depends on it), live wins on name.
-                            merged.append({**catalog_v, "name": live_v.get("name") or catalog_v["name"]})
+                            # ponytail: merge the catalog (curated
+                            # `language`) with the live entry (rich
+                            # metadata: gender, languageCode, categories,
+                            # tags, displayName, source, ageGroup,
+                            # promptLanguages). Order of precedence:
+                            #   - live wins on every metadata field
+                            #     EXCEPT `language` (the catalog is the
+                            #     curated value the FE label depends on).
+                            #   - if the catalog has no `language` for
+                            #     this voice, fall back to live's
+                            #     `languageCode`.
+                            #   - live's `description` wins when present
+                            #     (Inworld's blurb is more useful than
+                            #     the generic "English voice" fallback).
+                            merged_entry = {**catalog_v, **live_v}
+                            merged_entry["name"] = (
+                                live_v.get("name") or catalog_v["name"]
+                            )
+                            if not merged_entry.get("language"):
+                                merged_entry["language"] = (
+                                    live_v.get("languageCode") or ""
+                                )
+                            merged.append(merged_entry)
                         return {"models": merged}
                 # No key or fetch failed — fall back to the hardcoded
                 # catalog (23 voices, the FE shows them all with the
-                # `language` tag for grouping).
+                # `language` tag for grouping). The FE degrades
+                # gracefully when gender/categories are missing —
+                # chips just don't render.
                 return {"models": _HARDCODED_TTS_VOICES["inworld"]}
             return {"models": []}
 
