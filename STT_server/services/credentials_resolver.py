@@ -1146,62 +1146,41 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_TTS_VOICES["deepgram"]}
             if provider_id == "inworld":
-                # ponytail: try the live catalog from GET /voices/v1/voices
-                # (account-scoped voices the user has access to), but
-                # FILTER against the hardcoded _HARDCODED_TTS_VOICES
-                # list. The hardcoded list is the authoritative source
-                # of truth for this deployment — it carries the language
-                # tag the FE uses to label `Spanish (Mexico)` and drops
-                # any voice Inworld returns that we don't know about
-                # (prevents the dropdown from growing with preview
-                # voices or accidental custom uploads the operator
-                # didn't intend to expose).
+                # ponytail: return the FULL Inworld catalog from
+                # GET /voices/v1/voices (~269 SYSTEM voices + any
+                # IVC / PVC clones on the account). The previous
+                # implementation filtered against a hardcoded 23-voice
+                # curated subset — that hid Bruno, Marie, Alistair,
+                # and every other persona the operator asked for.
+                # The hardcoded list is still useful as a last-resort
+                # fallback when no API key is available and the live
+                # fetch fails.
                 if creds:
                     live = _fetch_inworld_voices(creds)
                     if live:
-                        live_by_id = {v["id"]: v for v in live}
-                        merged = []
-                        for catalog_v in _HARDCODED_TTS_VOICES["inworld"]:
-                            live_v = live_by_id.get(catalog_v["id"])
-                            if live_v is None:
-                                # Inworld account doesn't have this
-                                # voice. Skip — keeps the dropdown
-                                # aligned with the curated list.
-                                log.info(
-                                    "[inworld-voices] catalog voice %r "
-                                    "not on account, hiding.",
-                                    catalog_v["id"],
-                                )
-                                continue
-                            # ponytail: merge the catalog (curated
-                            # `language`) with the live entry (rich
-                            # metadata: gender, languageCode, categories,
-                            # tags, displayName, source, ageGroup,
-                            # promptLanguages). Order of precedence:
-                            #   - live wins on every metadata field
-                            #     EXCEPT `language` (the catalog is the
-                            #     curated value the FE label depends on).
-                            #   - if the catalog has no `language` for
-                            #     this voice, fall back to live's
-                            #     `languageCode`.
-                            #   - live's `description` wins when present
-                            #     (Inworld's blurb is more useful than
-                            #     the generic "English voice" fallback).
-                            merged_entry = {**catalog_v, **live_v}
-                            merged_entry["name"] = (
-                                live_v.get("name") or catalog_v["name"]
-                            )
-                            if not merged_entry.get("language"):
-                                merged_entry["language"] = (
-                                    live_v.get("languageCode") or ""
-                                )
-                            merged.append(merged_entry)
-                        return {"models": merged}
-                # No key or fetch failed — fall back to the hardcoded
-                # catalog (23 voices, the FE shows them all with the
-                # `language` tag for grouping). The FE degrades
-                # gracefully when gender/categories are missing —
-                # chips just don't render.
+                        # Build a lookup from the curated catalog so a
+                        # voice that's also in the hardcoded list
+                        # inherits the curated `language` label
+                        # (e.g. the FE used to render 'Spanish
+                        # (Mexico)' instead of the bare 'es-MX').
+                        catalog_by_id = {
+                            v["id"]: v for v in _HARDCODED_TTS_VOICES["inworld"]
+                        }
+                        for voice in live:
+                            catalog_v = catalog_by_id.get(voice["id"])
+                            if catalog_v and catalog_v.get("language"):
+                                # ponytail: the catalog wins on
+                                # `language` only — every other field
+                                # (gender, ageGroup, categories,
+                                # description, languageCode) comes from
+                                # Inworld live, which is the
+                                # authoritative source.
+                                voice["language"] = catalog_v["language"]
+                        return {"models": live}
+                # No key or fetch failed — fall back to the curated
+                # 23-voice catalog so the dropdown is never empty
+                # (the FE degrades gracefully when gender / categories
+                # are missing — chips just don't render).
                 return {"models": _HARDCODED_TTS_VOICES["inworld"]}
             return {"models": []}
 
