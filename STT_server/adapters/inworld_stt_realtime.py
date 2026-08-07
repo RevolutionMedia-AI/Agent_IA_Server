@@ -121,6 +121,20 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
     """
     api_key = _resolve_api_key(session)
     if not api_key:
+        # ponytail: previously this was a silent return, which left
+        # process_transcripts blocked on an empty queue forever and
+        # the operator saw only the initial greeting followed by
+        # silence. Surface the missing key + escalate via on_failure
+        # so the TTS fallback ("no te escuche bien") plays.
+        log.error(
+            "[INWORLD_STT] session=%s: no Inworld api_key resolved "
+            "(user_id=%s agent_id=%s). Subir la key en Settings -> API "
+            "o cambiar stt_provider en el agente.",
+            getattr(session, "session_key", "?"),
+            getattr(session, "user_id", None),
+            getattr(session, "agent_id", None),
+        )
+        await on_failure(session)
         return
 
     model_id = _resolve_model(session)
@@ -175,8 +189,22 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                     except json.JSONDecodeError:
                         continue
 
-                    if "transcription" in msg:
-                        p = msg["transcription"] or {}
+                    # ponytail: Inworld envuelve TODAS las respuestas
+                    # bajo una clave top-level "result":
+                    #   {"result": {"transcription": {...}}}
+                    #   {"result": {"speechStarted": {...}}}
+                    #   {"result": {"usage": {...}}}
+                    # Sin desenvolver el envelope, "transcription"
+                    # nunca esta en `msg` y todos los transcripts se
+                    # descartaban silenciosamente. Si la respuesta
+                    # viene sin envolver (caso raro), caemos al
+                    # fallback top-level para mantener compatibilidad.
+                    payload = msg.get("result") if isinstance(msg, dict) and "result" in msg else msg
+                    if not isinstance(payload, dict):
+                        payload = msg
+
+                    if "transcription" in payload:
+                        p = payload["transcription"] or {}
                         text = (p.get("transcript") or "").strip()
                         is_final = bool(p.get("isFinal"))
                         if text:
@@ -195,7 +223,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                             })
                         continue
 
-                    if "speechStarted" in msg or "speechStopped" in msg:
+                    if "speechStarted" in payload or "speechStopped" in payload:
                         # ponytail: VAD events for barge-in. The TurnManager
                         # does its own barge-in via session-level VAD
                         # (audio_ingest.py), so we accept and ignore these
@@ -203,16 +231,27 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                         # off speechStarted if caller needs server-side VAD.
                         continue
 
-                    if "usage" in msg:
+                    if "usage" in payload:
                         # Per docs: "Coming soon" - not populated yet.
                         continue
 
-                    if "error" in msg:
+                    if "error" in msg or "error" in payload:
+                        err = (msg.get("error") if isinstance(msg, dict) else None) \
+                              or (payload.get("error") if isinstance(payload, dict) else None)
                         log.error(
                             "[INWORLD_STT] WS error in %s: %s",
-                            session.session_key, msg["error"],
+                            session.session_key, err,
                         )
                         break
+
+                    # ponytail: caer aqui significa que Inworld envio
+                    # un mensaje con una forma que no reconocemos. Sin
+                    # este log, el siguiente bug de contrato seria
+                    # invisible (igual que paso con el envelope "result").
+                    log.debug(
+                        "[INWORLD_STT] unrecognised message in %s: %s",
+                        session.session_key, msg,
+                    )
 
                 if session.closed:
                     return
