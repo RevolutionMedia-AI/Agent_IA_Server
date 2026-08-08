@@ -534,6 +534,35 @@ def build_messages(session: CallSession, user_text: str) -> list[dict]:
             }
         )
 
+    # ponytail: anti-loop genérico. gpt-4o-mini a temperature baja
+    # tiende a imitar literalmente los diálogos de ejemplo que el
+    # custom_prompt del agente pueda contener. Cuando el caller
+    # responde "sí, adelante" después de un intro, el modelo produce
+    # el mismo intro en vez de avanzar la conversación. Este system
+    # message cita el último reply del asistente y le prohíbe
+    # repetirlo — el LLM sigue el system prompt (prepended) más
+    # que el ejemplo embebido (background).
+    n_assistant = sum(1 for e in session.history if e["role"] == "assistant")
+    if n_assistant >= 1:
+        last_assistant = next(
+            (e["content"] for e in reversed(session.history) if e["role"] == "assistant"),
+            "",
+        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "CRITICAL ANTI-LOOP: You have already spoken in this call. "
+                "Read the conversation history before responding. "
+                "NEVER repeat the same opening greeting, self-introduction, "
+                "or permission request if the user has already responded. "
+                "If the user just said 'yes' / 'go ahead' / 'adelante' / 'si' / "
+                "'ok', MOVE DIRECTLY to the next question or action — do NOT "
+                "re-introduce yourself, re-disclose call recording, or "
+                "re-ask permission to proceed. Your previous reply was:\n\n"
+                f"\"{last_assistant[:400]}\""
+            ),
+        })
+
     messages.extend(session.history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_text})
     return messages

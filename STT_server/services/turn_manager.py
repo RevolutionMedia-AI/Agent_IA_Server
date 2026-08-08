@@ -723,6 +723,36 @@ async def handle_agent_reply(
     else:
         reply, llm_ms, tts_metrics, llm_error = await stream_llm_reply_with_tts(session, user_text, generation)
 
+    # ponytail: anti-loop safety net. The system message in
+    # build_messages usually stops the LLM from repeating itself,
+    # but gpt-4o-mini at low temperature can still ignore it when
+    # the custom_prompt has scripted dialogues. If the LLM returns
+    # byte-identical text to the previous turn, the caller just
+    # heard the same audio — we'd be entering a loop. Replace the
+    # reply with a short fallback so the user gets a chance to
+    # re-state instead of the same audio twice.
+    if reply and not llm_error and not prepared_reply:
+        last_assistant_reply = next(
+            (e["content"].strip() for e in reversed(session.history)
+             if e["role"] == "assistant"),
+            "",
+        )
+        if last_assistant_reply and reply.strip() == last_assistant_reply:
+            log.warning(
+                "[ANTI-LOOP] LLM returned identical reply to last turn in %s gen=%s — aborting with fallback.",
+                session.session_key, generation,
+            )
+            reply = (
+                "Perdona, parece que me repetí. ¿Me dices en qué puedo ayudarte?"
+            )
+            try:
+                fb_metric = await run_tts_with_retries(session, reply, generation)
+                tts_metrics.append(fb_metric)
+            except Exception:
+                log.exception(
+                    "[ANTI-LOOP] TTS fallback failed in %s", session.session_key,
+                )
+
     if generation != session.active_generation or not reply:
         return
 
