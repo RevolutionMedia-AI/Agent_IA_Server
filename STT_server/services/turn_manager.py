@@ -300,7 +300,12 @@ async def _stream_llm_with_tools(
             log.info("[TTS] Sanitized streaming LLM segment for %s: %.120r -> %.120r", session.session_key, segment[:120], safe_seg[:120])
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, safe_seg, "text_segment_queue")
 
-    def emit_done() -> None:
+    def emit_done(_unused: str | None = None) -> None:
+        # ponytail: accept (and ignore) an optional arg so callers
+        # like openai_llm.stream_llm_reply_sync can pass the full
+        # reply string without TypeError. The arg is meaningless here
+        # — the only thing this closure does is enqueue the None
+        # sentinel that ends the play_tts_from_text_queue loop.
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, None, "text_segment_queue")
 
     llm_started = time.perf_counter()
