@@ -158,9 +158,12 @@ async def stream_tts_segment(
     #   prompt's expected locale.
     # - applyTextNormalization=ON → Inworld expands "order 451086"
     #   into speakable words instead of letter-by-letter.
-    # - enhanceGeneration=true → server-side denoise pass before
-    #   returning audio. Marginal (~5-10ms) but cleaner output for
-    #   the telephone codec.
+    # - enhanceGeneration=false → server-side denoise pass disabled.
+    #   Was producing "puff" artifacts and occasional word clipping on
+    #   the streaming chunks for inworld-tts-2 in Spanish — the
+    #   post-process inserts synthetic breath between words and
+    #   sometimes cuts phonemes. Re-enable per-voice if a specific
+    #   voice profile benefits from it.
     language_code = (getattr(session, "preferred_language", None) or "es").strip().lower()
     body = json.dumps({
         "text": text,
@@ -168,7 +171,7 @@ async def stream_tts_segment(
         "modelId": model_id,
         "language": language_code,
         "applyTextNormalization": "ON",
-        "enhanceGeneration": True,
+        "enhanceGeneration": False,
         "audioConfig": {
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
@@ -340,7 +343,7 @@ async def stream_tts_segment(
                         "modelId": model_id,
                         "language": language_code,
                         "applyTextNormalization": "ON",
-                        "enhanceGeneration": True,
+                        "enhanceGeneration": False,
                         "audioConfig": {
                             "audioEncoding": "MULAW",
                             "sampleRateHertz": 8000,
@@ -434,7 +437,7 @@ def fetch_preview(
         "voiceId": voice_id or DEFAULT_VOICE_ID,
         "modelId": _model_id_for_preview,
         "applyTextNormalization": "ON",
-        "enhanceGeneration": True,
+        "enhanceGeneration": False,
         "audioConfig": {
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
