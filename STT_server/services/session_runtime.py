@@ -44,8 +44,14 @@ def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]
     return (None, None)
 
 
-def _load_agent_tools(agent_id: str | None) -> list[dict]:
-    """Load tools for an agent from agent_tools.json."""
+def _load_agent_tools(agent_id: str | None, user_id: str | None = None) -> list[dict]:
+    """Load tools for an agent from agent_tools.json.
+
+    ponytail: includes "shared" tools too — tools stored with
+    agent_id="__shared__" and a matching user_id are loaded as
+    if they belonged to the agent. Per-user scope: a user can only
+    attach their own shared tools to their agents.
+    """
     if not agent_id:
         return []
     tools_file = os.path.join(
@@ -58,7 +64,15 @@ def _load_agent_tools(agent_id: str | None) -> list[dict]:
             all_tools = json.load(f) or []
     except (FileNotFoundError, json.JSONDecodeError, IOError):
         return []
-    return [t for t in all_tools if isinstance(t, dict) and t.get("agent_id") == agent_id]
+    out = [t for t in all_tools if isinstance(t, dict) and t.get("agent_id") == agent_id]
+    if user_id:
+        out.extend(
+            t for t in all_tools
+            if isinstance(t, dict)
+            and t.get("agent_id") == "__shared__"
+            and t.get("user_id") == user_id
+        )
+    return out
 
 
 def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:

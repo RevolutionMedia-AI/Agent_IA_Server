@@ -701,7 +701,11 @@ async def media_stream(ws: WebSocket) -> None:
                                  session.session_key, session.user_id)
                     # Load agent tools for function calling
                     from STT_server.services.session_runtime import _load_agent_tools
-                    session.agent_tools = _load_agent_tools(session.agent_id)
+                    # ponytail: pass user_id so shared tools owned by
+                    # this user are also loaded (the marketplace
+                    # pattern: shared tools live with agent_id=
+                    # "__shared__" in the same JSON file).
+                    session.agent_tools = _load_agent_tools(session.agent_id, session.user_id)
                     if session.agent_tools:
                         log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
                 # ponytail: helper that closes over `session` so the
