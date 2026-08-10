@@ -42,7 +42,7 @@ from STT_server.domain.language import (
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
-from STT_server.services.tool_executor import execute_tool
+from STT_server.services.tool_executor import execute_tool, record_tool_result
 
 
 log = logging.getLogger("stt_server")
@@ -374,6 +374,10 @@ async def _stream_llm_with_tools(
                     try:
                         tool_result = await execute_tool(webhook_url, tool_args, tool_name)
                         log.info("[Tools] Tool '%s' result: %s", tool_name, str(tool_result)[:200])
+                        # ponytail: per-tool observability. Best-effort —
+                        # the helper swallows I/O errors so the live
+                        # call is never broken by a stats write failure.
+                        record_tool_result(tool_def.get("id"), True, "invocation")
                         # Add tool result to session history for context
                         tool_result_text = json.dumps(tool_result) if isinstance(tool_result, dict) else str(tool_result)
                         session.history.append({
@@ -382,6 +386,7 @@ async def _stream_llm_with_tools(
                         })
                     except Exception as exc:
                         log.error("[Tools] Tool '%s' execution failed: %s", tool_name, exc)
+                        record_tool_result(tool_def.get("id"), False, "invocation")
                         session.history.append({
                             "role": "tool",
                             "content": f"Tool '{tool_name}' error: {str(exc)}",

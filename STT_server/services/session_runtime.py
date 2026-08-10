@@ -26,6 +26,11 @@ _AGENTS_FILE = os.path.join(
     "data",
     "agents.json",
 )
+_TOOLS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "data",
+    "agent_tools.json",
+)
 
 
 def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]:
@@ -54,13 +59,8 @@ def _load_agent_tools(agent_id: str | None, user_id: str | None = None) -> list[
     """
     if not agent_id:
         return []
-    tools_file = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "data",
-        "agent_tools.json",
-    )
     try:
-        with open(tools_file, "r", encoding="utf-8") as f:
+        with open(_TOOLS_FILE, "r", encoding="utf-8") as f:
             all_tools = json.load(f) or []
     except (FileNotFoundError, json.JSONDecodeError, IOError):
         return []

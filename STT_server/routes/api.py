@@ -675,14 +675,16 @@ async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(requ
     tool = next((t for t in tools if t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]), None)
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
-    from STT_server.services.tool_executor import execute_tool, ToolExecutionError
+    from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
     try:
         sample_args = {}
         for param_name in tool.get("parameters", {}).get("required", []):
             sample_args[param_name] = f"sample_{param_name}"
         result = await execute_tool(tool["webhook_url"], sample_args, tool["name"])
+        record_tool_result(tool["id"], True, "test")
         return {"success": True, "result": result}
     except ToolExecutionError as exc:
+        record_tool_result(tool["id"], False, "test")
         return {"success": False, "error": str(exc)}
 
 
@@ -780,14 +782,16 @@ async def test_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
                 None)
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
-    from STT_server.services.tool_executor import execute_tool, ToolExecutionError
+    from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
     try:
         sample_args = {}
         for param_name in tool.get("parameters", {}).get("required", []):
             sample_args[param_name] = f"sample_{param_name}"
         result = await execute_tool(tool["webhook_url"], sample_args, tool["name"])
+        record_tool_result(tool["id"], True, "test")
         return {"success": True, "result": result}
     except ToolExecutionError as exc:
+        record_tool_result(tool["id"], False, "test")
         return {"success": False, "error": str(exc)}
 
 

@@ -27,6 +27,11 @@ class AgentTool:
         id: Optional[str] = None,
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
+        last_tested_at: Optional[str] = None,
+        last_test_result: Optional[str] = None,
+        last_invoked_at: Optional[str] = None,
+        last_invocation_status: Optional[str] = None,
+        invocation_count: int = 0,
     ):
         self.id = id or str(uuid.uuid4())
         self.agent_id = agent_id
@@ -41,6 +46,14 @@ class AgentTool:
         }
         self.created_at = created_at or self._now_iso()
         self.updated_at = updated_at or self._now_iso()
+        # ponytail: per-tool observability. None = never recorded;
+        # counter defaults to 0 so legacy rows from before the field
+        # existed behave like a fresh tool.
+        self.last_tested_at = last_tested_at
+        self.last_test_result = last_test_result
+        self.last_invoked_at = last_invoked_at
+        self.last_invocation_status = last_invocation_status
+        self.invocation_count = int(invocation_count or 0)
 
     @staticmethod
     def _now_iso() -> str:
@@ -57,6 +70,11 @@ class AgentTool:
             "parameters": self.parameters,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "last_tested_at": self.last_tested_at,
+            "last_test_result": self.last_test_result,
+            "last_invoked_at": self.last_invoked_at,
+            "last_invocation_status": self.last_invocation_status,
+            "invocation_count": self.invocation_count,
         }
 
     def to_openai_function(self) -> dict:
@@ -82,6 +100,11 @@ class AgentTool:
             parameters=data.get("parameters"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
+            last_tested_at=data.get("last_tested_at"),
+            last_test_result=data.get("last_test_result"),
+            last_invoked_at=data.get("last_invoked_at"),
+            last_invocation_status=data.get("last_invocation_status"),
+            invocation_count=data.get("invocation_count", 0),
         )
 
     def update(self, **kwargs) -> None:
