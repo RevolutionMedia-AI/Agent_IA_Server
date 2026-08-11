@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse, Response

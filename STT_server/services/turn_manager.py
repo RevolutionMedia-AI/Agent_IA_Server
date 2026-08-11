@@ -23,7 +23,6 @@ from STT_server.config import (
     TEXT_SEGMENT_QUEUE_MAXSIZE,
     TTS_MAX_RETRIES,
     TTS_RETRY_BACKOFF_MS,
-    TTS_TIMEOUT_SEC,
 )
 from STT_server.domain.language import (
     detect_language,

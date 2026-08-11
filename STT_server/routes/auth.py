@@ -15,9 +15,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Header, Body
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
 
 # Import the storage shim. This rebinds load_users/save_users/etc
 # to the JSON or Postgres implementation based on DATABASE_URL.

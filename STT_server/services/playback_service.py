@@ -17,11 +17,10 @@ from STT_server.config import (
 from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.wait_signals import wait_stream_ready
-from STT_server.services._instrumentation import StageTimer, Stages
+from STT_server.services._instrumentation import Stages
 from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.common import drain_queue_nowait, enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.utils.safe_path import UnsafePathError, sanitize_id
-import os
 # RNNoise removed: playback sends mu-law frames directly to Twilio.
 
 
