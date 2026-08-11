@@ -17,19 +17,26 @@ def track_twilio_sequence(session, event) -> None:
     """Parse sequenceNumber/timestamp from a Twilio `media` event and update
     session-attached counters (gaps, dupes, reorders, jitter). Shape-agnostic
     across `media.chunk` vs `media.payload` — these fields live on the envelope."""
+    # ponytail: hotfix for production crash — initialize ALL counters at the
+    # start of every call so the log.warning on the gap branch can read
+    # _twilio_seq_dupes / _twilio_seq_reorders without AttributeError when
+    # the very first anomaly observed is a gap. Without this, the gap
+    # branch would raise before the f-string finished rendering.
+    _seq_state(session, "_twilio_seq_dupes", 0)
+    _seq_state(session, "_twilio_seq_reorders", 0)
+    _seq_state(session, "_twilio_seq_gaps", 0)
+    _seq_state(session, "_twilio_first_seq", -1)
+
     seq = int(event.get("sequenceNumber", -1) or -1)
     prev = _seq_state(session, "_twilio_last_seq", -1)
     if seq >= 0:
         if prev >= 0:
             if seq == prev:
-                _seq_state(session, "_twilio_seq_dupes", 0)
                 session._twilio_seq_dupes += 1
             elif seq < prev:
-                _seq_state(session, "_twilio_seq_reorders", 0)
                 session._twilio_seq_reorders += 1
             elif seq > prev + 1:
                 gap = seq - prev - 1
-                _seq_state(session, "_twilio_seq_gaps", 0)
                 session._twilio_seq_gaps += gap
                 log.warning(
                     "[SEQ_GAP] session=%s stream=%s prev=%s got=%s missing=%d (running gaps=%d dupes=%d reorders=%d)",
