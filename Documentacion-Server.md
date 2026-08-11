@@ -256,7 +256,6 @@ Durante la reproduccion del asistente (`assistant_speaking=True`), los chunks de
 | Idioma | `language.*` | Deteccion de idioma, analisis linguistico, segmentacion TTS, extraccion de datos |
 | Runtime de sesion | `session_runtime.*` | Registro, limpieza, tracking de tareas y monitoreo de inactividad |
 | Utilidades | `common.*` | Proteccion de endpoints, operaciones de cola con drop policy |
-| Email | `utils/send_audio_email.py` | Envio de audio por email via SMTP (utilidad auxiliar) |
 
 ## Relacion con frontend y base de datos
 
@@ -326,8 +325,7 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
     ├── static/
     │   └── greeting.wav
     └── utils/
-        └── send_audio_email.py
-```
+        ```
 
 ## Responsabilidad de cada carpeta o modulo
 
@@ -354,8 +352,7 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 | `STT_server/domain/session.py` | Dataclass `CallSession` con todo el estado por llamada |
 | `STT_server/services/` | Orquestacion de audio, reproduccion, turnos y sesiones |
 | `STT_server/static/` | Archivos estaticos servidos via `/static` (saludo pregrabado) |
-| `STT_server/utils/` | Utilidades auxiliares (envio de email) |
-| `ConvertLocalSTT/` | Scripts auxiliares de transcripcion local (heredado) |
+| `STT_server/utils/` | Utilidades auxiliares (path safety, credenciales, providers) |
 | `scripts/` | Scripts de diagnostico, analisis de audio, testing y depuracion |
 
 ## Archivos principales
@@ -1207,7 +1204,6 @@ Se recomiendan al menos las siguientes validaciones:
 - anuncio de fallo de STT al usuario en su idioma;
 - soporte Docker con Dockerfile y start.sh;
 - servicio de archivos estaticos;
-- utilidad de envio de audio por email;
 - scripts de diagnostico y analisis de audio;
 - arquitectura modular: adapters, domain, services, utils.
 
