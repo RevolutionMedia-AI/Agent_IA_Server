@@ -2,10 +2,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 numpy
-librosa
-soundfile
 webrtcvad
-faster-whisper
 openai
 twilio
 websockets
