@@ -118,24 +118,6 @@ def _hash_password(pwd: str) -> str:
 _session_cache = {}  # token -> {"entry": {...}, "expires_at": datetime}
 
 
-def _cache_get(token: str):
-    cached = _session_cache.get(token)
-    if not cached:
-        return None
-    if cached["expires_at"] < datetime.now(timezone.utc):
-        _session_cache.pop(token, None)
-        return None
-    return cached["entry"]
-
-
-def _cache_put(token: str, entry: dict) -> None:
-    try:
-        expires_at = _parse_expires_at(entry["expires_at"])
-    except (ValueError, KeyError):
-        return
-    _session_cache[token] = {"entry": entry, "expires_at": expires_at}
-
-
 def _parse_expires_at(raw) -> datetime:
     """Parse a stored expires_at value, tolerating both offset-aware and
     naive ISO strings. Sessions written before the auth refactor don't
@@ -968,15 +950,6 @@ def list_numbers_alias(auth: dict = Depends(require_auth)):
 @api_router.post("/numbers")
 def create_number_alias(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
     return create_phone_number(data, auth)
-
-
-def _format_phone_number(country: str, digits: str) -> str:
-    d = digits.strip()
-    if country == "+52":
-        return f"+52 {d[:2]} {d[2:6]} {d[6:]}" if len(d) >= 10 else f"+52 {d}"
-    if country == "+1":
-        return f"+1 {d[:3]} {d[3:6]} {d[6:]}" if len(d) >= 10 else f"+1 {d}"
-    return f"{country}{d}"
 
 
 # ---------- /settings ----------
