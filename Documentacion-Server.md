@@ -474,7 +474,7 @@ Los datos extraidos se almacenan en `session.collected_data` y se inyectan en el
 
 | Restriccion | Descripcion |
 | --- | --- |
-| Umbral minimo de utterance | El audio debe superar `MIN_UTTERANCE_MS` (180 ms) y `MIN_SPEECH_FRAMES` (5) |
+| Umbral minimo de utterance | El audio debe superar `SPEECH_START_FRAMES` (1 frame) y `END_SILENCE_FRAMES` (14 frames) |
 | Formato de salida | El TTS se convierte a mu-law a 8 kHz para compatibilidad con Twilio |
 | Idiomas normalizados | Solo se aceptan `en` y `es` como idiomas operativos |
 | Estado efimero | Al reiniciar el proceso se pierde todo el estado de llamadas |
@@ -660,7 +660,6 @@ Cuando se detecta barge-in:
 
 ## Validaciones importantes
 
-- se ignoran utterances demasiado cortas (< `MIN_UTTERANCE_MS`);
 - se filtran utterances no accionables (saludos, fillers, pronombres aislados);
 - se detectan y descartan alucinaciones STT y ecos del TTS;
 - se descartan duplicados exactos de transcripciones previas;
@@ -907,13 +906,10 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 | Variable | Default actual | Proposito |
 | --- | --- | --- |
 | `WEBRTC_VAD_MODE` | `1` | Agresividad del VAD (0=menos agresivo, 3=mas agresivo) |
-| `MIN_UTTERANCE_MS` | `180` | Duracion minima aceptada para una utterance |
-| `MIN_SPEECH_FRAMES` | `5` | Frames minimos de voz |
 | `END_SILENCE_FRAMES` | `14` | Frames de silencio para cierre de turno (280 ms) |
 | `SPEECH_START_FRAMES` | `1` | Frames requeridos para detectar inicio |
 | `MIN_BARGE_IN_FRAMES` | `12` | Frames minimos para interrupcion |
 | `PRE_SPEECH_FRAMES` | `5` | Frames previos retenidos |
-| `TRIM_TRAILING_SILENCE_FRAMES` | `6` | Recorte final de silencio |
 | `MIN_VOICE_RMS` | `260` | Umbral RMS minimo de voz |
 | `BARGE_IN_MIN_RMS` | `900` | Umbral RMS minimo promedio para barge-in |
 | `ENABLE_BARGE_IN` | `true` | Activa interrupcion del asistente |

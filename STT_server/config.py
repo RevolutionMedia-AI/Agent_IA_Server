@@ -138,13 +138,10 @@ RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
 DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "elevenlabs").strip().lower()
 
 # VAD / barge-in / pre-speech buffer tunables (audio_ingest).
-MIN_UTTERANCE_MS = int(os.getenv("MIN_UTTERANCE_MS", "180"))
-MIN_SPEECH_FRAMES = int(os.getenv("MIN_SPEECH_FRAMES", "5"))
 END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "14"))
 SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "1"))
 MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "12"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
-TRIM_TRAILING_SILENCE_FRAMES = int(os.getenv("TRIM_TRAILING_SILENCE_FRAMES", "6"))
 MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
 BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "900"))
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
