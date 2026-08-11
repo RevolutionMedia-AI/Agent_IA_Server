@@ -250,7 +250,7 @@ Durante la reproduccion del asistente (`assistant_speaking=True`), los chunks de
 | Turn Manager | `turn_manager.process_transcripts()` | Coordina prefetch, gracia, filtrado, ecos y pipeline de respuesta |
 | LLM | `openai_llm.call_llm()` / `stream_llm_reply_sync()` | Genera respuesta con streaming y contexto enriquecido |
 | Rime TTS | `rime_tts.stream_tts_segment()` | Sintesis via WebSocket con conversion PCM→mu-law |
-| Deepgram TTS | `deepgram_tts.stream_tts_segment()` | Sintesis via HTTP con mu-law nativo |
+| Deepgram TTS | `tts_dispatcher._stream_deepgram()` (inline) | Sintesis via HTTP con mu-law nativo (inline en dispatcher; sin archivo adapter) |
 | Playback | `playback_service.playback_loop()` | Emite audio fragmentado con pacing y marcas a Twilio |
 | Sesion | `session.CallSession` | Aisla el estado de una llamada |
 | Idioma | `language.*` | Deteccion de idioma, analisis linguistico, segmentacion TTS, extraccion de datos |
@@ -310,7 +310,6 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
     ├── adapters/
     │   ├── deepgram_stt_batch.py
     │   ├── deepgram_stt_realtime.py
-    │   ├── deepgram_tts.py
     │   ├── openai_llm.py
     │   ├── openai_realtime.py
     │   ├── rime_tts.py
@@ -349,7 +348,6 @@ No existe frontend ni base de datos. Toda la comunicacion del sistema ocurre ent
 | `STT_server/adapters/deepgram_stt_realtime.py` | STT realtime con sistema de candidatos y reconexion |
 | `STT_server/adapters/deepgram_stt_batch.py` | STT batch via HTTP con reintentos |
 | `STT_server/adapters/rime_tts.py` | TTS via WebSocket con conversion PCM→mu-law y resampleo |
-| `STT_server/adapters/deepgram_tts.py` | TTS via HTTP con mu-law nativo |
 | `STT_server/adapters/twilio_media.py` | Helpers para enviar media, marks y clear a Twilio |
 | `STT_server/domain/` | Modelo de datos (`CallSession`) y logica de dominio |
 | `STT_server/domain/language.py` | System prompt, deteccion de idioma, segmentacion TTS, extraccion de datos |
@@ -896,9 +894,6 @@ Las rutas expuestas no tienen proteccion aplicativa. La seguridad depende princi
 
 | Variable | Default actual | Proposito |
 | --- | --- | --- |
-| `DEEPGRAM_TTS_ENCODING` | `mulaw` | Encoding del audio saliente |
-| `DEEPGRAM_TTS_SAMPLE_RATE` | `8000` | Sample rate del TTS |
-
 ## Variables de idioma y saludo
 
 | Variable | Default actual | Proposito |
