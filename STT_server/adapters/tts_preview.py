@@ -11,7 +11,6 @@ from __future__ import annotations
 import io
 import logging
 import wave
-import asyncio
 import json
 import urllib.parse
 import urllib.request
@@ -21,6 +20,7 @@ import numpy as np
 
 from STT_server.domain.session import CallSession
 from STT_server.services.credentials_resolver import resolve_provider, test_provider
+from STT_server.services.thread_pool import to_thread as _to_thread
 
 log = logging.getLogger("stt_server.tts_preview")
 
@@ -111,7 +111,7 @@ async def preview_tts(
                 return resp.read()
 
         try:
-            pcm_bytes = await asyncio.to_thread(_oai_fetch)
+            pcm_bytes = await _to_thread(_oai_fetch)
         except Exception as exc:
             log.warning("[tts_preview] provider=openai fetch failed: %s", exc)
             raise
@@ -146,7 +146,7 @@ async def preview_tts(
                 return resp.read()
 
         try:
-            raw = await asyncio.to_thread(_dg_fetch)
+            raw = await _to_thread(_dg_fetch)
         except Exception as exc:
             log.warning("[tts_preview] provider=deepgram fetch failed: %s", exc)
             raise
@@ -166,7 +166,7 @@ async def preview_tts(
             return _iw_fetch(text, voice_id or "", model_id or "", inline_key)
 
         try:
-            mulaw = await asyncio.to_thread(_iw_run)
+            mulaw = await _to_thread(_iw_run)
         except Exception as exc:
             log.warning("[tts_preview] provider=inworld fetch failed: %s", exc)
             raise
@@ -206,8 +206,7 @@ _MULAW_BIAS = 0x84
 
 def _mulaw_to_pcm16(mulaw_bytes: bytes) -> bytes:
     # ponytail: ITU G.711 mu-law decode via numpy (the BE already ships
-    # scipy/numpy — see rime_tts.py). audioop is deprecated in 3.13 so
-    # we don't use it.
+    # scipy/numpy — see rime_tts.py); stdlib decoder was removed in 3.13.
     arr = np.frombuffer(mulaw_bytes, dtype=np.uint8)
     arr = np.bitwise_and(np.bitwise_not(arr).astype(np.int16), 0xFF)
     sign = (arr & 0x80) != 0

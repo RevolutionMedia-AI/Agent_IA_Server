@@ -5,7 +5,7 @@ Usage: python scripts/mulaw_to_wav.py in.mulaw out.wav
 """
 import sys
 import os
-import audioop
+from STT_server.services import audio_codec
 import wave
 
 
@@ -20,7 +20,7 @@ def main():
         return 3
     data = open(inp, 'rb').read()
     try:
-        pcm = audioop.ulaw2lin(data, 2)
+        pcm = audio_codec.ulaw2lin(data, 2)
     except Exception as e:
         print("ulaw2lin error:", e)
         return 4

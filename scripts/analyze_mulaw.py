@@ -5,7 +5,7 @@ import struct
 import collections
 import math
 import statistics
-import audioop
+from STT_server.services import audio_codec
 
 
 def human(n):
@@ -31,7 +31,7 @@ def main():
     print("Counts: 0x00=", ctr.get(0, 0), " 0xFF=", ctr.get(0xFF, 0))
 
     try:
-        pcm = audioop.ulaw2lin(data, 2)
+        pcm = audio_codec.ulaw2lin(data, 2)
     except Exception as e:
         print("ulaw2lin error:", e)
         return 3

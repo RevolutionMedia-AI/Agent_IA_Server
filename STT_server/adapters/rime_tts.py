@@ -22,6 +22,8 @@ from STT_server.domain.language import (
     sanitize_tts_text,
 )
 from STT_server.domain.session import CallSession
+from STT_server.services._instrumentation import StageTimer, Stages
+from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.credentials_resolver import resolve_provider
 
 
@@ -126,48 +128,75 @@ def _scipy_available() -> bool:
 
 
 def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes = b"") -> tuple[bytes, bytes]:
-    """Convert raw PCM16-LE bytes at *src_rate* to mu-law 8 kHz.
+    """Down-convert signed PCM16 LE samples from ``src_rate`` to mu-law 8 kHz mono.
 
-    Returns ``(mulaw_bytes, leftover_src_bytes)`` where *leftover_src_bytes* is
-    the remaining source PCM bytes that should be prepended to the next
-    chunk so sample/time boundaries stay aligned across messages.
+    Returns ``(mulaw_bytes_for_complete_frames, leftover_pcm_bytes_for_next_call)``.
+    Uses ``scipy.signal.resample_poly`` with a Kaiser-window FIR (beta=8.0,
+    ~60 dB stopband) for anti-aliased down-conversion when scipy is available;
+    otherwise degrades to nearest-neighbour decimation.
     """
+    try:
+        import numpy as np
+        from scipy.signal import resample_poly
+        HAVE_SCIPY = True
+    except ImportError:
+        HAVE_SCIPY = False
+
     data = remainder + pcm_bytes
-    total_src_samples = len(data) // 2
-    if total_src_samples == 0:
+    n_samples = len(data) // 2
+    if n_samples == 0:
         log.debug(f"[RIME_TTS] No usable audio samples. Data len: {len(data)}")
         return b"", data
 
-    try:
-        src_samples = list(struct.unpack(f"<{total_src_samples}h", data[: total_src_samples * 2]))
-    except Exception as e:
-        log.error(f"[RIME_TTS] Error unpacking PCM data: {e}, total_src_samples={total_src_samples}, data_len={len(data)}")
-        return b"", data
-
-    # Resample to 8 kHz if needed
-    if src_rate != TWILIO_SAMPLE_RATE:
-        log.debug(f"[RIME_TTS] Resampling from {src_rate}Hz to {TWILIO_SAMPLE_RATE}Hz, src_samples={len(src_samples)}")
-        dest_samples = _resample_samples(src_samples, src_rate, TWILIO_SAMPLE_RATE)
-    else:
-        dest_samples = src_samples
-
-    dest_total = len(dest_samples)
+    g = math.gcd(src_rate, TWILIO_SAMPLE_RATE)
+    up = TWILIO_SAMPLE_RATE // g
+    down = src_rate // g
     FRAME_SAMPLES = 160  # 20 ms @ 8 kHz
-    usable_dest = dest_total - (dest_total % FRAME_SAMPLES)
-    if usable_dest == 0:
-        # Not enough resampled samples to emit a full 20ms frame yet.
+
+    if src_rate == TWILIO_SAMPLE_RATE:
+        # Already at 8 kHz — just trim to frame boundary and encode.
+        usable_out = (n_samples // FRAME_SAMPLES) * FRAME_SAMPLES
+        if usable_out == 0:
+            return b"", data
+        mulaw = _pcm16_to_mulaw(data[: usable_out * 2])
+        log.debug(f"[RIME_TTS] PCM->mulaw (8k passthrough): src={n_samples} out={usable_out} mulaw_bytes={len(mulaw)}")
+        return mulaw, data[usable_out * 2:]
+
+    # Need at least `down` input samples to produce one output sample.
+    n_aligned = (n_samples // down) * down
+    if n_aligned < down:
+        return b"", data
+    expected_out = (n_aligned * up) // down  # exact integer output count
+
+    if HAVE_SCIPY:
+        samples = np.frombuffer(data[: n_aligned * 2], dtype=np.int16).astype(np.float64)
+        # ponytail: pad one edge sample each side so the kaiser FIR boundaries
+        # don't smear the first/last output samples; the extra output sample(s)
+        # are trimmed from the front below.
+        padded = np.pad(samples, (1, 1), mode="edge")
+        res = resample_poly(padded, up=up, down=down, window=("kaiser", 8.0))
+        trim_front = max(0, len(res) - expected_out)
+        res = res[trim_front: trim_front + expected_out]
+        out_int = np.clip(np.round(res), -32768, 32767).astype(np.int16)
+        pcm_8k = out_int.tobytes()
+        log.debug(f"[RIME_TTS] Resampled {src_rate}->{TWILIO_SAMPLE_RATE} via kaiser FIR: src={n_aligned} out={expected_out}")
+    else:
+        # ponytail: degrades to decimation if scipy missing; install scipy==1.11+ in requirements.txt
+        n_in = struct.unpack(f"<{n_aligned}h", data[: n_aligned * 2])
+        pcm_8k = struct.pack(f"<{expected_out}h", *n_in[::down])
+        log.warning(f"[RIME_TTS] scipy unavailable — decimation fallback {src_rate}->{TWILIO_SAMPLE_RATE}; audio quality degraded")
+
+    usable_out = (expected_out // FRAME_SAMPLES) * FRAME_SAMPLES
+    if usable_out == 0:
         return b"", data
 
-    # Map back to source samples consumed using time mapping
-    src_samples_used = int(round((usable_dest * src_rate) / TWILIO_SAMPLE_RATE))
-    used_src_bytes = src_samples_used * 2
-    leftover_src_bytes = data[used_src_bytes:]
-
-    out_samples = dest_samples[:usable_dest]
-    pcm = struct.pack(f"<{len(out_samples)}h", *out_samples)
-    mulaw = _pcm16_to_mulaw(pcm)
-    log.debug(f"[RIME_TTS] Converted PCM->mulaw: src_in={total_src_samples} used_src={src_samples_used} dest_out={len(out_samples)} mulaw_bytes={len(mulaw)}")
-    return mulaw, leftover_src_bytes
+    mulaw = _pcm16_to_mulaw(pcm_8k[: usable_out * 2])
+    # Source samples consumed for the usable output, rounded down to a multiple
+    # of `down` so the next call's data length is also a clean multiple.
+    src_samples_used = (usable_out * down) // up
+    src_samples_used = (src_samples_used // down) * down
+    log.debug(f"[RIME_TTS] Converted PCM->mulaw: src_in={n_samples} used_src={src_samples_used} dest_out={usable_out} mulaw_bytes={len(mulaw)}")
+    return mulaw, data[src_samples_used * 2:]
 
 
 async def stream_tts_segment(
@@ -177,6 +206,19 @@ async def stream_tts_segment(
     emit_item,
 ) -> tuple[float | None, float]:
     """Stream TTS audio from Rime via WebSocket, emitting mulaw chunks as they arrive."""
+    # ponytail: AudioFrameProcessor is the single owner of frame buffering.
+    # One per stream; emit_silence_tail=False drops the partial trailing
+    # frame at segment end (boundary click fix).
+    frame_proc = AudioFrameProcessor(emit_silence_tail=False)
+    # ponytail: stamp TTS_FIRST_BYTE on the first audio byte from this adapter.
+    def _mark_first_byte() -> None:
+        session._stage_timer = session._stage_timer or StageTimer(
+            call_id=session.session_key,
+            turn_id=0,
+            generation=session.active_generation,
+        )
+        if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
+            session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "rime")
     api_key = creds.get("api_key")
@@ -298,12 +340,13 @@ async def stream_tts_segment(
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] Rime WS TTFB (binary) ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
+                    if mulaw_bytes:
+                        _mark_first_byte()
                     if save_audio:
                         audio_accum.extend(mulaw_bytes)
-                    for i in range(0, len(mulaw_bytes), 4096):
-                        chunk = mulaw_bytes[i : i + 4096]
-                        log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
-                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
+                    for frame in frame_proc.feed(mulaw_bytes):
+                        log.debug("[TTS] Emitting audio frame: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(frame))
+                        emit_item({"type": "audio", "generation": generation, "data": frame, "source": "tts"})
                         emitted_audio = True
                     continue
 
@@ -339,12 +382,13 @@ async def stream_tts_segment(
                         log.warning("[TTS] Rime WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
 
                     mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
+                    if mulaw_bytes:
+                        _mark_first_byte()
                     if save_audio:
                         audio_accum.extend(mulaw_bytes)
-                    for i in range(0, len(mulaw_bytes), 4096):
-                        chunk = mulaw_bytes[i : i + 4096]
-                        log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
-                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
+                    for frame in frame_proc.feed(mulaw_bytes):
+                        log.debug("[TTS] Emitting audio frame: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(frame))
+                        emit_item({"type": "audio", "generation": generation, "data": frame, "source": "tts"})
                         emitted_audio = True
                     continue
 
@@ -424,6 +468,9 @@ async def stream_tts_segment(
                 log.error(f"[TTS] Error guardando audio: {e}")
 
         # Siempre emitir segment_end, sin importar qué excepción ocurrió
+        # ponytail: drop the partial trailing frame at segment end
+        # (emit_silence_tail=False).
+        frame_proc.flush()
         emit_item({"type": "segment_end", "generation": generation, "has_audio": emitted_audio})
 
     total_ms = (time.perf_counter() - started_at) * 1000

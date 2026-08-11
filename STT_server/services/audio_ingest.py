@@ -1,5 +1,3 @@
-import asyncio
-import audioop
 import base64
 import logging
 import time
@@ -20,8 +18,11 @@ from STT_server.config import (
     TWILIO_SR,
 )
 from STT_server.domain.session import CallSession
+from STT_server.services import audio_codec
+from STT_server.services._instrumentation import StageTimer, Stages
 from STT_server.services.common import enqueue_with_drop
 from STT_server.services.playback_service import interrupt_current_turn
+from STT_server.services.thread_pool import to_thread as _to_thread
 
 
 log = logging.getLogger("stt_server")
@@ -31,7 +32,7 @@ FRAME_BYTES = FRAME_SAMPLES * 2
 
 
 def get_frame_rms(frame: bytes) -> int:
-    return audioop.rms(frame, 2)
+    return audio_codec.rms(frame, 2)
 
 
 def _is_probable_voice_sync(frame: bytes) -> tuple[bool, int]:
@@ -40,12 +41,12 @@ def _is_probable_voice_sync(frame: bytes) -> tuple[bool, int]:
 
 
 async def is_probable_voice(frame: bytes) -> tuple[bool, int]:
-    """M4: VAD + RMS are CPU-bound (audioop + webrtcvad). At 50 fps per call
+    """M4: VAD + RMS are CPU-bound (audio_codec + webrtcvad). At 50 fps per call
     and 10 concurrent calls that's ~1.5 ms of CPU per frame x 500 fps = 750 ms
     of CPU per second on one core, blocking the event loop. Offload to
     the default thread pool so the WebSocket handler stays responsive.
     """
-    return await asyncio.to_thread(_is_probable_voice_sync, frame)
+    return await _to_thread(_is_probable_voice_sync, frame)
 
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
@@ -94,7 +95,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
 
     # Conversión y chequeo de formato
     try:
-        pcm16 = audioop.ulaw2lin(raw, 2)
+        pcm16 = audio_codec.ulaw2lin(raw, 2)
         # Verifica que el audio sea mono y 16-bit
         if len(pcm16) % 2 != 0:
             log.warning(f"[VAD] Audio PCM16 no tiene longitud par: {len(pcm16)}")
@@ -159,11 +160,36 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                             await interrupt_current_turn(session)
 
                 if not session.assistant_speaking and session.voice_streak >= SPEECH_START_FRAMES:
+                    # session._stage_timer is a runtime-attached per-call
+                    # StageTimer used by the latency dashboard to measure
+                    # STT -> LLM -> TTS stage deltas. It is created lazily
+                    # on the first non-empty utterance detection so we
+                    # don't pay the cost for calls that never speak, and
+                    # the mark() below is guarded so only the FIRST
+                    # INICIO DE VOZ event stamps Stages.STT_FIRST_RESULT
+                    # (subsequent ones are no-ops, so the timeline keeps
+                    # the true first-result timestamp).
+                    session._stage_timer = session._stage_timer or StageTimer(
+                        call_id=session.session_key,
+                        turn_id=0,
+                        generation=session.active_generation,
+                    )
+                    if Stages.STT_FIRST_RESULT not in session._stage_timer._stages:
+                        session._stage_timer.mark(Stages.STT_FIRST_RESULT)
                     session.last_activity_at = time.monotonic()
                     session.speech_frames.extend(session.pre_speech_frames)
                     session.speech_frame_count = session.voice_streak
                     session.silence_frames = 0
                     log.info(f"[VAD] INICIO DE VOZ: streak={session.voice_streak}, speech_frame_count={session.speech_frame_count}")
+                    barge_in_gap = (
+                        f" barge_in_gap={(time.monotonic() - session.barge_in_at):.2f}s"
+                        if session.barge_in_at is not None
+                        else ""
+                    )
+                    log.info(
+                        "[VAD] new user turn: session=%s active_gen=%s%s",
+                        session.session_key, session.active_generation, barge_in_gap,
+                    )
             else:
                 session.voice_streak = 0
             continue

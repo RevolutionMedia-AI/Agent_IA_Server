@@ -17,6 +17,13 @@ log = logging.getLogger("stt_server")
 
 sessions: dict[str, CallSession] = {}
 
+# ponytail: idle/duration monitor polling cadence. Landed here (instead of
+# config.py) so the constant is colocated with the only two functions that
+# read it. Kept tiny — the goal is "responsive shutdown on tear-down",
+# not a config knob for operators.
+IDLE_MONITOR_POLL_SEC = 5.0
+MAX_DURATION_MONITOR_POLL_SEC = 10.0
+
 # ponytail: agents.json lookup for the per-call usage record. We need
 # the agent's stt_provider/llm_provider (the session only carries
 # tts_provider); loading the whole file here is fine — it's small and
@@ -83,6 +90,30 @@ def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:
 
 async def register_session(session: CallSession) -> None:
     sessions[session.session_key] = session
+    # ponytail: lazy-init the per-call StageTimer here, exactly once
+    # per session. STT_Server.py's start-event handler is the only
+    # caller, so this runs before any adapter can emit its first
+    # stage. wait_signals.mark_stage() also lazy-inits as a safety
+    # net for code paths that bypass register_session (debug
+    # endpoints, tests).
+    if session.stage_timer is None:
+        from STT_server.services._instrumentation import StageTimer
+        session.stage_timer = StageTimer(
+            call_id=session.session_key,
+            turn_id=0,
+            generation=session.active_generation,
+        )
+        # ponytail: alias the underscore-prefixed name so audio_ingest.py
+        # (which already attaches to session._stage_timer) reuses the
+        # same timer instead of constructing a parallel one. Same
+        # instance, same stage timestamps — the dashboard sees one
+        # timeline per call.
+        session._stage_timer = session.stage_timer  # type: ignore[attr-defined]
+    # ponytail: P2 round-3 — attach the per-call metrics container so
+    # all adapters can `session.metrics.incr(...)`/`.observe_ms(...)`
+    # without the attach_metrics idempotency dance. Idempotent.
+    from STT_server.services.audio_metrics import attach_metrics
+    attach_metrics(session, call_id=session.session_key)
     # ponytail: H2 from the call-flow audit. Mirror the in-memory
     # registration to Postgres so a server crash doesn't orphan
     # the CallSession forever (memory leak across restarts). Best
@@ -116,6 +147,16 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
         return
 
     session.closed = True
+
+    # ponytail: P2 round-3 — emit the consolidated end-of-call summary
+    # BEFORE the usage record and queue teardown so all adapter-recorded
+    # counters are still attached to the session. Idempotent + best-effort:
+    # nothing here can crash cleanup.
+    try:
+        from STT_server.services.call_summary import emit_call_summary
+        await emit_call_summary(log, session)
+    except Exception:
+        log.exception("emit_call_summary failed")
 
     # ponytail: write the per-call usage record BEFORE we lose the
     # session data. The aggregation in /api/usage reads from this
@@ -207,7 +248,7 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
     try:
         while not session.closed:
             if session.assistant_speaking:
-                await asyncio.sleep(5)
+                await asyncio.sleep(IDLE_MONITOR_POLL_SEC)
                 continue
             remaining = IDLE_SILENCE_TIMEOUT_SEC - (time.monotonic() - session.last_activity_at)
             if remaining <= 0:
@@ -221,7 +262,7 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                 except Exception:
                     pass
                 break
-            await asyncio.sleep(min(remaining, 5))
+            await asyncio.sleep(min(remaining, IDLE_MONITOR_POLL_SEC))
     except asyncio.CancelledError:
         return
     except Exception:
@@ -239,7 +280,7 @@ async def monitor_max_call_duration(session: CallSession, ws: WebSocket) -> None
         return
     try:
         while not session.closed:
-            await asyncio.sleep(10)
+            await asyncio.sleep(MAX_DURATION_MONITOR_POLL_SEC)
             if session.closed:
                 return
             if session.started_at is None:

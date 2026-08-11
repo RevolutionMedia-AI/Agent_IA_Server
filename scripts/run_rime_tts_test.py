@@ -3,7 +3,7 @@ import sys, os
 # Ensure repo root is on sys.path so `STT_server` package can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import asyncio
-import audioop
+from STT_server.services import audio_codec
 import wave
 import sys
 try:
@@ -42,7 +42,7 @@ async def main():
     with open(fname, "rb") as f:
         mulaw = f.read()
     try:
-        pcm = audioop.ulaw2lin(mulaw, 2)
+        pcm = audio_codec.ulaw2lin(mulaw, 2)
     except Exception as e:
         print("Error converting ulaw->pcm:", e)
         return 3

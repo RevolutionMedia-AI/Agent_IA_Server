@@ -1,4 +1,3 @@
-import asyncio
 import io
 import json
 import logging
@@ -30,6 +29,7 @@ from STT_server.domain.language import (
     normalize_supported_language,
 )
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.thread_pool import to_thread as _to_thread
 
 
 def pcm16_to_wav_bytes(pcm16_audio: bytes, sample_rate: int = TWILIO_SR, channels: int = TWILIO_CHANNELS) -> bytes:
@@ -152,4 +152,4 @@ async def transcribe_block(
     language_hint: str | None = None,
     user_id: str | None = None,
 ) -> tuple[list[str], str]:
-    return await asyncio.to_thread(transcribe_sync, pcm16_audio, language_hint, user_id)
+    return await _to_thread(transcribe_sync, pcm16_audio, language_hint, user_id)

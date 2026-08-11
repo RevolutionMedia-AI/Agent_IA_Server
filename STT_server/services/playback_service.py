@@ -10,14 +10,15 @@ from STT_server.adapters.tts_dispatcher import stream_tts_segment
 from STT_server.adapters.twilio_media import send_twilio_clear, send_twilio_mark, send_twilio_media
 from STT_server.config import (
     LOG_TWILIO_PLAYBACK,
-    STREAM_SID_WAIT_MAX_MS,
-    STREAM_SID_WAIT_POLL_MS,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
     SAVE_TWILIO_FRAMES,
 )
 from STT_server.domain.language import split_tts_segments
 from STT_server.domain.session import CallSession
+from STT_server.services.wait_signals import wait_stream_ready
+from STT_server.services._instrumentation import StageTimer, Stages
+from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.common import drain_queue_nowait, enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.utils.safe_path import UnsafePathError, sanitize_id
 import os
@@ -47,7 +48,31 @@ def enqueue_playback_clear(session: CallSession) -> None:
 
 
 async def interrupt_current_turn(session: CallSession) -> None:
+    """Barge-in: invalidate every in-flight TTS item by bumping
+    ``active_generation`` and advancing ``cancelled_through`` to the
+    bumped-1 value.
+
+    Convention (Phase-2 refactor):
+      - Every item pushed to ``playback_queue`` carries
+        ``{"generation": <active_generation_at_enqueue>}``.
+      - ``playback_loop`` drops any item where
+        ``generation != session.active_generation`` OR
+        ``generation <= session.cancelled_through``.
+      - Adapters (inworld_tts, rime_tts, openai_tts, etc.) MUST read
+        ``session.active_generation`` at each emit — NOT at task spawn
+        time — so producer threads that can't be cancelled mid-stream
+        still tag their late frames with the live generation and the
+        consumer drops them silently.
+    """
     session.active_generation += 1
+    session.cancelled_through = max(session.cancelled_through, session.active_generation - 1)
+    session.barge_in_at = time.monotonic()
+    log.info(
+        "[BARGE-IN] session=%s active_gen=%s cancelled_through=%s",
+        session.session_key, session.active_generation, session.cancelled_through,
+    )
+    # TODO other adapters should check session.active_generation at each emit
+    # (inworld_tts.py, rime_tts.py, openai_tts.py — out of scope for this phase).
 
     # Stop any pending response generation and prefetch.
     if session.reply_task and not session.reply_task.done():
@@ -105,8 +130,11 @@ async def play_initial_greeting(session: CallSession) -> None:
     session.assistant_speaking = True
     session.assistant_started_at = time.perf_counter()
     session.last_activity_at = time.monotonic()
-    # Wait a moment for the audio stream to be established.
-    await asyncio.sleep(0.4)
+    # P0: replaced hardcoded 0.4s sleep with event-based wait for the
+    # stream_sid_ready signal. If the start event already arrived the
+    # wait returns instantly; if not, it returns the moment Twilio sends
+    # it (or a timeout, configurable via STREAM_SID_WAIT_TIMEOUT_MS).
+    await wait_stream_ready(session)
     # Generate the TTS via the session's configured TTS provider. The
     # playback_loop will pick up the queued audio and stream it to Twilio.
     from STT_server.services.turn_manager import run_tts_with_retries
@@ -161,6 +189,15 @@ async def play_error_and_hangup(
 
 
 async def playback_loop(ws: WebSocket, session: CallSession) -> None:
+    # ponytail: AudioFrameProcessor is the defensive consumer-side
+    # framer. TTS adapters pre-frame their bytes (one 160-byte item
+    # per emit), so feed() here is a no-op for aligned input. It
+    # guarantees Twilio only ever sees 160-byte mu-law frames even
+    # if a non-own-file adapter bypasses the producer-side framing.
+    # emit_silence_tail=False drops the partial trailing frame at
+    # call end (boundary click fix).
+    frame_proc = AudioFrameProcessor(emit_silence_tail=False)
+    first_frame_marked = False
     try:
         while True:
             item = await session.playback_queue.get()
@@ -178,16 +215,19 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
             if generation != session.active_generation:
                 continue
 
+            # ponytail: stale-frame drop. Even if a producer thread
+            # hasn't yet seen the generation bump (HTTP TTS mid-stream
+            # bytes landing here), any item tagged at-or-below
+            # cancelled_through is from a barge-in'd turn. Drop silently.
+            if generation <= session.cancelled_through:
+                continue
+
             if item_type == "audio":
                 if not session.stream_sid:
-                    # Wait briefly for Twilio to send the stream SID.
-                    # L6: was hardcoded 100 iterations * 50 ms = 5 s.
-                    # Now driven by STREAM_SID_WAIT_MAX_MS / STREAM_SID_WAIT_POLL_MS.
-                    wait_iterations = max(1, STREAM_SID_WAIT_MAX_MS // max(1, STREAM_SID_WAIT_POLL_MS))
-                    for _ in range(wait_iterations):
-                        await asyncio.sleep(STREAM_SID_WAIT_POLL_MS / 1000.0)
-                        if session.stream_sid:
-                            break
+                    # P0: replaced 5s polling loop with event-based wait.
+                    # stream_sid_ready event is set by the Twilio 'start'
+                    # handler in STT_Server.py the instant Twilio sends it.
+                    await wait_stream_ready(session)
                 if not session.stream_sid:
                     log.warning("[PLAYBACK] No stream_sid for audio item, skipping")
                     continue
@@ -200,61 +240,62 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 # ponytail: removed per-frame log.debug - one chunk can
                 # contain 50+ frames, and at INFO that's a flood. The
                 # one-line summary at the bottom covers the same info.
-                # ponytail: validate Twilio's 20ms alignment. Inworld
-                # sends mu-law at 8000 Hz where each byte is exactly
-                # 0.125 ms - so 160 bytes = 20 ms, which is the size
-                # Twilio expects for one media packet. If Inworld
-                # ever returns a stream at a different rate (or a
-                # chunk that doesn't end on a frame boundary), the
-                # leftover gets emitted as a short final packet with
-                # a "pacing_ms" that doesn't match Twilio's clock -
-                # the user perceives that as a tiny click/pop at the
-                # boundary. Log a one-line summary if any non-aligned
-                # chunk comes in so we can see it once per turn
-                # instead of once per frame.
+                # ponytail: feed the chunk through AudioFrameProcessor.
+                # TTS adapters pre-frame to 160-byte items, so this
+                # returns one frame per emit. Any non-aligned bytes
+                # (e.g. legacy adapters that bypassed framing) get
+                # buffered for the next chunk instead of emitted as
+                # short packets — that was the source of the <20ms
+                # boundary click.
                 sent_frames = 0
-                for start in range(0, len(chunk), TWILIO_OUTBOUND_CHUNK_BYTES):
-                    frame = chunk[start : start + TWILIO_OUTBOUND_CHUNK_BYTES]
-                    if frame:
-                        if SAVE_TWILIO_FRAMES:
-                            try:
-                                # ponytail: sanitize_id kills any path-
-                                # traversal chars in session_key before
-                                # it goes into a filesystem path. The
-                                # server-issued values (id(ws), Twilio
-                                # call_sid) already match, but defending
-                                # at the write site is the cheapest
-                                # place to neutralise the file-include
-                                # scanner finding.
-                                safe_key = sanitize_id(
-                                    str(getattr(session, "session_key", "unknown")),
-                                    field="session_key",
-                                )
-                                fname = f"twilio_out_{safe_key}_{generation}.mulaw"
-                                with open(fname, "ab") as f:
-                                    f.write(frame)
-                            except (UnsafePathError, OSError) as exc:
-                                log.warning(
-                                    "Skipping twilio_out frame for %s: %s",
-                                    session.session_key, exc,
-                                )
-                            except Exception:
-                                log.exception("Error escribiendo frame Twilio para %s", session.session_key)
-
-                        send_start = time.perf_counter()
-                        await send_twilio_media(ws, session.stream_sid, frame)
-                        sent_frames += 1
-                        # Pace outgoing frames proportionally to their duration.
-                        # A full frame (TWILIO_OUTBOUND_CHUNK_BYTES) represents
-                        # TWILIO_OUTBOUND_PACING_MS milliseconds of audio.
+                for frame in frame_proc.feed(chunk):
+                    if SAVE_TWILIO_FRAMES:
                         try:
-                            pacing_ms = (len(frame) / TWILIO_OUTBOUND_CHUNK_BYTES) * TWILIO_OUTBOUND_PACING_MS
+                            # ponytail: sanitize_id kills any path-
+                            # traversal chars in session_key before
+                            # it goes into a filesystem path. The
+                            # server-issued values (id(ws), Twilio
+                            # call_sid) already match, but defending
+                            # at the write site is the cheapest
+                            # place to neutralise the file-include
+                            # scanner finding.
+                            safe_key = sanitize_id(
+                                str(getattr(session, "session_key", "unknown")),
+                                field="session_key",
+                            )
+                            fname = f"twilio_out_{safe_key}_{generation}.mulaw"
+                            with open(fname, "ab") as f:
+                                f.write(frame)
+                        except (UnsafePathError, OSError) as exc:
+                            log.warning(
+                                "Skipping twilio_out frame for %s: %s",
+                                session.session_key, exc,
+                            )
                         except Exception:
-                            pacing_ms = TWILIO_OUTBOUND_PACING_MS
-                        elapsed = time.perf_counter() - send_start
-                        wait = (pacing_ms / 1000.0) - elapsed if pacing_ms > 0 else 0.0
-                        if wait > 0:
-                            await asyncio.sleep(wait)
+                            log.exception("Error escribiendo frame Twilio para %s", session.session_key)
+
+                    if not first_frame_marked:
+                        # ponytail: instrument — first 160-byte frame
+                        # crossing the WS boundary is the playback TTFB.
+                        timer = getattr(session, "_stage_timer", None)
+                        if timer is not None:
+                            timer.mark(Stages.FIRST_160_FRAME_SENT)
+                        first_frame_marked = True
+
+                    send_start = time.perf_counter()
+                    await send_twilio_media(ws, session.stream_sid, frame)
+                    sent_frames += 1
+                    # Pace outgoing frames proportionally to their duration.
+                    # A full frame (TWILIO_OUTBOUND_CHUNK_BYTES) represents
+                    # TWILIO_OUTBOUND_PACING_MS milliseconds of audio.
+                    try:
+                        pacing_ms = (len(frame) / TWILIO_OUTBOUND_CHUNK_BYTES) * TWILIO_OUTBOUND_PACING_MS
+                    except Exception:
+                        pacing_ms = TWILIO_OUTBOUND_PACING_MS
+                    elapsed = time.perf_counter() - send_start
+                    wait = (pacing_ms / 1000.0) - elapsed if pacing_ms > 0 else 0.0
+                    if wait > 0:
+                        await asyncio.sleep(wait)
                 # ponytail: collapsed the previous "Playback audio / Timing
                 # stats / per-frame debug" stack into a single INFO line.
                 # Old logging fired 2-3 messages per audio chunk; with
@@ -284,10 +325,17 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     # Setting assistant_speaking = False here causes the STT to
                     # pick up the agent's own voice as user input (echo loop).
                     # Enviar mark para rastrear segmento (si tenemos stream_sid)
+                    # TODO instrumentation:mark_ack — Twilio 'mark' ack handler
+                    # lives in STT_Server.py:822, which is outside this agent's
+                    # owned file set. When that file gains the
+                    # Stages.TWILIO_MARK_ACK instrumentation, mark the timer
+                    # via getattr(session, "_stage_timer", None).mark(
+                    #     Stages.TWILIO_MARK_ACK,
+                    # ) in the mark-ack branch.
                     try:
                         session.mark_counter += 1
                         mark_name = f"gen-{generation}-seg-{session.mark_counter}"
-                        session.pending_marks.add(mark_name)
+                        session.pending_marks[mark_name] = time.monotonic()
                         if session.stream_sid:
                             await send_twilio_mark(ws, session.stream_sid, mark_name)
                             if LOG_TWILIO_PLAYBACK:

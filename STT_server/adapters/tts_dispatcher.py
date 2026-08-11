@@ -19,7 +19,10 @@ import urllib.request
 
 from STT_server.config import DEFAULT_TTS_PROVIDER
 from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS
+from STT_server.services._instrumentation import StageTimer, Stages
+from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.thread_pool import to_thread as _to_thread
 
 log = logging.getLogger("stt_server")
 
@@ -78,6 +81,22 @@ async def stream_tts_segment(
     # anyway, so an inline path keeps the call simple.
     api_key = _resolve_api_key(session, provider)
     if not api_key:
+        # ponytail: P3 — surface the missing-key error to the playback queue
+        # so the operator sees a structured item instead of a silent mute.
+        # The exception is still raised so callers can branch, but emit the
+        # marker FIRST so the queue advances cleanly with the consumer's
+        # error-handling branch (playback_service.playback_loop already
+        # handles `item_type == "error"`).
+        log.error(
+            "[TTS] %s API key not configured for session=%s; emitting error marker",
+            provider, session.session_key,
+        )
+        emit_item({
+            "type": "error",
+            "generation": generation,
+            "message": f"{provider} API key not configured",
+        })
+        emit_item({"type": "segment_end", "generation": generation})
         raise RuntimeError(f"{provider} API key not configured.")
 
     if provider == "openai":
@@ -96,8 +115,17 @@ async def _stream_openai(
     emit_item,
     api_key: str,
 ) -> tuple[float | None, float]:
+    from STT_server.services._instrumentation import Stages  # ponytail: lazy per spec
     import time
     started = time.perf_counter()
+    if not api_key:
+        # ponytail: P3 — defense-in-depth. _stream_openai should not be
+        # called without an api_key, but emit a structured error if it is.
+        log.error("[TTS] openai called without api_key for session=%s", session.session_key)
+        emit_item({"type": "error", "generation": generation,
+                   "message": "openai TTS: API key not configured"})
+        emit_item({"type": "segment_end", "generation": generation})
+        return None, 0.0
     # ponytail: per-agent speed override (006_agent_runtime_params.sql).
     # OpenAI TTS accepts 0.25..4.0; we clamp to the adapter's safe
     # range so a typo doesn't trip an HTTP 400.
@@ -111,22 +139,54 @@ async def _stream_openai(
         "speed": speed,
     }).encode("utf-8")
 
-    def _fetch() -> bytes:
+    loop = asyncio.get_running_loop()
+    ttfb_ms: float | None = None
+
+    def _emit_frame(frame: bytes) -> None:
+        nonlocal ttfb_ms
+        if ttfb_ms is None:
+            ttfb_ms = (time.perf_counter() - started) * 1000
+            # ponytail: stamp TTS_FIRST_BYTE on the first 160-byte frame emitted.
+            session._stage_timer = session._stage_timer or StageTimer(
+                call_id=session.session_key,
+                turn_id=0,
+                generation=session.active_generation,
+            )
+            if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
+                session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
+        loop.call_soon_threadsafe(
+            emit_item, {"type": "audio", "generation": generation, "data": frame}
+        )
+
+    def _fetch() -> None:
+        from STT_server.adapters.rime_tts import _pcm16_bytes_to_mulaw_8k
         req = urllib.request.Request(
             "https://api.openai.com/v1/audio/speech",
             data=body,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
         )
+        # ponytail: AudioFrameProcessor owns 20ms framing; emit_silence_tail=False
+        # drops the partial trailing frame to avoid a <20ms packet boundary click.
+        proc = AudioFrameProcessor(emit_silence_tail=False)
+        pcm_remainder = b""
         with urllib.request.urlopen(req, timeout=45) as resp:
-            return resp.read()
+            while True:
+                # ponytail: cheap closed-check per chunk; thread stays sync.
+                if getattr(session, "closed", False):
+                    break
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(chunk, 24000, pcm_remainder)
+                if not mulaw_bytes:
+                    continue
+                for frame in proc.feed(mulaw_bytes):
+                    _emit_frame(frame)
+        for frame in proc.flush():
+            _emit_frame(frame)
 
-    pcm_bytes = await asyncio.to_thread(_fetch)
-    from STT_server.adapters.rime_tts import _pcm16_bytes_to_mulaw_8k
-    mulaw, _ = _pcm16_bytes_to_mulaw_8k(pcm_bytes, 24000)
-    ttfb_ms = (time.perf_counter() - started) * 1000
-    if mulaw:
-        emit_item({"type": "audio", "generation": generation, "data": mulaw})
+    await _to_thread(_fetch)
     emit_item({"type": "segment_end", "generation": generation})
     return ttfb_ms, (time.perf_counter() - started) * 1000
 
@@ -140,6 +200,14 @@ async def _stream_deepgram(
 ) -> tuple[float | None, float]:
     import time
     started = time.perf_counter()
+    if not api_key:
+        # ponytail: P3 — defense-in-depth. _stream_deepgram should not be
+        # called without an api_key, but emit a structured error if it is.
+        log.error("[TTS] deepgram called without api_key for session=%s", session.session_key)
+        emit_item({"type": "error", "generation": generation,
+                   "message": "deepgram TTS: API key not configured"})
+        emit_item({"type": "segment_end", "generation": generation})
+        return None, 0.0
     params = urllib.parse.urlencode({
         "model": getattr(session, "voice_id", None) or "aura-asteria-en",
         "encoding": "mulaw",
@@ -158,9 +226,23 @@ async def _stream_deepgram(
         with urllib.request.urlopen(req, timeout=45) as resp:
             return resp.read()
 
-    raw = await asyncio.to_thread(_fetch)
+    raw = await _to_thread(_fetch)
     ttfb_ms = (time.perf_counter() - started) * 1000
     if raw:
-        emit_item({"type": "audio", "generation": generation, "data": bytes(raw)})
+        # ponytail: stamp TTS_FIRST_BYTE on the first audio byte from this adapter.
+        session._stage_timer = session._stage_timer or StageTimer(
+            call_id=session.session_key,
+            turn_id=0,
+            generation=session.active_generation,
+        )
+        if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
+            session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
+        # ponytail: AudioFrameProcessor is the single owner of frame buffering;
+        # emit_silence_tail=False drops the partial trailing frame to avoid a
+        # <20ms packet boundary click.
+        proc = AudioFrameProcessor(emit_silence_tail=False)
+        for frame in proc.feed(bytes(raw)):
+            emit_item({"type": "audio", "generation": generation, "data": frame})
+        proc.flush()
     emit_item({"type": "segment_end", "generation": generation})
     return ttfb_ms, (time.perf_counter() - started) * 1000

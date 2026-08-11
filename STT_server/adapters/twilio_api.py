@@ -15,6 +15,8 @@ import logging
 from typing import Any
 from urllib.parse import quote_plus
 
+from STT_server.services.thread_pool import to_thread as _to_thread
+
 log = logging.getLogger("stt_server")
 
 
@@ -79,8 +81,6 @@ async def validate_twilio_credentials(account_sid: str, auth_token: str) -> dict
 
     Returns dict with 'valid' bool and optional 'error' message.
     """
-    import asyncio
-
     def _validate() -> dict:
         try:
             client = _get_twilio_client(account_sid, auth_token)
@@ -95,7 +95,7 @@ async def validate_twilio_credentials(account_sid: str, auth_token: str) -> dict
             log.warning("Twilio credential validation failed: %s", exc)
             return {"valid": False, "error": str(exc)}
 
-    return await asyncio.to_thread(_validate)
+    return await _to_thread(_validate)
 
 
 async def configure_voice_webhook(
@@ -118,8 +118,6 @@ async def configure_voice_webhook(
     Returns:
         dict with 'success' bool and optional details.
     """
-    import asyncio
-
     def _configure() -> dict:
         try:
             client = _get_twilio_client(account_sid, auth_token)
@@ -162,7 +160,7 @@ async def configure_voice_webhook(
             log.exception("Error configuring Twilio webhook")
             return {"success": False, "error": str(exc)}
 
-    return await asyncio.to_thread(_configure)
+    return await _to_thread(_configure)
 
 
 async def make_outbound_call(
@@ -184,8 +182,6 @@ async def make_outbound_call(
     Returns:
         dict with 'success' bool and call_sid or error.
     """
-    import asyncio
-
     def _call() -> dict:
         try:
             client = _get_twilio_client(account_sid, auth_token)
@@ -215,7 +211,7 @@ async def make_outbound_call(
             log.exception("Error making outbound call")
             return {"success": False, "error": str(exc)}
 
-    return await asyncio.to_thread(_call)
+    return await _to_thread(_call)
 
 
 async def list_phone_numbers(
@@ -226,8 +222,6 @@ async def list_phone_numbers(
 
     Returns dict with 'success' bool and 'numbers' list or 'error'.
     """
-    import asyncio
-
     def _list() -> dict:
         try:
             client = _get_twilio_client(account_sid, auth_token)
@@ -251,4 +245,4 @@ async def list_phone_numbers(
             log.exception("Error listing Twilio phone numbers")
             return {"success": False, "error": str(exc)}
 
-    return await asyncio.to_thread(_list)
+    return await _to_thread(_list)

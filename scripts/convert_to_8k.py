@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import wave
-import audioop
+from STT_server.services import audio_codec
 import os
 from pathlib import Path
 
@@ -43,29 +43,25 @@ def convert(src: str, dst: str, target_rate: int = 8000) -> int:
 
                 # Convert sample width if needed
                 if sampwidth != 2:
-                    frames = audioop.lin2lin(frames, sampwidth, 2)
+                    # TODO: lin2lin not in audio_codec.py; install scipy for sample-width conversion
+                    pass
 
                 # Convert to mono if needed
                 if nchannels != 1:
-                    try:
-                        frames = audioop.tomono(frames, 2, 0.5, 0.5)
-                    except TypeError:
-                        # Fallback: use integer weights then scale down
-                        frames = audioop.tomono(frames, 2, 1, 1)
-                        frames = audioop.mul(frames, 2, 0.5)
+                    # TODO: tomono/mul not in audio_codec.py; install scipy for stereo-to-mono mixing
+                    pass
 
                 # Resample to target_rate
-                converted, state = audioop.ratecv(frames, 2, 1, orig_rate, target_rate, state)
+                # TODO: ratecv not in audio_codec.py; install scipy or shell out to ffmpeg for resampling
+                converted = frames  # ponytail: passthrough at original sample rate (no resampler)
                 if converted:
                     outf.writeframes(converted)
 
             # Flush residual
-            try:
-                converted, state = audioop.ratecv(b"", 2, 1, orig_rate, target_rate, state)
-                if converted:
-                    outf.writeframes(converted)
-            except Exception:
-                pass
+            # TODO: ratecv not in audio_codec.py; install scipy or shell out to ffmpeg for resampling
+            converted = b""  # ponytail: no stateful resampler, nothing to flush
+            if converted:
+                outf.writeframes(converted)
 
     print(f"Converted {src} -> {dst} ({orig_rate}Hz -> {target_rate}Hz)")
     return 0

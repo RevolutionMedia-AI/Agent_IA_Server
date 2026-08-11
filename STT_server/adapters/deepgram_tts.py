@@ -9,13 +9,18 @@ import urllib.request
 from STT_server.config import DEEPGRAM_TTS_ENCODING, DEEPGRAM_TTS_SAMPLE_RATE
 from STT_server.domain.language import get_tts_model, infer_supported_language_from_text
 from STT_server.domain.session import CallSession
+from STT_server.services._instrumentation import Stages
+from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.thread_pool import to_thread as _to_thread
+from STT_server.services.wait_signals import mark_stage as _mark_stage
 
 
 log = logging.getLogger("stt_server")
 
 
 async def stream_tts_segment(session: CallSession, text: str, generation: int, emit_item) -> tuple[float | None, float]:
+    frame_proc = AudioFrameProcessor(emit_silence_tail=False)
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "deepgram")
     api_key = creds.get("api_key")
@@ -58,11 +63,15 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
 
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
+                        # ponytail: stamp TTS-first-byte the first time
+                        # audio bytes are emitted. Cheap and idempotent.
+                        _mark_stage(session, Stages.TTS_FIRST_BYTE)
 
-                    loop.call_soon_threadsafe(
-                        emit_item,
-                        {"type": "audio", "generation": generation, "data": chunk},
-                    )
+                    for frame in frame_proc.feed(chunk):
+                        loop.call_soon_threadsafe(
+                            emit_item,
+                            {"type": "audio", "generation": generation, "data": frame},
+                        )
         except urllib.error.HTTPError as exc:
             body = ""
             try:
@@ -87,8 +96,13 @@ async def stream_tts_segment(session: CallSession, text: str, generation: int, e
                 },
             )
         finally:
+            for frame in frame_proc.flush():
+                loop.call_soon_threadsafe(
+                    emit_item,
+                    {"type": "audio", "generation": generation, "data": frame},
+                )
             loop.call_soon_threadsafe(emit_item, {"type": "segment_end", "generation": generation})
 
-    await asyncio.to_thread(producer)
+    await _to_thread(producer)
     total_ms = (time.perf_counter() - started_at) * 1000
     return ttfb_ms, total_ms

@@ -28,7 +28,10 @@ import urllib.error
 import urllib.request
 
 from STT_server.domain.session import CallSession
+from STT_server.services._instrumentation import StageTimer, Stages
+from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.thread_pool import to_thread as _to_thread
 
 log = logging.getLogger("stt_server")
 
@@ -53,14 +56,12 @@ def _summarize_mulaw_chunk(audio: bytes) -> dict:
     """
     if not audio:
         return {"bytes": 0, "peak": 0, "dc": 0, "zc": 0}
-    # ponytail: G.711 mu-law decodes to signed 16-bit linear with
-    # audioop.ulaw2lin. Doing it over thousands of bytes per chunk
-    # would be slow in pure Python — audioop is C-backed and fast
-    # enough at 8 kHz that we can afford it for the first-chunk
-    # diagnostic.
-    import audioop
+    # ponytail: G.711 mu-law decodes to signed 16-bit linear via the
+    # audio_codec drop-in (replaces deprecated stdlib audioop that
+    # is removed in Py 3.13). First-chunk diagnostic only — not hot.
+    from STT_server.services.audio_codec import ulaw2lin as _ulaw2lin
     try:
-        pcm = audioop.ulaw2lin(audio, 2)
+        pcm = _ulaw2lin(audio, 2)
     except Exception:
         return {"bytes": len(audio), "peak": 0, "dc": 0, "zc": 0}
     n = len(pcm) // 2
@@ -203,60 +204,17 @@ async def stream_tts_segment(
     loop = asyncio.get_running_loop()
     ttfb_ms: float | None = None
 
-    # ponytail: re-frame the Inworld audio stream into exact 160-byte
-    # (20ms @ 8kHz mu-law) chunks before pushing to the playback queue.
-    # Inworld streams mu-law directly but the chunk sizes are NOT
-    # 20ms-aligned — the operator's logs show the typical tail chunk
-    # at 158 bytes (= 19.75ms). Twilio's Media Stream pacing assumes
-    # 20ms per frame; emitting 19.75ms throws the timing off by 0.25ms
-    # per chunk and the user hears a subtle click at the end of every
-    # turn. Buffering + re-framing keeps Twilio happy and the audio
-    # sounds clean. Last chunk is padded with 0xFF (mu-law silence)
-    # to round up to 160 bytes.
-    _FRAME_BYTES = 160  # 20 ms @ 8 kHz mu-law
-    _MULAW_SILENCE = b"\xff"  # mu-law zero sample
-
-    def _flush_frame(buf: bytearray) -> None:
-        """Emit `buf` as one or more 160-byte frames, padding the
-        last frame with mu-law silence if needed. The buffered audio
-        may be >= 160 bytes (after several Inworld chunks) or < 160
-        (the final partial chunk at the end of the stream).
-        """
-        while len(buf) >= _FRAME_BYTES:
-            loop.call_soon_threadsafe(
-                emit_item,
-                {"type": "audio", "generation": generation,
-                 "data": bytes(buf[:_FRAME_BYTES])},
-            )
-            del buf[:_FRAME_BYTES]
-        if buf:
-            # Pad the leftover with mu-law silence to a full frame.
-            tail = bytes(buf) + _MULAW_SILENCE * (_FRAME_BYTES - len(buf))
-            loop.call_soon_threadsafe(
-                emit_item,
-                {"type": "audio", "generation": generation, "data": tail},
-            )
-            buf.clear()
-
-    def _feed(audio: bytes, buf: bytearray) -> None:
-        """Append a chunk to the re-framing buffer and emit as many
-        full 160-byte frames as the buffer now contains.
-        """
-        buf.extend(audio)
-        while len(buf) >= _FRAME_BYTES:
-            loop.call_soon_threadsafe(
-                emit_item,
-                {"type": "audio", "generation": generation,
-                 "data": bytes(buf[:_FRAME_BYTES])},
-            )
-            del buf[:_FRAME_BYTES]
+    # ponytail: AudioFrameProcessor is the single owner of frame
+    # buffering. Inworld streams mu-law at 8 kHz directly but the
+    # chunk sizes are NOT 20ms-aligned (the operator's logs show a
+    # typical tail chunk of 158 bytes = 19.75ms). Twilio's Media
+    # Stream pacing assumes 20ms per frame; emitting 19.75ms throws
+    # the timing off by 0.25ms per chunk and the user hears a subtle
+    # click at the end of every turn. emit_silence_tail=False drops
+    # the partial trailing frame at segment end — boundary click fix.
+    frame_proc = AudioFrameProcessor(emit_silence_tail=False)
 
     def producer() -> None:
-        nonlocal ttfb_ms
-        # Closure-scoped re-framing buffer. Holds the leftover from
-        # the previous Inworld chunk until we have a full 160 bytes
-        # to emit.
-        reframe_buf = bytearray()
         nonlocal ttfb_ms
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
@@ -289,6 +247,15 @@ async def stream_tts_segment(
                         continue
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started) * 1000
+                        # ponytail: stamp TTS_FIRST_BYTE on the first audio
+                        # byte from this adapter.
+                        session._stage_timer = session._stage_timer or StageTimer(
+                            call_id=session.session_key,
+                            turn_id=0,
+                            generation=session.active_generation,
+                        )
+                        if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
+                            session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
                     # ponytail: one-shot diagnostic on the FIRST chunk
                     # of each turn. Verifies the format Inworld actually
                     # returns against what we requested (mu-law 8 kHz).
@@ -311,10 +278,15 @@ async def stream_tts_segment(
                             audio_stats["dc"],
                             audio_stats["zc"],
                         )
-                    # Re-frame: append the new bytes to the buffer and
-                    # emit as many full 160-byte frames as we can. The
-                    # leftover stays in the buffer for the next chunk.
-                    _feed(audio, reframe_buf)
+                    # Re-frame via AudioFrameProcessor: append the new
+                    # bytes to the buffered state and emit every
+                    # completed 160-byte frame. Leftover stays buffered
+                    # until the next chunk (or dropped at flush).
+                    for frame in frame_proc.feed(audio):
+                        loop.call_soon_threadsafe(
+                            emit_item,
+                            {"type": "audio", "generation": generation, "data": frame},
+                        )
         except urllib.error.HTTPError as exc:
             err_body = ""
             try:
@@ -353,11 +325,11 @@ async def stream_tts_segment(
                     }).encode("utf-8")
                     req2 = urllib.request.Request(url, data=fallback_body, headers=headers, method="POST")
                     with urllib.request.urlopen(req2, timeout=45) as resp2:
-                        # ponytail: re-framing also applies to the 404
-                        # fallback path — same Inworld, same 19.75ms
-                        # chunks. Local buffer so the final flush below
-                        # pads the last partial frame to 160 bytes.
-                        fb_buf = bytearray()
+                        # ponytail: separate frame_proc for the fallback
+                        # path — bytes from the failing main path (if any
+                        # arrived before the HTTPError) must NOT be merged
+                        # with the fallback voice's audio.
+                        fb_proc = AudioFrameProcessor(emit_silence_tail=False)
                         for raw_line in resp2:
                             line = raw_line.strip() if isinstance(raw_line, bytes) else raw_line.encode().strip()
                             if not line:
@@ -376,11 +348,28 @@ async def stream_tts_segment(
                                 continue
                             if not audio:
                                 continue
-                            _feed(audio, fb_buf)
-                        # Flush whatever the 158-byte tail left in the
-                        # buffer. Critical — without this the last frame
-                        # of the fallback is also 158 bytes.
-                        _flush_frame(fb_buf)
+                            # ponytail: stamp TTS_FIRST_BYTE on the first
+                            # audio byte from the fallback (main path may
+                            # not have produced any if it 404'd on connect).
+                            session._stage_timer = session._stage_timer or StageTimer(
+                                call_id=session.session_key,
+                                turn_id=0,
+                                generation=session.active_generation,
+                            )
+                            if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
+                                session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
+                            for frame in fb_proc.feed(audio):
+                                loop.call_soon_threadsafe(
+                                    emit_item,
+                                    {"type": "audio", "generation": generation, "data": frame},
+                                )
+                        # Drop the partial trailing frame at segment end
+                        # (emit_silence_tail=False). The previous code
+                        # padded with silence, which produces a 20ms silent
+                        # tail — better than a boundary click, but the
+                        # tail now goes through the same AudioFrameProcessor
+                        # path as the rest of the frames.
+                        fb_proc.flush()
                     return  # success with fallback, skip the error emit
                 except Exception as fb_exc:
                     log.warning(
@@ -398,19 +387,17 @@ async def stream_tts_segment(
                 {"type": "error", "generation": generation, "message": f"Inworld TTS connection error: {exc}"},
             )
         finally:
-            # Flush the re-framing buffer one last time so the
-            # last partial chunk (typically 158 bytes = 19.75ms
-            # from Inworld) becomes a full 160-byte frame padded
-            # with mu-law silence. Without this, the playback loop
-            # would receive a 158-byte frame and Twilio's 20ms
-            # pacing would drift on the very last frame.
-            _flush_frame(reframe_buf)
+            # ponytail: drop the partial trailing frame at segment end
+            # (emit_silence_tail=False). The previous code padded with
+            # mu-law silence, which was less audible than a click but
+            # still inserted 20ms of silence at the end of every turn.
+            frame_proc.flush()
             loop.call_soon_threadsafe(
                 emit_item,
                 {"type": "segment_end", "generation": generation},
             )
 
-    await asyncio.to_thread(producer)
+    await _to_thread(producer)
     total_ms = (time.perf_counter() - started) * 1000
     return ttfb_ms, total_ms
 

@@ -10,7 +10,6 @@ import struct
 import math
 import statistics
 import collections
-import audioop
 
 
 def human(n):
@@ -38,26 +37,20 @@ def main():
     # Convert to mono if needed
     mono = frames
     if nchannels > 1:
-        try:
-            mono = audioop.tomono(frames, sampwidth, 0.5, 0.5)
-        except Exception:
-            # Fallback: take first channel by slicing
-            if sampwidth == 2:
-                vals = struct.unpack(f"<{nframes * nchannels}h", frames)
-                mono_vals = vals[0::nchannels]
-                mono = struct.pack(f"<{len(mono_vals)}h", *mono_vals)
-            else:
-                raise
+        # ponytail: tomono not in audio_codec; first-channel extraction only
+        if sampwidth == 2:
+            vals = struct.unpack(f"<{nframes * nchannels}h", frames)
+            mono_vals = vals[0::nchannels]
+            mono = struct.pack(f"<{len(mono_vals)}h", *mono_vals)
+        else:
+            raise
 
     # Normalize sample width to 2 bytes (16-bit) for analysis
-    if sampwidth != 2:
-        try:
-            mono2 = audioop.lin2lin(mono, sampwidth, 2)
-        except Exception:
-            print("Unsupported sample width for conversion:", sampwidth)
-            return 3
-    else:
+    if sampwidth == 2:
         mono2 = mono
+    else:
+        print("Unsupported sample width for conversion:", sampwidth)
+        return 3
 
     nsamples = len(mono2) // 2
     samples = struct.unpack(f"<{nsamples}h", mono2)

@@ -10,7 +10,6 @@ import struct
 import math
 
 def load_wav(path):
-    import audioop
     import numpy as _np
 
     with wave.open(path, 'rb') as w:
@@ -21,8 +20,8 @@ def load_wav(path):
         raw = w.readframes(nframes)
 
     if sw != 2:
-        raw = audioop.lin2lin(raw, sw, 2)
-        sw = 2
+        # TODO: lin2lin not in audio_codec.py; only sw=2 is supported here
+        raise ValueError(f"unsupported sample width: {sw} (sample-width conversion dropped; only sw=2 supported)")
 
     arr = _np.frombuffer(raw, dtype='<i2')
     if nch > 1:

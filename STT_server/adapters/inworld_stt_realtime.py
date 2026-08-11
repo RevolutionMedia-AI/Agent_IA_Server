@@ -13,7 +13,6 @@ Endpoint: https://docs.inworld.ai/api-reference/sttAPI/speechtotext/transcribe-s
 Model:    inworld/inworld-stt-1 (first-party)
 """
 import asyncio
-import audioop
 import base64
 import json
 import logging
@@ -22,6 +21,12 @@ import struct
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+try:
+    import numpy as np
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
     STT_RECONNECT_BASE_DELAY_MS,
@@ -29,6 +34,7 @@ from STT_server.config import (
     STT_RECONNECT_MAX_DELAY_MS,
 )
 from STT_server.domain.session import CallSession
+from STT_server.services.audio_codec import ulaw2lin
 from STT_server.services.credentials_resolver import resolve_provider
 
 log = logging.getLogger("stt_server")
@@ -39,6 +45,8 @@ INWORLD_WS_URL = (
 )
 INWORLD_STT_SAMPLE_RATE = 16000  # raw PCM requires >=8000; 16k matches the doc default
 INWORLD_DEFAULT_MODEL = "inworld/inworld-stt-1"
+# ponytail: 8 × 20ms = 160ms batch, retains ~1 frame of TTFB latency cost
+INWORLD_BATCH_FRAMES = 8
 # ponytail: ceiling on how long we'll wait for the FIRST transcript
 # after the WS connects. The "result envelope" bug went undetected for
 # the entire call because nothing logged the silence. This watchdog
@@ -61,12 +69,20 @@ def _mulaw_8k_to_pcm16_16k(mulaw: bytes) -> bytes:
     we interpolate at the mid-points so the rate is correct without
     hallucinating high-frequency content.
     """
-    pcm_8k = audioop.ulaw2lin(mulaw, 2)  # PCM16 @ 8 kHz mono
+    pcm_8k = ulaw2lin(mulaw, 2)  # PCM16 @ 8 kHz mono
     n_8k = len(pcm_8k) // 2
     if n_8k == 0:
         return b""
+    if HAVE_NUMPY:
+        samples_8k = np.frombuffer(pcm_8k, dtype="<i2")
+        samples_16k = np.empty(2 * n_8k, dtype="<i2")
+        samples_16k[0::2] = samples_8k
+        if n_8k > 1:
+            samples_32 = samples_8k.astype(np.int32)
+            samples_16k[1:-1:2] = (samples_32[:-1] + samples_32[1:]) >> 1
+        samples_16k[-1] = samples_8k[-1]
+        return samples_16k.tobytes()
     samples_8k = struct.unpack(f"<{n_8k}h", pcm_8k)
-    # Linear 2x upsample with mid-point averaging.
     samples_16k = [0] * (2 * n_8k)
     for i, s in enumerate(samples_8k):
         samples_16k[2 * i] = s
@@ -99,6 +115,7 @@ async def _inworld_audio_sender(ws, session: CallSession, model_id: str, languag
         }
     }))
 
+    batch_buf: list[bytes] = []
     while True:
         try:
             chunk = await asyncio.wait_for(session.stt_audio_queue.get(), timeout=5.0)
@@ -109,6 +126,13 @@ async def _inworld_audio_sender(ws, session: CallSession, model_id: str, languag
             # ping Inworld with empty data - just wait for the next frame.
             continue
         if chunk is None:
+            if batch_buf:
+                pcm = _mulaw_8k_to_pcm16_16k(b"".join(batch_buf))
+                batch_buf.clear()
+                if pcm:
+                    await ws.send(json.dumps({
+                        "audioChunk": {"content": base64.b64encode(pcm).decode("ascii")},
+                    }))
             # ponytail: None is the "session ended" sentinel that
             # session_runtime enqueues before tearing the session down.
             try:
@@ -118,7 +142,11 @@ async def _inworld_audio_sender(ws, session: CallSession, model_id: str, languag
             return
         if not chunk:
             continue
-        pcm = _mulaw_8k_to_pcm16_16k(chunk)
+        batch_buf.append(chunk)
+        if len(batch_buf) < INWORLD_BATCH_FRAMES:
+            continue
+        pcm = _mulaw_8k_to_pcm16_16k(b"".join(batch_buf))
+        batch_buf.clear()
         if not pcm:
             continue
         await ws.send(json.dumps({

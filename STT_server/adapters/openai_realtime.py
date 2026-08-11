@@ -516,6 +516,31 @@ async def _event_receiver(ws, session: CallSession) -> None:
                             "type": "session.update",
                             "session": {"instructions": _build_instructions(session)},
                         }))
+                    # ponytail: P3 — push to the central transcript_queue so
+                    # process_transcripts sees this final. The
+                    # `trigger_llm=False` flag stops it from calling
+                    # launch_reply_pipeline (OpenAI Realtime handles the LLM
+                    # itself on the same WS). Anti-loop, replace-current,
+                    # order-escalation, and memory deduplication all run.
+                    try:
+                        from STT_server.services.common import enqueue_nowait_with_drop
+                        enqueue_nowait_with_drop(
+                            session.transcript_queue,
+                            {
+                                "text": transcript,
+                                "is_final": True,
+                                "speech_final": True,
+                                "language": session.preferred_language,
+                                "source": "openai_realtime",
+                                "trigger_llm": False,
+                            },
+                            "transcript_queue",
+                        )
+                    except Exception:
+                        log.exception(
+                            "Failed to enqueue openai_realtime transcript to "
+                            "transcript_queue for session=%s", session.session_key,
+                        )
                 continue
 
             # ── Response lifecycle ──
@@ -559,7 +584,16 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     from STT_server.domain.language import pop_streaming_segments
                     segments, pending = pop_streaming_segments(pending)
                     for seg in segments:
-                        enqueue_nowait_with_drop(tq, seg, "text_segment_queue")
+                        # P1: drop-newest when full instead of drop-oldest (was
+                        # silently losing the opener of an LLM reply). With
+                        # maxsize now 64 this is rare, but when it does happen,
+                        # losing the NEWEST unconsumed segment is still better
+                        # than losing the OLDEST (still pending consumption).
+                        try:
+                            tq.put_nowait(seg)
+                        except asyncio.QueueFull:
+                            log.warning("[text_segment_queue] dropped NEWEST item at %d/%d (queue full)",
+                                        tq.qsize(), TEXT_SEGMENT_QUEUE_MAXSIZE)
                 continue
 
             if etype == "response.output_text.done":

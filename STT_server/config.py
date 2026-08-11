@@ -57,15 +57,18 @@ FILLER_TTS_ENABLED = os.getenv("FILLER_TTS_ENABLED", "true").strip().lower() in 
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 LOG_TRANSCRIPT_CONTENT = os.getenv("LOG_TRANSCRIPT_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-STREAM_SID_WAIT_MAX_MS = int(os.getenv("STREAM_SID_WAIT_MAX_MS", "5000"))
-STREAM_SID_WAIT_POLL_MS = int(os.getenv("STREAM_SID_WAIT_POLL_MS", "50"))
+# ponytail: P0 — was 5000ms polling; now event-based via wait_signals.py
+STREAM_SID_WAIT_TIMEOUT_MS = int(os.getenv("STREAM_SID_WAIT_TIMEOUT_MS", "0"))
 
 STT_AUDIO_QUEUE_MAXSIZE = int(os.getenv("STT_AUDIO_QUEUE_MAXSIZE", "300"))
 REALTIME_AUDIO_QUEUE_MAXSIZE = int(os.getenv("REALTIME_AUDIO_QUEUE_MAXSIZE", "300"))
 STT_MUTE_BUFFER_CHUNKS = int(os.getenv("STT_MUTE_BUFFER_CHUNKS", "25"))
 TRANSCRIPT_QUEUE_MAXSIZE = int(os.getenv("TRANSCRIPT_QUEUE_MAXSIZE", "32"))
 PLAYBACK_QUEUE_MAXSIZE = int(os.getenv("PLAYBACK_QUEUE_MAXSIZE", "1024"))
-TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "16"))
+# ponytail: P1 — bumped from 16 to 64. The previous maxsize silently
+# dropped the LLM reply opener when load exceeded ~16 segments
+# enqueued faster than the TTS consumer drained them.
+TEXT_SEGMENT_QUEUE_MAXSIZE = int(os.getenv("TEXT_SEGMENT_QUEUE_MAXSIZE", "64"))
 UTTERANCE_QUEUE_MAXSIZE = int(os.getenv("UTTERANCE_QUEUE_MAXSIZE", "256"))
 
 # Streaming segmentation (LLM token-stream → TTS chunk boundaries).

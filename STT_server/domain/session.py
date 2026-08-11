@@ -92,6 +92,14 @@ class CallSession:
     voice_streak: int = 0
     silence_frames: int = 0
     active_generation: int = 0
+    # ponytail: every generation <= this is invalid; producers abort when
+    # their gen <= cancelled_through. Set by interrupt_current_turn after
+    # bumping active_generation. Replaces per-adapter cancel handshakes —
+    # producers pull active_generation at each emit and compare.
+    cancelled_through: int = 0
+    # ponytail: monotonic ts of last barge-in, for diagnostics only.
+    # Producers must NOT branch on this; it's instrumentation.
+    barge_in_at: float | None = None
     response_active: bool = False
     history: list[dict[str, str]] = field(default_factory=list)
     utterance_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=lambda: asyncio.Queue(maxsize=UTTERANCE_QUEUE_MAXSIZE))
@@ -100,7 +108,9 @@ class CallSession:
     stt_mute_buffer: deque[bytes] = field(default_factory=lambda: deque(maxlen=STT_MUTE_BUFFER_CHUNKS))
     transcript_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=TRANSCRIPT_QUEUE_MAXSIZE))
     tasks: set[asyncio.Task] = field(default_factory=set)
-    pending_marks: set[str] = field(default_factory=set)
+    # ponytail: name → monotonic-ts when mark was sent, so the consumer in
+    # STT_Server.py's mark handler can compute RTT.
+    pending_marks: dict[str, float] = field(default_factory=dict)
     mark_counter: int = 0
     assistant_speaking: bool = False
     assistant_started_at: float | None = None
@@ -119,6 +129,16 @@ class CallSession:
     realtime_audio_queue: asyncio.Queue[bytes | None] = field(default_factory=lambda: asyncio.Queue(maxsize=REALTIME_AUDIO_QUEUE_MAXSIZE))
     realtime_text_queue: asyncio.Queue | None = None
     generation_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    # ponytail: set by the 'start' event handler when Twilio sends streamSid.
+    # Replaces the polling loop in playback_service — wait_signals.wait_stream_ready
+    # blocks on this event instead of spinning on a 50ms timer.
+    stream_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    # ponytail: per-call pipeline stage timer. Lazily set by
+    # session_runtime.register_session; mark_stage() in wait_signals.py
+    # will lazy-init if mark arrives before register_session. Defined
+    # here as Optional + forward reference to dodge the circular import
+    # between domain.session and services._instrumentation.
+    stage_timer: object | None = None
     stt_failure_announced: bool = False
     last_processed_user_text: str = ""
     closed: bool = False

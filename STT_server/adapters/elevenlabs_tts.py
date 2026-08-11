@@ -18,7 +18,10 @@ from STT_server.domain.language import (
     sanitize_tts_text,
 )
 from STT_server.domain.session import CallSession
+from STT_server.services.audio_frame_processor import AudioFrameProcessor
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services._instrumentation import Stages
+from STT_server.services.wait_signals import mark_stage as _mark_stage
 
 
 log = logging.getLogger("stt_server")
@@ -38,6 +41,7 @@ async def stream_tts_segment(
     which produces mu-law 8 kHz audio directly compatible with Twilio -- no
     resampling or mu-law encoding needed.
     """
+    frame_proc = AudioFrameProcessor(emit_silence_tail=False)
     user_id = getattr(session, "user_id", None)
     creds = resolve_provider(user_id, "elevenlabs")
     api_key = creds.get("api_key")
@@ -144,15 +148,19 @@ async def stream_tts_segment(
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] ElevenLabs WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
+                        # ponytail: stamp the TTS-first-byte event the first
+                        # time audio is enqueued. Cheap and idempotent.
+                        _mark_stage(session, Stages.TTS_FIRST_BYTE)
 
                     mulaw_bytes = raw_msg  # Already mu-law 8kHz -- no conversion needed
                     if save_audio:
                         audio_accum.extend(mulaw_bytes)
                     for i in range(0, len(mulaw_bytes), 4096):
                         chunk = mulaw_bytes[i : i + 4096]
-                        log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
-                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
-                        emitted_audio = True
+                        for frame in frame_proc.feed(chunk):
+                            log.debug("[TTS] Emitting audio frame: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(frame))
+                            emit_item({"type": "audio", "generation": generation, "data": frame, "source": "tts"})
+                            emitted_audio = True
                     continue
 
                 # Text frame -- JSON (could be audio with base64, error, done, or alignment info)
@@ -167,6 +175,9 @@ async def stream_tts_segment(
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] ElevenLabs WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
+                        # ponytail: stamp the TTS-first-byte event the first
+                        # time audio is enqueued. Cheap and idempotent.
+                        _mark_stage(session, Stages.TTS_FIRST_BYTE)
 
                     try:
                         mulaw_bytes = base64.b64decode(msg["audio"])
@@ -178,9 +189,10 @@ async def stream_tts_segment(
                         audio_accum.extend(mulaw_bytes)
                     for i in range(0, len(mulaw_bytes), 4096):
                         chunk = mulaw_bytes[i : i + 4096]
-                        log.debug("[TTS] Emitting audio chunk: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(chunk))
-                        emit_item({"type": "audio", "generation": generation, "data": chunk, "source": "tts"})
-                        emitted_audio = True
+                        for frame in frame_proc.feed(chunk):
+                            log.debug("[TTS] Emitting audio frame: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(frame))
+                            emit_item({"type": "audio", "generation": generation, "data": frame, "source": "tts"})
+                            emitted_audio = True
 
                     # Check if this is the final audio chunk
                     if msg.get("isFinal"):
@@ -287,6 +299,8 @@ async def stream_tts_segment(
             except Exception as e:
                 log.error(f"[TTS] Error guardando audio: {e}")
 
+        for frame in frame_proc.flush():
+            emit_item({"type": "audio", "generation": generation, "data": frame, "source": "tts"})
         emit_item({"type": "segment_end", "generation": generation, "has_audio": emitted_audio})
 
     total_ms = (time.perf_counter() - started_at) * 1000

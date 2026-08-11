@@ -43,6 +43,9 @@ from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
 from STT_server.services.tool_executor import execute_tool, record_tool_result
+from STT_server.services._instrumentation import Stages
+from STT_server.services.wait_signals import mark_stage as _mark_stage
+from STT_server.services.thread_pool import to_thread as _to_thread
 
 
 log = logging.getLogger("stt_server")
@@ -245,7 +248,15 @@ async def enqueue_delayed_filler(
     if generation != session.active_generation or session.closed or first_segment_event.is_set():
         return
 
-    await enqueue_with_drop(text_queue, filler_text, "text_segment_queue")
+    # P1: drop-newest when full instead of drop-oldest (was silently losing
+    # the opener of an LLM reply). With maxsize now 64 this is rare, but
+    # when it does happen, losing the NEWEST unconsumed segment is still
+    # better than losing the OLDEST (which is still pending consumption).
+    try:
+        text_queue.put_nowait(filler_text)
+    except asyncio.QueueFull:
+        log.warning("[text_segment_queue] dropped NEWEST item at %d/%d (queue full)",
+                    text_queue.qsize(), TEXT_SEGMENT_QUEUE_MAXSIZE)
 
 
 async def stream_llm_reply_with_tts(
@@ -298,6 +309,15 @@ async def _stream_llm_with_tools(
             safe_seg = segment
         if safe_seg != segment:
             log.info("[TTS] Sanitized streaming LLM segment for %s: %.120r -> %.120r", session.session_key, segment[:120], safe_seg[:120])
+        # ponytail: stamp the LLM-first-token event the first time a
+        # segment (i.e. a populated token chunk) arrives. This is the
+        # earliest observable signal in turn_manager that the LLM has
+        # produced output — openai_llm.py is the actual producer but
+        # we can't touch it. Multi-provider safe: every provider
+        # routes through emit_segment.
+        _mark_stage(session, Stages.LLM_FIRST_TOKEN)
+        # queue full → keep drop-oldest helper; the 64 maxsize makes it rare,
+        # and rewriting the threadsafe path is a larger refactor.
         loop.call_soon_threadsafe(enqueue_nowait_with_drop, text_queue, safe_seg, "text_segment_queue")
 
     def emit_done(_unused: str | None = None) -> None:
@@ -315,7 +335,7 @@ async def _stream_llm_with_tools(
 
     messages = build_messages(session, user_text)
     producer_task = asyncio.create_task(
-        asyncio.to_thread(
+        _to_thread(
             stream_llm_reply_sync,
             messages,
             lambda: generation != session.active_generation or session.closed,
@@ -464,6 +484,12 @@ async def cancel_deferred_final_flush(session: CallSession) -> None:
 # anything 2+ words with terminal punctuation is a valid turn.
 VERY_SHORT_WORD_LIMIT = 1
 
+# ponytail: P3 — cap on auto-recovery from process_transcripts exceptions.
+# The previous code returned silently on any Exception, which starved the
+# reply pipeline until Twilio cut the stream. We now retry with backoff;
+# the cap stops a poison loop from running forever.
+_MAX_TRANSCRIPT_RETRIES = 5
+
 
 def user_is_speaking(session: CallSession) -> bool:
     return bool(session.speech_frames or session.voice_streak > 0)
@@ -514,6 +540,7 @@ async def process_final_transcript(
     text: str,
     language: str,
     speech_final: bool,
+    trigger_llm: bool = True,
 ) -> None:
     pending_partial = session.partial_reply_task
     if pending_partial and not pending_partial.done():
@@ -527,6 +554,18 @@ async def process_final_transcript(
     update_memory(session, text)
     if not should_generate_response(session, text):
         log.info("No se genera respuesta para final duplicado en %s: %s", session.session_key, text)
+        if speech_final:
+            session.current_transcript = ""
+        return
+
+    # ponytail: P3 — when the source is OpenAI Realtime (or any provider
+    # that runs its own LLM internally), the housekeeping above
+    # (memory, anti-loop, replace_current) still runs but we must NOT
+    # trigger a second LLM. The flag is plumbed from process_transcripts
+    # via the queued item's `trigger_llm` field.
+    if not trigger_llm:
+        log.info("[process_final_transcript] skipping launch_reply_pipeline (trigger_llm=False) for %s: %s",
+                 session.session_key, text[:120])
         if speech_final:
             session.current_transcript = ""
         return
@@ -856,50 +895,27 @@ async def enqueue_transcript_event(session: CallSession, event: dict) -> None:
 
 
 async def process_transcripts(session: CallSession) -> None:
-    try:
-        while True:
-            item = await session.transcript_queue.get()
-            text = (item.get("text") or "").strip()
-            if not text:
-                continue
+    retries = 0
+    while not session.closed:
+        try:
+            while True:
+                item = await session.transcript_queue.get()
+                text = (item.get("text") or "").strip()
+                if not text:
+                    continue
 
-            language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
-            source = item.get("source") or "realtime"
-            is_final = bool(item.get("is_final"))
-            speech_final = bool(item.get("speech_final"))
-            if is_final:
-                session.preferred_language = language
-            session.current_transcript = text
+                language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
+                source = item.get("source") or "realtime"
+                is_final = bool(item.get("is_final"))
+                speech_final = bool(item.get("speech_final"))
+                if is_final:
+                    session.preferred_language = language
+                session.current_transcript = text
 
-            if is_final and not final_transcript_ready(session, is_final):
-                log.info("Final recibido pero usuario sigue hablando, pausar procesamiento: %s", session.session_key)
-                session.deferred_final_text = text
-                session.deferred_final_language = language
-                await cancel_deferred_final_flush(session)
-                task = asyncio.create_task(flush_deferred_final_after_grace(session))
-                session.deferred_final_flush_task = task
-                session.tasks.add(task)
-                task.add_done_callback(session.tasks.discard)
-                continue
-
-            if is_final:
-                # Merge with any pending deferred text.
-                if session.deferred_final_text:
-                    await cancel_deferred_final_flush(session)
-                    text = f"{session.deferred_final_text} {text}".strip()
-                    language = normalize_supported_language(session.deferred_final_language or language)
-                    session.deferred_final_text = ""
-                    session.deferred_final_language = None
-
-                # While the assistant is speaking, always defer the final
-                # so we don't cut off the current response with a new turn.
-                if session.assistant_speaking or should_defer_final_transcript(text):
+                if is_final and not final_transcript_ready(session, is_final):
+                    log.info("Final recibido pero usuario sigue hablando, pausar procesamiento: %s", session.session_key)
                     session.deferred_final_text = text
                     session.deferred_final_language = language
-                    if session.assistant_speaking:
-                        log.info("Defiriendo final (asistente hablando) en %s: %s", session.session_key, text)
-                    else:
-                        log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
                     await cancel_deferred_final_flush(session)
                     task = asyncio.create_task(flush_deferred_final_after_grace(session))
                     session.deferred_final_flush_task = task
@@ -907,29 +923,69 @@ async def process_transcripts(session: CallSession) -> None:
                     task.add_done_callback(session.tasks.discard)
                     continue
 
-                # If the text is purely non-actionable (greeting, filler,
-                # name mention) don't trigger a turn — just defer it so it
-                # can be merged with the real request when it arrives.
-                if is_non_actionable_utterance(text):
-                    session.deferred_final_text = text
-                    session.deferred_final_language = language
-                    log.info("Defiriendo final no-accionable en %s: %s", session.session_key, text)
-                    await cancel_deferred_final_flush(session)
-                    task = asyncio.create_task(flush_deferred_final_after_grace(session))
-                    session.deferred_final_flush_task = task
-                    session.tasks.add(task)
-                    task.add_done_callback(session.tasks.discard)
+                if is_final:
+                    # Merge with any pending deferred text.
+                    if session.deferred_final_text:
+                        await cancel_deferred_final_flush(session)
+                        text = f"{session.deferred_final_text} {text}".strip()
+                        language = normalize_supported_language(session.deferred_final_language or language)
+                        session.deferred_final_text = ""
+                        session.deferred_final_language = None
+
+                    # While the assistant is speaking, always defer the final
+                    # so we don't cut off the current response with a new turn.
+                    if session.assistant_speaking or should_defer_final_transcript(text):
+                        session.deferred_final_text = text
+                        session.deferred_final_language = language
+                        if session.assistant_speaking:
+                            log.info("Defiriendo final (asistente hablando) en %s: %s", session.session_key, text)
+                        else:
+                            log.info("Defiriendo final incompleto en %s: %s", session.session_key, text)
+                        await cancel_deferred_final_flush(session)
+                        task = asyncio.create_task(flush_deferred_final_after_grace(session))
+                        session.deferred_final_flush_task = task
+                        session.tasks.add(task)
+                        task.add_done_callback(session.tasks.discard)
+                        continue
+
+                    # If the text is purely non-actionable (greeting, filler,
+                    # name mention) don't trigger a turn — just defer it so it
+                    # can be merged with the real request when it arrives.
+                    if is_non_actionable_utterance(text):
+                        session.deferred_final_text = text
+                        session.deferred_final_language = language
+                        log.info("Defiriendo final no-accionable en %s: %s", session.session_key, text)
+                        await cancel_deferred_final_flush(session)
+                        task = asyncio.create_task(flush_deferred_final_after_grace(session))
+                        session.deferred_final_flush_task = task
+                        session.tasks.add(task)
+                        task.add_done_callback(session.tasks.discard)
+                        continue
+
+                    # ponytail: P3 — honor the queued item's trigger_llm flag.
+                    # OpenAI Realtime sets this False (it owns its own LLM
+                    # pipeline) so we run the housekeeping (anti-loop,
+                    # replace-current, memory) without triggering a second LLM.
+                    await process_final_transcript(
+                        session, text, language,
+                        speech_final=speech_final,
+                        trigger_llm=bool(item.get("trigger_llm", True)),
+                    )
                     continue
 
-                await process_final_transcript(session, text, language, speech_final=speech_final)
+                # Partial transcripts: no action — wait for the final.
                 continue
-
-            # Partial transcripts: no action — wait for the final.
-            continue
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Error en process_transcripts")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            retries += 1
+            log.exception("Error en process_transcripts (retry %d/%d)",
+                          retries, _MAX_TRANSCRIPT_RETRIES)
+            if retries > _MAX_TRANSCRIPT_RETRIES:
+                log.error("process_transcripts exceeded %d retries; giving up for session=%s",
+                          _MAX_TRANSCRIPT_RETRIES, session.session_key)
+                return
+            await asyncio.sleep(0.1)
 
 
 async def announce_stt_failure_once(session: CallSession) -> None:

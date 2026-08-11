@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import time
@@ -11,6 +10,7 @@ from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS
 from STT_server.domain.language import detect_language, get_language_instruction,                  pop_streaming_segments
 from STT_server.domain.session import CallSession
 from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.thread_pool import to_thread as _to_thread
 from STT_server.utils.safe_http import UnsafeURLError, validate_public_url
 
 
@@ -575,10 +575,10 @@ async def call_llm(session: CallSession, user_text: str) -> str:
     provider = _session_provider(session)
     if provider == "anthropic":
         config = _anthropic_config(session)
-        return await asyncio.to_thread(_anthropic_call_sync, messages, config, session)
+        return await _to_thread(_anthropic_call_sync, messages, config, session)
     if provider == "gemini":
         config = _gemini_config(session)
-        return await asyncio.to_thread(_gemini_call_sync, messages, config, session)
+        return await _to_thread(_gemini_call_sync, messages, config, session)
     # OpenAI-compatible: openai or MiniMax.
     try:
         client = _openai_client(session) if provider == "openai" else _minimax_client(session)
@@ -606,7 +606,7 @@ async def call_llm(session: CallSession, user_text: str) -> str:
             log.exception("LLM ERROR")
             return "Lo siento, tuve un problema momentaneo. Puedes repetirlo?"
 
-    return await asyncio.to_thread(sync_call)
+    return await _to_thread(sync_call)
 
 
 def stream_llm_reply_sync(
@@ -734,6 +734,12 @@ def stream_llm_reply_sync(
                 except json.JSONDecodeError:
                     args = {}
                 parsed_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+            # ponytail: P3 — emit the None sentinel so play_tts_from_text_queue's
+            # "wait for segment OR None" loop wakes up and dispatches the tool
+            # calls via execute_tool_callback. Without this the consumer is
+            # blocked forever after a tool-call turn (the "hang after 3 turns"
+            # symptom from the Phase 1 audit).
+            emit_done(None)
             return full_reply.strip(), None, parsed_calls
 
         # ponytail: log the LLM's full reply so the operator can
@@ -869,4 +875,4 @@ async def list_models(api_key: str | None = None) -> dict:
         except Exception as exc:
             return {"error": str(exc)}
 
-    return await asyncio.to_thread(sync_list)
+    return await _to_thread(sync_list)

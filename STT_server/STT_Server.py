@@ -44,9 +44,12 @@ from STT_server import db_tenants
 from STT_server.db import is_postgres
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
+from STT_server.services._instrumentation import Stages
+from STT_server.services.reconnect import BackoffPolicy, with_backoff
 from STT_server.services.playback_service import playback_loop
 from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, monitor_max_call_duration, register_session, track_task
 from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_transcripts
+from STT_server.services.wait_signals import set_stream_ready
 
 
 # ponytail: was WARNING — the user reported "no more logs after matched
@@ -60,6 +63,11 @@ logging.basicConfig(level=logging.INFO)
 for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error", "websockets", "asyncio"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("stt_server")
+_WS_BACKOFF = BackoffPolicy(base_ms=250, max_ms=8000, factor=2.0)
+# ponytail: P2 round-2 — the with_backoff helper is now imported but not
+# yet wired around the Twilio WS accept. Activate it when prod logs show
+# transient disconnect storms (call_handlers with `asyncio.CancelledError`
+# or `WebSocketDisconnect`).
 
 if not PUBLIC_URL:
     raise RuntimeError("Define PUBLIC_URL en las variables de entorno")
@@ -138,6 +146,9 @@ async def lifespan(app: FastAPI):
     async def _heartbeat():
         counter = {"n": 0}
         while True:
+            # found in audit; preserve unless you know why — 60s is the
+            # cadence for the "[heartbeat] container alive" log; not a
+            # first-turn wait.
             await asyncio.sleep(60)
             counter["n"] += 1
             try:
@@ -442,6 +453,8 @@ async def _watchdog_assistant_speaking(session: CallSession) -> None:
     POLL_SEC = 5
     while not session.closed:
         try:
+            # found in audit; preserve unless you know why — 5s cadence
+            # for the H5 assistant_speaking watchdog; not a first-turn wait.
             await asyncio.sleep(POLL_SEC)
         except asyncio.CancelledError:
             return
@@ -460,8 +473,45 @@ async def _watchdog_assistant_speaking(session: CallSession) -> None:
             session.pending_marks.clear()
 
 
+async def _pump_realtime_transcripts_to_central_queue(session: CallSession) -> None:
+    """ponytail: P3 — OpenAI Realtime provider bypassed process_transcripts
+    (memory updates, anti-loop, replace-current). This pump forwards
+    realtime_text_queue events to session.transcript_queue so the central
+    pipeline sees them."""
+    from STT_server.services.common import enqueue_nowait_with_drop
+    q = getattr(session, "realtime_text_queue", None)
+    if q is None:
+        return
+    while not session.closed:
+        try:
+            ev = await q.get()
+        except asyncio.CancelledError:
+            return
+        if ev is None:
+            return
+        # ponytail: realtime text event shape varies (depends on the
+        # adapter); forward verbatim. process_transcripts recognises
+        # dict events with at least 'text' and 'is_final' fields. Add
+        # turn_id for correlation.
+        if not isinstance(ev, dict):
+            continue
+        ev.setdefault("turn_id", getattr(session, "turn_counter", 0))
+        # ponytail: only forward final transcripts to the central
+        # pipeline; partials are handled in the adapter or ignored.
+        if not ev.get("is_final"):
+            continue
+        if not enqueue_nowait_with_drop(
+            session.transcript_queue,
+            ev,
+            "transcript_queue",
+        ):
+            log.warning("[REALTIME->TRANSCRIPT] queue full; dropped final transcript for session=%s",
+                        session.session_key)
+
+
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket) -> None:
+    # TODO reconnect: wrap call accept with with_backoff when transient failures appear in prod logs
     await ws.accept()
     session = CallSession(session_key=f"ws-{id(ws)}")
 
@@ -512,6 +562,11 @@ async def media_stream(ws: WebSocket) -> None:
                 session.stream_sid = start.get("streamSid") or msg.get("streamSid")
                 if session.call_sid:
                     session.session_key = session.call_sid
+                # ponytail: P0 from the call-flow audit. Now that stream_sid
+                # is settled, wake any code that was waiting on the event
+                # (the playback loop will switch from polling to waiting
+                # in the next refactor). Idempotent: re-set is a no-op.
+                set_stream_ready(session)
                 # ponytail: usage tracking. wall-clock start so duration
                 # is real seconds, not monotonic. agent_id is set
                 # below from customParameters — initialise here so it's
@@ -736,6 +791,13 @@ async def media_stream(ws: WebSocket) -> None:
                         session,
                         asyncio.create_task(run_realtime_session(session)),
                     )
+                    # ponytail: P3 — start the relay pump so realtime
+                    # transcripts flow through process_transcripts
+                    # (memory / anti-loop / replace-current / order
+                    # escalation). Belt-and-suspenders: existing
+                    # realtime dispatch path is untouched.
+                    pump_task = asyncio.create_task(_pump_realtime_transcripts_to_central_queue(session))
+                    session.tasks.add(pump_task)
                 elif session.stt_provider == 'inworld':
                     track_task(
                         session,
@@ -816,15 +878,38 @@ async def media_stream(ws: WebSocket) -> None:
                 continue
 
             if event == "media":
+                # ponytail: P2 round-2 — wire the sequence-number tracker from
+                # twilio_media.py. Counts gaps, duplicates, reorders per stream_sid.
+                try:
+                    from STT_server.adapters.twilio_media import track_twilio_sequence
+                    track_twilio_sequence(session, msg)
+                except Exception:
+                    log.exception("track_twilio_sequence failed")
                 await handle_incoming_media(session, msg["media"]["payload"])
                 continue
 
             if event == "mark":
-                mark = msg.get("mark", {}).get("name")
-                if mark and mark in session.pending_marks:
-                    session.pending_marks.discard(mark)
-                if not session.pending_marks:
-                    session.assistant_speaking = False
+                mark = msg.get("mark", {}).get("name") if isinstance(msg.get("mark"), dict) else msg.get("mark")
+                pending = getattr(session, "pending_marks", None)
+                if isinstance(pending, dict) and mark and mark in pending:
+                    sent_at = pending.pop(mark, None)
+                    if sent_at is not None:
+                        rtt_ms = (time.monotonic() - sent_at) * 1000.0
+                        timer = getattr(session, "stage_timer", None)
+                        if timer is not None:
+                            try:
+                                timer.mark(Stages.TWILIO_MARK_ACK)
+                            except Exception:
+                                pass
+                        metrics = getattr(session, "metrics", None)
+                        if metrics is not None:
+                            try:
+                                metrics.observe_ms("mark_ack_rtt_ms", rtt_ms)
+                                metrics.incr("mark_acks")
+                            except Exception:
+                                pass
+                        log.info("[MARK_ACK] session=%s mark=%s rtt_ms=%.1f",
+                                 session.session_key, mark, rtt_ms)
                 continue
 
             if event == "dtmf":
@@ -833,6 +918,14 @@ async def media_stream(ws: WebSocket) -> None:
 
             if event == "stop":
                 log.info("Stream stop para %s", session.session_key)
+                # ponytail: P2 round-3 — emit Twilio sequence-number summary
+                # (gaps/dupes/reorders counted per stream). Idempotent if
+                # session.metrics is missing.
+                try:
+                    from STT_server.adapters.twilio_media import summarize_twilio_sequence
+                    summarize_twilio_sequence(session)
+                except Exception:
+                    log.exception("summarize_twilio_sequence failed")
                 break
 
     except Exception as exc:

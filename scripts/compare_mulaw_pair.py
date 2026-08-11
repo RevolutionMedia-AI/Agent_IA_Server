@@ -2,7 +2,7 @@
 import sys
 import os
 import struct
-import audioop
+from STT_server.services import audio_codec
 import math
 import statistics
 
@@ -37,8 +37,8 @@ def compare(a_path, b_path):
 
     # Convert to PCM16 using ulaw -> 2-byte samples
     try:
-        a_pcm = audioop.ulaw2lin(a, 2)
-        b_pcm = audioop.ulaw2lin(b, 2)
+        a_pcm = audio_codec.ulaw2lin(a, 2)
+        b_pcm = audio_codec.ulaw2lin(b, 2)
     except Exception as e:
         print("ulaw2lin conversion error:", e)
         return
