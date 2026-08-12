@@ -56,7 +56,7 @@ INWORLD_BATCH_FRAMES = 8
 # fallback. Only active while received_any_result is False — once
 # we have at least one transcript, normal silence (caller thinking)
 # is allowed and the watchdog stays out of the way.
-STT_INACTIVITY_TIMEOUT_S = 25
+STT_INACTIVITY_TIMEOUT_S = 60
 
 
 def _mulaw_8k_to_pcm16_16k(mulaw: bytes) -> bytes:
