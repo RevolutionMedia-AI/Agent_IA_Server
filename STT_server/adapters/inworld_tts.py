@@ -143,7 +143,12 @@ async def stream_tts_segment(
     # official doc; we clamp to 1.5 here so a future code path that
     # writes 1.8 doesn't silently degrade the audio).
     _speed = getattr(session, "tts_speed", None)
-    speaking_rate = max(0.5, min(1.5, _speed if _speed is not None else 1.0))
+    # ponytail: bumped default from 1.0 to 1.15 per operator feedback
+    # ("the TTS sounds slow and lumbering on the call"). 1.15 is
+    # still within Inworld's natural-speech band (≤1.5 per docs) and
+    # does not trigger the "too fast" denoise heuristics. Per-agent
+    # overrides via session.tts_speed still apply on top.
+    speaking_rate = max(0.5, min(1.5, _speed if _speed is not None else 1.15))
     # ponytail: Steering is only honored by inworld-tts-2 (full
     # support). On 1.5-mini / 1.5-max the tags are silently ignored
     # or rendered inconsistently, so we gate the flag to tts-2. The
