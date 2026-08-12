@@ -58,7 +58,7 @@ ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lo
 LOG_TRANSCRIPT_CONTENT = os.getenv("LOG_TRANSCRIPT_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # ponytail: P0 — was 5000ms polling; now event-based via wait_signals.py
-STREAM_SID_WAIT_TIMEOUT_MS = int(os.getenv("STREAM_SID_WAIT_TIMEOUT_MS", "0"))
+STREAM_SID_WAIT_TIMEOUT_MS = int(os.getenv("STREAM_SID_WAIT_TIMEOUT_MS", "5000"))
 
 STT_AUDIO_QUEUE_MAXSIZE = int(os.getenv("STT_AUDIO_QUEUE_MAXSIZE", "300"))
 REALTIME_AUDIO_QUEUE_MAXSIZE = int(os.getenv("REALTIME_AUDIO_QUEUE_MAXSIZE", "300"))

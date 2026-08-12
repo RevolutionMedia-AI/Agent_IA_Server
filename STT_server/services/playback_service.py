@@ -39,7 +39,13 @@ def enqueue_playback_clear(session: CallSession) -> None:
     """M2: was async with `await enqueue_with_drop`, but the body is sync
     (enqueue_with_drop just wraps a put_nowait). The await was a no-op
     that confused every caller. Now plain sync."""
-    enqueue_with_drop(
+    # ponytail: hotfix — call the SYNC variant directly. The previous
+    # code invoked the async `enqueue_with_drop` without `await`,
+    # producing a RuntimeWarning every barge-in AND silently dropping
+    # the clear item (the coroutine was never awaited so the queue
+    # was never actually cleared). enqueue_nowait_with_drop does the
+    # same work in a non-async wrapper.
+    enqueue_nowait_with_drop(
         session.playback_queue,
         {"type": "clear", "generation": session.active_generation},
         "playback_queue",

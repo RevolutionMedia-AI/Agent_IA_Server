@@ -84,8 +84,22 @@ def set_stream_ready(session: "CallSession") -> None:
     event.set()
 
 
-async def wait_stream_ready(session: "CallSession", timeout: float) -> bool:
-    """Await ``stream_ready`` up to *timeout* seconds. Returns True if set."""
+async def wait_stream_ready(session: "CallSession", timeout: float | None = None) -> bool:
+    """Await ``stream_ready`` up to *timeout* seconds. Returns True if set.
+    If *timeout* is None, falls back to ``STREAM_SID_WAIT_TIMEOUT_MS / 1000``,
+    or 5 seconds if that env var is 0 (which matches the pre-Phase-2 legacy
+    behavior the welcome greeting path expects)."""
+    if timeout is None:
+        from STT_server.config import STREAM_SID_WAIT_TIMEOUT_MS
+        ms = STREAM_SID_WAIT_TIMEOUT_MS
+        # ponytail: hotfix — STREAM_SID_WAIT_TIMEOUT_MS default was 0 which
+        # made the wait effectively instant. With timeout=0 the wait
+        # returns immediately even if the start event hasn't fired,
+        # so the welcome greeting is enqueued before stream_sid exists
+        # and gets dropped. The legacy behavior was a 5s polling wait;
+        # we keep that as the fallback default so the welcome greeting
+        # always reaches Twilio.
+        timeout = (ms / 1000.0) if ms > 0 else 5.0
     event = getattr(session, "stream_ready", None)
     if event is None:
         return False
