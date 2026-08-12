@@ -9,6 +9,7 @@ from STT_server.config import (
     PLAYBACK_QUEUE_MAXSIZE,
     PRE_SPEECH_FRAMES,
     REALTIME_AUDIO_QUEUE_MAXSIZE,
+    SPEECH_FRAMES_MAX,
     STT_AUDIO_QUEUE_MAXSIZE,
     STT_MUTE_BUFFER_CHUNKS,
     TRANSCRIPT_QUEUE_MAXSIZE,
@@ -87,7 +88,13 @@ class CallSession:
     user_id: str | None = None
     vad_buffer: bytearray = field(default_factory=bytearray)
     pre_speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=PRE_SPEECH_FRAMES))
-    speech_frames: list[bytes] = field(default_factory=list)
+    # AUDIO-005: deque(maxlen=...) bounds the per-utterance PCM buffer at
+    # SPEECH_FRAMES_MAX frames (~60 s default). Replaces the unbounded
+    # list — a sustained-signal caller (or a stuck VAD) could otherwise
+    # grow memory until END_SILENCE_FRAMES fired. drop-oldest is the
+    # right policy here: the leading frames are stale by definition once
+    # the utterance exceeds the cap.
+    speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=SPEECH_FRAMES_MAX))
     speech_frame_count: int = 0
     voice_streak: int = 0
     silence_frames: int = 0

@@ -175,8 +175,22 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
 
     session.generation_changed.set()
 
-    if session.speech_frames:
-        session.speech_frames.clear()
+    # AUDIO-005: free every per-call audio buffer so the dataclass holds
+    # zero audio bytes after cleanup. speech_frames is already a bounded
+    # deque (maxlen=SPEECH_FRAMES_MAX) but we still .clear() to release
+    # the bytes eagerly. vad_buffer is an unbounded bytearray in the happy
+    # path it drains to ~zero, but a misbehaving caller could leave a
+    # few KB behind; clear it too. pre_speech_frames is bounded by
+    # PRE_SPEECH_FRAMES but the slot-holding bytes can be large.
+    session.speech_frames.clear()
+    session.vad_buffer.clear()
+    session.pre_speech_frames.clear()
+    session.stt_mute_buffer.clear()
+    # ponytail: AUDIO-005 — reset the once-per-session cap warning
+    # flag. cleanup_session may run after a subsequent call reuses
+    # the same session_key (rare but possible in tests); reset
+    # defensively.
+    session._speech_frames_cap_warned = False
 
     for task in list(session.tasks):
         task.cancel()

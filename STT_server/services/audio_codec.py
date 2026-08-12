@@ -119,7 +119,11 @@ def _encode_sample(s: int) -> int:
 
 # ── self-test ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import audioop
+    try:
+        import audioop
+        _HAVE_AUDIOOP = True
+    except ImportError:
+        _HAVE_AUDIOOP = False
     import random
 
     # 1. ulaw 0xFF decodes to silent zero (positive silence in PCMU).
@@ -148,12 +152,15 @@ if __name__ == "__main__":
             raise AssertionError(f"{fn.__name__} did not raise for width=3")
 
     # 5. Drift check vs audioop across all 256 mu-law inputs (warning if mismatched).
-    drift = 0
-    for b in range(256):
-        mine = ulaw2lin(bytes([b]), 2)
-        theirs = audioop.ulaw2lin(bytes([b]), 2)
-        if mine != theirs:
-            drift += 1
-    assert drift == 0, f"decode drift vs audioop: {drift}/256 entries"
+    # audioop was removed in Python 3.13 — the pure-Python table is the source of truth
+    # and the round-trip + 256-code coverage above already proves correctness.
+    if _HAVE_AUDIOOP:
+        drift = 0
+        for b in range(256):
+            mine = ulaw2lin(bytes([b]), 2)
+            theirs = audioop.ulaw2lin(bytes([b]), 2)
+            if mine != theirs:
+                drift += 1
+        assert drift == 0, f"decode drift vs audioop: {drift}/256 entries"
 
     print("audio_codec: OK")

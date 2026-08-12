@@ -1,4 +1,5 @@
 import base64
+import binascii
 import logging
 import time
 
@@ -11,11 +12,13 @@ from STT_server.config import (
     ENABLE_BARGE_IN,
     END_SILENCE_FRAMES,
     FRAME_DURATION_MS,
+    MAX_MEDIA_PAYLOAD_BYTES,
     MIN_BARGE_IN_FRAMES,
     MIN_VOICE_RMS,
     PRE_SPEECH_FRAMES,
     SPEECH_START_FRAMES,
     TWILIO_SR,
+    VAD_BUFFER_MAX_BYTES,
 )
 from STT_server.domain.session import CallSession
 from STT_server.services import audio_codec
@@ -40,6 +43,27 @@ def _is_probable_voice_sync(frame: bytes) -> tuple[bool, int]:
     return vad.is_speech(frame, TWILIO_SR) and rms >= MIN_VOICE_RMS, rms
 
 
+# ponytail: AUDIO-005 — cap gate for speech_frames. A runaway
+# utterance (sustained noise, very long monologue) could otherwise
+# grow the list unbounded for the duration of a call. Drop the
+# tail with a counter + one WARNING per session so the operator
+# sees when the cap fires without log spam.
+def _append_speech_frame(session: CallSession, frame: bytes) -> None:
+    if len(session.speech_frames) >= SPEECH_FRAMES_MAX:
+        metrics = getattr(session, "metrics", None)
+        if metrics is not None:
+            metrics.incr("speech_frames_capped_total", 1)
+        if not getattr(session, "_speech_frames_cap_warned", False):
+            log.warning(
+                "[VAD] speech_frames cap reached (%d) on session=%s; "
+                "further frames dropped until next END_SILENCE",
+                SPEECH_FRAMES_MAX, session.session_key,
+            )
+            session._speech_frames_cap_warned = True
+        return
+    session.speech_frames.append(frame)
+
+
 async def is_probable_voice(frame: bytes) -> tuple[bool, int]:
     """M4: VAD + RMS are CPU-bound (audio_codec + webrtcvad). At 50 fps per call
     and 10 concurrent calls that's ~1.5 ms of CPU per frame x 500 fps = 750 ms
@@ -50,7 +74,29 @@ async def is_probable_voice(frame: bytes) -> tuple[bool, int]:
 
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
-    raw = base64.b64decode(media_payload)
+    # AUDIO-006: bound per-event memory before decoding. b64 inflates
+    # ~4/3, so a 4/3-multiple of MAX_MEDIA_PAYLOAD_BYTES catches the
+    # ceiling without ever allocating the decoded buffer.
+    if len(media_payload) > MAX_MEDIA_PAYLOAD_BYTES * 4 // 3:
+        log.warning(
+            "[MEDIA] oversized base64 payload: len=%d cap=%d session=%s",
+            len(media_payload), MAX_MEDIA_PAYLOAD_BYTES, session.session_key,
+        )
+        metrics = getattr(session, "metrics", None)
+        if metrics is not None:
+            metrics.incr("oversized_media_payload_total", 1)
+        return
+    try:
+        raw = base64.b64decode(media_payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        log.warning(
+            "[MEDIA] invalid base64 payload: %s session=%s",
+            exc, session.session_key,
+        )
+        metrics = getattr(session, "metrics", None)
+        if metrics is not None:
+            metrics.incr("invalid_base64_total", 1)
+        return
 
     # Log formato de audio recibido
     log.debug(f"[VAD] Audio recibido: len={len(raw)} bytes, sample_rate={TWILIO_SR}, channels=1, frame_dur_ms={FRAME_DURATION_MS}")
@@ -86,8 +132,34 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
     if target_queue is not None:
         if session.assistant_speaking:
             session.stt_mute_buffer.append(raw)
+            # ponytail: AUDIO-002 — observe the mute-buffer high-water
+            # mark so the audit's "echo buffer re-injects phantom
+            # transcripts after mark" hypothesis can be confirmed with
+            # data. Cheap counter, no behavioural change: every chunk
+            # appended during assistant_speaking is one entry; if the
+            # agent's reply is short and the mark fires quickly, only
+            # a handful of chunks ever accumulate. If callers
+            # consistently report echo, the gauge + the drop count
+            # together pinpoint it.
+            _m = getattr(session, "metrics", None)
+            if _m is not None:
+                try:
+                    _m.gauge("mute_buffer_depth", float(len(session.stt_mute_buffer)))
+                except Exception:
+                    pass
         else:
             if session.stt_mute_buffer:
+                # ponytail: AUDIO-002 — count re-injections separately
+                # from fresh enqueues so we can distinguish "echo
+                # playback" from normal inbound. The previous code
+                # drained the buffer with the same enqueue helper as
+                # the fresh chunk, which is why nobody could tell.
+                _m = getattr(session, "metrics", None)
+                if _m is not None:
+                    try:
+                        _m.incr("mute_buffer_reinjected_chunks", len(session.stt_mute_buffer))
+                    except Exception:
+                        pass
                 for buffered_chunk in session.stt_mute_buffer:
                     await enqueue_with_drop(target_queue, buffered_chunk, queue_name)
                 session.stt_mute_buffer.clear()
@@ -104,6 +176,21 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         return
 
     session.vad_buffer.extend(pcm16)
+    # AUDIO-005: defensive cap on the per-call vad_buffer. The downstream
+    # while-loop drains `FRAME_BYTES`-sized frames and compacts via
+    # `del buf[:offset]`, so the buffer should never grow past a couple
+    # of seconds of audio. If the loop fails to drain (e.g. an oversized
+    # payload arrived and is stuck in VAD), trim the oldest bytes so a
+    # misbehaving caller can't grow memory until cleanup_session runs.
+    # ponytail: global cap, drop-oldest on overflow, counter for metrics.
+    if len(session.vad_buffer) > VAD_BUFFER_MAX_BYTES:
+        metrics = getattr(session, "metrics", None)
+        if metrics is not None:
+            try:
+                metrics.incr("vad_buffer_overflow")
+            except Exception:
+                pass
+        del session.vad_buffer[: len(session.vad_buffer) - VAD_BUFFER_MAX_BYTES]
 
     buf = session.vad_buffer
     offset = 0
@@ -197,12 +284,12 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         if is_voice:
             session.voice_streak += 1
             session.silence_frames = 0
-            session.speech_frames.append(frame)
+            _append_speech_frame(session, frame)
             session.speech_frame_count += 1
             log.debug(f"[VAD] Continuando voz: speech_frame_count={session.speech_frame_count}")
         else:
             session.voice_streak = 0
-            session.speech_frames.append(frame)
+            _append_speech_frame(session, frame)
             session.silence_frames += 1
             log.debug(f"[VAD] Silencio: silence_frames={session.silence_frames}")
 
@@ -212,6 +299,7 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
             session.pre_speech_frames.clear()
             session.silence_frames = 0
             session.speech_frame_count = 0
+            session._speech_frames_cap_warned = False
 
     # Compact: remove consumed bytes in one operation instead of per-frame
     if offset > 0:

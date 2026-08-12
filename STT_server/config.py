@@ -39,6 +39,13 @@ TWILIO_CHANNELS = 1
 FRAME_DURATION_MS = 20
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
 TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
+# ponytail: AUDIO-006 — per-event base64 payload cap. Twilio sends
+# ~160-800 byte PCMU payloads; 8192 decoded bytes leaves generous
+# headroom (2 frames at 8 kHz / 20 ms is 320 bytes; 8192 is 25x).
+# Bounds memory if an upstream proxy or test harness sends a huge
+# event. Compare against b64 length (4/3 inflation), so we never
+# even allocate the decoded buffer.
+MAX_MEDIA_PAYLOAD_BYTES = int(os.getenv("MAX_MEDIA_PAYLOAD_BYTES", "8192"))
 
 # webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive).
 # ponytail: P0 follow-up — bumped default 1 -> 2 per operator feedback.
@@ -150,6 +157,18 @@ SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "1"))
 # activity for 320ms easily; click/noise bursts typically don't.
 MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "16"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
+# AUDIO-005: hard cap on the per-utterance PCM buffer (audio_ingest).
+# 20 ms @ 8 kHz PCM16 = 320 bytes/frame. 3000 frames = 60 s ≈ 960 KB.
+# Bounded via deque(maxlen=...) so a sustained-signal caller cannot grow
+# memory unboundedly while waiting for END_SILENCE_FRAMES. Drop-oldest
+# is fine here: the leading frames are stale by definition once the
+# utterance exceeds the cap.
+SPEECH_FRAMES_MAX = int(os.getenv("SPEECH_FRAMES_MAX", "3000"))
+# AUDIO-005: hard cap on the partial-decoded vad_buffer. Stays small in
+# the happy path (under 1 s of audio, ~16 KB). This guard rejects
+# pathological inputs (bursts of oversized media payloads) before the
+# bytearray grows past a sane ceiling. Trim from the left when full.
+VAD_BUFFER_MAX_BYTES = int(os.getenv("VAD_BUFFER_MAX_BYTES", "65536"))  # 64 KB ≈ 2 s
 # ponytail: P0 follow-up — bumped 260 -> 800. The RMS threshold is the
 # PRIMARY filter for non-speech noise. Telephony line noise + clicks
 # typically peak well below 800; real human voice easily clears 1000+.

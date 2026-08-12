@@ -560,6 +560,42 @@ async def media_stream(ws: WebSocket) -> None:
                 start = msg.get("start", {})
                 session.call_sid = start.get("callSid")
                 session.stream_sid = start.get("streamSid") or msg.get("streamSid")
+                # ponytail: AUDIO-006 — Twilio's contract guarantees
+                # PCMU/8000/1 today, but we capture the actual envelope
+                # so a future change is loud not silent. Validation runs
+                # before register_session; metrics is None here so we
+                # use getattr and increment if attach_metrics has run
+                # (e.g. on a re-start event).
+                media_format_in = start.get("mediaFormat")
+                if isinstance(media_format_in, dict):
+                    _mf_encoding = media_format_in.get("encoding")
+                    _mf_sample_rate = media_format_in.get("sampleRate")
+                    _mf_channels = media_format_in.get("channels")
+                else:
+                    _mf_encoding = _mf_sample_rate = _mf_channels = None
+                _mf_valid = (
+                    isinstance(_mf_encoding, str)
+                    and (_mf_encoding.startswith("audio/x-mulaw") or _mf_encoding.startswith("audio/pcmu"))
+                    and _mf_sample_rate == 8000
+                    and _mf_channels == 1
+                )
+                if _mf_valid:
+                    session.media_format = {
+                        "encoding": _mf_encoding,
+                        "sample_rate": _mf_sample_rate,
+                        "channels": _mf_channels,
+                    }
+                    session.media_format_mismatch = False
+                else:
+                    session.media_format_mismatch = True
+                    log.warning(
+                        "[MEDIA] unexpected mediaFormat: encoding=%r sampleRate=%r channels=%r "
+                        "(expected audio/x-mulaw or audio/pcmu @ 8000 Hz, mono) session=%s",
+                        _mf_encoding, _mf_sample_rate, _mf_channels, session.session_key,
+                    )
+                    _mf_metrics = getattr(session, "metrics", None)
+                    if _mf_metrics is not None:
+                        _mf_metrics.incr("invalid_media_format_total", 1)
                 if session.call_sid:
                     session.session_key = session.call_sid
                 # ponytail: P0 from the call-flow audit. Now that stream_sid

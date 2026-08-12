@@ -107,6 +107,12 @@ async def interrupt_current_turn(session: CallSession) -> None:
     # Draining it (the previous behaviour) caused phantom
     # transcripts of the user's own echo. Clear instead.
     session.stt_mute_buffer.clear()
+    # ponytail: AUDIO-005 — clear any in-flight speech_frames too.
+    # They predate the barge-in and belong to the cancelled turn;
+    # letting them persist would mix frames across turns the next
+    # time INICIO DE VOZ fires.
+    session.speech_frames.clear()
+    session._speech_frames_cap_warned = False
     drain_queue_nowait(session.playback_queue)
     enqueue_playback_clear(session)
     session.generation_changed.set()
@@ -202,6 +208,12 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
     # emit_silence_tail=False drops the partial trailing frame at
     # call end (boundary click fix).
     frame_proc = AudioFrameProcessor(emit_silence_tail=False)
+    # ponytail: AUDIO-001 + AUDIO-004 — stash the framer on the
+    # session so the per-call summary at cleanup_session time can
+    # surface bytes_in / frames_out / padded_tail_frames /
+    # dropped_tail_bytes. The audit says these need measurement
+    # before sizing policy; we cannot size without observing.
+    session._playback_frame_proc = frame_proc
     first_frame_marked = False
     try:
         while True:
@@ -299,6 +311,19 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         pacing_ms = TWILIO_OUTBOUND_PACING_MS
                     elapsed = time.perf_counter() - send_start
                     wait = (pacing_ms / 1000.0) - elapsed if pacing_ms > 0 else 0.0
+                    # ponytail: AUDIO-008 — record pacing drift (how much
+                    # wall-clock the send+loop took beyond the desired
+                    # 20ms-per-frame budget) as a latency observation.
+                    # Operators reading the per-call summary can see
+                    # p50/p99 drift; under load this is the signal that
+                    # pacing is the bottleneck, not the WS send.
+                    drift_ms = elapsed * 1000.0
+                    _metrics = getattr(session, "metrics", None)
+                    if _metrics is not None:
+                        try:
+                            _metrics.observe_ms("pacing_drift_ms", drift_ms)
+                        except Exception:
+                            pass
                     if wait > 0:
                         await asyncio.sleep(wait)
                 # ponytail: collapsed the previous "Playback audio / Timing

@@ -180,11 +180,30 @@ def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes =
         out_int = np.clip(np.round(res), -32768, 32767).astype(np.int16)
         pcm_8k = out_int.tobytes()
         log.debug(f"[RIME_TTS] Resampled {src_rate}->{TWILIO_SAMPLE_RATE} via kaiser FIR: src={n_aligned} out={expected_out}")
+        # ponytail: AUDIO-007 — record which resample path served this
+        # segment. The audit notes the fallback degrades quality silently
+        # when scipy is missing. Per-call summary exposes the counter
+        # so a missing-scipy image is loud.
+        try:
+            _m = getattr(session, "metrics", None)
+            if _m is not None:
+                _m.incr("rime_resample_scipy_segments")
+        except Exception:
+            pass
     else:
         # ponytail: degrades to decimation if scipy missing; install scipy==1.11+ in requirements.txt
         n_in = struct.unpack(f"<{n_aligned}h", data[: n_aligned * 2])
         pcm_8k = struct.pack(f"<{expected_out}h", *n_in[::down])
         log.warning(f"[RIME_TTS] scipy unavailable — decimation fallback {src_rate}->{TWILIO_SAMPLE_RATE}; audio quality degraded")
+        # ponytail: AUDIO-007 — same counter, fallback path. With both
+        # counters on, ops can see rime_resample_fallback_segments > 0
+        # at a glance and start the scipy install.
+        try:
+            _m = getattr(session, "metrics", None)
+            if _m is not None:
+                _m.incr("rime_resample_fallback_segments")
+        except Exception:
+            pass
 
     usable_out = (expected_out // FRAME_SAMPLES) * FRAME_SAMPLES
     if usable_out == 0:

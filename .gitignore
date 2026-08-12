@@ -41,3 +41,7 @@ uvicorn.test.out
 # Datos de usuario (contienen hashes de passwords y tokens de sesión — NUNCA commitear)
 STT_server/data/
 !STT_server/data/.gitkeep
+
+# Per-call audio metrics (append-only JSONL -- runtime output, never commit)
+data/audio_metrics/
+!data/audio_metrics/.gitkeep

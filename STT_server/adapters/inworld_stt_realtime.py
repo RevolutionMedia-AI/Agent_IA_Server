@@ -116,6 +116,16 @@ async def _inworld_audio_sender(ws, session: CallSession, model_id: str, languag
     }))
 
     batch_buf: list[bytes] = []
+    # ponytail: AUDIO-009 — measure how long the batch takes to fill.
+    # The audit calls out that the 8-chunk batch assumes every payload
+    # is one 20ms Twilio frame; if upstream groups/fragments, the
+    # wait grows silently. Track batch start (first chunk of this
+    # batch) separately from per-chunk arrival so the batch_wait
+    # observation reflects the time to fill 8 frames, not the time
+    # since the last chunk.
+    import time as _time
+    _batch_started: float | None = None
+    _last_chunk_at: float | None = None
     while True:
         try:
             chunk = await asyncio.wait_for(session.stt_audio_queue.get(), timeout=5.0)
@@ -142,11 +152,31 @@ async def _inworld_audio_sender(ws, session: CallSession, model_id: str, languag
             return
         if not chunk:
             continue
+        _now = _time.monotonic()
+        if _batch_started is None:
+            _batch_started = _now
+        # ponytail: AUDIO-009 — per-chunk inter-arrival histogram (time
+        # between consecutive Twilio frames reaching the sender loop).
+        _m = getattr(session, "metrics", None)
+        if _m is not None and _last_chunk_at is not None:
+            try:
+                _m.observe_ms("inworld_chunk_arrival_ms", (_now - _last_chunk_at) * 1000.0)
+            except Exception:
+                pass
+        _last_chunk_at = _now
         batch_buf.append(chunk)
         if len(batch_buf) < INWORLD_BATCH_FRAMES:
             continue
+        # ponytail: AUDIO-009 — full-batch fill time (8 chunks of audio).
+        if _m is not None and _batch_started is not None:
+            try:
+                _m.observe_ms("inworld_batch_wait_ms", (_now - _batch_started) * 1000.0)
+            except Exception:
+                pass
         pcm = _mulaw_8k_to_pcm16_16k(b"".join(batch_buf))
         batch_buf.clear()
+        _batch_started = None
+        _last_chunk_at = None
         if not pcm:
             continue
         await ws.send(json.dumps({
