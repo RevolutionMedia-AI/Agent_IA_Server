@@ -687,6 +687,18 @@ async def media_stream(ws: WebSocket) -> None:
                     # here so the adapter's existing fallback chain keeps
                     # working unchanged for legacy agents.
                     session.llm_temperature = _safe_float(agent_cfg.get('llm_temperature'))
+                # ponytail: hotfix for production bug where agent rows
+                # stored llm_temperature=-1 (a FE sentinel for "use
+                # default") were passed verbatim to OpenAI/Anthropic/
+                # Gemini/MiniMax. The adapters' `is not None` check
+                # let -1.0 through, which made providers default to ~1.0
+                # (their internal fallback), producing over-eager
+                # interpretations like "goodbye on first turn" when
+                # the user said only one short word. Treat any negative
+                # value as "no override" so the adapter default (0.2)
+                # applies.
+                if session.llm_temperature is not None and session.llm_temperature < 0:
+                    session.llm_temperature = None
                     session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
                     session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
                     # ponytail: prepend a per-TTS-provider hint to the
