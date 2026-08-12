@@ -451,7 +451,7 @@ def looks_like_incomplete_utterance(text: str) -> bool:
     return False
 
 
-def split_tts_segments(text: str, max_chars: int = 300, short_text_threshold: int = 220) -> list[str]:
+def split_tts_segments(text: str, max_chars: int = 700, short_text_threshold: int = 400) -> list[str]:
     """Split a reply into segments safe to send to TTS one at a time.
 
     ponytail: the previous version split on every `.!?` followed by a
