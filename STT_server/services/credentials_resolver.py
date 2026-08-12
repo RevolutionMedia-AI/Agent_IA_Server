@@ -1242,8 +1242,7 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
 
         return {"models": [], "error": f"Unknown service '{service}'"}
     except Exception as exc:
-        import traceback as _tb
-        _tb.print_exc(file=__import__('sys').stderr)
+        log.exception("[list_provider_models] %s/%s failed: %s", service, provider_id, exc)
         return {"models": [], "error": _sanitize_error(str(exc))[:300]}
 
 

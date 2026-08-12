@@ -16,11 +16,21 @@ echo "Starting app on port $PORT"
 # had f-strings and single-quoted literals that confused the parser
 # depending on whether $m contained special characters. The heredoc
 # sidesteps all of that.
+# ponytail: SEC-001 — bootstrap admin password comes from env var only.
+# The literal default that lived here before has been removed.
+# Generate a strong one with:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Then set BOOTSTRAP_ADMIN_PASSWORD in Railway env vars (or the local
+# .env) BEFORE the first deploy that runs this script. Without it, the
+# script fails fast instead of silently shipping a known-credential
+# admin.
+: "${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD must be set on first deploy. Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\". Or set it in Railway env vars.}"
+
 ADMIN_ID='user-admin-001'
-ADMIN_EMAIL='admin@revolutionmedia.ai'
+ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-admin@revolutionmedia.ai}"
 ADMIN_NAME='Revolution Media Admin'
 ADMIN_ROLE='admin'
-ADMIN_HASH=$(printf '%s' 'Adminrevolutionmedia@109' | python -c 'import sys, hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+ADMIN_HASH=$(printf '%s' "$BOOTSTRAP_ADMIN_PASSWORD" | python -c 'import sys, hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
 
 # Resolve DATABASE_URL (Railway sometimes splits across PG* vars).
 if [ -z "$DATABASE_URL" ] && [ -n "$PGHOST" ] && [ -n "$PGUSER" ] && [ -n "$PGPASSWORD" ] && [ -n "$PGDATABASE" ]; then

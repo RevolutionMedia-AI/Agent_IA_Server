@@ -199,15 +199,44 @@ api_router = APIRouter()
 async def call_status(request: Request) -> dict:
     """Twilio status callback. Twilio POSTs form-encoded data here as
     the call progresses. We accept any status and return 200 so Twilio
-    doesn't retry. No auth: Twilio signature validation lives in
-    STT_Server.py's /voice webhook instead (this endpoint is only
-    informational).
+    doesn't retry.
+    ponytail: same signature model as /voice — Twilio signs every webhook
+    with the per-number Twilio subaccount auth token, looked up via the
+    called number's row. Reject (403) anything that doesn't match.
     """
     try:
         form = await request.form()
+        form_dict = {k: str(v) if v is not None else "" for k, v in form.items()}
     except Exception as exc:
         log.warning("[call-status] could not read form: %s", exc)
         return {"ok": True}
+    # Per-number Twilio auth token (same lookup /voice uses).
+    called_to = form_dict.get("To") or form_dict.get("to")
+    per_number_token = None
+    if called_to:
+        try:
+            from STT_server.adapters.twilio_api import validate_twilio_signature
+            from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
+            row = _find_num_for_sig(called_to) or {}
+            per_number_token = row.get("twilio_auth_token") or None
+        except Exception as exc:
+            log.warning("[call-status] per-number token lookup failed: %s", exc)
+    sig = request.headers.get("X-Twilio-Signature", "")
+    if per_number_token and sig:
+        from STT_server.config import PUBLIC_URL as _PUB_URL
+        signature_url = f"{_PUB_URL.rstrip('/')}{request.url.path}"
+        if request.url.query:
+            signature_url += f"?{request.url.query}"
+        if not validate_twilio_signature(per_number_token, signature_url, sig, form_dict):
+            log.warning("[call-status] invalid Twilio signature from %s to=%s",
+                        request.client.host if request.client else "?",
+                        called_to or "(missing)")
+            raise HTTPException(status_code=403, detail="invalid signature")
+    elif per_number_token and not sig:
+        # Token is configured but no signature arrived — likely a proxy
+        # stripped the header or someone is probing. Refuse.
+        log.warning("[call-status] missing X-Twilio-Signature (to=%s)", called_to or "(missing)")
+        raise HTTPException(status_code=403, detail="missing signature")
     call_sid = form.get("CallSid")
     call_status_val = form.get("CallStatus")
     duration = form.get("Duration")
@@ -242,8 +271,9 @@ def health() -> dict:
         else:
             out["checks"]["postgres"] = "skipped (JSON backend)"
     except Exception as exc:
+        log.exception("[/health] postgres check failed: %s", exc)
         out["ok"] = False
-        out["checks"]["postgres"] = f"FAIL: {exc}"
+        out["checks"]["postgres"] = "FAIL: database unavailable"
     # 2. PUBLIC_URL set?
     from STT_server.config import PUBLIC_URL
     if PUBLIC_URL:
@@ -1387,8 +1417,9 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
             api_key=body.api_key,
         )
     except Exception as exc:
-        tts_log.error("tts_preview failed for provider=%s voice=%s: %s", body.provider, body.voice_id, exc)
-        raise HTTPException(status_code=502, detail=f"TTS preview failed: {exc}")
+        tts_log.exception("tts_preview failed for provider=%s voice=%s: %s",
+                          body.provider, body.voice_id, exc)
+        raise HTTPException(status_code=502, detail="tts provider error")
     if not audio_bytes:
         raise HTTPException(
             status_code=502,
