@@ -27,11 +27,13 @@ test.out
 uvicorn.test.err
 uvicorn.test.out
 
-# archivos md 
+# archivos md
 *.md
 .DOCUMENTACION_TECNICA.md
 .Documentacion-Server.md
 .CAMBIOS_2026-03-23.md
+# agent catalog must be tracked
+!agents/**/*.md
 
 # Datos de usuario (contienen hashes de passwords y tokens de sesión — NUNCA commitear)
 STT_server/data/
