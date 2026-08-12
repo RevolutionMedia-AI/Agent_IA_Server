@@ -375,7 +375,11 @@ async def _stream_llm_with_tools(
         for tc in tool_calls:
             tool_name = tc.get("name", "")
             tool_args = tc.get("arguments", {})
-            log.info("[Tools] Executing tool '%s' with args=%s", tool_name, tool_args)
+            log.info(
+                "[Tools] Executing tool '%s' args_keys=%s",
+                tool_name,
+                list(tool_args.keys()) if isinstance(tool_args, dict) else type(tool_args).__name__,
+            )
             # Find the tool definition to get webhook_url and filler_phrase
             agent_tools = getattr(session, "agent_tools", []) or []
             tool_def = next((t for t in agent_tools if t.get("name") == tool_name), None)
@@ -392,7 +396,10 @@ async def _stream_llm_with_tools(
                 if webhook_url:
                     try:
                         tool_result = await execute_tool(webhook_url, tool_args, tool_name)
-                        log.info("[Tools] Tool '%s' result: %s", tool_name, str(tool_result)[:200])
+                        log.info(
+                            "[Tools] Tool '%s' executed ok result_len=%d",
+                            tool_name, len(str(tool_result)),
+                        )
                         # ponytail: per-tool observability. Best-effort —
                         # the helper swallows I/O errors so the live
                         # call is never broken by a stats write failure.
@@ -552,7 +559,10 @@ async def process_final_transcript(
     # Collect structured data from final transcript and check duplication.
     update_memory(session, text)
     if not should_generate_response(session, text):
-        log.info("No se genera respuesta para final duplicado en %s: %s", session.session_key, text)
+        if LOG_TRANSCRIPT_CONTENT:
+            log.info("No se genera respuesta para final duplicado en %s: %s", session.session_key, text)
+        else:
+            log.info("No se genera respuesta para final duplicado en %s len=%d", session.session_key, len(text))
         if speech_final:
             session.current_transcript = ""
         return
@@ -563,8 +573,12 @@ async def process_final_transcript(
     # trigger a second LLM. The flag is plumbed from process_transcripts
     # via the queued item's `trigger_llm` field.
     if not trigger_llm:
-        log.info("[process_final_transcript] skipping launch_reply_pipeline (trigger_llm=False) for %s: %s",
-                 session.session_key, text[:120])
+        if LOG_TRANSCRIPT_CONTENT:
+            log.info("[process_final_transcript] skipping launch_reply_pipeline (trigger_llm=False) for %s: %s",
+                     session.session_key, text)
+        else:
+            log.info("[process_final_transcript] skipping launch_reply_pipeline (trigger_llm=False) for %s len=%d",
+                     session.session_key, len(text))
         if speech_final:
             session.current_transcript = ""
         return
@@ -689,7 +703,10 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
     await cancel_prefetch_task(session)
     clear_prefetched_reply(session)
 
-    log.info("Procesando final diferido en %s: %s", session.session_key, text)
+    if LOG_TRANSCRIPT_CONTENT:
+        log.info("Procesando final diferido en %s: %s", session.session_key, text)
+    else:
+        log.info("Procesando final diferido en %s len=%d", session.session_key, len(text))
     await process_final_transcript(session, text, language, speech_final=True)
 
 
@@ -758,9 +775,8 @@ async def handle_agent_reply(
         log.warning("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
     else:
         log.warning(
-            "Usuario (%s) [%s]: len=%d key=%s",
+            "Usuario (%s) [%s]: len=%d",
             session.session_key, trigger, len(user_text),
-            (user_text[:40] + "...") if len(user_text) > 40 else user_text,
         )
 
     if prepared_reply:
@@ -818,9 +834,8 @@ async def handle_agent_reply(
         log.warning("Agente (%s): %s", session.session_key, reply)
     else:
         log.warning(
-            "Agente (%s): len=%d %s",
+            "Agente (%s): len=%d",
             session.session_key, len(reply),
-            (reply[:40] + "...") if len(reply) > 40 else reply,
         )
 
     total_ms = (time.perf_counter() - started_at) * 1000

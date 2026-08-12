@@ -7,6 +7,7 @@ import httpx
 from datetime import datetime, timezone
 from typing import Optional
 import logging
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -105,10 +106,10 @@ class ToolExecutor:
         }
 
         log.info(
-            "[ToolExecutor] Executing tool '%s' -> %s with args: %s",
+            "[ToolExecutor] Executing tool '%s' host=%s args_keys=%s",
             tool_name,
-            webhook_url,
-            arguments,
+            urlparse(webhook_url).hostname or "<unknown>",
+            list(arguments.keys()) if isinstance(arguments, dict) else type(arguments).__name__,
         )
 
         try:
@@ -130,9 +131,10 @@ class ToolExecutor:
                     result = {"raw_response": response.text}
 
                 log.info(
-                    "[ToolExecutor] Tool '%s' completed successfully: %s",
+                    "[ToolExecutor] Tool '%s' completed status=%s content_len=%s",
                     tool_name,
-                    str(result)[:200],
+                    response.status_code,
+                    response.headers.get("content-length") or len(response.content),
                 )
                 return result
 

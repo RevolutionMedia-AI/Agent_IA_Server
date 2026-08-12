@@ -493,7 +493,10 @@ async def _event_receiver(ws, session: CallSession) -> None:
             if etype == "conversation.item.input_audio_transcription.completed":
                 transcript = (event.get("transcript") or "").strip()
                 if transcript:
-                    log.info("Usuario (%s) [realtime]: %s", session.session_key, transcript)
+                    log.info(
+                        "[OPENAI_REALTIME] transcript final session=%s len=%d lang=%s",
+                        session.session_key, len(transcript), session.preferred_language,
+                    )
                     session.current_transcript = transcript
                     session.last_activity_at = time.monotonic()
                     session.history.append({"role": "user", "content": transcript})
@@ -672,7 +675,10 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     if len(session.history) > MAX_HISTORY_MESSAGES:
                         session.history[:] = session.history[-MAX_HISTORY_MESSAGES:]
                     session.last_processed_user_text = session.current_transcript
-                    log.info("Agente (%s): %s", session.session_key, reply)
+                    log.info(
+                        "[OPENAI_REALTIME] assistant reply session=%s len=%d",
+                        session.session_key, len(reply),
+                    )
 
                 # Wait for TTS playback to finish
                 tts_metrics: list[tuple[float | None, float]] = []
