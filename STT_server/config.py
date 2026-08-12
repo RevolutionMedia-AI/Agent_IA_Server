@@ -41,7 +41,12 @@ TWILIO_OUTBOUND_CHUNK_BYTES = 160
 TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 
 # webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive).
-WEBRTC_VAD_MODE = int(os.getenv("WEBRTC_VAD_MODE", "1"))
+# ponytail: P0 follow-up — bumped default 1 -> 2 per operator feedback.
+# Mode 1 fires on noise bursts (clicks, line hiss) reaching BARGE_IN_MIN_RMS
+# sustained for MIN_BARGE_IN_FRAMES; mode 2 rejects more non-speech while
+# still triggering on real human speech (which has distinctive formant
+# transitions that VAD mode 2 catches reliably).
+WEBRTC_VAD_MODE = int(os.getenv("WEBRTC_VAD_MODE", "2"))
 
 # Default call language — per-call override comes from agent row
 # (session.preferred_language). Default 'es' for the platform's
@@ -140,12 +145,26 @@ DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "elevenlabs").strip().l
 # VAD / barge-in / pre-speech buffer tunables (audio_ingest).
 END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "14"))
 SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "1"))
-MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "12"))
+# ponytail: P0 follow-up — bumped default 12 -> 16 (~320ms of consecutive
+# VAD-positive frames required). Real human speech sustains voice
+# activity for 320ms easily; click/noise bursts typically don't.
+MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "16"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
-MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "260"))
-BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "900"))
+# ponytail: P0 follow-up — bumped 260 -> 800. The RMS threshold is the
+# PRIMARY filter for non-speech noise. Telephony line noise + clicks
+# typically peak well below 800; real human voice easily clears 1000+.
+MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "800"))
+# ponytail: P0 follow-up — bumped 900 -> 2500. The pre-barge-in RMS
+# check uses pre_speech_frames[-MIN_BARGE_IN_FRAMES:] averaged, so the
+# absolute RMS must be loud AND sustained for barge-in to fire.
+BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "2500"))
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
-ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "3000"))
+# ponytail: P0 follow-up — bumped 3000 -> 5000ms. The echo of the AI's
+# own voice reaching the user's phone mic can sustain VAD-trigger
+# levels past the previous 3s window. 5s covers any reasonable
+# greeting reply (the welcome is ~12s of speech; we accept barge-in
+# risk on the tail of the reply rather than mid-greeting).
+ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "5000"))
 
 # LLM context window and response length — runtime tunables.
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
