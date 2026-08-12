@@ -1,8 +1,10 @@
 """Tool executor service for calling n8n webhooks internally during conversations."""
 
 import asyncio
+import ipaddress
 import json
 import os
+import socket
 import httpx
 from datetime import datetime, timezone
 from typing import Optional
@@ -21,6 +23,104 @@ _TOOLS_FILE = os.path.join(
     "data",
     "agent_tools.json",
 )
+
+
+# ponytail: SSRF allow-list for tool webhook URLs. The user can override
+# via the TOOL_WEBHOOK_ALLOW_HOSTS env var (comma-separated hostnames)
+# when they actually need to reach an internal n8n on a private
+# network. By default the executor refuses loopback / link-local /
+# RFC1918 / cloud-metadata addresses so a compromised tool URL can't
+# be used to probe AWS/GCP/Azure metadata or hit internal services.
+TOOL_WEBHOOK_ALLOW_HOSTS = frozenset(
+    h.strip().lower() for h in os.environ.get("TOOL_WEBHOOK_ALLOW_HOSTS", "").split(",") if h.strip()
+)
+TOOL_WEBHOOK_ALLOW_PRIVATE = os.environ.get("TOOL_WEBHOOK_ALLOW_PRIVATE", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def _resolve_host_ips(host: str) -> list[str]:
+    """Resolve a hostname to all its A/AAAA IPs. Catches DNS-based
+    SSRF where the hostname passes a textual deny-list check but the
+    resolver returns an internal IP. Empty list on failure.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return []
+    out: list[str] = []
+    for family, _, _, _, sockaddr in infos:
+        if family in (socket.AF_INET, socket.AF_INET6):
+            out.append(sockaddr[0])
+    return out
+
+
+def _ip_is_blocked(ip_str: str) -> bool:
+    """True when ip_str is loopback, link-local, multicast, unspecified,
+    or RFC1918 / ULA / CGNAT. The categories we never want a tool
+    webhook to hit by accident."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable — fail closed
+    return (
+        ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_private  # covers RFC1918 + IPv6 ULA + CGNAT 100.64/10
+        or ip.is_reserved
+    )
+
+
+def _validate_webhook_url(webhook_url: str) -> None:
+    """Reject URLs that resolve to internal / metadata addresses.
+
+    Raises ToolExecutionError on a blocked host. The check runs before
+    the network call so a malicious tool row can't probe internal
+    services even once.
+    """
+    try:
+        parsed = urlparse(webhook_url)
+    except Exception as exc:
+        raise ToolExecutionError(f"webhook URL parse failed: {exc}")
+    if parsed.scheme not in ("http", "https"):
+        raise ToolExecutionError(
+            f"webhook URL scheme '{parsed.scheme}' not allowed (http/https only)"
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ToolExecutionError("webhook URL has no host")
+    # Explicit allow-list short-circuits the IP block (so an operator
+    # can whitelist an internal n8n host by name).
+    if host in TOOL_WEBHOOK_ALLOW_HOSTS:
+        return
+    # Resolve and inspect every IP. Catches both textual private
+    # literals (10.x, 192.168.x) and DNS-resolved internal addresses.
+    ips = _resolve_host_ips(host)
+    if not ips:
+        raise ToolExecutionError(f"webhook host '{host}' did not resolve")
+    if TOOL_WEBHOOK_ALLOW_PRIVATE:
+        # Operator opted in: private IPs are fine, but still block
+        # link-local / metadata addresses that are never legitimate
+        # webhook targets.
+        for ip in ips:
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+                raise ToolExecutionError(
+                    f"webhook host {host} resolved to blocked address {ip}"
+                )
+        return
+    for ip in ips:
+        if _ip_is_blocked(ip):
+            raise ToolExecutionError(
+                f"webhook host {host} resolved to blocked address {ip} "
+                "(loopback / private / link-local / metadata). "
+                "Set TOOL_WEBHOOK_ALLOW_PRIVATE=1 or TOOL_WEBHOOK_ALLOW_HOSTS to override."
+            )
 
 
 def record_tool_result(tool_id: str, ok: bool, kind: str) -> None:
@@ -98,12 +198,25 @@ class ToolExecutor:
             The JSON response from n8n as a dict.
 
         Raises:
-            ToolExecutionError: If the webhook call fails or times out.
+            ToolExecutionError: If the webhook call fails or times out,
+                or the URL fails SSRF validation.
         """
         payload = {
             "tool_name": tool_name,
             "arguments": arguments,
         }
+
+        # ponytail: SSRF guard. Run BEFORE any DNS / network call so a
+        # blocked URL never reaches the resolver. _validate_webhook_url
+        # raises ToolExecutionError on loopback / RFC1918 / metadata.
+        try:
+            _validate_webhook_url(webhook_url)
+        except ToolExecutionError as exc:
+            log.warning(
+                "[ToolExecutor] SSRF rejected tool '%s' url=%s err=%s",
+                tool_name, webhook_url, exc,
+            )
+            raise
 
         log.info(
             "[ToolExecutor] Executing tool '%s' host=%s args_keys=%s",
@@ -113,7 +226,14 @@ class ToolExecutor:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            # ponytail: follow_redirects=False so a 30x to an internal
+            # address can't bypass the SSRF check (the redirect target
+            # is NOT validated by _validate_webhook_url because that
+            # runs only on the original URL). If the user genuinely
+            # needs to follow a redirect, they can change the tool URL.
+            async with httpx.AsyncClient(
+                timeout=self.timeout, follow_redirects=False,
+            ) as client:
                 response = await client.post(
                     webhook_url,
                     json=payload,

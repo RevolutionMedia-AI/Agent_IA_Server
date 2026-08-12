@@ -107,7 +107,17 @@ def _now_iso() -> str:
 
 
 def _hash_password(pwd: str) -> str:
-    return hashlib.sha256(pwd.encode()).hexdigest()
+    # ponytail: salted PBKDF2-HMAC-SHA256 with 600k iters — matches
+    # the format ``routes/auth.hash_password()`` writes for new
+    # registrations and the format ``routes/auth.verify_password()``
+    # accepts on login. The password-change endpoint below used to
+    # write a bare SHA-256 hash here, which the verify function still
+    # accepted (backwards-compat) but the next login would
+    # transparently upgrade. Now new passwords are PBKDF2 from the
+    # start. Same algorithm as auth.py so a user changing their
+    # password and a user registering look identical on disk.
+    from STT_server.routes.auth import hash_password
+    return hash_password(pwd)
 
 
 # ponytail: in-memory cache of valid (token -> entry). require_auth first checks
@@ -154,18 +164,37 @@ def require_auth(authorization: str = Header(None)) -> dict:
     entre Postgres (si DATABASE_URL esta seteado) y JSON (fallback),
     asi require_auth queda consistente con el resto del flow.
     """
+    entry = resolve_bearer(authorization, raise_on_missing=True)
+    return entry  # type: ignore[return-value]
+
+
+def resolve_bearer(authorization, *, raise_on_missing: bool = False):
+    """Resolve a Bearer token to its session entry (or None).
+
+    Public helper so other modules (e.g. STT_Server's bearer-state
+    middleware) can reuse the same lookup without re-implementing it.
+    `raise_on_missing` selects between the dependency-injection 401
+    contract (True) and the best-effort middleware contract (False,
+    returns None).
+    """
     from STT_server.db_users import load_sessions, save_sessions
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        if raise_on_missing:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return None
     token = authorization[len("Bearer "):]
     sessions = load_sessions()
     entry = sessions.get(token)
     if not entry:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        if raise_on_missing:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return None
     try:
         expires_at = _parse_expires_at(entry["expires_at"])
     except ValueError:
-        raise HTTPException(status_code=401, detail="Token corrupted")
+        if raise_on_missing:
+            raise HTTPException(status_code=401, detail="Token corrupted")
+        return None
     if datetime.now(timezone.utc) > expires_at:
         # Best-effort delete; on Postgres the JSON fallback is a no-op.
         try:
@@ -173,8 +202,15 @@ def require_auth(authorization: str = Header(None)) -> dict:
             save_sessions(sessions)
         except Exception:
             pass
-        raise HTTPException(status_code=401, detail="Token expired")
+        if raise_on_missing:
+            raise HTTPException(status_code=401, detail="Token expired")
+        return None
     return entry
+
+
+# Backwards-compatible alias used by the bearer-state middleware.
+def _resolve_session_entry(token: str):
+    return resolve_bearer(f"Bearer {token}", raise_on_missing=False)
 
 
 def _get_user(user_id: str) -> Optional[dict]:

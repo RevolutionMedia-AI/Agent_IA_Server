@@ -60,7 +60,20 @@ def is_postgres() -> bool:
 
 
 def _init_pool():
-    """Lazy init the connection pool. Called on first get_conn()."""
+    """Lazy init the connection pool. Called on first get_conn().
+
+    ponytail: previous version released the lock BEFORE creating the
+    pool. Two threads hitting _init_pool simultaneously both saw
+    ``_pool is None``, both entered the with-block, but only the
+    first to win the lock-check left. The other thread exited the
+    ``with _pool_lock`` block and started creating a SECOND pool —
+    meaning two ThreadedConnectionPool instances leaked, each
+    holding 1..10 idle Postgres connections against the same DB.
+    Under load the connection count went 1 + 2 + 3 ... and we
+    exhausted the DB's max_connections. Move ALL of the construction
+    inside the lock; the cost is a one-shot ~200ms stall on the
+    first concurrent call to get_conn().
+    """
     global _pool
     if _pool is not None:
         return _pool
@@ -74,18 +87,18 @@ def _init_pool():
                 "Either set DATABASE_URL in the environment, or use the JSON "
                 "backend (don't call db.get_conn() when DATABASE_URL is unset)."
             )
-    # Lazy import — keeps the JSON-only deployments free of psycopg2.
-    import psycopg2
-    from psycopg2 import pool as pg_pool
-    from psycopg2.extras import RealDictCursor
-    log.warning("[db] connecting to Postgres: host=%s db=%s", url.split("@")[-1], url.split("/")[-1])
-    # ponytail: RealDictCursor so fetchall() returns dicts and we can do
-    # row["id"] instead of row[0]. The plain cursor returned tuples,
-    # which made _row_to_user crash with "tuple indices must be integers".
-    _pool = pg_pool.ThreadedConnectionPool(
-        minconn=1, maxconn=10, dsn=url, cursor_factory=RealDictCursor,
-    )
-    return _pool
+        # Lazy import — keeps the JSON-only deployments free of psycopg2.
+        import psycopg2
+        from psycopg2 import pool as pg_pool
+        from psycopg2.extras import RealDictCursor
+        log.warning("[db] connecting to Postgres: host=%s db=%s", url.split("@")[-1], url.split("/")[-1])
+        # ponytail: RealDictCursor so fetchall() returns dicts and we can do
+        # row["id"] instead of row[0]. The plain cursor returned tuples,
+        # which made _row_to_user crash with "tuple indices must be integers".
+        _pool = pg_pool.ThreadedConnectionPool(
+            minconn=1, maxconn=10, dsn=url, cursor_factory=RealDictCursor,
+        )
+        return _pool
 
 
 @contextmanager

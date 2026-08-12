@@ -236,6 +236,15 @@ if PG_URL:
                 print(f"  applied {ok} statements ({len(non_noop)} unexpected error(s))")
                 for e in non_noop:
                     print(f"    WARN: {e}")
+                # ponytail: FAIL-FAST on a real (non-noop) migration
+                # error. The previous version logged WARN and kept
+                # serving: a corrupted migration would deploy green
+                # and crash at first use. Abort the boot so the
+                # platform / Railway marks the deploy failed and
+                # the operator gets a clear signal. The 'already
+                # exists' idempotent case is still allowed through.
+                print(f"[startup] FATAL: migration {name} produced {len(non_noop)} non-idempotent error(s); aborting boot", file=sys.stderr)
+                sys.exit(1)
             else:
                 print(f"  applied {ok} statements (idempotent)")
         except Exception as exc:
@@ -259,7 +268,13 @@ if PG_URL:
         else:
             print("[startup] JSON backfill: nothing to copy (empty or already migrated)")
     except Exception as exc:
-        print(f"[startup] WARN: JSON backfill failed: {exc}")
+        # ponytail: fail-fast on backfill errors. The previous
+        # version logged WARN and kept serving — a partial
+        # backfill meant agents / numbers / tools silently missing
+        # from the live system until the operator noticed. Abort
+        # the boot so the failure is loud.
+        print(f"[startup] FATAL: JSON backfill failed: {exc}", file=sys.stderr)
+        sys.exit(1)
 else:
     # JSON backend. Self-heal users.json if missing.
     import json

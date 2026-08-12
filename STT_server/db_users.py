@@ -120,16 +120,39 @@ def load_users_db() -> list:
 
 
 def save_users_db(users: list) -> None:
-    """Replace the users table with the given list.
+    """Upsert each user in the given list. Never DELETE — a corrupt or
+    empty list from the JSON loader must NOT wipe the auth table.
 
-    We use a single transaction: DELETE all then INSERT the new set.
-    Simpler than upserting each row, and the user set is small (single
-    digits), so perf is fine. The auth flow only ever adds a new user
-    or updates an existing one — never a partial set.
+    Previous implementation did ``DELETE FROM users`` then INSERT, which
+    was a one-line data-loss bug: if ``users.json`` was missing,
+    truncated, or returned an empty list (any transient read failure),
+    the next save_users wiped every account. The JSON backend's
+    read-modify-write contract also means the caller only ever sends
+    the FULL set it loaded — so we can't just blindly DELETE. Upsert
+    by primary key is the safe primitive: missing rows stay put,
+    changed rows update, new rows insert.
     """
+    if not isinstance(users, list):
+        # ponytail: defensive — a None / dict / scalar from a corrupt
+        # JSON read should not silently wipe the table. Log and
+        # no-op. The next register/login cycle will reload and retry.
+        log.warning(
+            "[db_users] save_users_db refused: expected list, got %s",
+            type(users).__name__,
+        )
+        return
+    if not users:
+        # ponytail: empty list is a legitimate read result (file
+        # missing on first run, transient IO error). Treat as a
+        # no-op rather than a wipe. Operators add the first user
+        # via /auth/register, which then triggers a real upsert.
+        log.warning(
+            "[db_users] save_users_db called with empty list — no-op "
+            "(would previously have wiped the auth table)"
+        )
+        return
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM users")
             for u in users:
                 cur.execute(
                     """
@@ -137,6 +160,12 @@ def save_users_db(users: list) -> None:
                     VALUES (%s, %s, %s, %s, %s,
                             COALESCE(%s, NOW()),
                             COALESCE(%s, NOW()))
+                    ON CONFLICT (id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        email = EXCLUDED.email,
+                        password = EXCLUDED.password,
+                        role = EXCLUDED.role,
+                        updated_at = NOW()
                     """,
                     (
                         u.get("id"),

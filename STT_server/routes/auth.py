@@ -12,6 +12,7 @@ se resuelven en db_users.py segun que backend este disponible.
 import os
 import json
 import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -54,14 +55,126 @@ class UserResponse(BaseModel):
 # load_users / save_users / load_sessions / save_sessions vienen de
 # STT_server.db_users (import arriba) y resuelven al backend Postgres
 # o JSON segun DATABASE_URL.
+# ponytail: salted password hashing. PBKDF2-HMAC-SHA256 with 600k
+# iterations (OWASP 2023 recommendation for SHA-256). The on-disk
+# format is ``pbkdf2_sha256$ITER$SALT_HEX$HASH_HEX`` — self-describing
+# so we can tune iterations later without invalidating existing
+# hashes. Legacy unsalted SHA-256 hex (the original implementation)
+# is still verified on login so existing accounts keep working; the
+# first successful legacy login transparently re-hashes the password
+# with the new algorithm (the next save_users call persists the
+# upgraded hash). Constant-time comparison via hmac.compare_digest.
+_PBKDF2_ITERATIONS = 600_000
+_PBKDF2_HASH_NAME = "sha256"
+_PBKDF2_SALT_BYTES = 16
+_PBKDF2_PREFIX = f"pbkdf2_{_PBKDF2_HASH_NAME}"
+
+
+def _hash_password_pbkdf2(password: str) -> str:
+    salt = secrets.token_bytes(_PBKDF2_SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac(
+        _PBKDF2_HASH_NAME,
+        password.encode("utf-8"),
+        salt,
+        _PBKDF2_ITERATIONS,
+    )
+    return (
+        f"{_PBKDF2_PREFIX}${_PBKDF2_ITERATIONS}"
+        f"${salt.hex()}${digest.hex()}"
+    )
+
+
+def _verify_password_pbkdf2(password: str, encoded: str) -> bool:
+    try:
+        scheme, iter_s, salt_s, digest_s = encoded.split("$", 3)
+    except ValueError:
+        return False
+    if scheme != _PBKDF2_PREFIX:
+        return False
+    try:
+        iterations = int(iter_s)
+        salt = bytes.fromhex(salt_s)
+        expected = bytes.fromhex(digest_s)
+    except ValueError:
+        return False
+    actual = hashlib.pbkdf2_hmac(
+        _PBKDF2_HASH_NAME,
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(actual, expected)
+
+
+def _verify_password_legacy_sha256(password: str, stored_hash: str) -> bool:
+    """Legacy unsalted SHA-256 hex — verify-only, never used for new
+    passwords. Returns True on a match so the first login after this
+    rollout can succeed; the route layer then re-hashes and persists
+    via _upgrade_password_hash()."""
+    if not stored_hash or len(stored_hash) != 64:
+        return False
+    expected = hashlib.sha256(password.encode()).hexdigest()
+    return hmac.compare_digest(expected, stored_hash)
+
+
+def _upgrade_password_hash(user: dict, password: str) -> None:
+    """Re-hash a legacy SHA-256 password with PBKDF2 and persist.
+
+    Called on the first successful legacy login so the auth table
+    migrates over time without a separate one-shot script. Errors are
+    swallowed — the login still succeeded, the hash just stays legacy
+    until the next successful login.
+    """
+    user["password"] = _hash_password_pbkdf2(password)
+    # ponytail: the public auth surface only saves via save_users,
+    # which now does an upsert. Persist immediately so a subsequent
+    # crash doesn't leave the user on a legacy hash.
+    try:
+        save_users(load_users())  # round-trip through the storage shim
+        # Simpler & cheaper: we just mutated one row, but the JSON
+        # backend's save_users only writes via the shim. We can't
+        # mutate-in-place safely when other rows share the file, so
+        # re-load + re-write the whole list. Cheap for small user
+        # counts (single digits).
+    except Exception as exc:
+        log = logging.getLogger("stt_server.auth")
+        log.warning("[auth] legacy-hash upgrade failed for %s: %s",
+                    user.get("email"), exc)
+
 
 def hash_password(password: str) -> str:
-    """Hashear contraseña con SHA-256."""
+    """Hash a password with PBKDF2-HMAC-SHA256 (600k iters, random salt).
+
+    Stored format: ``pbkdf2_sha256$600000$<salt_hex>$<hash_hex>``.
+    The legacy hash_password (unsalted SHA-256) is preserved as
+    ``_legacy_hash_password`` for any caller that needs to reproduce
+    the on-disk value used by older migrations.
+    """
+    return _hash_password_pbkdf2(password)
+
+
+def _legacy_hash_password(password: str) -> str:
+    """Legacy unsalted SHA-256 — used by 002_seed_admin.sql and the
+    JSON-mode startup seeder, both of which embed a pre-computed hash
+    that must match the old format until the operator re-runs the
+    migration. The verifier accepts both formats, so a legacy-hashed
+    admin still works after the upgrade."""
     return hashlib.sha256(password.encode()).hexdigest()
 
+
 def verify_password(password: str, hashed: str) -> bool:
-    """Verificar contraseña."""
-    return hash_password(password) == hashed
+    """Verify a password against a stored hash.
+
+    Accepts both the new PBKDF2 format and the legacy unsalted
+    SHA-256 hex (64 chars). The first successful legacy login
+    transparently upgrades the stored hash to PBKDF2 — see
+    ``_upgrade_password_hash`` callers in the route handlers.
+    """
+    if not hashed:
+        return False
+    if hashed.startswith(f"{_PBKDF2_PREFIX}$"):
+        return _verify_password_pbkdf2(password, hashed)
+    return _verify_password_legacy_sha256(password, hashed)
 
 def generate_token() -> str:
     """Generar token de sesión seguro."""
@@ -186,6 +299,14 @@ async def login(user: UserLogin):
             status_code=401,
             detail="Credenciales inválidas"
         )
+    # ponytail: transparent upgrade. If the verified hash is the
+    # legacy unsalted SHA-256 format, re-hash with PBKDF2-HMAC-SHA256
+    # and persist. This is the migration path for every existing
+    # account — they get upgraded on first login without operator
+    # intervention. Errors are swallowed (next login will retry).
+    if stored_hash and not stored_hash.startswith(f"pbkdf2_{_PBKDF2_HASH_NAME}$"):
+        log.info("[auth] upgrading legacy SHA-256 hash to PBKDF2 for %s", user.email)
+        _upgrade_password_hash(found_user, user.password)
     
     # Generar token
     token = generate_token()

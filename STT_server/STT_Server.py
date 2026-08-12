@@ -205,6 +205,46 @@ app.add_middleware(
 # cryptic "No Access-Control-Allow-Origin" error in the browser.
 log.debug("[CORS] allowed origins: %s", ALLOWED_ORIGINS)
 
+
+# ponytail: bearer-token → request.state.user middleware so ownership
+# checks (`request.state.user["user_id"]`) work in route handlers that
+# declare ``dependencies=[Depends(require_auth)]`` (which discards the
+# dep's return value). The middleware is best-effort: a missing /
+# expired / invalid token simply leaves request.state.user unset;
+# require_auth still raises 401 for protected routes. Public routes
+# (e.g. /health, /voice webhook) ignore the state. Per-request lookup
+# is cheap (in-process dict read) and runs only when a Bearer header
+# is present.
+@app.middleware("http")
+async def _attach_user_state(request: Request, call_next):
+    try:
+        authz = request.headers.get("authorization") or request.headers.get("Authorization")
+        if authz and authz.lower().startswith("bearer "):
+            token = authz[7:].strip()
+            if token:
+                # Lazy import — keeps STT_Server.py import cheap and
+                # avoids a circular reference (api.py imports from
+                # here too).
+                from STT_server.routes.api import _parse_expires_at, _resolve_session_entry
+                entry = _resolve_session_entry(token)
+                if entry is not None:
+                    try:
+                        expires_at = _parse_expires_at(entry["expires_at"])
+                    except Exception:
+                        entry = None
+                    else:
+                        from datetime import datetime, timezone as _tz
+                        if datetime.now(_tz.utc) > expires_at:
+                            entry = None
+                if entry is not None:
+                    request.state.user = dict(entry)
+    except Exception:
+        # Never let the middleware fail the request — require_auth
+        # still has the dependency-injection gate for protected routes.
+        log.exception("[auth] user-state middleware failed (continuing without)")
+    return await call_next(request)
+
+
 # Serve static files (e.g. static/greeting.wav) at /static
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(static_dir):
@@ -265,6 +305,26 @@ async def voice(
         f"{type(parse_exc).__name__}: {parse_exc}" if parse_exc else "(none)",
     )
 
+    # ponytail: FAIL-CLOSED on parse failure. The previous version
+    # only ran the signature check `if form_dict:` — a missing or
+    # unparseable form body silently bypassed authentication and
+    # fell through to TwiML generation. A bot hitting /voice with
+    # `Content-Length: 0` got the agent's TwiML for free. Refuse the
+    # request before TwiML is generated; the operator sees the
+    # warning and Twilio sees a non-2xx so it doesn't keep retrying.
+    if parse_exc is not None or not form_dict:
+        log.error(
+            "[VOICE] refusing /voice: empty or unparseable form body "
+            "from %s (parse_exc=%s). The previous code returned 200 "
+            "TwiML anyway — that was a fail-open.",
+            request.client.host if request and request.client else "?",
+            parse_exc,
+        )
+        return Response(
+            content="Bad Request: empty form body",
+            status_code=400,
+        )
+
     # ponytail: per-number Twilio auth token. Twilio signs each webhook
     # with the auth token of the Twilio account that owns the phone
     # number that's calling. The user enters that token via
@@ -272,72 +332,71 @@ async def voice(
     # fallback to a global credential (removed per the spec).
     per_number_token = None
     per_number_row_id = None
-    if form_dict:
-        from STT_server.adapters.twilio_api import validate_twilio_signature
-        from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
-        try:
-            called_to = form_dict.get("To") or form_dict.get("to")
-            if called_to:
-                row = _find_num_for_sig(called_to)
-                if row:
-                    per_number_row_id = row.get("id")
-                    per_number_token = row.get("twilio_auth_token") or None
-        except Exception as exc:
-            log.warning("[VOICE] could not look up per-number auth token: %s", exc)
-        token_to_check = per_number_token
-        # ponytail: env fallback gone. If the phone number row has no
-        # twilio_auth_token, we refuse the call with 503 — the operator
-        # must edit the number and save the Twilio credentials before
-        # the webhook can route. No silent global-key acceptance.
-        if not token_to_check:
-            log.error(
-                "[VOICE] phone row %s has no twilio_auth_token — refusing "
-                "inbound call to To=%s. The user must save the Twilio "
-                "subaccount credentials via the Edit-number modal before "
-                "the number can route.",
-                per_number_row_id or "(unresolved)",
-                called_to or "(missing)",
-            )
-            return Response(
-                content="Phone number has no Twilio auth token configured. "
-                       "Edit the number and save the Twilio credentials.",
-                status_code=503,
-            )
-        # Twilio always signs webhooks. A missing signature with a
-        # configured token is suspicious (proxy stripping the header,
-        # or someone bypassing the check).
-        sig = request.headers.get("X-Twilio-Signature", "")
-        if not sig:
-            return Response(content="missing signature", status_code=403)
-        # Twilio signs the URL the request hit. When the
-        # request goes through a reverse proxy (Railway, Cloudflare)
-        # the Host header reflects the public hostname but the path
-        # the signature was computed against is the original
-        # PUBLIC_URL path. We rebuild the URL from PUBLIC_URL +
-        # request.url.path so signature verification works behind a
-        # proxy.
-        signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
-        if request.url.query:
-            signature_url += f"?{request.url.query}"
-        # ponytail: log the ingredients so the next "invalid signature"
-        # doesn't need a redeploy cycle to triage. Twilio signs the
-        # URL exactly as it sent the webhook; if PUBLIC_URL diverges
-        # (typo in env, trailing slash, http vs https) the signature
-        # mismatch is silent.
-        if not validate_twilio_signature(
-            token_to_check, signature_url, sig, form_dict
-        ):
-            log.warning(
-                "[VOICE] invalid Twilio signature from %s (per_number=%s) "
-                "public_url=%r sig_url=%r tok_prefix=%s... recv_sig_prefix=%s...",
-                request.client.host if request.client else "?",
-                bool(per_number_token),
-                PUBLIC_URL,
-                signature_url,
-                token_to_check[:8],
-                sig[:8],
-            )
-            return Response(content="invalid signature", status_code=403)
+    from STT_server.adapters.twilio_api import validate_twilio_signature
+    from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
+    try:
+        called_to = form_dict.get("To") or form_dict.get("to")
+        if called_to:
+            row = _find_num_for_sig(called_to)
+            if row:
+                per_number_row_id = row.get("id")
+                per_number_token = row.get("twilio_auth_token") or None
+    except Exception as exc:
+        log.warning("[VOICE] could not look up per-number auth token: %s", exc)
+    token_to_check = per_number_token
+    # ponytail: env fallback gone. If the phone number row has no
+    # twilio_auth_token, we refuse the call with 503 — the operator
+    # must edit the number and save the Twilio credentials before
+    # the webhook can route. No silent global-key acceptance.
+    if not token_to_check:
+        log.error(
+            "[VOICE] phone row %s has no twilio_auth_token — refusing "
+            "inbound call to To=%s. The user must save the Twilio "
+            "subaccount credentials via the Edit-number modal before "
+            "the number can route.",
+            per_number_row_id or "(unresolved)",
+            called_to or "(missing)",
+        )
+        return Response(
+            content="Phone number has no Twilio auth token configured. "
+                   "Edit the number and save the Twilio credentials.",
+            status_code=503,
+        )
+    # Twilio always signs webhooks. A missing signature with a
+    # configured token is suspicious (proxy stripping the header,
+    # or someone bypassing the check).
+    sig = request.headers.get("X-Twilio-Signature", "")
+    if not sig:
+        return Response(content="missing signature", status_code=403)
+    # Twilio signs the URL the request hit. When the
+    # request goes through a reverse proxy (Railway, Cloudflare)
+    # the Host header reflects the public hostname but the path
+    # the signature was computed against is the original
+    # PUBLIC_URL path. We rebuild the URL from PUBLIC_URL +
+    # request.url.path so signature verification works behind a
+    # proxy.
+    signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
+    if request.url.query:
+        signature_url += f"?{request.url.query}"
+    # ponytail: log the ingredients so the next "invalid signature"
+    # doesn't need a redeploy cycle to triage. Twilio signs the
+    # URL exactly as it sent the webhook; if PUBLIC_URL diverges
+    # (typo in env, trailing slash, http vs https) the signature
+    # mismatch is silent.
+    if not validate_twilio_signature(
+        token_to_check, signature_url, sig, form_dict
+    ):
+        log.warning(
+            "[VOICE] invalid Twilio signature from %s (per_number=%s) "
+            "public_url=%r sig_url=%r tok_prefix=%s... recv_sig_prefix=%s...",
+            request.client.host if request.client else "?",
+            bool(per_number_token),
+            PUBLIC_URL,
+            signature_url,
+            token_to_check[:8],
+            sig[:8],
+        )
+        return Response(content="invalid signature", status_code=403)
 
     ws_url = PUBLIC_URL.rstrip("/")
 
@@ -723,18 +782,28 @@ async def media_stream(ws: WebSocket) -> None:
                     # here so the adapter's existing fallback chain keeps
                     # working unchanged for legacy agents.
                     session.llm_temperature = _safe_float(agent_cfg.get('llm_temperature'))
-                # ponytail: hotfix for production bug where agent rows
-                # stored llm_temperature=-1 (a FE sentinel for "use
-                # default") were passed verbatim to OpenAI/Anthropic/
-                # Gemini/MiniMax. The adapters' `is not None` check
-                # let -1.0 through, which made providers default to ~1.0
-                # (their internal fallback), producing over-eager
-                # interpretations like "goodbye on first turn" when
-                # the user said only one short word. Treat any negative
-                # value as "no override" so the adapter default (0.2)
-                # applies.
-                if session.llm_temperature is not None and session.llm_temperature < 0:
-                    session.llm_temperature = None
+                    # ponytail: hotfix for production bug where agent rows
+                    # stored llm_temperature=-1 (a FE sentinel for "use
+                    # default") were passed verbatim to OpenAI/Anthropic/
+                    # Gemini/MiniMax. The adapters' `is not None` check
+                    # let -1.0 through, which made providers default to ~1.0
+                    # (their internal fallback), producing over-eager
+                    # interpretations like "goodbye on first turn" when
+                    # the user said only one short word. Treat any negative
+                    # value as "no override" so the adapter default (0.2)
+                    # applies. This is the ONLY conditional reset — the
+                    # fields below (llm_max_tokens, tts_speed, TTS hint,
+                    # tool loading) are independent and must ALWAYS apply
+                    # when an agent row is present, regardless of the
+                    # temperature value.
+                    if session.llm_temperature is not None and session.llm_temperature < 0:
+                        session.llm_temperature = None
+                    # ponytail: llm_max_tokens + tts_speed are
+                    # independent of llm_temperature. Apply them whenever
+                    # the agent row is present (the previous code gated
+                    # them on llm_temperature<0, so a legitimate
+                    # temperature=0.7 agent row with
+                    # llm_max_tokens=200 was silently ignored).
                     session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
                     session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
                     # ponytail: prepend a per-TTS-provider hint to the
@@ -779,11 +848,10 @@ async def media_stream(ws: WebSocket) -> None:
                                 # buried after 10KB of Tessa's prompt).
                                 # The "gesture vocabulary" line is the
                                 # canonical marker; if you grep the
-                                # session init log and don't see it in
-                                # the first 200 chars, the prepend
-                                # didn't run (likely tts_provider !=
-                                # 'inworld' or has_tts_hint() detected a
-                                # double-prepend).
+                                # session init log and don't see it in the
+                                # first 200 chars, the prepend didn't run
+                                # (likely tts_provider != 'inworld' or
+                                # has_tts_hint() detected a double-prepend).
                                 log.info(
                                     "[AGENT] custom_prompt HEAD session=%s len=%d preview=%r",
                                     session.session_key,
@@ -958,6 +1026,25 @@ async def media_stream(ws: WebSocket) -> None:
                                 pass
                         log.info("[MARK_ACK] session=%s mark=%s rtt_ms=%.1f",
                                  session.session_key, mark, rtt_ms)
+                # ponytail: AUDIO barge-in / echo gate. When Twilio
+                # confirms the LAST pending mark has played out, the
+                # assistant's audio is no longer reaching the caller
+                # and assistant_speaking must drop so the VAD starts
+                # picking up the caller's voice again. The previous
+                # code popped pending marks but never reset the flag,
+                # so assistant_speaking stayed True until the
+                # speaking-watchdog (5s poll) caught it — every post-
+                # play utterance lost its first 5s to the echo
+                # window. Idempotent: only fires when the pending set
+                # is empty AND we were actually speaking.
+                if isinstance(pending, dict) and not pending:
+                    if session.assistant_speaking:
+                        session.assistant_speaking = False
+                        session.assistant_started_at = None
+                        log.info(
+                            "[MARK_ACK] last mark cleared — assistant_speaking -> False for session=%s",
+                            session.session_key,
+                        )
                 continue
 
             if event == "dtmf":
@@ -1075,11 +1162,26 @@ async def get_available_config() -> dict:
 
 
 @app.get("/sessions", dependencies=[Depends(require_auth)])
-async def list_sessions() -> dict:
-    """List active call sessions with their current configuration."""
-    from STT_server.services.session_runtime import sessions
+async def list_sessions(request: Request) -> dict:
+    """List active call sessions owned by the authenticated user.
+
+    ponytail: the previous version returned every active session for
+    every caller — any admin token could see (and PATCH) another
+    admin's live calls. Now we filter by the session's resolved user
+    (set from tenant_id at call start), with admin tokens able to
+    see sessions whose owner is unset (legacy).
+    """
+    from STT_server.services.session_runtime import sessions as _sessions
+    user = getattr(request.state, "user", None) or {}
+    caller_id = user.get("user_id")
+    caller_role = (user.get("role") or "").strip().lower()
     result = {}
-    for key, s in sessions.items():
+    for key, s in _sessions.items():
+        owner = getattr(s, "user_id", None)
+        if owner and owner != caller_id and caller_role != "admin":
+            continue
+        if not owner and caller_role != "admin":
+            continue
         result[key] = {
             "call_sid": s.call_sid,
             "preferred_language": s.preferred_language,
@@ -1098,13 +1200,31 @@ class SessionConfigUpdate(BaseModel):
     custom_prompt: str | None = None
 
 
+def _require_session_owner(request: Request, session) -> "JSONResponse | None":
+    user = getattr(request.state, "user", None) or {}
+    caller_id = user.get("user_id")
+    caller_role = (user.get("role") or "").strip().lower()
+    owner = getattr(session, "user_id", None)
+    if owner and owner == caller_id:
+        return None
+    if not owner and caller_role == "admin":
+        return None
+    return JSONResponse(
+        status_code=404,
+        content={"error": f"Session '{session.session_key}' not found"},
+    )
+
+
 @app.get("/sessions/{session_key}", dependencies=[Depends(require_auth)])
-async def get_session_config(session_key: str) -> dict:
-    """Get the configuration of a specific session."""
-    from STT_server.services.session_runtime import sessions
-    session = sessions.get(session_key)
+async def get_session_config(session_key: str, request: Request) -> dict:
+    """Get the configuration of a specific session. 404 on owner mismatch."""
+    from STT_server.services.session_runtime import sessions as _sessions
+    session = _sessions.get(session_key)
     if not session:
         return JSONResponse(status_code=404, content={"error": f"Session '{session_key}' not found"})
+    forbidden = _require_session_owner(request, session)
+    if forbidden is not None:
+        return forbidden
     return {
         "session_key": session.session_key,
         "call_sid": session.call_sid,
@@ -1117,12 +1237,15 @@ async def get_session_config(session_key: str) -> dict:
 
 
 @app.patch("/sessions/{session_key}", dependencies=[Depends(require_auth)])
-async def update_session_config(session_key: str, body: SessionConfigUpdate = None) -> dict:
-    """Update per-session configuration: tts_provider, preferred_language, custom_prompt."""
-    from STT_server.services.session_runtime import sessions
-    session = sessions.get(session_key)
+async def update_session_config(session_key: str, request: Request, body: SessionConfigUpdate = None) -> dict:
+    """Update per-session configuration. 404 on owner mismatch."""
+    from STT_server.services.session_runtime import sessions as _sessions
+    session = _sessions.get(session_key)
     if not session:
         return JSONResponse(status_code=404, content={"error": f"Session '{session_key}' not found"})
+    forbidden = _require_session_owner(request, session)
+    if forbidden is not None:
+        return forbidden
 
     if body is None:
         body = SessionConfigUpdate()
@@ -1191,23 +1314,66 @@ class OutboundCallRequest(BaseModel):
 
 
 @app.get("/tenants", dependencies=[Depends(require_auth)])
-async def list_tenants() -> dict:
-    """List all configured tenants."""
+async def list_tenants(request: Request) -> dict:
+    """List tenants owned by the authenticated user.
+
+    ponytail: the previous version returned every tenant in the store
+    regardless of who was calling. Any admin token could see every
+    other admin's Twilio subaccount, phone numbers, and agent config.
+    Now we filter by ``tenant.user_id == request.state.user['user_id']``
+    so a user only sees their own. Tenants created before this field
+    existed (no user_id) are only visible to admin tokens (role=admin).
+    """
+    user = getattr(request.state, "user", None) or {}
+    caller_id = user.get("user_id")
+    caller_role = (user.get("role") or "").strip().lower()
     tenants = tenant_store.list_all()
+    visible = []
+    for t in tenants:
+        owner = getattr(t, "user_id", None)
+        if owner and owner == caller_id:
+            visible.append(t)
+        elif not owner and caller_role == "admin":
+            visible.append(t)
     return {
-        "tenants": [t.to_dict(include_secrets=False) for t in tenants],
-        "count": len(tenants),
+        "tenants": [t.to_dict(include_secrets=False) for t in visible],
+        "count": len(visible),
     }
 
 
+def _require_tenant_owner(request: Request, tenant: "TenantConfig"):
+    """Raise 404 (not 403, to avoid leaking existence) when the caller
+    doesn't own the tenant. Returns None on success."""
+    user = getattr(request.state, "user", None) or {}
+    caller_id = user.get("user_id")
+    caller_role = (user.get("role") or "").strip().lower()
+    owner = getattr(tenant, "user_id", None)
+    if owner and owner == caller_id:
+        return None
+    if not owner and caller_role == "admin":
+        return None
+    return JSONResponse(
+        status_code=404,
+        content={"error": f"Tenant '{tenant.tenant_id}' not found"},
+    )
+
+
 @app.post("/tenants", dependencies=[Depends(require_auth)])
-async def create_tenant(body: TenantCreateRequest) -> dict:
-    """Create a new tenant with Twilio credentials and agent configuration."""
+async def create_tenant(request: Request, body: TenantCreateRequest) -> dict:
+    """Create a new tenant with Twilio credentials and agent configuration.
+
+    ponytail: stamp the creating user's id onto the tenant so subsequent
+    list/get/patch/delete can scope to owner. Without this, the tenant
+    becomes orphaned and is only visible to admin role tokens.
+    """
     import uuid
     tenant_id = f"tenant-{uuid.uuid4().hex[:12]}"
+    user = getattr(request.state, "user", None) or {}
+    caller_id = user.get("user_id")
 
     tenant = TenantConfig(
         tenant_id=tenant_id,
+        user_id=caller_id,
         name=body.name or "",
         twilio_account_sid=body.twilio_account_sid or "",
         twilio_auth_token=body.twilio_auth_token or "",
@@ -1222,7 +1388,7 @@ async def create_tenant(body: TenantCreateRequest) -> dict:
     )
 
     tenant_store.upsert(tenant)
-    log.info("[TENANT] Created tenant %s (%s)", tenant_id, tenant.name)
+    log.info("[TENANT] Created tenant %s (%s) owner=%s", tenant_id, body.name, caller_id or "(none)")
 
     return {
         "tenant_id": tenant_id,
@@ -1231,20 +1397,31 @@ async def create_tenant(body: TenantCreateRequest) -> dict:
 
 
 @app.get("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
-async def get_tenant(tenant_id: str) -> dict:
-    """Get a tenant's configuration (secrets are masked)."""
+async def get_tenant(tenant_id: str, request: Request) -> dict:
+    """Get a tenant's configuration (secrets are masked). 404 on owner mismatch."""
     tenant = tenant_store.get(tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    forbidden = _require_tenant_owner(request, tenant)
+    if forbidden is not None:
+        return forbidden
     return tenant.to_dict(include_secrets=False)
 
 
 @app.patch("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
-async def update_tenant(tenant_id: str, body: TenantCreateRequest) -> dict:
-    """Update a tenant's configuration. Only provided fields are updated."""
+async def update_tenant(tenant_id: str, body: TenantCreateRequest, request: Request) -> dict:
+    """Update a tenant's configuration. Only provided fields are updated.
+
+    ponytail: ownership check added. PATCH on a tenant you don't own
+    returns 404 (same shape as not-found) so we don't leak the existence
+    of tenants belonging to other users.
+    """
     tenant = tenant_store.get(tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    forbidden = _require_tenant_owner(request, tenant)
+    if forbidden is not None:
+        return forbidden
 
     import time
     updated = {}
@@ -1301,8 +1478,13 @@ async def update_tenant(tenant_id: str, body: TenantCreateRequest) -> dict:
 
 
 @app.delete("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
-async def delete_tenant(tenant_id: str) -> dict:
-    """Delete a tenant configuration."""
+async def delete_tenant(tenant_id: str, request: Request) -> dict:
+    """Delete a tenant configuration. 404 on owner mismatch."""
+    tenant = tenant_store.get(tenant_id)
+    if tenant is not None:
+        forbidden = _require_tenant_owner(request, tenant)
+        if forbidden is not None:
+            return forbidden
     deleted = tenant_store.delete(tenant_id)
     if not deleted:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
@@ -1311,12 +1493,15 @@ async def delete_tenant(tenant_id: str) -> dict:
 
 
 @app.post("/tenants/{tenant_id}/validate-twilio", dependencies=[Depends(require_auth)])
-async def validate_tenant_twilio(tenant_id: str) -> dict:
-    """Validate a tenant's Twilio credentials."""
+async def validate_tenant_twilio(tenant_id: str, request: Request) -> dict:
+    """Validate a tenant's Twilio credentials. 404 on owner mismatch."""
     from STT_server.adapters.twilio_api import validate_twilio_credentials
     tenant = tenant_store.get(tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    forbidden = _require_tenant_owner(request, tenant)
+    if forbidden is not None:
+        return forbidden
     if not tenant.has_twilio_credentials:
         return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
 
