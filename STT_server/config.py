@@ -149,7 +149,13 @@ ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "3000"))
 
 # LLM context window and response length — runtime tunables.
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
-MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "150"))
+# ponytail: lowered 150 -> 100 per operator feedback (the LLM was
+# hitting the cap with verbose enumeration — "le recomiendo el plan
+# de veintitrés con veinte balboas, incluye cinco gigabytes,
+# doscientos cincuenta minutos, ..." — 100 tokens forces tighter
+# replies (≈400 chars), shorter TTS playback, less perceived
+# repetition. Per-agent override via session.llm_max_tokens still wins.
+MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "100"))
 
 # OpenAI Realtime temperature (API minimum 0.6).
 # ponytail: DEAD CODE — no adapter reads this. The Realtime GA migration
