@@ -127,13 +127,24 @@ def _scipy_available() -> bool:
     return _SCIPY_AVAILABLE
 
 
-def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes = b"") -> tuple[bytes, bytes]:
+def _pcm16_bytes_to_mulaw_8k(
+    pcm_bytes: bytes,
+    src_rate: int,
+    remainder: bytes = b"",
+    session: CallSession | None = None,
+) -> tuple[bytes, bytes]:
     """Down-convert signed PCM16 LE samples from ``src_rate`` to mu-law 8 kHz mono.
 
     Returns ``(mulaw_bytes_for_complete_frames, leftover_pcm_bytes_for_next_call)``.
     Uses ``scipy.signal.resample_poly`` with a Kaiser-window FIR (beta=8.0,
     ~60 dB stopband) for anti-aliased down-conversion when scipy is available;
     otherwise degrades to nearest-neighbour decimation.
+
+    ``session`` is optional and only used to attribute the AUDIO-007
+    resample-path counter (``rime_resample_scipy_segments`` vs
+    ``rime_resample_fallback_segments``) to the right call. External
+    callers (tts_preview, tts_dispatcher) can omit it — the metric
+    is just skipped, never wrong.
     """
     try:
         import numpy as np
@@ -185,7 +196,7 @@ def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes =
         # when scipy is missing. Per-call summary exposes the counter
         # so a missing-scipy image is loud.
         try:
-            _m = getattr(session, "metrics", None)
+            _m = getattr(session, "metrics", None) if session is not None else None
             if _m is not None:
                 _m.incr("rime_resample_scipy_segments")
         except Exception:
@@ -199,7 +210,7 @@ def _pcm16_bytes_to_mulaw_8k(pcm_bytes: bytes, src_rate: int, remainder: bytes =
         # counters on, ops can see rime_resample_fallback_segments > 0
         # at a glance and start the scipy install.
         try:
-            _m = getattr(session, "metrics", None)
+            _m = getattr(session, "metrics", None) if session is not None else None
             if _m is not None:
                 _m.incr("rime_resample_fallback_segments")
         except Exception:
@@ -358,7 +369,9 @@ async def stream_tts_segment(
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] Rime WS TTFB (binary) ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
-                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(raw_msg, sample_rate, pcm_remainder)
+                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(
+                        raw_msg, sample_rate, pcm_remainder, session=session,
+                    )
                     if mulaw_bytes:
                         _mark_first_byte()
                     if save_audio:
@@ -400,7 +413,9 @@ async def stream_tts_segment(
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] Rime WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
 
-                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(pcm_bytes, sample_rate, pcm_remainder)
+                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(
+                        pcm_bytes, sample_rate, pcm_remainder, session=session,
+                    )
                     if mulaw_bytes:
                         _mark_first_byte()
                     if save_audio:

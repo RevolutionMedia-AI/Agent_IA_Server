@@ -1,0 +1,36 @@
+# ponytail: minimal ruff config. The goal is to catch the same class of
+# bug that hit prod on 2026-08-14 (NameError: SPEECH_FRAMES_MAX — an
+# undefined name referenced in a function body, shipped because the
+# bytecode compiled cleanly and the test suite never exercised the
+# call path). Ruff's F821 (Undefined name) catches this at lint time
+# in CI; the project's existing test suite plus this one rule is
+# enough to keep it from recurring.
+#
+# Keep this file tiny. If we add too many rules here, the operator
+# workflow grinds to a halt on cosmetic warnings and starts ignoring
+# CI output — which is exactly how the original bug slipped through.
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "venv",
+    ".venv",
+    "STT_server/static",
+    "STT_server/data",
+    "scripts",
+    "docs",
+    "data",
+    "tools",
+]
+
+[lint]
+# F821 — Undefined name. This is the rule that catches the 2026-08-14
+# production bug (SPEECH_FRAMES_MAX referenced but not imported). It
+# is the only rule we want as a hard gate in CI; everything else is
+# advisory and we can opt into it as the codebase matures.
+select = ["F821"]
+
+[lint.per-file-ignores]
+# tests/ legitimately import modules at test time and reference
+# private helpers (_append_speech_frame). F401 (unused import) and
+# private-name usage are intentional there.
+"tests/*" = ["F401"]

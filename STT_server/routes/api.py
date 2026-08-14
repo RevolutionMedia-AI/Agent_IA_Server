@@ -55,6 +55,7 @@ from STT_server.db_phone_numbers import (
 from STT_server.db_tools import (
     upsert_tool as db_upsert_tool,
     delete_tool as db_delete_tool,
+    get_tool as db_get_tool,
 )
 from STT_server.db_settings import (
     get_settings as db_get_settings,
