@@ -223,6 +223,17 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
     except Exception:
         pass
 
+    # ponytail: 2026-08-14 audio review — flush + close the per-call
+    # capture files (A_inworld_<callSid>.mulaw + B_twilio_<callSid>.mulaw)
+    # so the B file sees the LAST frame and the operator can diff
+    # A vs B vs the AMR recording without waiting for the
+    # process to exit. No-op when TTS_AUDIO_CAPTURE_DIR is unset.
+    try:
+        from STT_server.services.audio_capture import close_all
+        close_all()
+    except Exception:
+        pass
+
 
 def _record_usage_for(session: CallSession) -> None:
     """Best-effort: write one usage row per call. Skipped silently

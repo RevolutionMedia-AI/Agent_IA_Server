@@ -29,6 +29,20 @@ log = logging.getLogger("stt_server")
 
 def emit_playback_item(session: CallSession, item: dict) -> bool:
     log.debug("[PLAYBACK] Enqueue playback item: session=%s type=%s gen=%s bytes=%s", getattr(session, 'session_key', '?'), item.get('type'), item.get('generation'), len(item.get('data', b'')) if 'data' in item else '-')
+    # ponytail: 2026-08-14 audio review — A/B-test capture.
+    # Write the exact μ-law bytes the TTS adapter produced
+    # (post-resample, post-μ-law encode) to the A file. This is
+    # the single chokepoint every TTS adapter routes through, so
+    # one write covers all providers (elevenlabs / rime / inworld
+    # / openai / deepgram). The companion B capture (exact 160-byte
+    # frames going to Twilio) lives in playback_loop right before
+    # send_twilio_media — diff A against B against the AMR recording
+    # to locate which stage introduces the artifacts.
+    if item.get("type") == "audio":
+        data = item.get("data") or b""
+        if data:
+            from STT_server.services.audio_capture import capture_a
+            capture_a(getattr(session, "call_sid", "") or "", data)
     ok = enqueue_nowait_with_drop(session.playback_queue, item, "playback_queue")
     if not ok:
         log.warning("[PLAYBACK] Failed to enqueue playback item (queue full): session=%s type=%s gen=%s", getattr(session, 'session_key', '?'), item.get('type'), item.get('generation'))
@@ -310,6 +324,19 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         first_frame_marked = True
 
                     send_start = time.perf_counter()
+                    # ponytail: 2026-08-14 audio review — B capture.
+                    # Write the exact 160-byte μ-law frame about to be
+                    # base64-encoded + sent on the WS. Pair with the A
+                    # capture (TTS-adapter output bytes) at
+                    # emit_playback_item. Diff A vs B vs the AMR
+                    # recording (Twilio / carrier) to localize the
+                    # artifact. No-op when TTS_AUDIO_CAPTURE_DIR is
+                    # empty (the default). Best-effort: a write
+                    # failure logs once and disables capture for
+                    # this call, NEVER blocks the WS send.
+                    if frame:
+                        from STT_server.services.audio_capture import capture_b
+                        capture_b(getattr(session, "call_sid", "") or "", frame)
                     await send_twilio_media(ws, session.stream_sid, frame)
                     sent_frames += 1
                     # Pace outgoing frames proportionally to their duration.

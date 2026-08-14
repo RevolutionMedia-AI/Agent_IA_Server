@@ -11,6 +11,7 @@ from STT_server.config import (
     STREAMING_SEGMENT_MAX_CHARS,
     STT_FAILURE_PROMPT_EN,
     STT_FAILURE_PROMPT_ES,
+    TTS_SINGLE_SEGMENT_PER_REPLY,
 )
 
 
@@ -468,6 +469,12 @@ def split_tts_segments(text: str, max_chars: int = 700, short_text_threshold: in
     if not stripped:
         return []
 
+    # ponytail: 2026-08-14 audio review — when TTS_SINGLE_SEGMENT_PER_REPLY
+    # is on (operator's A/B test), bypass every split and return the
+    # whole reply as one TTS request. Off by default.
+    if TTS_SINGLE_SEGMENT_PER_REPLY:
+        return [stripped]
+
     # ponytail: short replies go in one TTS call — no per-segment
     # round-trip latency. Most customer-service turns land here.
     if len(stripped) <= short_text_threshold:
@@ -500,6 +507,16 @@ def split_tts_segments(text: str, max_chars: int = 700, short_text_threshold: in
 def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str], str]:
     remainder = buffer
     segments: list[str] = []
+
+    # ponytail: 2026-08-14 audio review — when TTS_SINGLE_SEGMENT_PER_REPLY
+    # is on (operator's A/B test), the streaming segmenter also has to
+    # emit the entire buffer as one segment. Without this, the streaming
+    # LLM path (openai / openai_realtime) would still split on
+    # punctuation mid-reply, defeating the A/B test.
+    if TTS_SINGLE_SEGMENT_PER_REPLY:
+        if remainder.strip():
+            return [remainder.strip()], ""
+        return [], ""
 
     while remainder:
         cut_index: int | None = None

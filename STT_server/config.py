@@ -92,6 +92,33 @@ UTTERANCE_QUEUE_MAXSIZE = int(os.getenv("UTTERANCE_QUEUE_MAXSIZE", "256"))
 # 400-char inputs fine. Override with the env var if needed.
 STREAMING_SEGMENT_MAX_CHARS = int(os.getenv("STREAMING_SEGMENT_MAX_CHARS", "400"))
 STREAMING_FIRST_SEGMENT_CHARS = int(os.getenv("STREAMING_FIRST_SEGMENT_CHARS", "400"))
+# ponytail: 2026-08-14 audio review — A/B-test the segmentation hypothesis
+# (multiple TTS calls per reply produce audible discontinuities that
+# AMR re-encoding turns into metallic noise). When this flag is true,
+# pop_streaming_segments() and split_tts_segments() both return the
+# whole reply as a single segment, regardless of length. Off by
+# default; flip on via env var for the operator's A/B test.
+# Expected behaviour: 1 reply = 1 TTS request = 1 playback with no
+# inter-segment concatenation discontinuity. If the artifacts
+# disappear in this mode, segmentation is the cause; if they
+# remain, the cause is downstream of TTS (pacing, mux, codec).
+TTS_SINGLE_SEGMENT_PER_REPLY = os.getenv("TTS_SINGLE_SEGMENT_PER_REPLY", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+# ponytail: opt-in audio capture for the 2026-08-14 A/B test. When
+# this env var points at an existing directory, the runtime writes
+# two files per Twilio callSid:
+#   <dir>/A_inworld_<callSid>.mulaw  — exact bytes the TTS adapter
+#                                       produced (post-resample, post-
+#                                       mu-law encode), in order.
+#   <dir>/B_twilio_<callSid>.mulaw   — exact 160-byte frames sent
+#                                       to Twilio, in order.
+# Diffing A and B against each other and against the AMR recording
+# (capture C, from Twilio/carrier) tells us exactly which stage
+# introduces the noise. Default empty = disabled; capture is
+# best-effort (a write failure logs once and disables for the
+# call, never crashes the live path).
+TTS_AUDIO_CAPTURE_DIR = os.getenv("TTS_AUDIO_CAPTURE_DIR", "").strip()
 PARTIAL_TRANSCRIPT_START_CHARS = int(os.getenv("PARTIAL_TRANSCRIPT_START_CHARS", "20"))
 PARTIAL_TRANSCRIPT_DEBOUNCE_MS = int(os.getenv("PARTIAL_TRANSCRIPT_DEBOUNCE_MS", "200"))
 FINAL_RESTART_DELTA_CHARS = int(os.getenv("FINAL_RESTART_DELTA_CHARS", "12"))
