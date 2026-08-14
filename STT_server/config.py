@@ -151,7 +151,16 @@ DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "elevenlabs").strip().l
 
 # VAD / barge-in / pre-speech buffer tunables (audio_ingest).
 END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "14"))
-SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "1"))
+# ponytail: 2026-08-14 audio review — bump 1 → 4. At 20 ms/frame, 4
+# frames is ~80 ms of sustained voice-positive + RMS-above-threshold
+# before INICIO DE VOZ fires. With SPEECH_START_FRAMES=1 a single
+# echo / click / consonant in the user's own audio (or a single
+# post-playback tail frame from the agent) was enough to trigger
+# a turn — the LLM heard "no escuché bien" three times in one
+# call because each agent tail fired a fresh VAD start. 4 frames
+# of sustained energy is well under a human phoneme (~100 ms for
+# the shortest stop consonants) so latency cost is negligible.
+SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "4"))
 # ponytail: P0 follow-up — bumped default 12 -> 16 (~320ms of consecutive
 # VAD-positive frames required). Real human speech sustains voice
 # activity for 320ms easily; click/noise bursts typically don't.

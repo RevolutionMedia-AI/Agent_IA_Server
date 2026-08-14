@@ -119,6 +119,20 @@ class CallSession:
     # STT_Server.py's mark handler can compute RTT.
     pending_marks: dict[str, float] = field(default_factory=dict)
     mark_counter: int = 0
+    # ponytail: AUDIO echo gate — count of segments of the ACTIVE
+    # generation whose Mark events Twilio has not yet acked.
+    # ``pending_marks`` (above) is a per-mark dictionary used for RTT
+    # computation; ``pending_playback_marks`` is the per-generation
+    # counter used to decide when the assistant has truly finished
+    # playing — only when this reaches zero AND ``active_generation``
+    # matches, ``assistant_speaking`` drops. Earlier code checked
+    # ``not pending_marks`` after every pop, which fired on every
+    # segment of a multi-segment reply (one at a time) and let VAD
+    # grab the audio echo / click / TTS-tail that lands between
+    # segments. See the 2026-08-14 audio review: each seg-9/seg-10/
+    # seg-11 ack of gen=7 logged "last mark cleared" and dropped
+    # ``assistant_speaking`` three times in a row.
+    pending_playback_marks: int = 0
     assistant_speaking: bool = False
     assistant_started_at: float | None = None
     current_transcript: str = ""

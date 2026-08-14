@@ -248,22 +248,31 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                             await interrupt_current_turn(session)
 
                 if not session.assistant_speaking and session.voice_streak >= SPEECH_START_FRAMES:
-                    # session._stage_timer is a runtime-attached per-call
+                    # session._stage_timer is a runtime-attached per-turn
                     # StageTimer used by the latency dashboard to measure
-                    # STT -> LLM -> TTS stage deltas. It is created lazily
-                    # on the first non-empty utterance detection so we
-                    # don't pay the cost for calls that never speak, and
-                    # the mark() below is guarded so only the FIRST
-                    # INICIO DE VOZ event stamps Stages.STT_FIRST_RESULT
-                    # (subsequent ones are no-ops, so the timeline keeps
-                    # the true first-result timestamp).
-                    session._stage_timer = session._stage_timer or StageTimer(
+                    # STT -> LLM -> TTS stage deltas. The previous version
+                    # created the timer once-per-session and never reset
+                    # it, which meant every turn after the first one
+                    # showed ``stt_first_result`` stamped at the FIRST
+                    # turn's wall-clock time (e.g. 8383ms across the
+                    # entire call), and downstream deltas drifted negative
+                    # as monotonic time advanced (e.g.
+                    # ``first_160_frame_sent=-41049.339ms`` in 2026-08-14
+                    # logs). The fix: build a fresh timer at every new
+                    # turn boundary. The OLD timer is flushed to the
+                    # log first so its timeline isn't silently dropped.
+                    _old_timer = getattr(session, "_stage_timer", None)
+                    if _old_timer is not None:
+                        try:
+                            log.info("[stage_timer] previous turn: %s", _old_timer.to_log_line())
+                        except Exception:
+                            pass
+                    session._stage_timer = StageTimer(
                         call_id=session.session_key,
-                        turn_id=0,
+                        turn_id=session.active_generation,
                         generation=session.active_generation,
                     )
-                    if Stages.STT_FIRST_RESULT not in session._stage_timer._stages:
-                        session._stage_timer.mark(Stages.STT_FIRST_RESULT)
+                    session._stage_timer.mark(Stages.STT_FIRST_RESULT)
                     session.last_activity_at = time.monotonic()
                     session.speech_frames.extend(session.pre_speech_frames)
                     session.speech_frame_count = session.voice_streak

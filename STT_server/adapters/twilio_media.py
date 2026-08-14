@@ -16,7 +16,25 @@ def _seq_state(session, key, default=0):
 def track_twilio_sequence(session, event) -> None:
     """Parse sequenceNumber/timestamp from a Twilio `media` event and update
     session-attached counters (gaps, dupes, reorders, jitter). Shape-agnostic
-    across `media.chunk` vs `media.payload` — these fields live on the envelope."""
+    across `media.chunk` vs `media.payload` — these fields live on the envelope.
+
+    ponytail: the previous version compared sequenceNumber across ALL
+    event types (media, mark, start, stop). Twilio assigns its own
+    monotonic sequenceNumber to each WebSocket message, but the
+    media-stream counter is continuous across the whole session —
+    every media, mark, start and stop carries one. The detector was
+    reading the same counter and seeing a +1 jump between a `media`
+    event and the next `mark` event, logging it as a sequence gap.
+    The logs from 2026-08-14 show gaps in lock-step with mark acks
+    (prev=3893, got=3895, missing=1) and never with actual missing
+    audio — the count was tracking Twilio's WS heartbeat, not our
+    audio. Filter to media events so the counter means what its
+    name says: "how many audio frames did Twilio fail to send us?".
+    """
+    event_type = event.get("event")
+    if event_type != "media":
+        return
+
     # ponytail: hotfix for production crash — initialize ALL counters at the
     # start of every call so the log.warning on the gap branch can read
     # _twilio_seq_dupes / _twilio_seq_reorders without AttributeError when

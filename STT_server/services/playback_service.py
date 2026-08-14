@@ -113,6 +113,16 @@ async def interrupt_current_turn(session: CallSession) -> None:
     # time INICIO DE VOZ fires.
     session.speech_frames.clear()
     session._speech_frames_cap_warned = False
+    # ponytail: AUDIO echo gate — reset the per-generation
+    # playback-marks counter on barge-in. The previous generation's
+    # segment_ends are already drained by the next line; if any
+    # leaked through (race with the playback loop) their Twilio
+    # marks will arrive, get popped from ``pending_marks``, and
+    # decrement the counter below zero — that's fine, the
+    # ``max(0, ...)`` floor in the mark-ack handler keeps the metric
+    # honest. We must reset to zero on barge-in so the next turn's
+    # ack-count starts fresh.
+    session.pending_playback_marks = 0
     drain_queue_nowait(session.playback_queue)
     enqueue_playback_clear(session)
     session.generation_changed.set()
@@ -366,6 +376,18 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         session.mark_counter += 1
                         mark_name = f"gen-{generation}-seg-{session.mark_counter}"
                         session.pending_marks[mark_name] = time.monotonic()
+                        # ponytail: AUDIO echo gate — only count this
+                        # segment toward the per-generation "still
+                        # playing" budget if the segment belongs to
+                        # the CURRENTLY ACTIVE generation. Stale
+                        # segment_ends from a cancelled turn (drained
+                        # by interrupt_current_turn but still race-
+                        # processed before the drain landed) must
+                        # NOT bump the counter, otherwise the ack
+                        # logic below waits forever for a mark that
+                        # Twilio will never send.
+                        if generation == session.active_generation:
+                            session.pending_playback_marks += 1
                         if session.stream_sid:
                             await send_twilio_mark(ws, session.stream_sid, mark_name)
                             if LOG_TWILIO_PLAYBACK:

@@ -1008,6 +1008,17 @@ async def media_stream(ws: WebSocket) -> None:
                 mark = msg.get("mark", {}).get("name") if isinstance(msg.get("mark"), dict) else msg.get("mark")
                 pending = getattr(session, "pending_marks", None)
                 if isinstance(pending, dict) and mark and mark in pending:
+                    # ponytail: AUDIO echo gate — parse the generation
+                    # out of the mark name so we can decrement the
+                    # per-generation counter only when the mark belongs
+                    # to the ACTIVE generation. The previous code
+                    # compared ``not pending`` after every pop, which
+                    # fired on every segment of a multi-segment reply
+                    # (one at a time) and let VAD grab echo between
+                    # segments. Counter only drops when ALL segments
+                    # of the current generation have been acked.
+                    _gen_match = re.match(r"^gen-(\d+)-seg-\d+$", mark)
+                    _ack_generation = int(_gen_match.group(1)) if _gen_match else None
                     sent_at = pending.pop(mark, None)
                     if sent_at is not None:
                         rtt_ms = (time.monotonic() - sent_at) * 1000.0
@@ -1024,27 +1035,27 @@ async def media_stream(ws: WebSocket) -> None:
                                 metrics.incr("mark_acks")
                             except Exception:
                                 pass
-                        log.info("[MARK_ACK] session=%s mark=%s rtt_ms=%.1f",
-                                 session.session_key, mark, rtt_ms)
-                # ponytail: AUDIO barge-in / echo gate. When Twilio
-                # confirms the LAST pending mark has played out, the
-                # assistant's audio is no longer reaching the caller
-                # and assistant_speaking must drop so the VAD starts
-                # picking up the caller's voice again. The previous
-                # code popped pending marks but never reset the flag,
-                # so assistant_speaking stayed True until the
-                # speaking-watchdog (5s poll) caught it — every post-
-                # play utterance lost its first 5s to the echo
-                # window. Idempotent: only fires when the pending set
-                # is empty AND we were actually speaking.
-                if isinstance(pending, dict) and not pending:
-                    if session.assistant_speaking:
-                        session.assistant_speaking = False
-                        session.assistant_started_at = None
-                        log.info(
-                            "[MARK_ACK] last mark cleared — assistant_speaking -> False for session=%s",
-                            session.session_key,
-                        )
+                        log.info("[MARK_ACK] session=%s mark=%s gen=%s rtt_ms=%.1f",
+                                 session.session_key, mark, _ack_generation, rtt_ms)
+                    # Decrement counter only when the mark belongs to
+                    # the currently active generation; otherwise the
+                    # counter is stale (we're in a new turn, the old
+                    # turn's marks are racing in). Floor at zero so a
+                    # leaked ack can never push the metric negative.
+                    if _ack_generation is not None and _ack_generation == session.active_generation:
+                        session.pending_playback_marks = max(0, session.pending_playback_marks - 1)
+                        # The whole turn has finished playing when
+                        # both conditions hold: the counter is zero
+                        # AND we were actually speaking (so we don't
+                        # fire on a stray ack from a generation we
+                        # never sent audio for).
+                        if session.pending_playback_marks == 0 and session.assistant_speaking:
+                            session.assistant_speaking = False
+                            session.assistant_started_at = None
+                            log.info(
+                                "[MARK_ACK] generation=%s fully played — assistant_speaking -> False for session=%s",
+                                _ack_generation, session.session_key,
+                            )
                 continue
 
             if event == "dtmf":
