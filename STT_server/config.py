@@ -157,6 +157,20 @@ INITIAL_GREETING_TEXT_ES = os.getenv(
     "INITIAL_GREETING_TEXT_ES",
     "Hola, gracias por llamar. Mi nombre es Athenas, soy su asistente virtual. ¿En qué puedo ayudarle?",
 ).strip()
+# ponytail: 2026-08-14 production log review — the operator
+# reported "no se escucha nada hasta después de 28 segundos"
+# after the call connects. Root cause was a 236-char welcome_message
+# in Spanish that took ~18 s to play at speakingRate=1.15; plus
+# the user's reaction time + barge-in detection + LLM TTFB added
+# another ~10 s before the first non-greeting agent message. The
+# 28 s was real and avoidable without changing the welcome text:
+# cap the greeting to a length that plays in < ~10 s, regardless
+# of what the agent row has stored. Agents with shorter greetings
+# are unaffected; agents with longer greetings get truncated at
+# the nearest sentence boundary (or the configured fallback) so
+# the caller hears the agent within a few seconds of connecting.
+# Default 200 chars (~10 s of speech at 1.15x). Set via env var.
+INITIAL_GREETING_MAX_CHARS = int(os.getenv("INITIAL_GREETING_MAX_CHARS", "200"))
 
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 
@@ -197,17 +211,32 @@ RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
 DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "elevenlabs").strip().lower()
 
 # VAD / barge-in / pre-speech buffer tunables (audio_ingest).
-END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "14"))
-# ponytail: 2026-08-14 audio review — bump 1 → 4. At 20 ms/frame, 4
-# frames is ~80 ms of sustained voice-positive + RMS-above-threshold
-# before INICIO DE VOZ fires. With SPEECH_START_FRAMES=1 a single
-# echo / click / consonant in the user's own audio (or a single
-# post-playback tail frame from the agent) was enough to trigger
-# a turn — the LLM heard "no escuché bien" three times in one
-# call because each agent tail fired a fresh VAD start. 4 frames
-# of sustained energy is well under a human phoneme (~100 ms for
-# the shortest stop consonants) so latency cost is negligible.
-SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "4"))
+# ponytail: 2026-08-14 production log review (CA5f48c4...) — VAD was
+# firing on 80 ms of voice + 280 ms of silence and forwarding 3-char
+# transcripts ("len=3") to the LLM, which then responded with
+# "Disculpe, esa parte no la escuché bien. ¿Me la podría repetir?"
+# every time the user started speaking briefly. The LLM correctly
+# identified 3 chars as un-understandable; the bug was that the VAD
+# treated such short utterances as a turn at all. End the turn on
+# more sustained silence; require more sustained voice before
+# starting one.
+END_SILENCE_FRAMES = int(os.getenv("END_SILENCE_FRAMES", "25"))
+# ponytail: 2026-08-14 production log review — bump 4 → 6 (~120 ms).
+# 4 frames (~80 ms) was still triggerable by a single click or
+# post-playback tail. 6 frames requires ~120 ms of sustained
+# voice-positive + RMS-above-threshold before INICIO DE VOZ fires.
+# Still well under a human phoneme (~100 ms is the shortest stop
+# consonant); latency cost is negligible (~40 ms).
+SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "6"))
+# ponytail: 2026-08-14 — minimum voice frames for an utterance to be
+# forwarded to the LLM. Below this threshold the VAD reset + drop
+# the buffer as noise (a click, a consonant, a single frame of
+# echo). Without this filter every echo / click reached the LLM and
+# the LLM correctly responded "I didn't understand" because the
+# input was uninterpretable. At 20 ms/frame, 25 frames = 500 ms of
+# sustained voice — well below a real-word duration but well above
+# anything a click / echo burst can sustain.
+MIN_UTTERANCE_VOICE_FRAMES = int(os.getenv("MIN_UTTERANCE_VOICE_FRAMES", "25"))
 # ponytail: P0 follow-up — bumped default 12 -> 16 (~320ms of consecutive
 # VAD-positive frames required). Real human speech sustains voice
 # activity for 320ms easily; click/noise bursts typically don't.

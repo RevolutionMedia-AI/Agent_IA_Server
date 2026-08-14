@@ -205,6 +205,48 @@ async def play_initial_greeting(session: CallSession) -> None:
         )
         return
 
+    # ponytail: 2026-08-14 — cap the greeting length so the caller
+    # doesn't wait 20+ seconds before hearing the agent's first
+    # utterance. We prefer to TRUNCATE at the nearest sentence
+    # boundary within the cap; if no sentence boundary fits we
+    # fall back to a hard cut. The truncation is silent — the
+    # operator can shorten the welcome_message on the agent row if
+    # they want the full text. Without this the operator reported
+    # "no se escucha nada hasta después de 28 segundos" because the
+    # agent's 236-char welcome_message took ~18 s to play at
+    # speakingRate=1.15.
+    from STT_server.config import INITIAL_GREETING_MAX_CHARS
+    if len(greeting) > INITIAL_GREETING_MAX_CHARS:
+        cap = INITIAL_GREETING_MAX_CHARS
+        truncated = greeting[:cap]
+        # Cut at the LAST sentence terminator within the cap so the
+        # greeting still ends naturally — never mid-word. We accept
+        # any position for the terminator (no lower bound) so tight
+        # caps like 50 chars still produce a sentence fragment rather
+        # than a mid-word cut. The terminator set is ordered so we
+        # prefer ". " (cleanest cut) over bare "." (acceptable) over
+        # punctuation that would only land mid-word.
+        last_terminator_idx = -1
+        last_terminator_len = 0
+        for terminator in (". ", "! ", "? ", "¡", "¿", ".", "!", "?"):
+            idx = truncated.rfind(terminator)
+            if idx > last_terminator_idx:
+                last_terminator_idx = idx
+                last_terminator_len = len(terminator)
+        if last_terminator_idx >= 0:
+            greeting = truncated[: last_terminator_idx + last_terminator_len].strip()
+        else:
+            # No sentence terminator within the cap. Hard cut.
+            greeting = truncated.rstrip()
+        log.info(
+            "[PLAYBACK] greeting truncated from %d to %d chars "
+            "(INITIAL_GREETING_MAX_CHARS=%d) session=%s",
+            len(welcome) if welcome else len(greeting),
+            len(greeting),
+            cap,
+            session.session_key,
+        )
+
     log.info(
         "[PLAYBACK] playing initial greeting (source=%s, %d chars, lang=%s) for session=%s",
         greeting_source,

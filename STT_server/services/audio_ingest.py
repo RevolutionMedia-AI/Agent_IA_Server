@@ -14,6 +14,7 @@ from STT_server.config import (
     FRAME_DURATION_MS,
     MAX_MEDIA_PAYLOAD_BYTES,
     MIN_BARGE_IN_FRAMES,
+    MIN_UTTERANCE_VOICE_FRAMES,
     MIN_VOICE_RMS,
     PRE_SPEECH_FRAMES,
     SPEECH_FRAMES_MAX,
@@ -304,6 +305,35 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
             log.debug(f"[VAD] Silencio: silence_frames={session.silence_frames}")
 
         if session.speech_frames and session.silence_frames >= END_SILENCE_FRAMES:
+            # ponytail: 2026-08-14 production log review — the VAD was
+            # firing FIN DE VOZ on 14 voice frames + 280 ms of silence
+            # (= 14 frames), then forwarding 3-char transcripts ("len=3")
+            # to the LLM, which then correctly responded "I didn't
+            # understand" because the input was un-interpretable.
+            # The bug was the VAD treating 80 ms of voice + 280 ms of
+            # silence as a turn. Drop the buffer as noise when the
+            # voice portion is below MIN_UTTERANCE_VOICE_FRAMES (default
+            # 25 = 500 ms of sustained voice) — clicks, single-consonant
+            # bursts, and post-playback tail frames can't sustain that.
+            if session.speech_frame_count < MIN_UTTERANCE_VOICE_FRAMES:
+                log.info(
+                    f"[VAD] NOISE_REJECT: speech_frame_count={session.speech_frame_count} "
+                    f"< MIN_UTTERANCE_VOICE_FRAMES={MIN_UTTERANCE_VOICE_FRAMES}; "
+                    f"discarding without LLM call session={session.session_key}"
+                )
+                _m = getattr(session, "metrics", None)
+                if _m is not None:
+                    try:
+                        _m.incr("vad_short_utterance_rejected_total")
+                    except Exception:
+                        pass
+                session.speech_frames.clear()
+                session.pre_speech_frames.clear()
+                session.silence_frames = 0
+                session.speech_frame_count = 0
+                session.voice_streak = 0
+                session._speech_frames_cap_warned = False
+                continue
             log.info(f"[VAD] FIN DE VOZ: speech_frame_count={session.speech_frame_count}, silence_frames={session.silence_frames}")
             session.speech_frames.clear()
             session.pre_speech_frames.clear()
