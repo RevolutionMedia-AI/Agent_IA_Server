@@ -138,6 +138,26 @@ STT_RECONNECT_MAX_DELAY_MS = int(os.getenv("STT_RECONNECT_MAX_DELAY_MS", "2000")
 STT_FAILURE_PROMPT_EN = os.getenv("STT_FAILURE_PROMPT_EN", "I'm having trouble hearing you right now.").strip()
 STT_FAILURE_PROMPT_ES = os.getenv("STT_FAILURE_PROMPT_ES", "Estoy teniendo problemas para escucharte en este momento.").strip()
 
+# ponytail: 2026-08-14 — initial greeting the agent speaks as soon
+# as the call connects. Sent DIRECTLY to TTS (no STT, no LLM
+# intermediate), so the caller hears the agent greet them without
+# waiting for them to speak first. Per-agent override lives on
+# agent.welcome_message (higher priority); the env vars below
+# are the platform fallback when the agent has no welcome_message
+# configured. Default-on so a fresh deployment without any per-agent
+# config still greets the caller instead of dead-air silence.
+INITIAL_GREETING_ENABLED = os.getenv("INITIAL_GREETING_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+INITIAL_GREETING_TEXT_EN = os.getenv(
+    "INITIAL_GREETING_TEXT_EN",
+    "Thank you for calling. My name is Athenas, your virtual assistant. How can I help you today?",
+).strip()
+INITIAL_GREETING_TEXT_ES = os.getenv(
+    "INITIAL_GREETING_TEXT_ES",
+    "Hola, gracias por llamar. Mi nombre es Athenas, soy su asistente virtual. ¿En qué puedo ayudarle?",
+).strip()
+
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 
 # Max call duration guardrail: hard-timeout to prevent phantom calls

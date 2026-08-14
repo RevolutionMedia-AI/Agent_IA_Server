@@ -143,21 +143,75 @@ async def interrupt_current_turn(session: CallSession) -> None:
 
 
 async def play_initial_greeting(session: CallSession) -> None:
-    """Play the agent's welcome_message (set by media_stream at call start)
-    via the TTS pipeline so the caller hears the agent greet them first.
-    No-op if welcome_message is empty / not configured.
+    """Speak the initial greeting as soon as the call connects.
 
-    ponytail: set assistant_speaking = True BEFORE scheduling the TTS
-    so monitor_idle_silence knows the agent is about to speak and
-    doesn't count the TTFB window as user silence. The flag gets
-    cleared by playback_loop when Twilio confirms playback completion
-    via the mark event.
+    ponytail: 2026-08-14 — the user reported "the initial greeting
+    prompt isn't firing". Root cause: the previous version required
+    ``session.welcome_message`` to be set on the agent row; agents
+    without one configured produced dead-air silence until the
+    caller spoke. Fix: pick the greeting text with this priority —
+      1. ``session.welcome_message`` (per-agent override, if set)
+      2. ``INITIAL_GREETING_TEXT_ES`` / ``_EN`` (platform fallback,
+         picked by the call's preferred_language)
+      3. None of the above → no-op (silent start, preserved for
+         agents that explicitly opt out via INITIAL_GREETING_ENABLED=false)
+
+    Sent DIRECTLY to TTS via ``run_tts_with_retries`` — no STT,
+    no LLM intermediate. The caller hears the agent greet them
+    within the TTS provider's TTFB (typically 200-300 ms for
+    Inworld, with the previous warmup path adding a pre-cached
+    file we can drop in).
+
+    The caller-side perception is: connect → silence ≤ 300 ms →
+    agent greets. No more dead-air wait-for-the-customer-to-speak.
     """
+    # Per-agent override wins (lets the agent personalize the
+    # greeting without touching env vars).
     welcome = getattr(session, 'welcome_message', None)
-    if not welcome or not welcome.strip():
-        log.debug("[PLAYBACK] play_initial_greeting skipped (no welcome_message)")
+    greeting: str | None = None
+    greeting_source = ""
+
+    if welcome and welcome.strip():
+        greeting = welcome.strip()
+        greeting_source = "agent.welcome_message"
+    else:
+        # ponytail: platform fallback. The agent's preferred_language
+        # decides which variant; default to ES because most operator
+        # deployments on this platform target es-419 customers.
+        from STT_server.config import (
+            INITIAL_GREETING_ENABLED,
+            INITIAL_GREETING_TEXT_EN,
+            INITIAL_GREETING_TEXT_ES,
+        )
+        if not INITIAL_GREETING_ENABLED:
+            log.debug(
+                "[PLAYBACK] play_initial_greeting skipped "
+                "(INITIAL_GREETING_ENABLED=false and no agent welcome_message) session=%s",
+                session.session_key,
+            )
+            return
+        lang = (getattr(session, 'preferred_language', None) or "es").strip().lower()
+        if lang.startswith("en"):
+            greeting = INITIAL_GREETING_TEXT_EN or None
+            greeting_source = "INITIAL_GREETING_TEXT_EN"
+        else:
+            greeting = INITIAL_GREETING_TEXT_ES or None
+            greeting_source = "INITIAL_GREETING_TEXT_ES"
+
+    if not greeting:
+        log.debug(
+            "[PLAYBACK] play_initial_greeting skipped (no greeting text resolved) session=%s",
+            session.session_key,
+        )
         return
-    log.info("[PLAYBACK] playing initial greeting (%d chars) for session=%s", len(welcome), session.session_key)
+
+    log.info(
+        "[PLAYBACK] playing initial greeting (source=%s, %d chars, lang=%s) for session=%s",
+        greeting_source,
+        len(greeting),
+        getattr(session, 'preferred_language', None) or "?",
+        session.session_key,
+    )
     # Mark the agent as speaking NOW (before the TTS provider responds).
     # Without this the idle monitor could fire during the TTFB window
     # (some TTS providers take 1-2 s to first byte), think the user is
@@ -174,7 +228,7 @@ async def play_initial_greeting(session: CallSession) -> None:
     # playback_loop will pick up the queued audio and stream it to Twilio.
     from STT_server.services.turn_manager import run_tts_with_retries
     try:
-        await run_tts_with_retries(session, welcome.strip(), session.active_generation)
+        await run_tts_with_retries(session, greeting, session.active_generation)
     except Exception as exc:
         log.warning("[PLAYBACK] initial greeting TTS failed: %s", exc)
         session.assistant_speaking = False

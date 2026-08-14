@@ -460,32 +460,25 @@ async def voice(
     # for no fixed greetings in code (the .wav carried the old
     # Tigo/Camila script), and the agent's `welcome_message` already
     # plays via `play_initial_greeting` once the media stream opens
-    # with a real voice and the correct prompt. Keep the env-var
-    # opt-in path in case an operator wants to insert their own
-    # pre-recorded file later — it just no longer falls back to
-    # "the file happens to be on disk".
-    if False:  # TWIML_INITIAL_GREETING_ENABLED: removed per spec, see config.py
-        static_local = os.path.join(os.path.dirname(__file__), "static", "greeting.wav")
-        play_url = f"{PUBLIC_URL.rstrip('/')}/static/greeting.wav"
-        twiml = f"""
-    <Response>
-        <Play>{play_url}</Play>
-        <Connect>
-            <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
-        </Connect>
-    </Response>
-    """
-    else:
-        # ponytail: bug history. This template used {stream_params} (a
-        # Python list), which rendered as ['<Parameter .../>', ...] inside
-        # the <Stream> element. Twilio's TwiML parser treated that literal
-        # text as a child text node, NOT as <Parameter> elements, and
-        # silently dropped them. Net effect: the WebSocket 'start' event
-        # arrived with customParameters={} and the call ran without an
-        # agent_id (see [AGENT] has no agent_id in customParameters log).
-        # stream_params_str was already joined above for exactly this
-        # purpose; use it.
-        twiml = f"""
+    # with a real voice and the correct prompt.
+    #
+    # ponytail: 2026-08-14 — the old `if False: TWIML_INITIAL_GREETING_ENABLED`
+    # block (Play static greeting.wav before Connect) was dead code
+    # left over from the 3c14ac6 refactor; the TwiML never played
+    # the file even with the env var set. Removed entirely. The
+    # in-band greeting now goes through play_initial_greeting
+    # (TTS, no LLM/STT intermediate).
+
+    # ponytail: bug history. This template used {stream_params} (a
+    # Python list), which rendered as ['<Parameter .../>', ...] inside
+    # the <Stream> element. Twilio's TwiML parser treated that literal
+    # text as a child text node, NOT as <Parameter> elements, and
+    # silently dropped them. Net effect: the WebSocket 'start' event
+    # arrived with customParameters={} and the call ran without an
+    # agent_id (see [AGENT] has no agent_id in customParameters log).
+    # stream_params_str was already joined above for exactly this
+    # purpose; use it.
+    twiml = f"""
     <Response>
         <Connect>
             <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
@@ -967,16 +960,23 @@ async def media_stream(ws: WebSocket) -> None:
                         "Settings → API).",
                         session.session_key, session.agent_id, session.user_id,
                     )
-                # ponytail: if the agent has a welcome_message, schedule
-                # play_initial_greeting so the TTS speaks first. It's a
-                # no-op for agents without one (preserves the previous
-                # silent-start behavior).
-                if getattr(session, 'welcome_message', None):
-                    from STT_server.services.playback_service import play_initial_greeting
-                    track_task(
-                        session,
-                        asyncio.create_task(play_initial_greeting(session))
-                    )
+                # ponytail: 2026-08-14 — fire the initial greeting as soon as the
+                # call connects, so the caller hears the agent greet
+                # them within ~300 ms (TTS TTFB) instead of dead-air
+                # silence. The greeting text is resolved inside
+                # ``play_initial_greeting`` with priority:
+                #   1. session.welcome_message (per-agent override)
+                #   2. INITIAL_GREETING_TEXT_ES / _EN (platform fallback
+                #      picked by session.preferred_language)
+                # If neither resolves, the function is a no-op and
+                # the call starts silent (preserves opt-out for
+                # agents that explicitly disable via
+                # INITIAL_GREETING_ENABLED=false).
+                from STT_server.services.playback_service import play_initial_greeting
+                track_task(
+                    session,
+                    asyncio.create_task(play_initial_greeting(session))
+                )
                 track_task(session, asyncio.create_task(monitor_idle_silence(session, ws)))
                 # Guardrail: hard-timeout to prevent phantom calls.
                 # If the call runs longer than MAX_CALL_DURATION_SEC, we
