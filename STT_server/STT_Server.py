@@ -137,6 +137,63 @@ def _safe_int(v) -> int | None:
 async def lifespan(app: FastAPI):
     db_tenants.backfill_from_json()
 
+    # ponytail: 2026-08-14 — pre-generate the static greeting WAVs at
+    # boot so the first call after deploy doesn't pay the TTS TTFB
+    # (the operator reported "el saludo llega después de 28 Segundos
+    # de iniciada la llamada" without this — most of those 28 s are
+    # Twilio WS handshake + buffering, all of which we skip when
+    # /voice returns TwiML ``<Play>`` of a pre-existing file).
+    # Best-effort: if the TTS provider is unreachable at boot the
+    # task logs and continues; the /voice handler will lazily
+    # generate the file on the next call.
+    import asyncio
+    from pathlib import Path
+    from STT_server.services.greeting import pregenerate_greeting_at_startup
+
+    static_dir = Path(os.path.dirname(__file__)) / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from STT_server.config import (
+            DEFAULT_TTS_PROVIDER,
+            INITIAL_GREETING_TEXT_EN,
+            INITIAL_GREETING_TEXT_ES,
+        )
+
+        def _resolve_api_key_for_provider(provider: str) -> str:
+            """Resolve the TTS API key for boot-time pre-generation.
+
+            Tries the per-user resolver first (canonical path) and
+            falls back to the env-var lookup. Returns '' if neither
+            yields a key — the pre-generation then skips this
+            provider and the in-band greeting fires as a fallback.
+            """
+            try:
+                from STT_server.services.credentials_resolver import resolve_provider
+                creds = resolve_provider(None, provider)
+                key = (creds.get("api_key") or "").strip()
+                if key:
+                    return key
+            except Exception:
+                pass
+            return os.getenv(f"{provider.upper()}_API_KEY", "").strip()
+
+        pregenerate_greeting_at_startup(
+            static_dir=static_dir,
+            texts={
+                "en": INITIAL_GREETING_TEXT_EN,
+                "es": INITIAL_GREETING_TEXT_ES,
+            },
+            voice_ids={"en": "", "es": ""},
+            api_key_resolver=lambda: _resolve_api_key_for_provider(
+                DEFAULT_TTS_PROVIDER
+            ),
+            tts_provider=DEFAULT_TTS_PROVIDER,
+        )
+    except Exception as exc:
+        log.warning(
+            "[startup] greeting pre-generation bootstrap failed: %s", exc,
+        )
+
     # ponytail: emit a heartbeat log every 60s so Railway's container
     # cycles (if any) are visible — every "container alive Ns" line is a
     # proof the worker is up. If you see two of these in a row without
@@ -455,19 +512,43 @@ async def voice(
 
     stream_params_str = ''.join(stream_params)
 
-    # ponytail: dropped the <Play> of static/greeting.wav that fired
-    # whenever the file existed on disk. The user explicitly asked
-    # for no fixed greetings in code (the .wav carried the old
-    # Tigo/Camila script), and the agent's `welcome_message` already
-    # plays via `play_initial_greeting` once the media stream opens
-    # with a real voice and the correct prompt.
-    #
-    # ponytail: 2026-08-14 — the old `if False: TWIML_INITIAL_GREETING_ENABLED`
-    # block (Play static greeting.wav before Connect) was dead code
-    # left over from the 3c14ac6 refactor; the TwiML never played
-    # the file even with the env var set. Removed entirely. The
-    # in-band greeting now goes through play_initial_greeting
-    # (TTS, no LLM/STT intermediate).
+    # ponytail: 2026-08-14 — operator reports "el saludo llega
+    # después de 28 Segundos de iniciada la llamada". 28 s = Twilio
+    # WS-handshake + Twilio→phone buffering + TTS TTFB, all of which
+    # happen BEFORE the user hears audio with the previous flow.
+    # Fix: pre-generate a static greeting WAV at boot (see
+    # STT_server/services/greeting.py). If the file exists on disk
+    # when /voice fires, include TwiML ``<Play>`` BEFORE
+    # ``<Connect>`` so Twilio plays the file AS SOON AS the call
+    # connects — before any backend handshake, no WS round-trip, no
+    # TTS provider involvement. The caller hears audio within ~500 ms
+    # of connecting. The WS then opens in parallel and the in-band
+    # greeting (if any) plays after. The static greeting is the
+    # platform DEFAULT (Athenas, EN+ES); agents with a custom
+    # ``welcome_message`` still get that custom greeting via the
+    # in-band ``play_initial_greeting`` once the WS opens.
+    from pathlib import Path
+    from STT_server.services.greeting import static_greeting_path
+    static_dir = Path(os.path.dirname(__file__)) / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    # The /voice webhook doesn't yet know which language the call
+    # is — the agent's preferred_language is set later in the start
+    # event from customParameters or the agent row. Default to ES
+    # (the operator's primary market).
+    lang = (os.getenv("DEFAULT_CALL_LANGUAGE", "es") or "es").strip().lower()
+    if not lang.startswith("en"):
+        lang = "es"
+    greeting_path = static_greeting_path(static_dir, lang)
+    play_section = ""
+    if greeting_path.exists() and greeting_path.stat().st_size > 44:
+        play_section = (
+            f'<Play>{PUBLIC_URL.rstrip("/")}/static/{greeting_path.name}</Play>'
+        )
+        log.info(
+            "[VOICE] including TwiML <Play> for greeting %s (%.1f KB)",
+            greeting_path.name,
+            greeting_path.stat().st_size / 1024,
+        )
 
     # ponytail: bug history. This template used {stream_params} (a
     # Python list), which rendered as ['<Parameter .../>', ...] inside
@@ -478,7 +559,17 @@ async def voice(
     # agent_id (see [AGENT] has no agent_id in customParameters log).
     # stream_params_str was already joined above for exactly this
     # purpose; use it.
-    twiml = f"""
+    if play_section:
+        twiml = f"""
+    <Response>
+        {play_section}
+        <Connect>
+            <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
+        </Connect>
+    </Response>
+    """
+    else:
+        twiml = f"""
     <Response>
         <Connect>
             <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
