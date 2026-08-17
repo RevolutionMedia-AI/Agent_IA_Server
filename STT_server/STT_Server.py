@@ -512,43 +512,47 @@ async def voice(
 
     stream_params_str = ''.join(stream_params)
 
-    # ponytail: 2026-08-14 — operator reports "el saludo llega
-    # después de 28 Segundos de iniciada la llamada". 28 s = Twilio
-    # WS-handshake + Twilio→phone buffering + TTS TTFB, all of which
-    # happen BEFORE the user hears audio with the previous flow.
-    # Fix: pre-generate a static greeting WAV at boot (see
-    # STT_server/services/greeting.py). If the file exists on disk
-    # when /voice fires, include TwiML ``<Play>`` BEFORE
-    # ``<Connect>`` so Twilio plays the file AS SOON AS the call
-    # connects — before any backend handshake, no WS round-trip, no
-    # TTS provider involvement. The caller hears audio within ~500 ms
-    # of connecting. The WS then opens in parallel and the in-band
-    # greeting (if any) plays after. The static greeting is the
-    # platform DEFAULT (Athenas, EN+ES); agents with a custom
-    # ``welcome_message`` still get that custom greeting via the
-    # in-band ``play_initial_greeting`` once the WS opens.
-    from pathlib import Path
-    from STT_server.services.greeting import static_greeting_path
-    static_dir = Path(os.path.dirname(__file__)) / "static"
-    static_dir.mkdir(parents=True, exist_ok=True)
-    # The /voice webhook doesn't yet know which language the call
-    # is — the agent's preferred_language is set later in the start
-    # event from customParameters or the agent row. Default to ES
-    # (the operator's primary market).
-    lang = (os.getenv("DEFAULT_CALL_LANGUAGE", "es") or "es").strip().lower()
-    if not lang.startswith("en"):
-        lang = "es"
-    greeting_path = static_greeting_path(static_dir, lang)
+    # ponytail: 2026-08-14 — TwiML ``<Play>`` of a pre-generated static
+    # greeting is OPT-IN (default OFF). The previous default-permissive
+    # behaviour caused the operator to see 30+ seconds of dead silence
+    # on every call: when the boot pre-generation had failed (no TTS
+    # API key was resolvable at user_id=None), the static file did
+    # NOT exist, the URL was a 404, and Twilio waited for the
+    # configured 404 timeout before opening the WebSocket. The WS
+    # audio was lost during that wait and the user heard nothing.
+    # With the opt-in default below, /voice returns plain
+    # ``<Connect>`` TwiML unless the pre-generation is known to have
+    # succeeded. The in-band greeting (which already has
+    # INITIAL_GREETING_MAX_CHARS + MIN_UTTERANCE_VOICE_FRAMES
+    # protecting it) fires after the WS opens — same behaviour the
+    # operator had before commit fc4da91.
+    from STT_server.config import INITIAL_GREETING_TWIML_PLAY
     play_section = ""
-    if greeting_path.exists() and greeting_path.stat().st_size > 44:
-        play_section = (
-            f'<Play>{PUBLIC_URL.rstrip("/")}/static/{greeting_path.name}</Play>'
-        )
-        log.info(
-            "[VOICE] including TwiML <Play> for greeting %s (%.1f KB)",
-            greeting_path.name,
-            greeting_path.stat().st_size / 1024,
-        )
+    if INITIAL_GREETING_TWIML_PLAY:
+        try:
+            from pathlib import Path
+            from STT_server.services.greeting import static_greeting_path
+            static_dir = Path(os.path.dirname(__file__)) / "static"
+            static_dir.mkdir(parents=True, exist_ok=True)
+            # The /voice webhook doesn't know which language the call
+            # is yet — the agent's preferred_language is set later in
+            # the start event. Default to ES (the operator's primary
+            # market).
+            lang = (os.getenv("DEFAULT_CALL_LANGUAGE", "es") or "es").strip().lower()
+            if not lang.startswith("en"):
+                lang = "es"
+            greeting_path = static_greeting_path(static_dir, lang)
+            if greeting_path.exists() and greeting_path.stat().st_size > 44:
+                play_section = (
+                    f'<Play>{PUBLIC_URL.rstrip("/")}/static/{greeting_path.name}</Play>'
+                )
+                log.info(
+                    "[VOICE] including TwiML <Play> for greeting %s (%.1f KB)",
+                    greeting_path.name,
+                    greeting_path.stat().st_size / 1024,
+                )
+        except Exception as exc:
+            log.warning("[VOICE] could not build TwiML <Play>: %s", exc)
 
     # ponytail: bug history. This template used {stream_params} (a
     # Python list), which rendered as ['<Parameter .../>', ...] inside

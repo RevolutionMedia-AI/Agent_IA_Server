@@ -21,9 +21,34 @@ break it.
 """
 from __future__ import annotations
 
+import importlib
 import struct
+from unittest.mock import patch
 
 import pytest
+
+
+def _reload_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-import config so the env vars take effect."""
+    import STT_server.config as cfg
+    importlib.reload(cfg)
+
+
+# ── Default (regression guards) ────────────────────────────────────────────
+
+
+def test_default_initial_greeting_twiml_play_is_off(monkeypatch) -> None:
+    """Pin the default safety: when the env var is unset, the
+    dangerous opt-in is OFF. The 2026-08-14 incident (40+ s of dead
+    silence because the boot pre-generation failed and Twilio held
+    the WS open waiting for a 404) is the reason this is off by
+    default. Operators who want pre-recorded greeting playback
+    must EXPLICITLY opt in AND ensure the file exists.
+    """
+    monkeypatch.delenv("INITIAL_GREETING_TWIML_PLAY", raising=False)
+    _reload_config(monkeypatch)
+    import STT_server.config as cfg
+    assert cfg.INITIAL_GREETING_TWIML_PLAY is False
 
 
 # ── WAV header correctness ────────────────────────────────────────────────
@@ -89,7 +114,11 @@ def test_static_greeting_path_uses_lang_suffix(tmp_path) -> None:
 # ── /voice TwiML response shape ────────────────────────────────────────────
 
 
-def _build_voice_twiml(static_greeting_exists: bool, lang: str = "es") -> str:
+def _build_voice_twiml(
+    static_greeting_exists: bool,
+    lang: str = "es",
+    twiml_play_enabled: bool = True,
+) -> str:
     """Reconstruct the TwiML response from the /voice handler.
 
     The handler is sync and not easy to call directly in tests, so
@@ -103,7 +132,12 @@ def _build_voice_twiml(static_greeting_exists: bool, lang: str = "es") -> str:
     # module's static/ directory). For the test we point at tmp_path.
     static_dir = _FAKE_STATIC_DIR
     play_section = ""
-    if static_greeting_exists:
+    # Mirror the production opt-in: <Play> only when explicitly
+    # enabled AND the file exists. The default in production is
+    # INITIAL_GREETING_TWIML_PLAY=false (the operator's reported
+    # incident: 404 from a missing file made Twilio hold the WS
+    # open for 30+ s, masking the in-band greeting).
+    if static_greeting_exists and twiml_play_enabled:
         play_section = (
             f'<Play>{_FAKE_PUBLIC_URL}/static/{static_greeting_path(static_dir, lang).name}</Play>'
         )
@@ -130,18 +164,33 @@ _FAKE_PUBLIC_URL = "https://example.test"
 _FAKE_WS_URL = "wss://example.test"
 
 
-def test_voice_twiml_includes_play_when_greeting_exists(tmp_path, monkeypatch) -> None:
-    """When the static greeting WAV exists on disk, /voice returns
-    TwiML with ``<Play>`` BEFORE ``<Connect>`` so Twilio plays the
-    file as soon as the call connects."""
+def test_voice_twiml_includes_play_when_enabled_and_greeting_exists(tmp_path, monkeypatch) -> None:
+    """When the opt-in TWIML_PLAY is on AND the static greeting WAV
+    exists on disk, /voice returns TwiML with ``<Play>`` BEFORE
+    ``<Connect>`` so Twilio plays the file as soon as the call
+    connects."""
     global _FAKE_STATIC_DIR
     _FAKE_STATIC_DIR = tmp_path
     (tmp_path / "greeting_es.wav").write_bytes(b"\xff" * 320)
-    twiml = _build_voice_twiml(static_greeting_exists=True)
+    twiml = _build_voice_twiml(static_greeting_exists=True, twiml_play_enabled=True)
     assert "<Play>" in twiml
     assert "greeting_es.wav" in twiml
     # <Play> must come BEFORE <Connect> so Twilio plays it first.
     assert twiml.index("<Play>") < twiml.index("<Connect>")
+
+
+def test_voice_twiml_omits_play_when_disabled_even_if_greeting_exists(tmp_path) -> None:
+    """The opt-in fix: when INITIAL_GREETING_TWIML_PLAY is OFF (the
+    new default), /voice returns plain ``<Connect>`` even when the
+    static file exists. This prevents the 30+ s of dead silence
+    the operator reported when the boot pre-generation had failed
+    and the URL was a 404."""
+    global _FAKE_STATIC_DIR
+    _FAKE_STATIC_DIR = tmp_path
+    (tmp_path / "greeting_es.wav").write_bytes(b"\xff" * 320)
+    twiml = _build_voice_twiml(static_greeting_exists=True, twiml_play_enabled=False)
+    assert "<Play>" not in twiml
+    assert "<Connect>" in twiml
 
 
 def test_voice_twiml_omits_play_when_greeting_missing(tmp_path) -> None:
@@ -160,7 +209,8 @@ def test_voice_twiml_omits_play_when_greeting_missing(tmp_path) -> None:
 def test_voice_twiml_picks_lang_specific_greeting(tmp_path) -> None:
     """When the file for the caller's language exists, /voice uses
     IT (not some other lang). Pin this so an EN call can't play the
-    ES file just because both happen to exist."""
+    ES file just because both happen to exist. Only fires when
+    TWIML_PLAY is enabled."""
     global _FAKE_STATIC_DIR
     _FAKE_STATIC_DIR = tmp_path
     (tmp_path / "greeting_en.wav").write_bytes(b"\xff" * 320)

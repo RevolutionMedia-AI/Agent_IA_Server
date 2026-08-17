@@ -165,12 +165,28 @@ INITIAL_GREETING_TEXT_ES = os.getenv(
 # another ~10 s before the first non-greeting agent message. The
 # 28 s was real and avoidable without changing the welcome text:
 # cap the greeting to a length that plays in < ~10 s, regardless
-# of what the agent row has stored. Agents with shorter greetings
-# are unaffected; agents with longer greetings get truncated at
-# the nearest sentence boundary (or the configured fallback) so
-# the caller hears the agent within a few seconds of connecting.
-# Default 200 chars (~10 s of speech at 1.15x). Set via env var.
+# of what the agent row has stored. Default 200 chars (~10 s of
+# speech at 1.15x). Set via env var.
 INITIAL_GREETING_MAX_CHARS = int(os.getenv("INITIAL_GREETING_MAX_CHARS", "200"))
+# ponytail: 2026-08-14 — opt-in TwiML ``<Play>`` of a pre-generated
+# static greeting. The operator reported that the previous default
+# (always include ``<Play>`` when the static file exists) caused
+# SILENCE for 30+ seconds on every call because the pre-generation
+# at boot hadn't run (no TTS API key was resolvable at boot with
+# user_id=None), so the URL was 404, and Twilio waited for the
+# configured 404 timeout before opening the WebSocket. The WS
+# audio was lost during that wait and the user heard nothing.
+# Fix: default this OFF. The operator can opt in by setting
+# INITIAL_GREETING_TWIML_PLAY=true AND ensuring the static file
+# exists on disk (the lifespan at startup pre-generates it from
+# INITIAL_GREETING_TEXT_EN/ES when a TTS API key is available).
+# Without the boot file, ``<Play>`` is silently skipped — the
+# in-band greeting (which the previous fix already protects with
+# MIN_UTTERANCE_VOICE_FRAMES and INITIAL_GREETING_MAX_CHARS) fires
+# after the WS opens.
+INITIAL_GREETING_TWIML_PLAY = os.getenv(
+    "INITIAL_GREETING_TWIML_PLAY", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 IDLE_SILENCE_TIMEOUT_SEC = float(os.getenv("IDLE_SILENCE_TIMEOUT_SEC", "45"))
 

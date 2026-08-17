@@ -433,6 +433,22 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     if frame:
                         from STT_server.services.audio_capture import capture_b
                         capture_b(getattr(session, "call_sid", "") or "", frame)
+                    # ponytail: 2026-08-14 — operator reported "nunca sale
+                    # el audio de bienvenida". The high-water on the
+                    # playback_queue was 27 but no frames= field in the
+                    # call summary, meaning (a) the playback_loop never
+                    # started OR (b) every send_twilio_media call was
+                    # silently failing. Add a one-shot debug log on the
+                    # FIRST frame sent so the operator can see in prod
+                    # exactly where the audio flow stops. Verbose
+                    # logging is enabled by the existing LOG_TWILIO_PLAYBACK
+                    # flag (no new env var).
+                    if LOG_TWILIO_PLAYBACK and sent_frames == 0:
+                        log.info(
+                            "[PLAYBACK] first frame session=%s gen=%s "
+                            "len=%d bytes about to call send_twilio_media",
+                            session.session_key, generation, len(frame),
+                        )
                     await send_twilio_media(ws, session.stream_sid, frame)
                     sent_frames += 1
                     # Pace outgoing frames proportionally to their duration.
