@@ -103,7 +103,12 @@ class CallSession:
     # their gen <= cancelled_through. Set by interrupt_current_turn after
     # bumping active_generation. Replaces per-adapter cancel handshakes —
     # producers pull active_generation at each emit and compare.
-    cancelled_through: int = 0
+    # Initial value MUST be -1 so the ``generation <= cancelled_through``
+    # check in playback_loop is false for the FIRST generation (gen=0)
+    # before any barge-in has happened. Setting this to 0 caused the
+    # in-band greeting to be silently skipped on every call, producing
+    # 30+ s of dead silence (the 2026-08-17 production incident).
+    cancelled_through: int = -1
     # ponytail: monotonic ts of last barge-in, for diagnostics only.
     # Producers must NOT branch on this; it's instrumentation.
     barge_in_at: float | None = None
