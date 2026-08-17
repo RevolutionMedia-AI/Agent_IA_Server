@@ -1,21 +1,13 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-numpy
-webrtcvad
-openai
-twilio
-websockets
-# ponytail: pin setuptools floor to clear the CVE-2024-6345 (incorrect
-# comparisons) and CVE-2024-3651 (IDNA) family. Upper bound <81 is
-# the project's compatibility ceiling (some transitive still choke on
-# 81+). The Dockerfile additionally runs `pip install --upgrade
-# 'setuptools>=70,<81'` at build time so the runtime never sees the
-# vulnerable version even if a future pin accidentally drops the floor.
-setuptools>=70.0,<81
-scipy>=1.17.1
-cryptography  # Fernet encryption for per-user provider credentials at rest
-psycopg2-binary  # Postgres driver. Optional — BE falls back to JSON files if DATABASE_URL is unset (local dev).
+# Pinned for reproducible builds. Updated by SEC-013 fix on 2026-08-12.
+# To upgrade: bump version explicitly and verify tests pass in CI.
+# Exact pins preferred; >=,<,* ranges only for fast-moving SDKs (twilio, openai).
+
+cryptography==49.0.0  # Fernet encryption for per-user provider credentials at rest
+fastapi==0.138.0
+numpy==2.4.6
+openai==2.43.0
+psycopg2-binary==2.9.12  # Postgres driver. Optional — BE falls back to JSON files if DATABASE_URL is unset (local dev).
+python-dotenv==1.2.2
 # ponytail: Starlette's `Request.form()` raises AssertionError if this
 # isn't installed. Twilio's voice webhook sends
 # application/x-www-form-urlencoded and we hit that path on every
@@ -25,9 +17,21 @@ psycopg2-binary  # Postgres driver. Optional — BE falls back to JSON files if 
 # every call fell into the no-agent branch. Used to ship as a
 # transitive dep of python-jose/passlib back when auth used those —
 # the auth refactor dropped them and the form parser went with them.
-python-multipart
+python-multipart==0.0.32
+scipy>=1.17.1
+twilio==9.10.9
+uvicorn[standard]==0.49.0
+websockets==16.0
+webrtcvad==2.0.10
 
-# Test deps (pytest + httpx already pulled in by fastapi/uvicorn in dev).
+# Build / dev / test (ranges OK — kept loose for tool upgrades).
+# ponytail: pin setuptools floor to clear the CVE-2024-6345 (incorrect
+# comparisons) and CVE-2024-3651 (IDNA) family. Upper bound <81 is
+# the project's compatibility ceiling (some transitive still choke on
+# 81+). The Dockerfile additionally runs `pip install --upgrade
+# 'setuptools>=70,<81'` at build time so the runtime never sees the
+# vulnerable version even if a future pin accidentally drops the floor.
+setuptools>=70.0,<81
 # httpx is used directly by the BE test suite (ASGITransport); pytest +
 # pytest-asyncio are needed to run `pytest tests/`.
 httpx>=0.27
