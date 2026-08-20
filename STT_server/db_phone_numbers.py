@@ -265,6 +265,57 @@ def delete_number(number_id: str, user_id: str) -> bool:
             return cur.rowcount > 0
 
 
+def find_for_agent(user_id: str, agent_id: str) -> dict | None:
+    """Resolve the phone number row that owns a given agent.
+
+    Used at call start to denormalize the Twilio subaccount auth (sid +
+    auth_token) onto the CallSession so the executor can later redirect
+    the live call (call_transfer tool kind) without another round-trip.
+
+    One agent can in theory have multiple numbers assigned (different
+    DIDs in the same campaign, or a number that was reassigned). We
+    return the most recently created matching row. If none exists the
+    agent has no Twilio-backed number → call_transfer is effectively
+    disabled for that call (the executor's missing-creds branch
+    surfaces a clear 4xx to the LLM).
+
+    The JSON-fallback path mirrors the SQL exactly: filter by
+    user_id + agent, sort by created_at desc, take the first row.
+    """
+    if not user_id or not agent_id:
+        return None
+    if not is_postgres():
+        if not NUMBERS_FILE.exists():
+            return None
+        try:
+            with open(NUMBERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or []
+        except (json.JSONDecodeError, IOError):
+            return None
+        candidates = [
+            n for n in data
+            if n.get("user_id") == user_id and n.get("agent") == agent_id
+        ]
+        candidates.sort(key=lambda n: n.get("created_at") or "", reverse=True)
+        return candidates[0] if candidates else None
+    base_cols = (
+        "id, user_id, provider, country, number, display, label, campaign, agent, "
+        "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
+        "sip_username, sip_password, whatsapp_phone_number_id, "
+        "whatsapp_access_token, created_at, updated_at"
+    )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {base_cols} FROM phone_numbers "
+                "WHERE user_id = %s AND agent = %s "
+                "ORDER BY created_at DESC LIMIT 1",
+                (user_id, agent_id),
+            )
+            row = cur.fetchone()
+            return _row_to_number(row) if row else None
+
+
 def find_by_number(to_number: str, user_id: str | None = None) -> dict | None:
     """Lookup a phone number by its E.164-style 'number' field. Used by
     the inbound Twilio webhook to find which agent handles the call.

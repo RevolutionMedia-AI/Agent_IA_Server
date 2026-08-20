@@ -99,6 +99,16 @@ class CallSession:
     # Adapters read this to pick per-user provider credentials. None means
     # "no per-user config, use system env-var defaults."
     user_id: str | None = None
+    # ponytail: Twilio subaccount creds that own this call. Denormalized
+    # at WS start from the phone_numbers row matched by (user_id, agent_id)
+    # via db_phone_numbers.find_for_agent. Used by the call_transfer tool
+    # executor — Twilio's calls(call_sid).update API call has to authenticate
+    # against the subaccount that owns the call, and that's whichever sub
+    # the operator wired to the agent's assigned number. None on legacy
+    # sessions (no phone_number row matched) → call_transfer is silently
+    # disabled for that call.
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
     vad_buffer: bytearray = field(default_factory=bytearray)
     pre_speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=PRE_SPEECH_FRAMES))
     # AUDIO-005: deque(maxlen=...) bounds the per-utterance PCM buffer at

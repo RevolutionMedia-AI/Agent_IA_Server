@@ -246,3 +246,68 @@ async def list_phone_numbers(
             return {"success": False, "error": str(exc)}
 
     return await _to_thread(_list)
+
+
+async def transfer_call(
+    account_sid: str,
+    auth_token: str,
+    call_sid: str,
+    destination: str,
+) -> dict:
+    """Redirect a live Twilio call to a new destination.
+
+    Uses calls(call_sid).update(twiml=...) with a <Response><Dial> block —
+    Twilio disconnects our media stream and dials the destination number,
+    then bridges the original caller to whoever picks up. We don't get a
+    second WebSocket for the bridged leg; the call is no longer ours.
+
+    The transfer can fail at multiple layers: bad destination format,
+    Twilio rejects the number (not provisioned, geo-blocked, etc.),
+    the auth_token doesn't own this call_sid. All surface as
+    success=False with the SDK error message — the call path catches
+    this in the executor and tells the LLM so the conversation can
+    recover gracefully instead of dead-airing the caller.
+
+    ponytail: the destination must be E.164. We don't enforce here
+    because the AgentTool.validate() layer already rejects malformed
+    destinations at save time, and re-validating on every transfer
+    would just duplicate the rule. If a stale row slips through (DB
+    edit, manual JSON poke), Twilio returns its own 4xx error which
+    we surface verbatim.
+    """
+    def _transfer() -> dict:
+        try:
+            client = _get_twilio_client(account_sid, auth_token)
+            # TwiML payload: drop the current media stream and dial
+            # the new destination. callerId defaults to the original
+            # caller (the agent's Twilio number) so the bridged party
+            # sees a familiar number on their display.
+            twiml = (
+                f'<Response><Dial callerId="{{ORIG}}">{destination}</Dial></Response>'
+            )
+            # ponytail: Twilio doesn't actually accept {ORIG} as a
+            # macro — the SDK leaves the caller id as-is. We pass
+            # the destination number through verbatim; the operator
+            # can pre-set callerId at the phone_number level if they
+            # want a specific outbound identity. Keeping the literal
+            # template above in a comment so future readers see what
+            # was intended if Twilio ever adds macros.
+            twiml = f'<Response><Dial>{destination}</Dial></Response>'
+            log.info(
+                "[TRANSFER] calls(%s).update(twiml=<Dial>%s</Dial>) via subaccount %s...",
+                call_sid, destination, account_sid[:6] or "?",
+            )
+            client.calls(call_sid).update(twiml=twiml)
+            return {
+                "success": True,
+                "call_sid": call_sid,
+                "destination": destination,
+            }
+        except Exception as exc:
+            log.exception(
+                "[TRANSFER] call_sid=%s destination=%s failed",
+                call_sid, destination,
+            )
+            return {"success": False, "error": str(exc)}
+
+    return await _to_thread(_transfer)

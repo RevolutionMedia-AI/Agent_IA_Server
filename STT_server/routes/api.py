@@ -672,22 +672,41 @@ def list_agent_tools(agent_id: str, auth: dict = Depends(require_auth)):
 class ToolCreate(BaseModel):
     name: str
     description: str
-    webhook_url: str
+    # ponytail: webhook_url is required for kind="webhook" (legacy) but
+    # irrelevant for kind="call_transfer" — the destination field carries
+    # the E.164 number we redirect the live call to. Pydantic can't
+    # express "required when X else optional" cleanly, so we accept
+    # Optional[str] here and let AgentTool.validate() enforce the rule
+    # downstream (single source of truth for the contract).
+    webhook_url: Optional[str] = ""
     filler_phrase: str = "Let me check the system..."
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
+    kind: Optional[str] = None  # "webhook" (default) | "call_transfer"
+    destination: Optional[str] = None  # E.164 for call_transfer
 
 
 @api_router.post("/agents/{agent_id}/tools")
 def create_agent_tool(agent_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new tool for an agent."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema
+    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
+    # ponytail: guard the kind field at the API boundary so an unknown
+    # value from the FE never reaches the executor's branch table. The
+    # AgentTool constructor also coerces, but failing fast here gives
+    # the FE a clearer 400 than a silent fall-through to "webhook".
+    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
+        )
     tool = AgentTool(
         agent_id=agent_id,
         name=data.name,
         description=data.description,
-        webhook_url=data.webhook_url,
+        webhook_url=data.webhook_url or "",
         filler_phrase=data.filler_phrase,
         parameters=data.parameters,
+        kind=data.kind,
+        destination=data.destination,
     )
     errors = tool.validate()
     if errors:
@@ -706,17 +725,32 @@ def create_agent_tool(agent_id: str, data: ToolCreate, auth: dict = Depends(requ
 @api_router.put("/agents/{agent_id}/tools/{tool_id}")
 def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Update an existing tool."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema
+    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
+    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
+        )
     tools = _load_tools()
     for t in tools:
         if t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]:
             t["name"] = data.name
             t["description"] = data.description
-            t["webhook_url"] = data.webhook_url
+            t["webhook_url"] = data.webhook_url or ""
             t["filler_phrase"] = data.filler_phrase
             t["parameters"] = data.parameters
+            # ponytail: persist the new fields on update. Same kind-aware
+            # validation runs at the end so a webhook → call_transfer flip
+            # (or vice-versa) can't sneak past without the matching
+            # required field being present.
+            t["kind"] = data.kind or t.get("kind", "webhook")
+            t["destination"] = data.destination
             from datetime import datetime, timezone
             t["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            rebuilt = AgentTool.from_dict(t)
+            errors = rebuilt.validate()
+            if errors:
+                raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
             is_valid, err = validate_json_schema(data.parameters)
             if not is_valid:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
@@ -778,14 +812,21 @@ def list_shared_tools(auth: dict = Depends(require_auth)):
 @api_router.post("/tools")
 def create_shared_tool(data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new shared n8n tool owned by the current user."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema
+    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
+    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
+        )
     tool = AgentTool(
         agent_id=SHARED_TOOL_AGENT_ID,
         name=data.name,
         description=data.description,
-        webhook_url=data.webhook_url,
+        webhook_url=data.webhook_url or "",
         filler_phrase=data.filler_phrase,
         parameters=data.parameters,
+        kind=data.kind,
+        destination=data.destination,
     )
     errors = tool.validate()
     if errors:
@@ -804,7 +845,12 @@ def create_shared_tool(data: ToolCreate, auth: dict = Depends(require_auth)):
 @api_router.put("/tools/{tool_id}")
 def update_shared_tool(tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Update an existing shared n8n tool owned by the current user."""
-    from STT_server.domain.tool import validate_json_schema
+    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
+    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
+        )
     tools = _load_tools()
     for t in tools:
         if (t.get("id") == tool_id
@@ -812,11 +858,17 @@ def update_shared_tool(tool_id: str, data: ToolCreate, auth: dict = Depends(requ
                 and t.get("user_id") == auth["user_id"]):
             t["name"] = data.name
             t["description"] = data.description
-            t["webhook_url"] = data.webhook_url
+            t["webhook_url"] = data.webhook_url or ""
             t["filler_phrase"] = data.filler_phrase
             t["parameters"] = data.parameters
+            t["kind"] = data.kind or t.get("kind", "webhook")
+            t["destination"] = data.destination
             from datetime import datetime, timezone
             t["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            rebuilt = AgentTool.from_dict(t)
+            errors = rebuilt.validate()
+            if errors:
+                raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
             is_valid, err = validate_json_schema(data.parameters)
             if not is_valid:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")

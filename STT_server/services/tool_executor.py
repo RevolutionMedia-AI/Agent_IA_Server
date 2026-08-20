@@ -287,3 +287,51 @@ async def execute_tool(
     """Convenience function to execute a tool using the singleton executor."""
     executor = get_tool_executor()
     return await executor.execute(webhook_url, arguments, tool_name)
+
+
+# ponytail: call_transfer executor. Lives next to execute_tool so both
+# tool kinds share the executor module — same SSRF / timeout policy,
+# same record_tool_result integration, same logging style. Kept as a
+# free function (not on ToolExecutor) because it doesn't share state
+# with the HTTP path: Twilio's update() is a one-shot REST call, no
+# keepalive client to manage.
+async def execute_call_transfer(
+    account_sid: str,
+    auth_token: str,
+    call_sid: str,
+    destination: str,
+    tool_name: str,
+) -> dict:
+    """Ask Twilio to redirect a live call to ``destination``.
+
+    The call leaves our WebSocket as soon as Twilio sends the <Dial>
+    TwiML — the operator hears ringing, the new party answers, the
+    two legs are bridged. We don't get a callback when the bridge
+    connects; success here means "Twilio accepted the redirect", not
+    "the destination picked up". That's a Twilio-side concern.
+
+    Raises ToolExecutionError when the auth pair doesn't own the
+    call_sid or the destination is rejected at the Twilio layer.
+    The caller (turn_manager) catches this and routes the error back
+    to the LLM so the conversation can recover.
+    """
+    from STT_server.adapters.twilio_api import transfer_call
+    log.info(
+        "[ToolExecutor] call_transfer '%s' call_sid=%s -> %s",
+        tool_name, call_sid, destination,
+    )
+    try:
+        result = await transfer_call(account_sid, auth_token, call_sid, destination)
+    except Exception as exc:
+        log.exception(
+            "[ToolExecutor] call_transfer '%s' transport error", tool_name,
+        )
+        raise ToolExecutionError(
+            f"call_transfer '{tool_name}' transport failed: {exc}"
+        )
+    if not result.get("success"):
+        raise ToolExecutionError(
+            f"call_transfer '{tool_name}' rejected by Twilio: "
+            f"{result.get('error') or 'unknown error'}"
+        )
+    return result

@@ -1,9 +1,25 @@
 """Agent Tool - Dynamic function calling integration with n8n."""
 
+import re
 from datetime import datetime, timezone
 from typing import Optional
 import json
 import uuid
+
+
+# ponytail: tool kinds. "webhook" is the legacy n8n integration; "call_transfer"
+# is a platform-side action that redirects the live Twilio call to a configured
+# destination (no external HTTP). The CRUD layer accepts either; the executor
+# branches on this field. Defaults to "webhook" so legacy rows (no `kind`
+# field) keep working unchanged.
+TOOL_KIND_WEBHOOK = "webhook"
+TOOL_KIND_CALL_TRANSFER = "call_transfer"
+VALID_TOOL_KINDS = frozenset({TOOL_KIND_WEBHOOK, TOOL_KIND_CALL_TRANSFER})
+
+# ponytail: cheap E.164 check for the transfer destination. Reuses the
+# pattern that PROVIDER_CATALOG uses for the Twilio phone_number field so
+# the operator gets the same validation in both places.
+E164_PATTERN = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
 class AgentTool:
@@ -14,6 +30,11 @@ class AgentTool:
 
     The parameters field follows JSON Schema to be compatible with OpenAI's
     function calling specification.
+
+    kind="call_transfer" replaces the webhook with a Twilio call redirect —
+    the executor asks Twilio to <Dial> the configured destination and the
+    call leaves our WebSocket. webhook_url is irrelevant for that kind;
+    destination (E.164) is the only required field.
     """
 
     def __init__(
@@ -21,9 +42,13 @@ class AgentTool:
         agent_id: str,
         name: str,
         description: str,
-        webhook_url: str,
+        webhook_url: str = "",
         filler_phrase: str = "Let me check the system...",
         parameters: Optional[dict] = None,
+        # ponytail: call_transfer support. Both default to None so legacy
+        # rows (no `kind` set) deserialize cleanly as webhook tools.
+        kind: Optional[str] = None,
+        destination: Optional[str] = None,
         id: Optional[str] = None,
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
@@ -44,6 +69,12 @@ class AgentTool:
             "properties": {},
             "required": [],
         }
+        # ponytail: coerce unknown kinds to "webhook" rather than
+        # letting them silently route to the wrong branch. The CRUD
+        # layer is the gatekeeper that should reject bad values; the
+        # constructor only runs for tools we already saved.
+        self.kind = kind if kind in VALID_TOOL_KINDS else TOOL_KIND_WEBHOOK
+        self.destination = destination
         self.created_at = created_at or self._now_iso()
         self.updated_at = updated_at or self._now_iso()
         # ponytail: per-tool observability. None = never recorded;
@@ -68,6 +99,11 @@ class AgentTool:
             "webhook_url": self.webhook_url,
             "filler_phrase": self.filler_phrase,
             "parameters": self.parameters,
+            # ponytail: serialize the new fields too so a round-trip
+            # through agent_tools.json (or a future Postgres tools
+            # table) preserves the operator's intent.
+            "kind": self.kind,
+            "destination": self.destination,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "last_tested_at": self.last_tested_at,
@@ -79,12 +115,22 @@ class AgentTool:
 
     def to_openai_function(self) -> dict:
         """Convert to OpenAI function calling format."""
+        # ponytail: a call_transfer tool has no parameters — the
+        # destination is fixed on the tool row, so the LLM can't
+        # influence where we route. Empty JSON Schema is the OpenAI
+        # contract for "no arguments"; the model will still emit a
+        # tool_call message, just with arguments={}.
+        params = (
+            {"type": "object", "properties": {}, "required": []}
+            if self.kind == TOOL_KIND_CALL_TRANSFER
+            else self.parameters
+        )
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": params,
             },
         }
 
@@ -95,9 +141,11 @@ class AgentTool:
             agent_id=data["agent_id"],
             name=data["name"],
             description=data["description"],
-            webhook_url=data["webhook_url"],
+            webhook_url=data.get("webhook_url", ""),
             filler_phrase=data.get("filler_phrase", "Let me check the system..."),
             parameters=data.get("parameters"),
+            kind=data.get("kind"),
+            destination=data.get("destination"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             last_tested_at=data.get("last_tested_at"),
@@ -119,15 +167,25 @@ class AgentTool:
         errors = []
         if not self.name or not self.name.strip():
             errors.append("name is required")
-        if not self.webhook_url or not self.webhook_url.strip():
-            errors.append("webhook_url is required")
-        try:
-            from urllib.parse import urlparse
-            result = urlparse(self.webhook_url)
-            if not all([result.scheme, result.netloc]):
-                errors.append("webhook_url must be a valid URL")
-        except Exception:
-            errors.append("webhook_url must be a valid URL")
+        # ponytail: kind-aware validation. webhooks need a URL,
+        # call_transfers need an E.164 destination. An old row
+        # accidentally carrying neither URL nor destination is the
+        # sign someone ran a partial migration — flag it loudly
+        # rather than silently saving a tool that can never fire.
+        if self.kind == TOOL_KIND_CALL_TRANSFER:
+            if not self.destination or not E164_PATTERN.match(self.destination.strip()):
+                errors.append("destination must be E.164 (e.g. +15071234567)")
+        else:
+            if not self.webhook_url or not self.webhook_url.strip():
+                errors.append("webhook_url is required for webhook tools")
+            else:
+                try:
+                    from urllib.parse import urlparse
+                    result = urlparse(self.webhook_url)
+                    if not all([result.scheme, result.netloc]):
+                        errors.append("webhook_url must be a valid URL")
+                except Exception:
+                    errors.append("webhook_url must be a valid URL")
         if not isinstance(self.parameters, dict):
             errors.append("parameters must be a JSON Schema object")
         return errors

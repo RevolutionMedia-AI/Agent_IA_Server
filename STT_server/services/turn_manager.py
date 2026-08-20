@@ -41,7 +41,8 @@ from STT_server.domain.language import (
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
-from STT_server.services.tool_executor import execute_tool, record_tool_result
+from STT_server.services.tool_executor import execute_tool, execute_call_transfer, record_tool_result
+from STT_server.domain.tool import TOOL_KIND_CALL_TRANSFER
 from STT_server.services._instrumentation import Stages
 from STT_server.services.wait_signals import mark_stage as _mark_stage
 from STT_server.services.thread_pool import to_thread as _to_thread
@@ -383,42 +384,119 @@ async def _stream_llm_with_tools(
             # Find the tool definition to get webhook_url and filler_phrase
             agent_tools = getattr(session, "agent_tools", []) or []
             tool_def = next((t for t in agent_tools if t.get("name") == tool_name), None)
-            if tool_def:
-                filler = tool_def.get("filler_phrase", "Let me check the system...")
-                webhook_url = tool_def.get("webhook_url", "")
-                # Play filler phrase immediately
-                if filler:
-                    try:
-                        await run_tts_with_retries(session, filler, generation)
-                    except Exception:
-                        log.warning("[Tools] Failed to play filler phrase for tool '%s'", tool_name)
-                # Execute tool
-                if webhook_url:
-                    try:
-                        tool_result = await execute_tool(webhook_url, tool_args, tool_name)
-                        log.info(
-                            "[Tools] Tool '%s' executed ok result_len=%d",
-                            tool_name, len(str(tool_result)),
-                        )
-                        # ponytail: per-tool observability. Best-effort —
-                        # the helper swallows I/O errors so the live
-                        # call is never broken by a stats write failure.
-                        record_tool_result(tool_def.get("id"), True, "invocation")
-                        # Add tool result to session history for context
-                        tool_result_text = json.dumps(tool_result) if isinstance(tool_result, dict) else str(tool_result)
-                        session.history.append({
-                            "role": "tool",
-                            "content": f"Tool '{tool_name}' result: {tool_result_text}",
-                        })
-                    except Exception as exc:
-                        log.error("[Tools] Tool '%s' execution failed: %s", tool_name, exc)
-                        record_tool_result(tool_def.get("id"), False, "invocation")
-                        session.history.append({
-                            "role": "tool",
-                            "content": f"Tool '{tool_name}' error: {str(exc)}",
-                        })
-            else:
+            if not tool_def:
                 log.warning("[Tools] No tool definition found for '%s'", tool_name)
+                continue
+            tool_kind = tool_def.get("kind", "webhook")
+            filler = tool_def.get("filler_phrase", "Let me check the system...")
+            # Play filler phrase immediately. For call_transfer we skip
+            # filler playback entirely: the call is about to leave our
+            # WebSocket, so any audio we queue may or may not reach the
+            # caller depending on how fast Twilio tears down the bridge.
+            # The LLM was told to say a brief verbal handoff in its
+            # reply text; that comes through the normal TTS path before
+            # we hit this branch.
+            if filler and tool_kind != TOOL_KIND_CALL_TRANSFER:
+                try:
+                    await run_tts_with_retries(session, filler, generation)
+                except Exception:
+                    log.warning("[Tools] Failed to play filler phrase for tool '%s'", tool_name)
+            if tool_kind == TOOL_KIND_CALL_TRANSFER:
+                # ponytail: call_transfer branch. Twilio API call to
+                # redirect the live call. Missing Twilio creds on the
+                # session is a config bug (the phone row had no
+                # auth_token) — we surface it as a tool error to the
+                # LLM so it can apologize and recover instead of
+                # silently dropping the call.
+                destination = tool_def.get("destination")
+                account_sid = getattr(session, "twilio_account_sid", None)
+                auth_token = getattr(session, "twilio_auth_token", None)
+                call_sid = getattr(session, "call_sid", None)
+                if not (account_sid and auth_token and call_sid and destination):
+                    log.warning(
+                        "[Tools] call_transfer '%s' skipped: missing creds "
+                        "(sid=%s token=%s call_sid=%s destination=%s)",
+                        tool_name,
+                        bool(account_sid), bool(auth_token),
+                        bool(call_sid), bool(destination),
+                    )
+                    session.history.append({
+                        "role": "tool",
+                        "content": (
+                            f"Tool '{tool_name}' error: call_transfer is not "
+                            "configured for this call (missing Twilio auth or "
+                            "destination)."
+                        ),
+                    })
+                    record_tool_result(tool_def.get("id"), False, "invocation")
+                    continue
+                try:
+                    transfer_result = await execute_call_transfer(
+                        account_sid, auth_token, call_sid, destination, tool_name,
+                    )
+                    log.info(
+                        "[Tools] call_transfer '%s' ok -> %s",
+                        tool_name, destination,
+                    )
+                    record_tool_result(tool_def.get("id"), True, "invocation")
+                    session.history.append({
+                        "role": "tool",
+                        "content": (
+                            f"Tool '{tool_name}' result: call transferred to "
+                            f"{destination}. End the conversation politely."
+                        ),
+                    })
+                    # ponytail: the call leaves our WebSocket as soon as
+                    # Twilio accepts the redirect — anything we queue
+                    # after this may not reach the caller. Mark the
+                    # session closed so the monitors and the playback
+                    # loop tear down cleanly instead of dead-airing.
+                    session.closed = True
+                    break  # no point processing further tool calls
+                except Exception as exc:
+                    log.error(
+                        "[Tools] call_transfer '%s' failed: %s",
+                        tool_name, exc,
+                    )
+                    record_tool_result(tool_def.get("id"), False, "invocation")
+                    session.history.append({
+                        "role": "tool",
+                        "content": f"Tool '{tool_name}' error: {str(exc)}",
+                    })
+                continue
+            # Default: webhook tool. Run the HTTP call as before.
+            webhook_url = tool_def.get("webhook_url", "")
+            if not webhook_url:
+                log.warning("[Tools] webhook tool '%s' has no webhook_url", tool_name)
+                session.history.append({
+                    "role": "tool",
+                    "content": f"Tool '{tool_name}' error: missing webhook_url",
+                })
+                record_tool_result(tool_def.get("id"), False, "invocation")
+                continue
+            try:
+                tool_result = await execute_tool(webhook_url, tool_args, tool_name)
+                log.info(
+                    "[Tools] Tool '%s' executed ok result_len=%d",
+                    tool_name, len(str(tool_result)),
+                )
+                # ponytail: per-tool observability. Best-effort —
+                # the helper swallows I/O errors so the live
+                # call is never broken by a stats write failure.
+                record_tool_result(tool_def.get("id"), True, "invocation")
+                # Add tool result to session history for context
+                tool_result_text = json.dumps(tool_result) if isinstance(tool_result, dict) else str(tool_result)
+                session.history.append({
+                    "role": "tool",
+                    "content": f"Tool '{tool_name}' result: {tool_result_text}",
+                })
+            except Exception as exc:
+                log.error("[Tools] Tool '%s' execution failed: %s", tool_name, exc)
+                record_tool_result(tool_def.get("id"), False, "invocation")
+                session.history.append({
+                    "role": "tool",
+                    "content": f"Tool '{tool_name}' error: {str(exc)}",
+                })
 
     llm_ms = (time.perf_counter() - llm_started) * 1000
     tts_metrics = await playback_task

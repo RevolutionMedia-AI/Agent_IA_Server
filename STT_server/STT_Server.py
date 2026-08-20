@@ -907,6 +907,38 @@ async def media_stream(ws: WebSocket) -> None:
                     session.idle_final_message = agent_cfg.get('idle_final_message')
                     session.idle_disconnect_timeout_sec = _safe_int(agent_cfg.get('idle_disconnect_timeout_sec'))
                     session.idle_max_attempts = _safe_int(agent_cfg.get('idle_max_attempts'))
+                    # ponytail: Twilio subaccount auth for the call_transfer
+                    # tool executor. We look up the phone_numbers row that
+                    # owns this agent (most recently created if multiple),
+                    # copy the sid + token onto the session, and the
+                    # executor reads from there at tool-call time. Missing
+                    # either field is fine — the executor surfaces a clear
+                    # error if the LLM tries to invoke a call_transfer tool
+                    # on a session without Twilio auth.
+                    if session.user_id and session.agent_id:
+                        try:
+                            from STT_server.db_phone_numbers import find_for_agent as _find_num_for_agent
+                            num_row = _find_num_for_agent(session.user_id, session.agent_id)
+                            if num_row:
+                                session.twilio_account_sid = num_row.get("twilio_account_sid") or None
+                                session.twilio_auth_token = num_row.get("twilio_auth_token") or None
+                                if session.twilio_account_sid and session.twilio_auth_token:
+                                    log.info(
+                                        "[TRANSFER] Twilio auth denormalized for %s (sid=%s...)",
+                                        session.session_key,
+                                        session.twilio_account_sid[:6] or "?",
+                                    )
+                                else:
+                                    log.warning(
+                                        "[TRANSFER] phone row %s has no twilio_account_sid/auth_token; "
+                                        "call_transfer tools will be unavailable for session %s",
+                                        num_row.get("id"), session.session_key,
+                                    )
+                        except Exception as exc:
+                            log.warning(
+                                "[TRANSFER] phone lookup failed for session=%s agent=%s: %s",
+                                session.session_key, session.agent_id, exc,
+                            )
                     # ponytail: prepend a per-TTS-provider hint to the
                     # system prompt so the LLM emits the right inline
                     # non-verbal tags (e.g. Inworld's steering). The
