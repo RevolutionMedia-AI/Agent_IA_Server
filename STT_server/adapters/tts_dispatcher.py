@@ -21,7 +21,7 @@ from STT_server.config import DEFAULT_TTS_PROVIDER
 from STT_server.domain.session import CallSession, VALID_TTS_PROVIDERS
 from STT_server.services._instrumentation import StageTimer, Stages
 from STT_server.services.audio_frame_processor import AudioFrameProcessor
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_provider, resolve_for_session
 from STT_server.services.thread_pool import to_thread as _to_thread
 
 log = logging.getLogger("stt_server")
@@ -41,9 +41,15 @@ def _resolve_provider(session: CallSession) -> str:
 
 
 def _resolve_api_key(session: CallSession, provider: str) -> str:
-    """Return the per-user API key for the given provider, or ''."""
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, provider) if user_id else {}
+    """Return the API key for the given TTS provider, or ''.
+
+    ponytail: 009_agent_use_own_key.sql. Delegates to
+    resolve_for_session so the resolver picks platform env vs.
+    per-user key based on session.tts_use_own_key. False = platform
+    env (Railway OPENAI_API_KEY etc.) fills the gap; True = per-user
+    wins. Empty dict means the operator must save a key somewhere.
+    """
+    creds = resolve_for_session(session, "tts", provider)
     return (creds.get("api_key") or "").strip()
 
 

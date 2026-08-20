@@ -939,6 +939,15 @@ async def media_stream(ws: WebSocket) -> None:
                                 "[TRANSFER] phone lookup failed for session=%s agent=%s: %s",
                                 session.session_key, session.agent_id, exc,
                             )
+                    # ponytail: credential-source toggle per slot
+                    # (009_agent_use_own_key.sql). Denormalized alongside
+                    # the rest of the agent_cfg so the TTS/STT/LLM
+                    # adapters can pick the right resolver mode in one
+                    # read. False = resolver may fall back to platform
+                    # env; True = resolver ignores platform env.
+                    session.stt_use_own_key = bool(agent_cfg.get("stt_use_own_key"))
+                    session.llm_use_own_key = bool(agent_cfg.get("llm_use_own_key"))
+                    session.tts_use_own_key = bool(agent_cfg.get("tts_use_own_key"))
                     # ponytail: prepend a per-TTS-provider hint to the
                     # system prompt so the LLM emits the right inline
                     # non-verbal tags (e.g. Inworld's steering). The

@@ -445,6 +445,44 @@ def validate_credentials(provider_id: str, credentials: dict[str, Any]) -> tuple
 
 # ── Resolution ──────────────────────────────────────────────────────────────
 
+# ponytail: platform env var names per provider. Reintroduced in
+# 009_agent_use_own_key.sql so new agents can ship without forcing
+# every operator to paste their own key first. The DEPLOYER sets
+# these on Railway (one env per provider — exactly what the old code
+# hardcoded before this resolver existed). The resolver reads them
+# when the per-user / per-agent row is empty, so a SaaS-style "use
+# our keys" UX lights up with a single FE toggle.
+PLATFORM_ENV_KEYS: dict[str, dict[str, str]] = {
+    "openai":     {"api_key": "OPENAI_API_KEY",       "realtime_model": "OPENAI_REALTIME_MODEL", "tts_model": "OPENAI_TTS_MODEL"},
+    "anthropic":  {"api_key": "ANTHROPIC_API_KEY",    "base_url": "ANTHROPIC_BASE_URL"},
+    "gemini":     {"api_key": "GEMINI_API_KEY",       "base_url": "GEMINI_BASE_URL"},
+    "minimax":    {"api_key": "MINIMAX_API_KEY",      "base_url": "MINIMAX_BASE_URL"},
+    "twilio":     {"account_sid": "TWILIO_ACCOUNT_SID", "auth_token": "TWILIO_AUTH_TOKEN", "phone_number": "TWILIO_PHONE_NUMBER"},
+    "elevenlabs": {"api_key": "ELEVENLABS_API_KEY",   "voice_id": "ELEVENLABS_VOICE_ID", "model_id": "ELEVENLABS_MODEL_ID"},
+    "rime":       {"api_key": "RIME_API_KEY",         "model_id": "RIME_MODEL_ID"},
+    "deepgram":   {"api_key": "DEEPGRAM_API_KEY",     "model": "DEEPGRAM_MODEL"},
+    "assemblyai": {"api_key": "ASSEMBLYAI_API_KEY",   "model": "ASSEMBLYAI_MODEL"},
+    "inworld":    {"api_key": "INWORLD_API_KEY"},
+}
+
+
+def _read_platform(provider_id: str) -> dict[str, str]:
+    """Read platform credentials for ``provider_id`` from os.environ.
+
+    Returns an empty dict when no env vars are set for the provider.
+    Never raises — a misconfigured deployer just means we fall back
+    to the per-user store (which is also empty for new agents, so
+    the call fails loud and the operator gets a clear error).
+    """
+    mapping = PLATFORM_ENV_KEYS.get(provider_id) or {}
+    out: dict[str, str] = {}
+    for field, env_name in mapping.items():
+        v = os.environ.get(env_name, "").strip()
+        if v:
+            out[field] = v
+    return out
+
+
 def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     """Read per-user encrypted credentials and decrypt them. Returns
     empty dict when the user has nothing stored or decryption fails.
@@ -474,15 +512,35 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     return {k: v for k, v in decrypted.items() if isinstance(v, str) and v}
 
 
-def resolve_provider(user_id: str | None, provider_id: str) -> dict[str, str]:
+def resolve_provider(
+    user_id: str | None,
+    provider_id: str,
+    use_own_key: bool = True,
+) -> dict[str, str]:
     """Resolve the active credentials for a provider, for the current user.
 
-    ponytail: env-var fallback removed in this commit batch. The
-    user enters their provider API keys via the FE (Settings → API
-    or ModalAgents inline fields) and they live in the encrypted
-    tools_integrations row. If the row is missing the field, the
-    resolver returns empty and the adapter fails explicitly. There
-    is no longer a global "system key" hidden in the env.
+    Two source layers, merged with per-user winning on conflict:
+      1. Per-user / per-agent credentials (tools_integrations row +
+         inline API key state if you wired one up). Read first.
+      2. Platform env vars (OPENAI_API_KEY etc., set by the deployer
+         on Railway). Used as fallback when the per-user row is
+         missing a field — restored in 009_agent_use_own_key.sql so
+         a fresh agent works without forcing every operator to paste
+         a key first.
+
+    use_own_key=True (default, legacy behaviour): per-user reads
+    apply, platform env fills the gaps. A user with their own key
+    keeps using it; a user without one falls back to the deployer's
+    key automatically.
+
+    use_own_key=False: per-user layer is skipped entirely. Only
+    platform env vars apply. Used by callers that branch on the
+    agent row's stt/llm/tts_use_own_key column — when the operator
+    toggled "use my own key" off, the resolver ignores the stored
+    credential even if it exists. (Note: we still never silently
+    drop a stored key at the storage layer — this only affects
+    resolution at call time. The key stays in tools_integrations
+    so flipping the toggle back on restores it.)
 
     Returns a flat dict of field -> value. Missing fields are absent
     from the dict, not set to None — callers should use ``.get()``.
@@ -492,13 +550,50 @@ def resolve_provider(user_id: str | None, provider_id: str) -> dict[str, str]:
         return {}
 
     out: dict[str, str] = {}
+    platform = _read_platform(provider_id)
 
-    per_user = _read_per_user(user_id, provider_id)
-    for f in spec.fields:
-        if f.name in per_user and per_user[f.name]:
-            out[f.name] = per_user[f.name]
+    if use_own_key:
+        per_user = _read_per_user(user_id, provider_id)
+        # per_user wins where set, platform fills the rest
+        for k, v in platform.items():
+            out[k] = v
+        for k, v in per_user.items():
+            if v:
+                out[k] = v
+    else:
+        # Toggle off: platform env only
+        out.update(platform)
 
     return out
+
+
+def resolve_for_session(
+    session,                    # CallSession, typed as Any to avoid the
+    category: str,              # circular import with domain.session.
+    provider_id: str,
+) -> dict[str, str]:
+    """Session-aware wrapper around resolve_provider.
+
+    Looks up the agent's `use_own_key` toggle for the given category
+    (stt / llm / tts) on the session — denormalised at WS start from
+    the agent row (009_agent_use_own_key.sql) — and forwards it.
+    Callers that already hold a session pass this in instead of
+    plumbing the category all the way to resolve_provider().
+
+    Falls back to use_own_key=True when the session attribute is
+    missing (legacy sessions predating the migration), so existing
+    per-user setups keep working.
+    """
+    flag_attr = {
+        "stt": "stt_use_own_key",
+        "llm": "llm_use_own_key",
+        "tts": "tts_use_own_key",
+    }.get(category)
+    use_own = True
+    if flag_attr is not None:
+        use_own = bool(getattr(session, flag_attr, True))
+    user_id = getattr(session, "user_id", None)
+    return resolve_provider(user_id, provider_id, use_own_key=use_own)
 
 
 def is_provider_configured(user_id: str | None, provider_id: str) -> bool:

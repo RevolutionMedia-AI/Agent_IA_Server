@@ -109,6 +109,16 @@ class CallSession:
     # disabled for that call.
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
+    # ponytail: per-slot credential source toggle (009_agent_use_own_key.sql).
+    # False (default) lets the resolver fall back to platform env vars
+    # (Railway OPENAI_API_KEY etc.) when no per-user key is stored.
+    # True forces the resolver to ignore platform env and require a
+    # per-user credential. Denormalized at WS start so the TTS/STT/LLM
+    # adapters can pick the right resolver mode without a second DB
+    # round-trip per call.
+    stt_use_own_key: bool = False
+    llm_use_own_key: bool = False
+    tts_use_own_key: bool = False
     vad_buffer: bytearray = field(default_factory=bytearray)
     pre_speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=PRE_SPEECH_FRAMES))
     # AUDIO-005: deque(maxlen=...) bounds the per-utterance PCM buffer at

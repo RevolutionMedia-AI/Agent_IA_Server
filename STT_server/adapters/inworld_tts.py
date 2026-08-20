@@ -30,7 +30,7 @@ import urllib.request
 from STT_server.domain.session import CallSession
 from STT_server.services._instrumentation import StageTimer, Stages
 from STT_server.services.audio_frame_processor import AudioFrameProcessor
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 from STT_server.services.thread_pool import to_thread as _to_thread
 
 log = logging.getLogger("stt_server")
@@ -82,8 +82,7 @@ def _summarize_mulaw_chunk(audio: bytes) -> dict:
 
 
 def _resolve_api_key(session: CallSession) -> str:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "inworld") if user_id else {}
+    creds = resolve_for_session(session, "tts", "inworld")
     return (creds.get("api_key") or "").strip()
 
 

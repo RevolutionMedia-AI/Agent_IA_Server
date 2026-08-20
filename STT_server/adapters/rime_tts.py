@@ -24,7 +24,7 @@ from STT_server.domain.language import (
 from STT_server.domain.session import CallSession
 from STT_server.services._instrumentation import StageTimer, Stages
 from STT_server.services.audio_frame_processor import AudioFrameProcessor
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 
 
 log = logging.getLogger("stt_server")
@@ -250,7 +250,7 @@ async def stream_tts_segment(
         if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
             session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
     user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "rime")
+    creds = resolve_for_session(session, "tts", "rime")
     api_key = creds.get("api_key")
     if not api_key:
         raise RuntimeError("Rime no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")

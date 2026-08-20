@@ -34,7 +34,7 @@ from STT_server.config import (
 )
 from STT_server.domain.language import normalize_supported_language
 from STT_server.domain.session import CallSession
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 
 log = logging.getLogger("stt_server")
 
@@ -84,8 +84,7 @@ def _build_url(language_hint: str | None) -> str:
 
 
 def _resolve_api_key(session: CallSession) -> str:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "assemblyai") if user_id else {}
+    creds = resolve_for_session(session, "stt", "assemblyai")
     return (creds.get("api_key") or "").strip()
 
 

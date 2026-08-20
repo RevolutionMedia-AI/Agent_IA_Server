@@ -370,6 +370,15 @@ class AgentCreate(BaseModel):
     idle_final_message: Optional[str] = None
     idle_disconnect_timeout_sec: Optional[int] = None
     idle_max_attempts: Optional[int] = None
+    # ponytail: per-slot credential source (009_agent_use_own_key.sql).
+    # false (default) means the resolver may fall back to platform env
+    # vars when no per-user key is configured. true means the agent
+    # must use ONLY the per-user / per-agent credential — useful when
+    # the operator wants strict cost isolation or needs to bypass
+    # the platform key for compliance reasons.
+    stt_use_own_key: Optional[bool] = None
+    llm_use_own_key: Optional[bool] = None
+    tts_use_own_key: Optional[bool] = None
 
 
 class AgentUpdate(BaseModel):
@@ -408,6 +417,10 @@ class AgentUpdate(BaseModel):
     idle_final_message: Optional[str] = None
     idle_disconnect_timeout_sec: Optional[int] = None
     idle_max_attempts: Optional[int] = None
+    # ponytail: credential source toggle — see AgentCreate above.
+    stt_use_own_key: Optional[bool] = None
+    llm_use_own_key: Optional[bool] = None
+    tts_use_own_key: Optional[bool] = None
 
 
 class PhoneNumberCreate(BaseModel):

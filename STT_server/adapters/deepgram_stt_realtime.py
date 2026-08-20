@@ -24,7 +24,7 @@ from STT_server.config import (
 )
 from STT_server.domain.language import infer_supported_language_from_text, normalize_deepgram_language, normalize_supported_language
 from STT_server.domain.session import CallSession
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 
 
 log = logging.getLogger("stt_server")
@@ -177,7 +177,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
     # the pipeline knows to skip STT. Model override follows the same
     # chain (per-user > DEEPGRAM_STT_MODEL env var).
     user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "deepgram")
+    creds = resolve_for_session(session, "stt", "deepgram")
     api_key = creds.get("api_key")
     if not api_key:
         return

@@ -19,7 +19,7 @@ from STT_server.domain.language import (
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_frame_processor import AudioFrameProcessor
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 from STT_server.services._instrumentation import Stages
 from STT_server.services.wait_signals import mark_stage as _mark_stage
 
@@ -42,8 +42,7 @@ async def stream_tts_segment(
     resampling or mu-law encoding needed.
     """
     frame_proc = AudioFrameProcessor(emit_silence_tail=False)
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "elevenlabs")
+    creds = resolve_for_session(session, "tts", "elevenlabs")
     api_key = creds.get("api_key")
     if not api_key:
         raise RuntimeError("ElevenLabs no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")

@@ -35,7 +35,7 @@ from STT_server.config import (
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.audio_codec import ulaw2lin
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 
 log = logging.getLogger("stt_server")
 
@@ -94,8 +94,7 @@ def _mulaw_8k_to_pcm16_16k(mulaw: bytes) -> bytes:
 
 
 def _resolve_api_key(session: CallSession) -> str:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "inworld") if user_id else {}
+    creds = resolve_for_session(session, "stt", "inworld")
     return (creds.get("api_key") or "").strip()
 
 

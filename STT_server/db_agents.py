@@ -27,8 +27,8 @@ Schema (001_schema.sql + 006_agent_runtime_params.sql):
     llm_temperature REAL,     -- 0.0..2.0 (NULL = adapter default 0.2)
     llm_max_tokens  INTEGER,  -- >0..4096  (NULL = config.MAX_RESPONSE_TOKENS)
     tts_speed      REAL,     -- 0.5..2.0  (NULL = provider default)
-    -- per-agent idle/silence detection (008_agent_idle_settings.sql).
-    -- NULL on every column = fall back to global IDLE_SILENCE_TIMEOUT_SEC
+-- per-agent idle/silence detection (008_agent_idle_settings.sql).
+    -- NULL on every column = fall back to the global IDLE_SILENCE_TIMEOUT_SEC
     -- (the legacy single-timeout-then-close behaviour).
     idle_enabled                BOOLEAN,     -- explicit opt-in
     idle_first_timeout_sec      INTEGER,     -- >0
@@ -37,6 +37,16 @@ Schema (001_schema.sql + 006_agent_runtime_params.sql):
     idle_final_message          TEXT,        -- <=1000 chars
     idle_disconnect_timeout_sec INTEGER,     -- >0
     idle_max_attempts           INTEGER,     -- 1..10
+    -- ponytail: per-agent credential-source toggle
+    -- (009_agent_use_own_key.sql). false = resolver may fall back to
+    -- platform env vars (Railway OPENAI_API_KEY etc.) when no per-user
+    -- key is stored. true = resolver must use ONLY the per-user /
+    -- per-agent credential. The flag is a behavioural switch that the
+    -- FE toggle drives — the BE never overrides a stored credential
+    -- just because the toggle is false.
+    stt_use_own_key             BOOLEAN NOT NULL DEFAULT FALSE,
+    llm_use_own_key             BOOLEAN NOT NULL DEFAULT FALSE,
+    tts_use_own_key             BOOLEAN NOT NULL DEFAULT FALSE,
     calls TEXT NOT NULL DEFAULT '0',
     perf INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -74,6 +84,7 @@ _AGENT_COLS = (
     "stt_provider, stt_model, tts_provider, tts_model, "
     "llm_provider, llm_model, "
     "llm_temperature, llm_max_tokens, tts_speed, "
+    "stt_use_own_key, llm_use_own_key, tts_use_own_key, "
     f"{_IDLE_COLS}, "
     "calls, perf, created_at, updated_at"
 )
@@ -182,6 +193,7 @@ def create_agent(user_id: str, payload: dict) -> dict:
             "stt_provider", "stt_model", "tts_provider", "tts_model",
             "llm_provider", "llm_model",
             "llm_temperature", "llm_max_tokens", "tts_speed",
+            "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
             "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
             "idle_subsequent_timeout_sec", "idle_final_message",
             "idle_disconnect_timeout_sec", "idle_max_attempts"]
@@ -199,6 +211,9 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("llm_provider"), payload.get("llm_model"),
               payload.get("llm_temperature"), payload.get("llm_max_tokens"),
               payload.get("tts_speed"),
+              payload.get("stt_use_own_key"),
+              payload.get("llm_use_own_key"),
+              payload.get("tts_use_own_key"),
               payload.get("idle_enabled"),
               payload.get("idle_first_timeout_sec"),
               payload.get("idle_first_message"),
@@ -250,6 +265,7 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                      "stt_provider", "stt_model", "tts_provider", "tts_model",
                      "llm_provider", "llm_model",
                      "llm_temperature", "llm_max_tokens", "tts_speed",
+                     "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
                      "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
                      "idle_subsequent_timeout_sec", "idle_final_message",
                      "idle_disconnect_timeout_sec", "idle_max_attempts"}:

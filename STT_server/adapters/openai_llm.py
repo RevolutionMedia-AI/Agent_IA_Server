@@ -9,7 +9,7 @@ from openai import OpenAI
 from STT_server.config import MAX_HISTORY_MESSAGES, MAX_RESPONSE_TOKENS
 from STT_server.domain.language import detect_language, get_language_instruction,                  pop_streaming_segments
 from STT_server.domain.session import CallSession
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_provider, resolve_for_session
 from STT_server.services.thread_pool import to_thread as _to_thread
 from STT_server.utils.safe_http import UnsafeURLError, validate_public_url
 
@@ -91,8 +91,7 @@ def _resolve_model(session: CallSession, provider: str) -> str:
 # ─── OpenAI ────────────────────────────────────────────────────────
 
 def _openai_client(session: CallSession) -> OpenAI:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "openai")
+    creds = resolve_for_session(session, "llm", "openai")
     key = creds.get("api_key")
     # ponytail: per-user key only. No more `_default_openai_client`
     # that silently fell back to a system env var — if the user didn't
@@ -113,8 +112,7 @@ def _openai_client(session: CallSession) -> OpenAI:
 # ─── MiniMax (OpenAI-compatible, custom base_url) ────────────────
 
 def _minimax_client(session: CallSession) -> OpenAI:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "minimax")
+    creds = resolve_for_session(session, "llm", "minimax")
     key = creds.get("api_key")
     if not key:
             raise RuntimeError(
@@ -141,8 +139,7 @@ def _minimax_client(session: CallSession) -> OpenAI:
 # ─── Anthropic (REST, no extra SDK dep) ───────────────────────────
 
 def _anthropic_config(session: CallSession) -> tuple[str, str, str]:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "anthropic")
+    creds = resolve_for_session(session, "llm", "anthropic")
     key = creds.get("api_key")
     if not key:
         raise RuntimeError(
@@ -317,8 +314,7 @@ def _anthropic_stream_sync(
 # ─── Gemini (REST, no extra SDK dep) ──────────────────────────────
 
 def _gemini_config(session: CallSession) -> tuple[str, str, str]:
-    user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "gemini")
+    creds = resolve_for_session(session, "llm", "gemini")
     key = creds.get("api_key")
     if not key:
         raise RuntimeError(

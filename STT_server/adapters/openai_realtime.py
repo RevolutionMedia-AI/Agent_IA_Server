@@ -26,7 +26,7 @@ from STT_server.domain.language import (
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop
-from STT_server.services.credentials_resolver import resolve_provider
+from STT_server.services.credentials_resolver import resolve_for_session
 
 
 log = logging.getLogger("stt_server")
@@ -129,7 +129,7 @@ def _build_session_update_payload(session: CallSession) -> str:
 async def run_realtime_session(session: CallSession) -> None:
     """Connect to OpenAI Realtime and run for the lifetime of the call."""
     user_id = getattr(session, "user_id", None)
-    creds = resolve_provider(user_id, "openai")
+    creds = resolve_for_session(session, "stt", "openai")
     api_key = creds.get("api_key")
     if not api_key:
         log.error(
