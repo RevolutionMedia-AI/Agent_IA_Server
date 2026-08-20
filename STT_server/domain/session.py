@@ -72,6 +72,19 @@ class CallSession:
     llm_temperature: float | None = None
     llm_max_tokens: int | None = None
     tts_speed: float | None = None
+    # ponytail: idle / silence detection (008_agent_idle_settings.sql).
+    # All None = fall back to the global IDLE_SILENCE_TIMEOUT_SEC (legacy
+    # single-timeout-then-close behaviour). When idle_enabled=True the
+    # monitor in session_runtime.monitor_idle_silence plays the prompt
+    # messages at the configured intervals and closes the websocket after
+    # idle_max_attempts + idle_disconnect_timeout_sec of silence.
+    idle_enabled: bool | None = None
+    idle_first_timeout_sec: int | None = None
+    idle_first_message: str | None = None
+    idle_subsequent_timeout_sec: int | None = None
+    idle_final_message: str | None = None
+    idle_disconnect_timeout_sec: int | None = None
+    idle_max_attempts: int | None = None
     # ponytail: which STT provider the agent picked. Mirrors the FE's
     # stt_provider dropdown. Set by the 'start' event handler in
     # STT_Server.py from (a) the agent config or (b) the per-user

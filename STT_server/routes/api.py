@@ -358,6 +358,18 @@ class AgentCreate(BaseModel):
     tts_model: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # Idle / silence detection (008_agent_idle_settings.sql). All optional —
+    # None on every field = fall back to the global IDLE_SILENCE_TIMEOUT_SEC.
+    # When idle_enabled=True the monitor plays the prompt messages at the
+    # configured intervals, then closes the websocket after idle_max_attempts
+    # of continued silence + idle_disconnect_timeout_sec.
+    idle_enabled: Optional[bool] = None
+    idle_first_timeout_sec: Optional[int] = None
+    idle_first_message: Optional[str] = None
+    idle_subsequent_timeout_sec: Optional[int] = None
+    idle_final_message: Optional[str] = None
+    idle_disconnect_timeout_sec: Optional[int] = None
+    idle_max_attempts: Optional[int] = None
 
 
 class AgentUpdate(BaseModel):
@@ -388,6 +400,14 @@ class AgentUpdate(BaseModel):
     tts_model: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # Idle / silence detection — see AgentCreate above.
+    idle_enabled: Optional[bool] = None
+    idle_first_timeout_sec: Optional[int] = None
+    idle_first_message: Optional[str] = None
+    idle_subsequent_timeout_sec: Optional[int] = None
+    idle_final_message: Optional[str] = None
+    idle_disconnect_timeout_sec: Optional[int] = None
+    idle_max_attempts: Optional[int] = None
 
 
 class PhoneNumberCreate(BaseModel):

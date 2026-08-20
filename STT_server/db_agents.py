@@ -27,6 +27,16 @@ Schema (001_schema.sql + 006_agent_runtime_params.sql):
     llm_temperature REAL,     -- 0.0..2.0 (NULL = adapter default 0.2)
     llm_max_tokens  INTEGER,  -- >0..4096  (NULL = config.MAX_RESPONSE_TOKENS)
     tts_speed      REAL,     -- 0.5..2.0  (NULL = provider default)
+    -- per-agent idle/silence detection (008_agent_idle_settings.sql).
+    -- NULL on every column = fall back to global IDLE_SILENCE_TIMEOUT_SEC
+    -- (the legacy single-timeout-then-close behaviour).
+    idle_enabled                BOOLEAN,     -- explicit opt-in
+    idle_first_timeout_sec      INTEGER,     -- >0
+    idle_first_message          TEXT,        -- <=1000 chars
+    idle_subsequent_timeout_sec INTEGER,     -- >0
+    idle_final_message          TEXT,        -- <=1000 chars
+    idle_disconnect_timeout_sec INTEGER,     -- >0
+    idle_max_attempts           INTEGER,     -- 1..10
     calls TEXT NOT NULL DEFAULT '0',
     perf INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -44,6 +54,29 @@ from pathlib import Path
 from STT_server.db import get_conn, is_postgres
 
 log = logging.getLogger("stt_server.db_agents")
+
+# ponytail: idle/silence-detection columns added by 008_agent_idle_settings.sql.
+# Single source of truth for SELECT / INSERT / UPDATE — every other place that
+# lists agent columns reads from here so a future field can't be silently
+# dropped by half the call sites (the 006 migration bug pattern).
+_IDLE_COLS = (
+    "idle_enabled, idle_first_timeout_sec, idle_first_message, "
+    "idle_subsequent_timeout_sec, idle_final_message, "
+    "idle_disconnect_timeout_sec, idle_max_attempts"
+)
+
+# Every SELECT/UPDATE/INSERT RETURNING in this module uses the same column
+# list. Keeping it as a constant stops "I added the column to the SELECT but
+# forgot the INSERT" bugs — one place to extend when 009 lands.
+_AGENT_COLS = (
+    "id, user_id, name, voice, voice_id, language, campaign, status, "
+    "description, tone, prompt, welcome_message, "
+    "stt_provider, stt_model, tts_provider, tts_model, "
+    "llm_provider, llm_model, "
+    "llm_temperature, llm_max_tokens, tts_speed, "
+    f"{_IDLE_COLS}, "
+    "calls, perf, created_at, updated_at"
+)
 
 # ponytail: keep the JSON-file path so we can read from it on first
 # boot to backfill Postgres when the migration runs against a project
@@ -83,13 +116,8 @@ def list_agents(user_id: str) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, user_id, name, voice, voice_id, language, campaign, status, "
-                "description, tone, prompt, welcome_message, "
-                "stt_provider, stt_model, tts_provider, tts_model, "
-                "llm_provider, llm_model, "
-                "llm_temperature, llm_max_tokens, tts_speed, "
-                "calls, perf, created_at, updated_at "
-                "FROM agents WHERE user_id = %s ORDER BY created_at DESC",
+                f"SELECT {_AGENT_COLS} FROM agents "
+                "WHERE user_id = %s ORDER BY created_at DESC",
                 (user_id,),
             )
             return [_row_to_agent(r) for r in cur.fetchall()]
@@ -115,24 +143,13 @@ def get_agent(agent_id: str, user_id: str | None = None) -> dict | None:
         with conn.cursor() as cur:
             if user_id is None:
                 cur.execute(
-                    "SELECT id, user_id, name, voice, voice_id, language, campaign, status, "
-                    "description, tone, prompt, welcome_message, "
-                    "stt_provider, stt_model, tts_provider, tts_model, "
-                    "llm_provider, llm_model, "
-                    "llm_temperature, llm_max_tokens, tts_speed, "
-                    "calls, perf, created_at, updated_at "
-                    "FROM agents WHERE id = %s",
+                    f"SELECT {_AGENT_COLS} FROM agents WHERE id = %s",
                     (agent_id,),
                 )
             else:
                 cur.execute(
-                    "SELECT id, user_id, name, voice, voice_id, language, campaign, status, "
-                    "description, tone, prompt, welcome_message, "
-                    "stt_provider, stt_model, tts_provider, tts_model, "
-                    "llm_provider, llm_model, "
-                    "llm_temperature, llm_max_tokens, tts_speed, "
-                    "calls, perf, created_at, updated_at "
-                    "FROM agents WHERE id = %s AND user_id = %s",
+                    f"SELECT {_AGENT_COLS} FROM agents "
+                    "WHERE id = %s AND user_id = %s",
                     (agent_id, user_id),
                 )
             row = cur.fetchone()
@@ -164,7 +181,10 @@ def create_agent(user_id: str, payload: dict) -> dict:
             "campaign", "status", "description", "tone", "prompt", "welcome_message",
             "stt_provider", "stt_model", "tts_provider", "tts_model",
             "llm_provider", "llm_model",
-            "llm_temperature", "llm_max_tokens", "tts_speed"]
+            "llm_temperature", "llm_max_tokens", "tts_speed",
+            "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
+            "idle_subsequent_timeout_sec", "idle_final_message",
+            "idle_disconnect_timeout_sec", "idle_max_attempts"]
     placeholders = ", ".join(["%s"] * len(cols))
     insert_cols = ", ".join(cols)
     values = [agent_id, user_id, payload.get("name", "Untitled"),
@@ -178,17 +198,19 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("tts_provider"), payload.get("tts_model"),
               payload.get("llm_provider"), payload.get("llm_model"),
               payload.get("llm_temperature"), payload.get("llm_max_tokens"),
-              payload.get("tts_speed")]
+              payload.get("tts_speed"),
+              payload.get("idle_enabled"),
+              payload.get("idle_first_timeout_sec"),
+              payload.get("idle_first_message"),
+              payload.get("idle_subsequent_timeout_sec"),
+              payload.get("idle_final_message"),
+              payload.get("idle_disconnect_timeout_sec"),
+              payload.get("idle_max_attempts")]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"INSERT INTO agents ({insert_cols}) VALUES ({placeholders}) "
-                "RETURNING id, user_id, name, voice, voice_id, language, campaign, status, "
-                "description, tone, prompt, welcome_message, "
-                "stt_provider, stt_model, tts_provider, tts_model, "
-                "llm_provider, llm_model, "
-                "llm_temperature, llm_max_tokens, tts_speed, "
-                "calls, perf, created_at, updated_at",
+                f"RETURNING {_AGENT_COLS}",
                 values,
             )
             row = cur.fetchone()
@@ -215,9 +237,9 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
         return None
     # ponytail: only update fields the caller passed (exclude_none), so a
     # PUT with {"name": "X"} doesn't blank out tts_provider. The set
-    # below also matches columns added in 006_agent_runtime_params.sql
-    # so the FE can PATCH temperature / max_tokens / tts_speed without
-    # the BE silently dropping them.
+    # below also matches columns added in 006_agent_runtime_params.sql +
+    # 008_agent_idle_settings.sql so the FE can PATCH temperature /
+    # max_tokens / tts_speed / idle_* without the BE silently dropping them.
     set_clauses = []
     values = []
     for k, v in payload.items():
@@ -227,7 +249,10 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                      "description", "tone", "prompt", "welcome_message",
                      "stt_provider", "stt_model", "tts_provider", "tts_model",
                      "llm_provider", "llm_model",
-                     "llm_temperature", "llm_max_tokens", "tts_speed"}:
+                     "llm_temperature", "llm_max_tokens", "tts_speed",
+                     "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
+                     "idle_subsequent_timeout_sec", "idle_final_message",
+                     "idle_disconnect_timeout_sec", "idle_max_attempts"}:
             continue
         set_clauses.append(f"{k} = %s")
         values.append(v)
@@ -240,12 +265,7 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
             cur.execute(
                 f"UPDATE agents SET {', '.join(set_clauses)} "
                 "WHERE id = %s AND user_id = %s "
-                "RETURNING id, user_id, name, voice, voice_id, language, campaign, status, "
-                "description, tone, prompt, welcome_message, "
-                "stt_provider, stt_model, tts_provider, tts_model, "
-                "llm_provider, llm_model, "
-                "llm_temperature, llm_max_tokens, tts_speed, "
-                "calls, perf, created_at, updated_at",
+                f"RETURNING {_AGENT_COLS}",
                 values,
             )
             row = cur.fetchone()

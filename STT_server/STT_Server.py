@@ -894,6 +894,19 @@ async def media_stream(ws: WebSocket) -> None:
                     # llm_max_tokens=200 was silently ignored).
                     session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
                     session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
+                    # ponytail: per-agent idle / silence detection
+                    # (008_agent_idle_settings.sql). None on every field
+                    # keeps the legacy global IDLE_SILENCE_TIMEOUT_SEC
+                    # behaviour so existing agents are unaffected. The
+                    # monitor in session_runtime.monitor_idle_silence
+                    # reads these on every poll tick.
+                    session.idle_enabled = agent_cfg.get('idle_enabled')
+                    session.idle_first_timeout_sec = _safe_int(agent_cfg.get('idle_first_timeout_sec'))
+                    session.idle_first_message = agent_cfg.get('idle_first_message')
+                    session.idle_subsequent_timeout_sec = _safe_int(agent_cfg.get('idle_subsequent_timeout_sec'))
+                    session.idle_final_message = agent_cfg.get('idle_final_message')
+                    session.idle_disconnect_timeout_sec = _safe_int(agent_cfg.get('idle_disconnect_timeout_sec'))
+                    session.idle_max_attempts = _safe_int(agent_cfg.get('idle_max_attempts'))
                     # ponytail: prepend a per-TTS-provider hint to the
                     # system prompt so the LLM emits the right inline
                     # non-verbal tags (e.g. Inworld's steering). The
