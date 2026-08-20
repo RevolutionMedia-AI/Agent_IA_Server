@@ -57,12 +57,25 @@ def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]
 
 
 def _load_agent_tools(agent_id: str | None, user_id: str | None = None) -> list[dict]:
-    """Load tools for an agent from agent_tools.json.
+    """Load the tools available to one agent.
 
-    ponytail: includes "shared" tools too — tools stored with
-    agent_id="__shared__" and a matching user_id are loaded as
-    if they belonged to the agent. Per-user scope: a user can only
-    attach their own shared tools to their agents.
+    Two scopes:
+      1. Per-agent tools — rows with agent_id == agent_id. Always
+         included; the agent that owns the row gets it implicitly.
+      2. Shared tools — rows with agent_id == "__shared__" and a
+         matching user_id. ONLY included when the agent id is in the
+         tool's `assignments` list. The old behaviour (auto-include
+         for every agent of the same owner) is gone — operators now
+         pick exactly which agents can invoke each shared tool.
+
+    ponytail: backwards-compat for tools saved before the assignments
+    field existed. A legacy shared tool without `assignments` (or
+    with `assignments == []`) gets backfilled to include every agent
+    of the same owner on the first read, so existing setups keep
+    working until the operator starts clicking Assign / Unassign.
+    Once they do, `assignments` becomes non-empty and the explicit
+    list takes over — the auto-include branch never fires again for
+    that tool.
     """
     if not agent_id:
         return []
@@ -72,14 +85,72 @@ def _load_agent_tools(agent_id: str | None, user_id: str | None = None) -> list[
     except (FileNotFoundError, json.JSONDecodeError, IOError):
         return []
     out = [t for t in all_tools if isinstance(t, dict) and t.get("agent_id") == agent_id]
-    if user_id:
-        out.extend(
-            t for t in all_tools
-            if isinstance(t, dict)
-            and t.get("agent_id") == "__shared__"
-            and t.get("user_id") == user_id
-        )
+    if not user_id:
+        return out
+
+    # ponytail: the explicit-assignment branch. A shared tool is
+    # included iff agent_id is in its assignments list. Tools with no
+    # assignments yet (legacy rows + newly created shared tools that
+    # the operator hasn't assigned anywhere) fall through to the
+    # auto-include backfill below so the upgrade path doesn't strand
+    # them.
+    shared = [
+        t for t in all_tools
+        if isinstance(t, dict)
+        and t.get("agent_id") == "__shared__"
+        and t.get("user_id") == user_id
+    ]
+    explicit = [t for t in shared if agent_id in (t.get("assignments") or [])]
+    out.extend(explicit)
+
+    # ponytail: backfill legacy rows. Only fires the first time a
+    # given shared tool is read after the upgrade — once
+    # `assignments` is non-empty (operator started assigning), this
+    # branch becomes a no-op for that tool. We also skip tools that
+    # have NO matching agents (e.g. owner has zero agents); keeping
+    # them unassigned is the correct state.
+    needs_backfill = [
+        t for t in shared
+        if not (t.get("assignments") or [])
+        and t is not explicit  # avoid double-include in the edge case
+    ]
+    if needs_backfill:
+        try:
+            from STT_server.db_agents import list_agents as _list_agents
+            owner_agents = _list_agents(user_id) or []
+            owner_agent_ids = {
+                a.get("id") for a in owner_agents
+                if isinstance(a, dict) and a.get("id")
+            }
+        except Exception:
+            owner_agent_ids = set()
+        for t in needs_backfill:
+            if not owner_agent_ids:
+                continue
+            # ponytail: write back to disk only the first time we read
+            # the tool — subsequent calls hit the explicit branch above
+            # because `assignments` is non-empty after we save.
+            t["assignments"] = sorted(owner_agent_ids)
+            try:
+                _save_tools_file(all_tools)
+            except Exception:
+                # Don't break the live call on a write hiccup — the
+                # next call will retry the backfill.
+                pass
+            out.extend(t for t in [t] if agent_id in owner_agent_ids)
     return out
+
+
+def _save_tools_file(tools: list) -> None:
+    """Persist agent_tools.json. Mirrors the helper in routes/api.py
+    but lives here so the runtime can write back without an import
+    cycle. Same write-once-per-call discipline: a write inside the
+    request path is bad, so the only caller is the backfill branch
+    above."""
+    DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(_TOOLS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tools, f, indent=2, ensure_ascii=False)
 
 
 def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:

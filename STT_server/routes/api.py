@@ -771,6 +771,84 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
     return {"success": True}
 
 
+# ponytail: explicit per-agent tool assignment. Shared tools
+# (agent_id="__shared__") used to auto-include for every agent of the
+# same owner, which left the operator no way to opt out. These two
+# endpoints let the operator pick exactly which agents can invoke
+# each shared tool. Per-agent tools (agent_id == agent_id) are
+# ignored here — they're implicitly available to their own agent and
+# can't be unassigned (delete the tool instead).
+@api_router.post("/agents/{agent_id}/tools/{tool_id}/assign")
+def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
+    """Assign a shared tool to an agent.
+
+    Adds ``agent_id`` to the tool's ``assignments`` list. Idempotent:
+    assigning an already-assigned agent is a no-op so the FE can
+    freely click the same button twice.
+    """
+    tools = _load_tools()
+    tool = next(
+        (t for t in tools
+         if t.get("id") == tool_id and t.get("user_id") == auth["user_id"]),
+        None,
+    )
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    if tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="Only shared tools can be assigned. Per-agent tools are already available to their agent.",
+        )
+    # ponytail: confirm the agent belongs to this user. The agent row
+    # is the source of truth for ownership; without this check a
+    # operator could fish another user's agent id and widen a shared
+    # tool's blast radius.
+    from STT_server.db_agents import get_agent as _get_agent
+    agent = _get_agent(agent_id, auth["user_id"])
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    assignments = tool.get("assignments") or []
+    if agent_id in assignments:
+        return tool  # idempotent
+    assignments.append(agent_id)
+    tool["assignments"] = assignments
+    from datetime import datetime, timezone
+    tool["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _save_tools(tools)
+    return tool
+
+
+@api_router.delete("/agents/{agent_id}/tools/{tool_id}/assign")
+def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
+    """Remove a shared tool assignment from an agent.
+
+    Drops ``agent_id`` from the tool's ``assignments`` list. Idempotent
+    — unassigning an agent that isn't currently assigned is a no-op.
+    """
+    tools = _load_tools()
+    tool = next(
+        (t for t in tools
+         if t.get("id") == tool_id and t.get("user_id") == auth["user_id"]),
+        None,
+    )
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    if tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="Only shared tools can be unassigned. Delete per-agent tools instead.",
+        )
+    assignments = tool.get("assignments") or []
+    if agent_id not in assignments:
+        return tool  # idempotent
+    assignments = [a for a in assignments if a != agent_id]
+    tool["assignments"] = assignments
+    from datetime import datetime, timezone
+    tool["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _save_tools(tools)
+    return tool
+
+
 @api_router.post("/agents/{agent_id}/tools/test")
 async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
     """Test a tool by executing its webhook with sample data."""

@@ -49,6 +49,13 @@ class AgentTool:
         # rows (no `kind` set) deserialize cleanly as webhook tools.
         kind: Optional[str] = None,
         destination: Optional[str] = None,
+        # ponytail: explicit per-agent tool assignment. Only meaningful
+        # for shared tools (agent_id="__shared__"): the list of agent
+        # ids that may invoke this tool. Per-agent tools are
+        # implicitly available to their own agent and ignore this field.
+        # Empty list = not assigned to anyone; the operator must
+        # explicitly assign shared tools to give agents access.
+        assignments: Optional[list] = None,
         id: Optional[str] = None,
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
@@ -75,6 +82,15 @@ class AgentTool:
         # constructor only runs for tools we already saved.
         self.kind = kind if kind in VALID_TOOL_KINDS else TOOL_KIND_WEBHOOK
         self.destination = destination
+        # ponytail: normalise assignments once at construction so the
+        # runtime comparison doesn't have to defend against None /
+        # non-list values on every read. De-dupe + sort isn't worth
+        # the cost; agent ids are unique strings, set membership is
+        # O(len) and the lists are tiny.
+        if isinstance(assignments, list):
+            self.assignments = [a for a in assignments if isinstance(a, str) and a]
+        else:
+            self.assignments = []
         self.created_at = created_at or self._now_iso()
         self.updated_at = updated_at or self._now_iso()
         # ponytail: per-tool observability. None = never recorded;
@@ -104,6 +120,7 @@ class AgentTool:
             # table) preserves the operator's intent.
             "kind": self.kind,
             "destination": self.destination,
+            "assignments": list(self.assignments),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "last_tested_at": self.last_tested_at,
@@ -146,6 +163,14 @@ class AgentTool:
             parameters=data.get("parameters"),
             kind=data.get("kind"),
             destination=data.get("destination"),
+            # ponytail: assignments defaults to None so a legacy row
+            # without the field deserialises as "no explicit assignment".
+            # The runtime backfill in _load_agent_tools converts that
+            # into "available to every agent the owner owns" so an
+            # upgrade from the old auto-include behaviour keeps
+            # working until the operator switches to explicit
+            # assignment via the Assign/Unassign buttons.
+            assignments=data.get("assignments"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             last_tested_at=data.get("last_tested_at"),
