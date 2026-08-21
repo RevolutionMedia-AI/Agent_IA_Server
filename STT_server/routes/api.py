@@ -699,9 +699,27 @@ def _save_tools(tools):
 
 @api_router.get("/agents/{agent_id}/tools")
 def list_agent_tools(agent_id: str, auth: dict = Depends(require_auth)):
-    """List all tools for an agent."""
+    """List all tools for an agent.
+
+    Returns per-agent tools (``agent_id == agent_id``) AND shared tools
+    owned by the same user that have been explicitly assigned to this
+    agent (``agent_id == "__shared__" and agent_id in assignments``).
+
+    Without the shared branch the FE re-fetch after an assign looked
+    identical to the pre-assign state — the shared tool stayed in
+    "Available shared" because the response never echoed it back. The
+    assignment itself succeeded; only the list refresh lied.
+    """
     tools = _load_tools()
-    return [t for t in tools if t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]]
+    out = []
+    for t in tools:
+        if t.get("user_id") != auth["user_id"]:
+            continue
+        if t.get("agent_id") == agent_id:
+            out.append(t)
+        elif t.get("agent_id") == SHARED_TOOL_AGENT_ID and agent_id in (t.get("assignments") or []):
+            out.append(t)
+    return out
 
 
 class ToolCreate(BaseModel):
