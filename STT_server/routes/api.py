@@ -671,8 +671,30 @@ def _load_tools():
 
 
 def _save_tools(tools):
-    with open(TOOLS_FILE, "w", encoding="utf-8") as f:
-        json.dump(tools, f, indent=2, ensure_ascii=False)
+    # ponytail: ensure the data dir exists before opening for write.
+    # On Railway the STT_server/data/ directory only ships with a
+    # .gitkeep — if no agent has been created yet (the only other
+    # code path that touches this directory), open(..., 'w') raises
+    # FileNotFoundError, which propagates BEFORE FastAPI's CORS
+    # middleware can attach headers. The browser then shows a
+    # misleading "No Access-Control-Allow-Origin header" error
+    # even though the BE itself is the problem. Same defensive
+    # pattern as _save() below (line ~101) — consistent style.
+    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        with open(TOOLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(tools, f, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        # ponytail: surface the real cause to the operator. A bare
+        # 500 with FastAPI's "Internal Server Error" body hides
+        # the underlying issue (disk full, read-only volume, etc.).
+        # Raising HTTPException keeps the CORS middleware in the
+        # loop so the browser doesn't mask the failure as a CORS
+        # error.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not persist agent_tools.json: {exc}",
+        )
 
 
 @api_router.get("/agents/{agent_id}/tools")
