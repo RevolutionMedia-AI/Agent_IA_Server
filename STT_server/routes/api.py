@@ -697,34 +697,66 @@ def _build_tool_payload(agent_id: str, data: "ToolCreate") -> dict:
     return payload
 
 
-async def _test_tool_row(tool: dict) -> dict:
-    """Execute one tool's webhook with sample args. Shared by both
+async def _test_tool_row(tool: dict, user_id: str) -> dict:
+    """Execute one tool's webhook with realistic args. Shared by both
     the per-agent test endpoint and the shared-tool test endpoint so
     a future change (e.g. async wrapping, retries) only needs to
-    happen in one place."""
+    happen in one place.
+
+    ponytail: if the operator curated a `test_prompt` on the tool,
+    we delegate to the LLM-driven generator (services/test_data_generator.py)
+    so the n8n workflow actually executes against plausible values
+    instead of the legacy "sample_<paramname>" placeholders that
+    n8n typically rejects. Otherwise we fall back to the placeholders
+    for backward compat — older tools that pre-date the field keep
+    working unchanged.
+    """
     from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
+    from STT_server.services.test_data_generator import (
+        TestDataUnavailable,
+        generate_test_payload,
+    )
     tool_id = tool.get("id")
     name = tool.get("name", "")
-    sample_args = {}
-    for param_name in (tool.get("parameters") or {}).get("required", []):
-        sample_args[param_name] = f"sample_{param_name}"
+    test_prompt = (tool.get("test_prompt") or "").strip()
+    if test_prompt:
+        try:
+            sample_args = generate_test_payload(tool, user_id)
+        except TestDataUnavailable as exc:
+            return {"success": False, "error": str(exc)}
+    else:
+        sample_args = {}
+        for param_name in (tool.get("parameters") or {}).get("required", []):
+            sample_args[param_name] = f"sample_{param_name}"
     try:
         result = await execute_tool(tool["webhook_url"], sample_args, name)
         record_tool_result(tool_id, True, "test")
-        return {"success": True, "result": result}
+        # ponytail: include the generated payload in the response so
+        # the FE tooltip / debug view shows what we actually sent —
+        # the operator can verify the LLM produced sensible data
+        # before they trust the workflow result.
+        return {
+            "success": True,
+            "result": result,
+            "sent_payload": sample_args,
+        }
     except ToolExecutionError as exc:
-        # ponytail: persist the headline so the FE tooltip on the
-        # tool card surfaces "HTTP 500: ..." without a Railway
-        # log grep. Other exceptions (connection refused, DNS, etc.)
-        # are caught by the generic except below.
         record_tool_result(tool_id, False, "test", error=str(exc))
-        return {"success": False, "error": str(exc)}
+        return {
+            "success": False,
+            "error": str(exc),
+            "sent_payload": sample_args,
+        }
     except Exception as exc:
         record_tool_result(
             tool_id, False, "test",
             error=f"{type(exc).__name__}: {exc}",
         )
-        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "success": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "sent_payload": sample_args,
+        }
 
 
 @api_router.get("/agents/{agent_id}/tools")
@@ -755,6 +787,14 @@ class ToolCreate(BaseModel):
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
     kind: Optional[str] = None  # "webhook" (default) | "call_transfer"
     destination: Optional[str] = None  # E.164 for call_transfer
+    # ponytail: optional free-form context the operator curates per
+    # integration. When set, the Test button asks the user's LLM to
+    # generate realistic data matching the parameters schema above
+    # (Mexican dentist appointment, "name=María López, today 3pm,
+    # 60min") so the n8n workflow actually executes against plausible
+    # values. Without it, the BE falls back to "sample_<paramname>"
+    # placeholders that n8n often rejects.
+    test_prompt: Optional[str] = None
 
 
 @api_router.post("/agents/{agent_id}/tools")
@@ -845,7 +885,7 @@ async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(requ
     tool = db_get_tool(tool_id, auth["user_id"])
     if not tool or tool.get("agent_id") != agent_id:
         raise HTTPException(status_code=404, detail="Tool not found")
-    return await _test_tool_row(tool)
+    return await _test_tool_row(tool, auth["user_id"])
 
 
 # ponytail: global n8n tools marketplace. Tools with agent_id="__shared__"
@@ -894,7 +934,7 @@ async def test_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
     tool = db_get_tool(tool_id, auth["user_id"])
     if not tool or tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
         raise HTTPException(status_code=404, detail="Tool not found")
-    return await _test_tool_row(tool)
+    return await _test_tool_row(tool, auth["user_id"])
 
 
 # ---------- /campaigns (global suggestions catalog) ----------

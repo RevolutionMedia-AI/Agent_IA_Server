@@ -93,6 +93,15 @@ class AgentTool:
         # same function_name), the second save logs a warning and
         # overwrites — the operator sees the agent list to detect.
         function_name: Optional[str] = None,
+        # ponytail: optional free-form context the operator curates
+        # per integration to drive the LLM-generated test data the
+        # Test button POSTs to n8n. Without it, the BE falls back to
+        # "sample_<paramname>" placeholders that n8n often rejects as
+        # unprocessable input. With it, the BE asks the user's
+        # configured LLM (OpenAI gpt-4o-mini by default) to generate
+        # realistic data matching the tool's parameters schema. The
+        # FE renders it as an optional textarea in the tool form.
+        test_prompt: Optional[str] = None,
         id: Optional[str] = None,
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
@@ -137,6 +146,18 @@ class AgentTool:
             if isinstance(function_name, str) and function_name
             else self._sanitize_function_name(self.name)
         )
+        # ponytail: the LLM test-data context for this integration.
+        # None / empty / whitespace means fall back to the old
+        # placeholder behavior (sample_<paramname>), which the
+        # operator can opt into by leaving the field blank. Trim
+        # then re-check so a whitespace-only string doesn't
+        # accidentally trigger the LLM call (the BE branch keys
+        # off `if test_prompt.strip()` so empty after strip
+        # == use placeholders).
+        if isinstance(test_prompt, str) and test_prompt.strip():
+            self.test_prompt = test_prompt.strip()
+        else:
+            self.test_prompt = None
         self.created_at = created_at or self._now_iso()
         self.updated_at = updated_at or self._now_iso()
         # ponytail: per-tool observability. None = never recorded;
@@ -168,6 +189,7 @@ class AgentTool:
             "destination": self.destination,
             "assignments": list(self.assignments),
             "function_name": self.function_name,
+            "test_prompt": self.test_prompt,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "last_tested_at": self.last_tested_at,
@@ -216,6 +238,7 @@ class AgentTool:
             parameters=data.get("parameters"),
             kind=data.get("kind"),
             destination=data.get("destination"),
+            test_prompt=data.get("test_prompt"),
             # ponytail: assignments defaults to None so a legacy row
             # without the field deserialises as "no explicit assignment".
             # The runtime backfill in _load_agent_tools converts that
