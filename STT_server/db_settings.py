@@ -55,7 +55,8 @@ def get_settings(user_id: str) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT user_id, name, company, timezone, notifications, updated_at "
+                "SELECT user_id, name, company, timezone, notifications, "
+                "test_data_model, updated_at "
                 "FROM settings WHERE user_id = %s",
                 (user_id,),
             )
@@ -68,6 +69,12 @@ def upsert_settings(user_id: str, payload: dict) -> dict:
     company = payload.get("company")
     timezone = payload.get("timezone") or "America/Mexico_City"
     notifications = payload.get("notifications")
+    # ponytail: test_data_model is a new optional column. The FE
+    # picks the LLM (default 'gpt-4o-mini'); the BE persists
+    # whatever the user chose and the test_data_generator reads it
+    # back on every Test button click. Empty string falls back to
+    # the DB default.
+    test_data_model = (payload.get("test_data_model") or "").strip() or "gpt-4o-mini"
     if not isinstance(notifications, dict):
         notifications = {"calls": True, "qa": True, "weekly": False, "marketing": False}
     if not is_postgres():
@@ -83,6 +90,7 @@ def upsert_settings(user_id: str, payload: dict) -> dict:
         merged = {**existing, **{
             "user_id": user_id, "name": name, "company": company,
             "timezone": timezone, "notifications": notifications,
+            "test_data_model": test_data_model,
         }}
         merged = {k: v for k, v in merged.items() if v is not None}
         with open(path, "w", encoding="utf-8") as f:
@@ -92,14 +100,16 @@ def upsert_settings(user_id: str, payload: dict) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO settings (user_id, name, company, timezone, notifications, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s::jsonb, NOW()) "
+                "INSERT INTO settings (user_id, name, company, timezone, "
+                "notifications, test_data_model, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb, %s, NOW()) "
                 "ON CONFLICT (user_id) DO UPDATE SET "
                 "name = COALESCE(EXCLUDED.name, settings.name), "
                 "company = COALESCE(EXCLUDED.company, settings.company), "
                 "timezone = EXCLUDED.timezone, "
                 "notifications = EXCLUDED.notifications, "
+                "test_data_model = EXCLUDED.test_data_model, "
                 "updated_at = NOW()",
-                (user_id, name, company, timezone, notif_json),
+                (user_id, name, company, timezone, notif_json, test_data_model),
             )
     return get_settings(user_id)

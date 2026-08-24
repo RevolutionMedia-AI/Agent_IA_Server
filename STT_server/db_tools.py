@@ -47,7 +47,7 @@ _AGENT_TOOLS_FILE = Path(__file__).resolve().parent / "data" / "agent_tools.json
 _TOOL_COLS = (
     "id, user_id, agent_id, name, description, "
     "webhook_url, filler_phrase, parameters, "
-    "kind, destination, assignments, function_name, test_prompt, "
+    "kind, destination, assignments, function_name, "
     "last_tested_at, last_test_result, last_test_error, last_test_error_at, "
     "last_invoked_at, last_invocation_status, last_invocation_error, "
     "last_invocation_error_at, invocation_count, "
@@ -204,11 +204,7 @@ def create_tool(
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"INSERT INTO agent_tools ("
-                "  id, user_id, agent_id, name, description, "
-                "  webhook_url, filler_phrase, parameters, "
-                "  kind, destination, assignments, function_name, test_prompt"
-                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s) "
+                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s) "
                 f"RETURNING {_TOOL_COLS}",
                 (
                     new_id, user_id,
@@ -222,7 +218,6 @@ def create_tool(
                     payload.get("destination"),
                     assignments_json,
                     payload.get("function_name") or "",
-                    payload.get("test_prompt") or None,
                 ),
             )
             row = cur.fetchone()

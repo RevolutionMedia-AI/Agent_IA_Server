@@ -1,7 +1,6 @@
 """LLM-driven test data generator for the tool Test button.
 
-When the operator has curated a `test_prompt` on a tool, the
-Test button (POST /agents/{id}/tools/{toolId}/test or
+The Test button (POST /agents/{id}/tools/{toolId}/test or
 /tools/{toolId}/test) asks the user's configured LLM to generate
 realistic data matching the tool's parameters schema before
 POSTing to the n8n webhook. Without this layer the BE used
@@ -10,10 +9,10 @@ unprocessable input — every Test button click was a 4xx.
 
 The generator uses OpenAI's function-calling API with the tool's
 own parameters schema as the function definition, so the LLM is
-forced to return a JSON object that matches the schema. We pick
-the cheapest model that supports function calling (gpt-4o-mini)
-and resolve the user's OpenAI key via the existing
-credentials_resolver — no new env vars, no new billing.
+forced to return a JSON object that matches the schema. The model
+is configured per-user via Settings (settings.test_data_model,
+default gpt-4o-mini) — the operator picks the model in the FE
+and the BE passes the choice through on every Test click.
 """
 from __future__ import annotations
 
@@ -23,27 +22,40 @@ from typing import Any
 
 log = logging.getLogger("stt_server.test_data_generator")
 
-# ponytail: gpt-4o-mini is the cheapest model in the OpenAI
-# function-calling family and handles JSON Schema function
-# definitions reliably. Switching to the user's preferred model
-# would need a small model-resolution layer that we don't have yet
-# — for now hard-code it and add a follow-up if the operator asks
-# for Anthropic / Gemini support for the test generator.
-_OPENAI_MODEL = "gpt-4o-mini"
+# ponytail: default model when the user hasn't picked one in
+# Settings. Cheapest in the OpenAI function-calling family and
+# handles JSON Schema function definitions reliably. The BE
+# Settings → API page lets the operator pick a different model
+# (gpt-4o, gpt-4-turbo) for higher-quality test data on complex
+# schemas; the value is persisted in settings.test_data_model and
+# read here on every click.
+DEFAULT_TEST_DATA_MODEL = "gpt-4o-mini"
 
 
 class TestDataUnavailable(RuntimeError):
     """Raised when the generator can't reach the LLM (no key, quota,
-    network). The caller surfaces this as a 4xx with a clear message
-    instead of the generic 500 the previous implementation emitted
-    when the JSON-file fallback path broke on Railway."""
+    network, missing model). The caller surfaces this as a 4xx with
+    a clear message instead of a generic 500."""
+
+
+def _resolve_model(user_id: str) -> str:
+    """Read the operator's chosen test-data model from the settings
+    table. Falls back to gpt-4o-mini if unset or unreadable."""
+    try:
+        from STT_server.db_settings import get_settings as _db_get_settings
+        s = _db_get_settings(user_id) or {}
+    except Exception as exc:
+        log.warning("[test_data_generator] settings read failed: %s", exc)
+        return DEFAULT_TEST_DATA_MODEL
+    model = (s.get("test_data_model") or "").strip()
+    return model or DEFAULT_TEST_DATA_MODEL
 
 
 def _resolve_openai_client(user_id: str | None):
     """Lazy-import OpenAI + resolve the user's key. Separated from
     the main flow so a missing openai package / unset key doesn't
     import-time-crash the whole app — we only pay the cost when an
-    operator actually hits the Test button with a test_prompt."""
+    operator actually hits the Test button."""
     try:
         from openai import OpenAI  # type: ignore
     except ImportError as exc:
@@ -58,8 +70,7 @@ def _resolve_openai_client(user_id: str | None):
     if not api_key:
         raise TestDataUnavailable(
             "OpenAI API key not configured. Save your OpenAI key in "
-            "Settings → API (or leave test_prompt blank to use the old "
-            "placeholder behavior)."
+            "Settings → API before running the Test button."
         )
     return OpenAI(api_key=api_key)
 
@@ -69,39 +80,38 @@ def generate_test_payload(tool: dict, user_id: str) -> dict[str, Any]:
     tool's parameters schema. Returns the parsed args dict that
     the Test button POSTs to the n8n webhook.
 
-    Raises TestDataUnavailable on missing config / SDK / quota so
-    the route layer can return a clear 4xx instead of a 500.
+    The LLM gets just the tool's name + description + parameters
+    schema — no per-tool prompt needed. It uses the schema's
+    field descriptions and required markers to decide what makes
+    sense. Operators who want more specific context can extend
+    the tool's description; we don't expose a separate prompt
+    field any more (the previous `test_prompt` column stays in
+    the schema for back-compat but is ignored by this generator).
 
-    Edge case: a tool with no `properties` (or `parameters` missing
-    entirely) still gets an empty JSON object back. n8n's Webhook
-    node accepts an empty body as long as the workflow downstream
-    doesn't require fields.
+    Raises TestDataUnavailable on missing config / SDK / quota /
+    invalid model so the route layer can return a clear 4xx
+    instead of a 500.
     """
     schema = tool.get("parameters") or {"type": "object", "properties": {}}
-    tool_name = tool.get("name", "tool")
-    tool_description = tool.get("description", "")
-    test_prompt = (tool.get("test_prompt") or "").strip()
-    if not test_prompt:
-        # ponytail: caller should not invoke us with an empty
-        # test_prompt — it falls back to the legacy placeholder
-        # branch instead. This guard is just defensive in case a
-        # future caller forgets the check.
-        return {}
+    tool_name = (tool.get("name") or "tool").strip()
+    tool_description = (tool.get("description") or "").strip()
 
+    model = _resolve_model(user_id)
     client = _resolve_openai_client(user_id)
     user_msg = (
         f"Generate realistic test data for the n8n webhook of the "
         f"\"{tool_name}\" tool.\n"
         f"Description: {tool_description or '(none)'}\n"
-        f"Context from the operator: {test_prompt}\n"
         f"Return a JSON object matching the parameters schema below. "
         f"Use plausible, real-world values for the specific domain "
-        f"described in the context.\n"
+        f"implied by the tool's name and description. Field "
+        f"descriptions in the schema are the operator's own "
+        f"hints — honour them.\n"
         f"Parameters schema:\n{json.dumps(schema, indent=2)}"
     )
     try:
         response = client.chat.completions.create(
-            model=_OPENAI_MODEL,
+            model=model,
             messages=[{"role": "user", "content": user_msg}],
             tools=[{
                 "type": "function",
@@ -109,12 +119,10 @@ def generate_test_payload(tool: dict, user_id: str) -> dict[str, Any]:
                     # ponytail: emit_test_data is a sentinel function
                     # name that exists only to force structured
                     # output. The LLM never actually "calls" it as a
-                    # real tool — it just has to return arguments that
-                    # match the parameters schema. We use
-                    # tool_choice=function to make sure no other tool
-                    # call slips in. Same trick the test_data
-                    # generation pattern uses elsewhere (foreman,
-                    # anthropic cookbook, etc.).
+                    # real tool — it just has to return arguments
+                    # that match the parameters schema. Same trick
+                    # the test_data generation pattern uses elsewhere
+                    # (foreman, anthropic cookbook, etc.).
                     "name": "emit_test_data",
                     "description": "Return the generated test data exactly as specified.",
                     "parameters": schema,
@@ -127,15 +135,17 @@ def generate_test_payload(tool: dict, user_id: str) -> dict[str, Any]:
         )
     except Exception as exc:
         # ponytail: wrap any LLM-side failure (rate limit, network,
-        # bad key) as TestDataUnavailable so the route layer can
-        # return a clean 4xx with a useful message instead of a 500.
+        # bad key, invalid model) as TestDataUnavailable so the
+        # route layer can return a clean 4xx with a useful message
+        # instead of a 500. The full trace still goes to log.warning
+        # for the deploy log.
         log.warning("[test_data_generator] LLM call failed: %s", exc)
         raise TestDataUnavailable(f"LLM call failed: {exc}") from exc
 
     if not response.choices or not response.choices[0].message.tool_calls:
         raise TestDataUnavailable(
-            "LLM did not return a structured tool call. The model may "
-            "be temporarily unavailable — try again."
+            f"LLM ({model}) did not return a structured tool call. "
+            "The model may be temporarily unavailable — try again."
         )
     args_str = response.choices[0].message.tool_calls[0].function.arguments
     try:

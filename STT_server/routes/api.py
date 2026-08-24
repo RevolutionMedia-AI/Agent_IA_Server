@@ -491,6 +491,12 @@ class SettingsUpdate(BaseModel):
     company: Optional[str] = None
     timezone: Optional[str] = None
     notifications: Optional[dict] = None
+    # ponytail: which OpenAI model the Test button uses to generate
+    # test data. Empty / None falls back to the DB default
+    # gpt-4o-mini. Validated loosely server-side - the
+    # OpenAI client just hands the string through and 400s if the
+    # model does not exist for the user account.
+    test_data_model: Optional[str] = None
 
 
 class PasswordChange(BaseModel):
@@ -787,14 +793,6 @@ class ToolCreate(BaseModel):
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
     kind: Optional[str] = None  # "webhook" (default) | "call_transfer"
     destination: Optional[str] = None  # E.164 for call_transfer
-    # ponytail: optional free-form context the operator curates per
-    # integration. When set, the Test button asks the user's LLM to
-    # generate realistic data matching the parameters schema above
-    # (Mexican dentist appointment, "name=María López, today 3pm,
-    # 60min") so the n8n workflow actually executes against plausible
-    # values. Without it, the BE falls back to "sample_<paramname>"
-    # placeholders that n8n often rejects.
-    test_prompt: Optional[str] = None
 
 
 @api_router.post("/agents/{agent_id}/tools")
