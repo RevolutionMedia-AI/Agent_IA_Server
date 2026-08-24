@@ -2,7 +2,6 @@
 
 import asyncio
 import ipaddress
-import json
 import os
 import socket
 import httpx
@@ -11,18 +10,9 @@ from typing import Optional
 import logging
 from urllib.parse import urlparse
 
+from STT_server.db_tools import get_tool as db_get_tool, update_tool as db_update_tool
+
 log = logging.getLogger(__name__)
-
-
-# ponytail: per-tool observability. Same storage as api.py's
-# _load_tools / _save_tools (STT_server/data/agent_tools.json) —
-# computed from __file__ so the executor module doesn't need to
-# import the routes module (which would create a circular import).
-_TOOLS_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data",
-    "agent_tools.json",
-)
 
 
 # ponytail: SSRF allow-list for tool webhook URLs. The user can override
@@ -131,50 +121,50 @@ def record_tool_result(tool_id: str, ok: bool, kind: str, error: str | None = No
     `error` is the short error string captured by the caller (the
     n8n response body, a connection error, etc.) so the operator
     can see why a tool failed without digging through Railway logs.
-    Best-effort: any I/O or parse error is swallowed so a write
-    failure never breaks the tool call. The caller treats this as
-    fire-and-forget.
+
+    ponytail: 010_agent_tools.sql moved storage to Postgres. We
+    look up the tool's owning user_id first (required by db_update_tool
+    for the row's WHERE clause), build the patch, and call the
+    helper. The previous file-based path was a load-find-mutate-save
+    round-trip; the Postgres path is one UPDATE statement and
+    survives container restarts.
     """
     try:
         if not tool_id:
             return
-        try:
-            with open(_TOOLS_FILE, "r", encoding="utf-8") as f:
-                tools = json.load(f) or []
-        except FileNotFoundError:
+        # ponytail: the new patch is a partial dict, not a full
+        # row — db_update_tool builds the SET clause from the keys
+        # actually present, so the row's other fields (id, agent_id,
+        # etc.) are untouched. We need user_id because db_update_tool
+        # scopes its WHERE clause by ownership; a tiny direct lookup
+        # is cheaper than threading user_id through every call site.
+        from STT_server.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM agent_tools WHERE id = %s LIMIT 1",
+                    (tool_id,),
+                )
+                row = cur.fetchone()
+        if not row:
             return
-        except (json.JSONDecodeError, IOError, OSError) as exc:
-            log.warning("[ToolExecutor] stats load failed (%s): %s", type(exc).__name__, exc)
-            return
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        user_id = row[0]
         status = "ok" if ok else "fail"
         # ponytail: cap the error string at 500 chars so a runaway
         # n8n stack-trace dump doesn't bloat every tool row on disk.
-        # The full trace is still in the Railway logs at log time —
-        # the persisted copy is just the headline so the FE can
-        # render a one-line tooltip.
         err_text = (error or "").strip()[:500] or None
-        updated = False
-        for t in tools:
-            if not isinstance(t, dict) or t.get("id") != tool_id:
-                continue
-            if kind == "test":
-                t["last_tested_at"] = now
-                t["last_test_result"] = status
-                t["last_test_error"] = err_text
-                t["last_test_error_at"] = now if err_text else None
-            else:
-                t["last_invoked_at"] = now
-                t["last_invocation_status"] = status
-                t["last_invocation_error"] = err_text
-                t["last_invocation_error_at"] = now if err_text else None
-                t["invocation_count"] = int(t.get("invocation_count", 0) or 0) + 1
-            updated = True
-            break
-        if not updated:
-            return
-        with open(_TOOLS_FILE, "w", encoding="utf-8") as f:
-            json.dump(tools, f, indent=2, ensure_ascii=False)
+        patch: dict = {}
+        if kind == "test":
+            patch["last_tested_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            patch["last_test_result"] = status
+            patch["last_test_error"] = err_text
+            patch["last_test_error_at"] = patch["last_tested_at"] if err_text else None
+        else:
+            patch["last_invoked_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            patch["last_invocation_status"] = status
+            patch["last_invocation_error"] = err_text
+            patch["last_invocation_error_at"] = patch["last_invoked_at"] if err_text else None
+        db_update_tool(tool_id, user_id, patch)
     except Exception as exc:
         log.warning("[ToolExecutor] record_tool_result failed for %s: %s", tool_id, exc)
 

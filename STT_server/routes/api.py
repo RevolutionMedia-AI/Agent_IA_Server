@@ -53,9 +53,13 @@ from STT_server.db_phone_numbers import (
     delete_number as db_delete_number,
 )
 from STT_server.db_tools import (
-    upsert_tool as db_upsert_tool,
-    delete_tool as db_delete_tool,
+    list_tools as db_list_tools,
     get_tool as db_get_tool,
+    create_tool as db_create_tool,
+    update_tool as db_update_tool,
+    delete_tool as db_delete_tool,
+    add_assignment as db_add_assignment,
+    remove_assignment as db_remove_assignment,
 )
 from STT_server.db_settings import (
     get_settings as db_get_settings,
@@ -640,61 +644,87 @@ def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
 
 
 # ---------- /agents/{agent_id}/tools CRUD ----------
+#
+# ponytail: 010_agent_tools.sql moved every read / write through
+# STT_server.db_tools (Postgres). The STT_server/data/agent_tools.json
+# file is now ONLY used as a one-time backfill source on first boot
+# — never read by the route layer again. The two helpers below
+# (build_tool_payload + _test_tool_row) are the only custom logic
+# the route handlers need on top of db_tools: Pydantic + AgentTool
+# validation that the storage layer shouldn't have to know about.
 
-# ponytail: this path used to be defined as a stray indented
-# assignment that ran at module load time and was easy to miss
-# when scanning the file. It's now a normal module-level
-# constant alongside the helper functions that use it.
-TOOLS_FILE = os.path.join(DATA_DIR, "agent_tools.json")
-
-
-def _load_tools():
-    # ponytail: on Railway the data/ volume is ephemeral so the
-    # agent_tools.json file frequently doesn't exist (every fresh
-    # deploy or restart). The previous IOError catch returned an
-    # empty list silently — but any other exception class (custom
-    # subclasses, OSError subclasses we didn't enumerate) would
-    # propagate as a 500 with no log. We now catch the broader
-    # Exception family and log the stack so the deploy logs surface
-    # the real cause the next time we get a 500 here.
-    try:
-        with open(TOOLS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f) or []
-    except FileNotFoundError:
-        return []
-    except (json.JSONDecodeError, IOError, OSError) as exc:
-        log.warning("[tools] load failed (%s): %s", type(exc).__name__, exc)
-        return []
-    except Exception as exc:
-        log.exception("[tools] unexpected load error: %s", exc)
-        return []
+# ponytail: marker for tools that any agent of the same owner can
+# invoke. Shared tools get explicit per-agent assignments stored
+# in agent_tools.assignments (JSONB array of agent_ids).
+SHARED_TOOL_AGENT_ID = "__shared__"
 
 
-def _save_tools(tools):
-    # ponytail: ensure the data dir exists before opening for write.
-    # On Railway the STT_server/data/ directory only ships with a
-    # .gitkeep — if no agent has been created yet (the only other
-    # code path that touches this directory), open(..., 'w') raises
-    # FileNotFoundError, which propagates BEFORE FastAPI's CORS
-    # middleware can attach headers. The browser then shows a
-    # misleading "No Access-Control-Allow-Origin header" error
-    # even though the BE itself is the problem. Same defensive
-    # pattern as _save() below (line ~101) — consistent style.
-    os.makedirs(DATA_DIR, exist_ok=True)
-    try:
-        with open(TOOLS_FILE, "w", encoding="utf-8") as f:
-            json.dump(tools, f, indent=2, ensure_ascii=False)
-    except OSError as exc:
-        # ponytail: surface the real cause to the operator. A bare
-        # 500 with FastAPI's "Internal Server Error" body hides
-        # the underlying issue (disk full, read-only volume, etc.).
-        # Raising HTTPException keeps the CORS middleware in the
-        # loop so the browser doesn't mask the failure as a CORS
-        # error.
+def _build_tool_payload(agent_id: str, data: "ToolCreate") -> dict:
+    """Shape the FE payload into the dict db_tools.create_tool
+    expects. Centralised so the per-agent and shared-tool creation
+    endpoints don't drift apart on validation, kind defaults, or
+    field handling."""
+    from STT_server.domain.tool import AgentTool, VALID_TOOL_KINDS
+    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
         raise HTTPException(
-            status_code=500,
-            detail=f"Could not persist agent_tools.json: {exc}",
+            status_code=400,
+            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
         )
+    tool = AgentTool(
+        agent_id=agent_id,
+        name=data.name,
+        description=data.description,
+        webhook_url=data.webhook_url or "",
+        filler_phrase=data.filler_phrase,
+        parameters=data.parameters,
+        kind=data.kind,
+        destination=data.destination,
+    )
+    errors = tool.validate()
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Validation errors: {', '.join(errors)}",
+        )
+    from STT_server.domain.tool import validate_json_schema
+    is_valid, err = validate_json_schema(data.parameters)
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON Schema: {err}",
+        )
+    payload = tool.to_dict()
+    return payload
+
+
+async def _test_tool_row(tool: dict) -> dict:
+    """Execute one tool's webhook with sample args. Shared by both
+    the per-agent test endpoint and the shared-tool test endpoint so
+    a future change (e.g. async wrapping, retries) only needs to
+    happen in one place."""
+    from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
+    tool_id = tool.get("id")
+    name = tool.get("name", "")
+    sample_args = {}
+    for param_name in (tool.get("parameters") or {}).get("required", []):
+        sample_args[param_name] = f"sample_{param_name}"
+    try:
+        result = await execute_tool(tool["webhook_url"], sample_args, name)
+        record_tool_result(tool_id, True, "test")
+        return {"success": True, "result": result}
+    except ToolExecutionError as exc:
+        # ponytail: persist the headline so the FE tooltip on the
+        # tool card surfaces "HTTP 500: ..." without a Railway
+        # log grep. Other exceptions (connection refused, DNS, etc.)
+        # are caught by the generic except below.
+        record_tool_result(tool_id, False, "test", error=str(exc))
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        record_tool_result(
+            tool_id, False, "test",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 @api_router.get("/agents/{agent_id}/tools")
@@ -703,23 +733,12 @@ def list_agent_tools(agent_id: str, auth: dict = Depends(require_auth)):
 
     Returns per-agent tools (``agent_id == agent_id``) AND shared tools
     owned by the same user that have been explicitly assigned to this
-    agent (``agent_id == "__shared__" and agent_id in assignments``).
-
-    Without the shared branch the FE re-fetch after an assign looked
-    identical to the pre-assign state — the shared tool stayed in
-    "Available shared" because the response never echoed it back. The
-    assignment itself succeeded; only the list refresh lied.
+    agent. Backed by Postgres via db_tools.list_tools(agent_id=...) —
+    the JSONB `?|` operator handles the "shared row whose
+    assignments array contains this agent_id" branch in a single
+    query.
     """
-    tools = _load_tools()
-    out = []
-    for t in tools:
-        if t.get("user_id") != auth["user_id"]:
-            continue
-        if t.get("agent_id") == agent_id:
-            out.append(t)
-        elif t.get("agent_id") == SHARED_TOOL_AGENT_ID and agent_id in (t.get("assignments") or []):
-            out.append(t)
-    return out
+    return db_list_tools(auth["user_id"], agent_id=agent_id)
 
 
 class ToolCreate(BaseModel):
@@ -741,86 +760,35 @@ class ToolCreate(BaseModel):
 @api_router.post("/agents/{agent_id}/tools")
 def create_agent_tool(agent_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new tool for an agent."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
-    # ponytail: guard the kind field at the API boundary so an unknown
-    # value from the FE never reaches the executor's branch table. The
-    # AgentTool constructor also coerces, but failing fast here gives
-    # the FE a clearer 400 than a silent fall-through to "webhook".
-    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
-        )
-    tool = AgentTool(
-        agent_id=agent_id,
-        name=data.name,
-        description=data.description,
-        webhook_url=data.webhook_url or "",
-        filler_phrase=data.filler_phrase,
-        parameters=data.parameters,
-        kind=data.kind,
-        destination=data.destination,
-    )
-    errors = tool.validate()
-    if errors:
-        raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
-    is_valid, err = validate_json_schema(data.parameters)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
-    tools = _load_tools()
-    tool_dict = tool.to_dict()
-    tool_dict["user_id"] = auth["user_id"]
-    tools.append(tool_dict)
-    _save_tools(tools)
-    return tool_dict
+    payload = _build_tool_payload(agent_id, data)
+    return db_create_tool(auth["user_id"], payload)
 
 
 @api_router.put("/agents/{agent_id}/tools/{tool_id}")
 def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
-    """Update an existing tool."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
-    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
-        )
-    tools = _load_tools()
-    for t in tools:
-        if t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]:
-            t["name"] = data.name
-            t["description"] = data.description
-            t["webhook_url"] = data.webhook_url or ""
-            t["filler_phrase"] = data.filler_phrase
-            t["parameters"] = data.parameters
-            # ponytail: persist the new fields on update. Same kind-aware
-            # validation runs at the end so a webhook → call_transfer flip
-            # (or vice-versa) can't sneak past without the matching
-            # required field being present.
-            t["kind"] = data.kind or t.get("kind", "webhook")
-            t["destination"] = data.destination
-            from datetime import datetime, timezone
-            t["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            rebuilt = AgentTool.from_dict(t)
-            errors = rebuilt.validate()
-            if errors:
-                raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
-            is_valid, err = validate_json_schema(data.parameters)
-            if not is_valid:
-                raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
-            _save_tools(tools)
-            return t
-    raise HTTPException(status_code=404, detail="Tool not found")
+    """Update an existing tool.
+
+    kind-aware: a webhook → call_transfer flip (or vice-versa) can't
+    sneak past without the matching required field being present
+    because we re-run AgentTool.from_dict + .validate() before
+    persisting the patch.
+    """
+    payload = _build_tool_payload(agent_id, data)
+    # ponytail: db_update_tool patches with the payload keys it
+    # receives — passing the full dict keeps the row's id intact.
+    # The user_id check on the WHERE clause prevents an operator from
+    # patching another user's row.
+    updated = db_update_tool(tool_id, auth["user_id"], payload)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    return updated
 
 
 @api_router.delete("/agents/{agent_id}/tools/{tool_id}")
 def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
     """Delete a tool from an agent."""
-    tools = _load_tools()
-    before = len(tools)
-    tools = [t for t in tools if not (t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"])]
-    if len(tools) == before:
+    if not db_delete_tool(tool_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Tool not found")
-    _save_tools(tools)
     return {"success": True}
 
 
@@ -833,18 +801,20 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
 # can't be unassigned (delete the tool instead).
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/assign")
 def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
-    """Assign a shared tool to an agent.
-
-    Adds ``agent_id`` to the tool's ``assignments`` list. Idempotent:
-    assigning an already-assigned agent is a no-op so the FE can
-    freely click the same button twice.
-    """
-    tools = _load_tools()
-    tool = next(
-        (t for t in tools
-         if t.get("id") == tool_id and t.get("user_id") == auth["user_id"]),
-        None,
-    )
+    """Assign a shared tool to an agent. Idempotent."""
+    # ponytail: confirm the agent belongs to this user. The agent
+    # row is the source of truth for ownership; without this check a
+    # operator could fish another user's agent id and widen a shared
+    # tool's blast radius.
+    from STT_server.db_agents import get_agent as _get_agent
+    if not _get_agent(agent_id, auth["user_id"]):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    # ponytail: load the tool first so we can short-circuit when
+    # the operator tries to assign a per-agent tool (only shared
+    # tools are assignable). db_add_assignment is JSONB-level
+    # idempotent on its own, but the 400 message needs the kind
+    # check to give the FE a clear error.
+    tool = db_get_tool(tool_id, auth["user_id"])
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
     if tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
@@ -852,38 +822,13 @@ def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require
             status_code=400,
             detail="Only shared tools can be assigned. Per-agent tools are already available to their agent.",
         )
-    # ponytail: confirm the agent belongs to this user. The agent row
-    # is the source of truth for ownership; without this check a
-    # operator could fish another user's agent id and widen a shared
-    # tool's blast radius.
-    from STT_server.db_agents import get_agent as _get_agent
-    agent = _get_agent(agent_id, auth["user_id"])
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    assignments = tool.get("assignments") or []
-    if agent_id in assignments:
-        return tool  # idempotent
-    assignments.append(agent_id)
-    tool["assignments"] = assignments
-    from datetime import datetime, timezone
-    tool["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    _save_tools(tools)
-    return tool
+    return db_add_assignment(tool_id, auth["user_id"], agent_id) or tool
 
 
 @api_router.delete("/agents/{agent_id}/tools/{tool_id}/assign")
 def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
-    """Remove a shared tool assignment from an agent.
-
-    Drops ``agent_id`` from the tool's ``assignments`` list. Idempotent
-    — unassigning an agent that isn't currently assigned is a no-op.
-    """
-    tools = _load_tools()
-    tool = next(
-        (t for t in tools
-         if t.get("id") == tool_id and t.get("user_id") == auth["user_id"]),
-        None,
-    )
+    """Remove a shared tool assignment from an agent. Idempotent."""
+    tool = db_get_tool(tool_id, auth["user_id"])
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
     if tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
@@ -891,170 +836,65 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
             status_code=400,
             detail="Only shared tools can be unassigned. Delete per-agent tools instead.",
         )
-    assignments = tool.get("assignments") or []
-    if agent_id not in assignments:
-        return tool  # idempotent
-    assignments = [a for a in assignments if a != agent_id]
-    tool["assignments"] = assignments
-    from datetime import datetime, timezone
-    tool["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    _save_tools(tools)
-    return tool
+    return db_remove_assignment(tool_id, auth["user_id"], agent_id) or tool
 
 
-@api_router.post("/agents/{agent_id}/tools/test")
+@api_router.post("/agents/{agent_id}/tools/{tool_id}/test")
 async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
     """Test a tool by executing its webhook with sample data."""
-    tools = _load_tools()
-    tool = next((t for t in tools if t.get("id") == tool_id and t.get("agent_id") == agent_id and t.get("user_id") == auth["user_id"]), None)
-    if not tool:
+    tool = db_get_tool(tool_id, auth["user_id"])
+    if not tool or tool.get("agent_id") != agent_id:
         raise HTTPException(status_code=404, detail="Tool not found")
-    from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
-    try:
-        sample_args = {}
-        for param_name in tool.get("parameters", {}).get("required", []):
-            sample_args[param_name] = f"sample_{param_name}"
-        result = await execute_tool(tool["webhook_url"], sample_args, tool["name"])
-        record_tool_result(tool["id"], True, "test")
-        return {"success": True, "result": result}
-    except ToolExecutionError as exc:
-        record_tool_result(tool["id"], False, "test")
-        return {"success": False, "error": str(exc)}
+    return await _test_tool_row(tool)
 
 
 # ponytail: global n8n tools marketplace. Tools with agent_id="__shared__"
-# in the same agent_tools.json file are visible to any of the owner's
-# agents (loaded by _load_agent_tools when called with user_id). The
-# endpoints below let the operator create / edit / delete shared tools
-# independently of any specific agent — the FE mounts them on the
-# /integrations page (navbar entry).
-SHARED_TOOL_AGENT_ID = "__shared__"
-
-
+# in Postgres are visible to any of the owner's agents (loaded by
+# _load_agent_tools when called with user_id). The endpoints below
+# let the operator create / edit / delete shared tools independently
+# of any specific agent — the FE mounts them on the /integrations
+# page (navbar entry).
 @api_router.get("/tools")
 def list_shared_tools(auth: dict = Depends(require_auth)):
     """List all shared n8n tools owned by the current user."""
-    tools = _load_tools()
-    return [t for t in tools if isinstance(t, dict)
-            and t.get("agent_id") == SHARED_TOOL_AGENT_ID
-            and t.get("user_id") == auth["user_id"]]
+    return [
+        t for t in db_list_tools(auth["user_id"])
+        if t.get("agent_id") == SHARED_TOOL_AGENT_ID
+    ]
 
 
 @api_router.post("/tools")
 def create_shared_tool(data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new shared n8n tool owned by the current user."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
-    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
-        )
-    tool = AgentTool(
-        agent_id=SHARED_TOOL_AGENT_ID,
-        name=data.name,
-        description=data.description,
-        webhook_url=data.webhook_url or "",
-        filler_phrase=data.filler_phrase,
-        parameters=data.parameters,
-        kind=data.kind,
-        destination=data.destination,
-    )
-    errors = tool.validate()
-    if errors:
-        raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
-    is_valid, err = validate_json_schema(data.parameters)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
-    tools = _load_tools()
-    tool_dict = tool.to_dict()
-    tool_dict["user_id"] = auth["user_id"]
-    tools.append(tool_dict)
-    _save_tools(tools)
-    return tool_dict
+    payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data)
+    return db_create_tool(auth["user_id"], payload)
 
 
 @api_router.put("/tools/{tool_id}")
 def update_shared_tool(tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Update an existing shared n8n tool owned by the current user."""
-    from STT_server.domain.tool import AgentTool, validate_json_schema, VALID_TOOL_KINDS
-    if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown kind '{data.kind}'. Expected one of: {sorted(VALID_TOOL_KINDS)}",
-        )
-    tools = _load_tools()
-    for t in tools:
-        if (t.get("id") == tool_id
-                and t.get("agent_id") == SHARED_TOOL_AGENT_ID
-                and t.get("user_id") == auth["user_id"]):
-            t["name"] = data.name
-            t["description"] = data.description
-            t["webhook_url"] = data.webhook_url or ""
-            t["filler_phrase"] = data.filler_phrase
-            t["parameters"] = data.parameters
-            t["kind"] = data.kind or t.get("kind", "webhook")
-            t["destination"] = data.destination
-            from datetime import datetime, timezone
-            t["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            rebuilt = AgentTool.from_dict(t)
-            errors = rebuilt.validate()
-            if errors:
-                raise HTTPException(status_code=400, detail=f"Validation errors: {', '.join(errors)}")
-            is_valid, err = validate_json_schema(data.parameters)
-            if not is_valid:
-                raise HTTPException(status_code=400, detail=f"Invalid JSON Schema: {err}")
-            _save_tools(tools)
-            return t
-    raise HTTPException(status_code=404, detail="Tool not found")
+    payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data)
+    updated = db_update_tool(tool_id, auth["user_id"], payload)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    return updated
 
 
 @api_router.delete("/tools/{tool_id}")
 def delete_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
     """Delete a shared n8n tool owned by the current user."""
-    tools = _load_tools()
-    before = len(tools)
-    tools = [t for t in tools
-             if not (t.get("id") == tool_id
-                     and t.get("agent_id") == SHARED_TOOL_AGENT_ID
-                     and t.get("user_id") == auth["user_id"])]
-    if len(tools) == before:
+    if not db_delete_tool(tool_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Tool not found")
-    _save_tools(tools)
     return {"success": True}
 
 
 @api_router.post("/tools/{tool_id}/test")
 async def test_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
     """Smoke-test a shared n8n tool by hitting its webhook with sample args."""
-    tools = _load_tools()
-    tool = next((t for t in tools
-                 if t.get("id") == tool_id
-                 and t.get("agent_id") == SHARED_TOOL_AGENT_ID
-                 and t.get("user_id") == auth["user_id"]),
-                None)
-    if not tool:
+    tool = db_get_tool(tool_id, auth["user_id"])
+    if not tool or tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
         raise HTTPException(status_code=404, detail="Tool not found")
-    from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
-    try:
-        sample_args = {}
-        for param_name in tool.get("parameters", {}).get("required", []):
-            sample_args[param_name] = f"sample_{param_name}"
-        result = await execute_tool(tool["webhook_url"], sample_args, tool["name"])
-        record_tool_result(tool["id"], True, "test")
-        return {"success": True, "result": result}
-    except ToolExecutionError as exc:
-        # ponytail: persist the headline so the FE tooltip on the
-        # tool card surfaces "HTTP 500: ..." without a Railway
-        # log grep. Other exceptions (connection refused, DNS, etc.)
-        # are caught by the generic except below.
-        record_tool_result(tool["id"], False, "test", error=str(exc))
-        return {"success": False, "error": str(exc)}
-    except Exception as exc:
-        record_tool_result(
-            tool["id"], False, "test",
-            error=f"{type(exc).__name__}: {exc}",
-        )
-        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+    return await _test_tool_row(tool)
 
 
 # ---------- /campaigns (global suggestions catalog) ----------

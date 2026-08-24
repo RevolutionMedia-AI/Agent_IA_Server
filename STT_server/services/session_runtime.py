@@ -8,6 +8,7 @@ import time
 from fastapi import WebSocket
 
 from STT_server.config import IDLE_SILENCE_TIMEOUT_SEC, MAX_CALL_DURATION_SEC
+from STT_server.db_tools import list_tools as db_list_tools
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_with_drop
 from STT_server.services.usage_store import has_user_stored_key, record_call
@@ -33,11 +34,6 @@ _AGENTS_FILE = os.path.join(
     "data",
     "agents.json",
 )
-_TOOLS_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "data",
-    "agent_tools.json",
-)
 
 
 def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]:
@@ -57,100 +53,32 @@ def _load_agent_providers(agent_id: str | None) -> tuple[str | None, str | None]
 
 
 def _load_agent_tools(agent_id: str | None, user_id: str | None = None) -> list[dict]:
-    """Load the tools available to one agent.
+    """Load the tools available to one agent at call start.
 
-    Two scopes:
+    ponytail: 010_agent_tools.sql moved the storage layer to Postgres
+    via STT_server.db_tools.list_tools(agent_id=...). The JSONB `?|`
+    operator inside list_tools handles the "shared tool whose
+    assignments array contains this agent_id" branch in a single
+    indexed query — no more client-side post-processing of the full
+    tool list, and crucially no more on-the-fly backfill writes to
+    a file the operator might restart away.
+
+    Two scopes (unchanged from the legacy contract):
       1. Per-agent tools — rows with agent_id == agent_id. Always
          included; the agent that owns the row gets it implicitly.
       2. Shared tools — rows with agent_id == "__shared__" and a
          matching user_id. ONLY included when the agent id is in the
-         tool's `assignments` list. The old behaviour (auto-include
-         for every agent of the same owner) is gone — operators now
-         pick exactly which agents can invoke each shared tool.
+         tool's `assignments` list. Operators pick exactly which
+         agents can invoke each shared tool via the Assign / Unassign
+         buttons in the edit modal.
 
-    ponytail: backwards-compat for tools saved before the assignments
-    field existed. A legacy shared tool without `assignments` (or
-    with `assignments == []`) gets backfilled to include every agent
-    of the same owner on the first read, so existing setups keep
-    working until the operator starts clicking Assign / Unassign.
-    Once they do, `assignments` becomes non-empty and the explicit
-    list takes over — the auto-include branch never fires again for
-    that tool.
+    Legacy "auto-include on first read" behaviour is gone — the
+    one-time backfill in db_tools.backfill_from_json() handles
+    pre-migration rows before this function ever runs.
     """
-    if not agent_id:
+    if not agent_id or not user_id:
         return []
-    try:
-        with open(_TOOLS_FILE, "r", encoding="utf-8") as f:
-            all_tools = json.load(f) or []
-    except (FileNotFoundError, json.JSONDecodeError, IOError):
-        return []
-    out = [t for t in all_tools if isinstance(t, dict) and t.get("agent_id") == agent_id]
-    if not user_id:
-        return out
-
-    # ponytail: the explicit-assignment branch. A shared tool is
-    # included iff agent_id is in its assignments list. Tools with no
-    # assignments yet (legacy rows + newly created shared tools that
-    # the operator hasn't assigned anywhere) fall through to the
-    # auto-include backfill below so the upgrade path doesn't strand
-    # them.
-    shared = [
-        t for t in all_tools
-        if isinstance(t, dict)
-        and t.get("agent_id") == "__shared__"
-        and t.get("user_id") == user_id
-    ]
-    explicit = [t for t in shared if agent_id in (t.get("assignments") or [])]
-    out.extend(explicit)
-
-    # ponytail: backfill legacy rows. Only fires the first time a
-    # given shared tool is read after the upgrade — once
-    # `assignments` is non-empty (operator started assigning), this
-    # branch becomes a no-op for that tool. We also skip tools that
-    # have NO matching agents (e.g. owner has zero agents); keeping
-    # them unassigned is the correct state.
-    needs_backfill = [
-        t for t in shared
-        if not (t.get("assignments") or [])
-        and t is not explicit  # avoid double-include in the edge case
-    ]
-    if needs_backfill:
-        try:
-            from STT_server.db_agents import list_agents as _list_agents
-            owner_agents = _list_agents(user_id) or []
-            owner_agent_ids = {
-                a.get("id") for a in owner_agents
-                if isinstance(a, dict) and a.get("id")
-            }
-        except Exception:
-            owner_agent_ids = set()
-        for t in needs_backfill:
-            if not owner_agent_ids:
-                continue
-            # ponytail: write back to disk only the first time we read
-            # the tool — subsequent calls hit the explicit branch above
-            # because `assignments` is non-empty after we save.
-            t["assignments"] = sorted(owner_agent_ids)
-            try:
-                _save_tools_file(all_tools)
-            except Exception:
-                # Don't break the live call on a write hiccup — the
-                # next call will retry the backfill.
-                pass
-            out.extend(t for t in [t] if agent_id in owner_agent_ids)
-    return out
-
-
-def _save_tools_file(tools: list) -> None:
-    """Persist agent_tools.json. Mirrors the helper in routes/api.py
-    but lives here so the runtime can write back without an import
-    cycle. Same write-once-per-call discipline: a write inside the
-    request path is bad, so the only caller is the backfill branch
-    above."""
-    DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(_TOOLS_FILE, "w", encoding="utf-8") as f:
-        json.dump(tools, f, indent=2, ensure_ascii=False)
+    return db_list_tools(user_id, agent_id=agent_id)
 
 
 def track_task(session: CallSession, task: asyncio.Task) -> asyncio.Task:
