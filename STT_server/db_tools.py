@@ -238,9 +238,16 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
         except (json.JSONDecodeError, IOError, OSError):
             return None
         out = None
+        # ponytail: same DB-managed filter as the Postgres branch
+        # below. Payload carries id / created_at / updated_at from
+        # AgentTool.to_dict(), and letting them through the merge
+        # would either rename the PK (id) or clobber the original
+        # creation timestamp (created_at). updated_at is rewritten
+        # unconditionally one line below.
+        db_managed = {"id", "user_id", "created_at", "updated_at"}
         for r in rows:
             if isinstance(r, dict) and r.get("id") == tool_id and r.get("user_id") == user_id:
-                r.update({k: v for k, v in payload.items() if v is not None})
+                r.update({k: v for k, v in payload.items() if v is not None and k not in db_managed})
                 r["updated_at"] = _now_iso()
                 out = r
                 break
@@ -251,12 +258,27 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
         return out
     # ponytail: build a dynamic SET clause from the payload so the
     # caller only needs to send the fields it actually changed.
-    # JSONB columns need a ::jsonb cast.
+    # JSONB columns need a ::jsonb cast. The DB-managed columns
+    # below are filtered out for two reasons:
+    #   1. updated_at is appended unconditionally at the end of the
+    #      SET clause as `updated_at = NOW()` — letting it through
+    #      here would produce `updated_at = ..., updated_at = NOW()`
+    #      and Postgres rejects with `multiple assignments to same
+    #      column`. Bit the operator just hit (railway traceback:
+    #      psycopg2.errors.SyntaxError on PUT /tools/{id}).
+    #   2. id, user_id, created_at are write-once on INSERT — letting
+    #      them through here would silently let the BE rebuild the
+    #      row's PK with AgentTool.to_dict()'s freshly-minted uuid,
+    #      or clobber the original creation timestamp, neither of
+    #      which the FE asked for.
     jsonb_keys = {"parameters", "assignments"}
+    db_managed = {"id", "user_id", "created_at", "updated_at"}
     set_clauses = []
     values: list = []
     for k, v in payload.items():
         if v is None:
+            continue
+        if k in db_managed:
             continue
         if k in jsonb_keys:
             set_clauses.append(f"{k} = %s::jsonb")
