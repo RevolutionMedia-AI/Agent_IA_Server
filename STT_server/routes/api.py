@@ -727,10 +727,17 @@ async def _test_tool_row(tool: dict, user_id: str) -> dict:
     test_prompt = (tool.get("test_prompt") or "").strip()
     if test_prompt:
         try:
-            sample_args = generate_test_payload(tool, user_id)
+            sample_args = generate_test_payload(tool, user_id, model=test_data_model)
         except TestDataUnavailable as exc:
             return {"success": False, "error": str(exc)}
     else:
+        # test_data_model lives on the agent_tools row (per_provider)
+        # per-user. The agent_modal sets it when the operator picks a
+        # model in the Integrations Connect modal; the credential save
+        # upserts it into the same encrypted row as the api_key.
+        # tool_def comes from db_get_tool which always returns the
+        # column after migration 013.
+        test_data_model = (tool.get("test_data_model") or "").strip() or "gpt-4o-mini"
         sample_args = {}
         for param_name in (tool.get("parameters") or {}).get("required", []):
             sample_args[param_name] = f"sample_{param_name}"
@@ -1365,6 +1372,15 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
     )
 
     encrypted = encrypt_credentials(cleaned)
+    # ponytail: test_data_model is the LLM the test_data_generator
+    # uses when the operator hits Test on a tool that has this
+    # provider configured. Default gpt-4o-mini for cost; the FE
+    # modal surfaces the dropdown for gpt-4o / gpt-4-turbo when the
+    # operator wants better reasoning on complex schemas. Optional
+    # in the body so older FE builds keep working.
+    test_data_model = (body.credentials or {}).pop("test_data_model", None)
+    if not isinstance(test_data_model, str) or not test_data_model.strip():
+        test_data_model = "gpt-4o-mini"
     db_upsert_tool(
         auth["user_id"],
         service_id,
@@ -1373,6 +1389,7 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
             "connected": bool(encrypted),
             "display_name": spec.name,
             "category": spec.category,
+            "test_data_model": test_data_model.strip()[:120],
         },
     )
     return {"success": True}

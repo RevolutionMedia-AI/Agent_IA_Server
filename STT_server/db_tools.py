@@ -47,7 +47,7 @@ _AGENT_TOOLS_FILE = Path(__file__).resolve().parent / "data" / "agent_tools.json
 _TOOL_COLS = (
     "id, user_id, agent_id, name, description, "
     "webhook_url, filler_phrase, parameters, "
-    "kind, destination, assignments, function_name, "
+    "kind, destination, assignments, function_name, test_data_model, "
     "last_tested_at, last_test_result, last_test_error, last_test_error_at, "
     "last_invoked_at, last_invocation_status, last_invocation_error, "
     "last_invocation_error_at, invocation_count, "

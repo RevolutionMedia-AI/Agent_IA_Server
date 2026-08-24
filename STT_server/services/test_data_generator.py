@@ -38,17 +38,15 @@ class TestDataUnavailable(RuntimeError):
     a clear message instead of a generic 500."""
 
 
-def _resolve_model(user_id: str) -> str:
-    """Read the operator's chosen test-data model from the settings
-    table. Falls back to gpt-4o-mini if unset or unreadable."""
-    try:
-        from STT_server.db_settings import get_settings as _db_get_settings
-        s = _db_get_settings(user_id) or {}
-    except Exception as exc:
-        log.warning("[test_data_generator] settings read failed: %s", exc)
-        return DEFAULT_TEST_DATA_MODEL
-    model = (s.get("test_data_model") or "").strip()
-    return model or DEFAULT_TEST_DATA_MODEL
+def _resolve_model(_model_override: str | None) -> str:
+    """Pick the LLM the generator should use.
+
+    Per-provider override (passed in from the route layer via
+    test_data_model on the agent_tools row, set by the FE Connect
+    modal) wins. Falls back to gpt-4o-mini for cost when unset.
+    """
+    m = (_model_override or "").strip()
+    return m or DEFAULT_TEST_DATA_MODEL
 
 
 def _resolve_openai_client(user_id: str | None):
@@ -75,7 +73,7 @@ def _resolve_openai_client(user_id: str | None):
     return OpenAI(api_key=api_key)
 
 
-def generate_test_payload(tool: dict, user_id: str) -> dict[str, Any]:
+def generate_test_payload(tool: dict, user_id: str, model: str | None = None) -> dict[str, Any]:
     """Ask the configured LLM for realistic test data matching the
     tool's parameters schema. Returns the parsed args dict that
     the Test button POSTs to the n8n webhook.
@@ -96,7 +94,7 @@ def generate_test_payload(tool: dict, user_id: str) -> dict[str, Any]:
     tool_name = (tool.get("name") or "tool").strip()
     tool_description = (tool.get("description") or "").strip()
 
-    model = _resolve_model(user_id)
+    model = _resolve_model(model)
     client = _resolve_openai_client(user_id)
     user_msg = (
         f"Generate realistic test data for the n8n webhook of the "
