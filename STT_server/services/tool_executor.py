@@ -123,11 +123,14 @@ def _validate_webhook_url(webhook_url: str) -> None:
             )
 
 
-def record_tool_result(tool_id: str, ok: bool, kind: str) -> None:
+def record_tool_result(tool_id: str, ok: bool, kind: str, error: str | None = None) -> None:
     """Update observability fields on a tool row after a run.
 
     `kind` is either "test" (operator clicked Test webhook) or
     "invocation" (the agent called the tool during a real call).
+    `error` is the short error string captured by the caller (the
+    n8n response body, a connection error, etc.) so the operator
+    can see why a tool failed without digging through Railway logs.
     Best-effort: any I/O or parse error is swallowed so a write
     failure never breaks the tool call. The caller treats this as
     fire-and-forget.
@@ -145,6 +148,12 @@ def record_tool_result(tool_id: str, ok: bool, kind: str) -> None:
             return
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         status = "ok" if ok else "fail"
+        # ponytail: cap the error string at 500 chars so a runaway
+        # n8n stack-trace dump doesn't bloat every tool row on disk.
+        # The full trace is still in the Railway logs at log time —
+        # the persisted copy is just the headline so the FE can
+        # render a one-line tooltip.
+        err_text = (error or "").strip()[:500] or None
         updated = False
         for t in tools:
             if not isinstance(t, dict) or t.get("id") != tool_id:
@@ -152,9 +161,13 @@ def record_tool_result(tool_id: str, ok: bool, kind: str) -> None:
             if kind == "test":
                 t["last_tested_at"] = now
                 t["last_test_result"] = status
+                t["last_test_error"] = err_text
+                t["last_test_error_at"] = now if err_text else None
             else:
                 t["last_invoked_at"] = now
                 t["last_invocation_status"] = status
+                t["last_invocation_error"] = err_text
+                t["last_invocation_error_at"] = now if err_text else None
                 t["invocation_count"] = int(t.get("invocation_count", 0) or 0) + 1
             updated = True
             break

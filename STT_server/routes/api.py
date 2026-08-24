@@ -1043,8 +1043,18 @@ async def test_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
         record_tool_result(tool["id"], True, "test")
         return {"success": True, "result": result}
     except ToolExecutionError as exc:
-        record_tool_result(tool["id"], False, "test")
+        # ponytail: persist the headline so the FE tooltip on the
+        # tool card surfaces "HTTP 500: ..." without a Railway
+        # log grep. Other exceptions (connection refused, DNS, etc.)
+        # are caught by the generic except below.
+        record_tool_result(tool["id"], False, "test", error=str(exc))
         return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        record_tool_result(
+            tool["id"], False, "test",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------- /campaigns (global suggestions catalog) ----------

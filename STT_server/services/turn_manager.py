@@ -450,7 +450,10 @@ async def _stream_llm_with_tools(
                             "destination)."
                         ),
                     })
-                    record_tool_result(tool_def.get("id"), False, "invocation")
+                    record_tool_result(
+                        tool_def.get("id"), False, "invocation",
+                        error="call_transfer not configured (missing Twilio auth or destination)",
+                    )
                     continue
                 try:
                     transfer_result = await execute_call_transfer(
@@ -480,7 +483,7 @@ async def _stream_llm_with_tools(
                         "[Tools] call_transfer '%s' failed: %s",
                         tool_name, exc,
                     )
-                    record_tool_result(tool_def.get("id"), False, "invocation")
+                    record_tool_result(tool_def.get("id"), False, "invocation", error=str(exc))
                     session.history.append({
                         "role": "tool",
                         "content": f"Tool '{tool_name}' error: {str(exc)}",
@@ -494,7 +497,10 @@ async def _stream_llm_with_tools(
                     "role": "tool",
                     "content": f"Tool '{tool_name}' error: missing webhook_url",
                 })
-                record_tool_result(tool_def.get("id"), False, "invocation")
+                record_tool_result(
+                    tool_def.get("id"), False, "invocation",
+                    error="missing webhook_url",
+                )
                 continue
             try:
                 tool_result = await execute_tool(webhook_url, tool_args, tool_name)
@@ -513,8 +519,15 @@ async def _stream_llm_with_tools(
                     "content": f"Tool '{tool_name}' result: {tool_result_text}",
                 })
             except Exception as exc:
+                # ponytail: capture the headline error so the operator
+                # sees it in the FE without grepping Railway logs. The
+                # full trace is still in `log.error` above.
+                err_headline = str(exc) if str(exc) else exc.__class__.__name__
                 log.error("[Tools] Tool '%s' execution failed: %s", tool_name, exc)
-                record_tool_result(tool_def.get("id"), False, "invocation")
+                record_tool_result(
+                    tool_def.get("id"), False, "invocation",
+                    error=err_headline,
+                )
                 session.history.append({
                     "role": "tool",
                     "content": f"Tool '{tool_name}' error: {str(exc)}",
