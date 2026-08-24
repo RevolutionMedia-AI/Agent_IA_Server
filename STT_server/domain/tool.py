@@ -37,6 +37,35 @@ class AgentTool:
     destination (E.164) is the only required field.
     """
 
+    # ponytail: OpenAI's function-calling spec restricts the function
+    # name to `^[a-zA-Z0-9_-]+$` — any space, slash, dot, or unicode
+    # character makes the entire chat.completions request fail with a
+    # 400. Operators are free to type human-readable names like
+    # "Google Calendar Schedule" in the FE (the field is just a label
+    # for the agent list), so we keep `name` as the display string and
+    # store a separate `function_name` that is always OpenAI-compliant.
+    # `function_name` is auto-derived from `name` on save if the
+    # operator doesn't set one explicitly.
+    @staticmethod
+    def _sanitize_function_name(raw: str) -> str:
+        """Map any string to `^[a-zA-Z0-9_-]+$`.
+
+        Replaces every invalid run with a single underscore, collapses
+        adjacent underscores, trims leading/trailing ones, and caps
+        at 64 chars (OpenAI's documented maximum). Falls back to
+        "tool" when the result would be empty (e.g. operator typed
+        only spaces / punctuation).
+        """
+        if not raw:
+            return "tool"
+        # Replace invalid runs with a single underscore. The class
+        # notation is the negation of the OpenAI whitelist.
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(raw))
+        cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+        if not cleaned:
+            return "tool"
+        return cleaned[:64]
+
     def __init__(
         self,
         agent_id: str,
@@ -56,6 +85,14 @@ class AgentTool:
         # Empty list = not assigned to anyone; the operator must
         # explicitly assign shared tools to give agents access.
         assignments: Optional[list] = None,
+        # ponytail: OpenAI-safe function name. Auto-derived from the
+        # operator-facing `name` on save so the LLM caller can use
+        # the human label in the UI without breaking the chat
+        # completions API. If the operator somehow produces a
+        # collision (two different display names sanitising to the
+        # same function_name), the second save logs a warning and
+        # overwrites — the operator sees the agent list to detect.
+        function_name: Optional[str] = None,
         id: Optional[str] = None,
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
@@ -91,6 +128,15 @@ class AgentTool:
             self.assignments = [a for a in assignments if isinstance(a, str) and a]
         else:
             self.assignments = []
+        # ponytail: see `_sanitize_function_name` above. The from_dict
+        # path stores `function_name` on disk; this constructor is
+        # also called directly from the route layer (create tool) which
+        # doesn't pass the field, so we always derive when missing.
+        self.function_name = (
+            function_name
+            if isinstance(function_name, str) and function_name
+            else self._sanitize_function_name(self.name)
+        )
         self.created_at = created_at or self._now_iso()
         self.updated_at = updated_at or self._now_iso()
         # ponytail: per-tool observability. None = never recorded;
@@ -121,6 +167,7 @@ class AgentTool:
             "kind": self.kind,
             "destination": self.destination,
             "assignments": list(self.assignments),
+            "function_name": self.function_name,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "last_tested_at": self.last_tested_at,
@@ -145,7 +192,13 @@ class AgentTool:
         return {
             "type": "function",
             "function": {
-                "name": self.name,
+                # ponytail: use the OpenAI-safe function_name (sanitised
+                # on save), NOT the operator-facing display name. The
+                # chat.completions API rejects names with spaces or
+                # punctuation (`^[a-zA-Z0-9_-]+$`) — we sanitise once
+                # in the constructor and round-trip via to_dict, so the
+                # value is stable across the LLM/executor boundary.
+                "name": self.function_name,
                 "description": self.description,
                 "parameters": params,
             },

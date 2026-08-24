@@ -267,13 +267,22 @@ async def stream_llm_reply_with_tts(
     # Get tools from session and convert to OpenAI format
     agent_tools = getattr(session, "agent_tools", []) or []
     if agent_tools:
-        # Convert tools to OpenAI function calling format
+        # Convert tools to OpenAI function calling format. The
+        # function name must satisfy `^[a-zA-Z0-9_-]+$` (OpenAI's
+        # chat.completions contract). We use the per-tool
+        # `function_name` field which the BE sanitises on save —
+        # falling back to a best-effort sanitisation of the display
+        # name for legacy rows that pre-date the field.
+        from STT_server.domain.tool import AgentTool as _AgentTool
         tools = []
         for t in agent_tools:
+            fn_name = t.get("function_name") or _AgentTool._sanitize_function_name(
+                t.get("name", "")
+            )
             tools.append({
                 "type": "function",
                 "function": {
-                    "name": t.get("name", ""),
+                    "name": fn_name,
                     "description": t.get("description", ""),
                     "parameters": t.get("parameters", {"type": "object", "properties": {}}),
                 },
@@ -381,9 +390,22 @@ async def _stream_llm_with_tools(
                 tool_name,
                 list(tool_args.keys()) if isinstance(tool_args, dict) else type(tool_args).__name__,
             )
-            # Find the tool definition to get webhook_url and filler_phrase
+            # Find the tool definition to get webhook_url and filler_phrase.
+            # Match by `function_name` first (the OpenAI-safe name the
+            # LLM just called with) and fall back to `name` for
+            # legacy rows that pre-date the function_name field. The
+            # fallback path also covers any drift between the stored
+            # function_name and the sanitised version recomputed
+            # here.
             agent_tools = getattr(session, "agent_tools", []) or []
-            tool_def = next((t for t in agent_tools if t.get("name") == tool_name), None)
+            from STT_server.domain.tool import AgentTool as _AgentTool
+            tool_def = next(
+                (t for t in agent_tools
+                 if t.get("function_name") == tool_name
+                 or t.get("name") == tool_name
+                 or _AgentTool._sanitize_function_name(t.get("name", "")) == tool_name),
+                None,
+            )
             if not tool_def:
                 log.warning("[Tools] No tool definition found for '%s'", tool_name)
                 continue
