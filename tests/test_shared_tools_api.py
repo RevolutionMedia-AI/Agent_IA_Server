@@ -162,6 +162,14 @@ async def test_test_endpoint_hits_webhook(
     with patch(
         "STT_server.services.tool_executor.execute_tool",
         new=AsyncMock(return_value={"ok": True}),
+    ), patch(
+        # Test now always consults the LLM-driven generator
+        # (test_data_generator.py). No OpenAI key wired into the
+        # test env, so mock the generator to bypass the upstream
+        # SDK + keychain resolution and still exercise the executor
+        # path that POSTs to the n8n webhook.
+        "STT_server.services.test_data_generator.generate_test_payload",
+        new=lambda tool, user_id, model=None: {"order_number": "ORD-42"},
     ):
         r = await client.post(
             f"/tools/{tool_id}/test",
@@ -169,6 +177,7 @@ async def test_test_endpoint_hits_webhook(
         )
     assert r.status_code == 200, r.text
     assert r.json()["success"] is True
+    assert r.json()["sent_payload"] == {"order_number": "ORD-42"}
 
 
 # ── Validation errors → 400 ──────────────────────────────────────────

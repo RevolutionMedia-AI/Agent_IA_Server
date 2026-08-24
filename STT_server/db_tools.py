@@ -204,7 +204,7 @@ def create_tool(
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s) "
+                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name, test_data_model) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s, %s) "
                 f"RETURNING {_TOOL_COLS}",
                 (
                     new_id, user_id,
@@ -218,6 +218,7 @@ def create_tool(
                     payload.get("destination"),
                     assignments_json,
                     payload.get("function_name") or "",
+                    payload.get("test_data_model") or "gpt-4o-mini",
                 ),
             )
             row = cur.fetchone()

@@ -700,6 +700,14 @@ def _build_tool_payload(agent_id: str, data: "ToolCreate") -> dict:
             detail=f"Invalid JSON Schema: {err}",
         )
     payload = tool.to_dict()
+    # ponytail: forward test_data_model into the payload so
+    # db_create_tool / db_update_tool can persist it on the row.
+    # AgentTool doesn't carry the field (it's a runtime LLM knob,
+    # not a tool definition) so we copy it here once. Empty / None
+    # falls back to gpt-4o-mini for parity with the legacy
+    # api_keys upsert path.
+    tdm = (data.test_data_model or "").strip()
+    payload["test_data_model"] = tdm or "gpt-4o-mini"
     return payload
 
 
@@ -709,13 +717,12 @@ async def _test_tool_row(tool: dict, user_id: str) -> dict:
     a future change (e.g. async wrapping, retries) only needs to
     happen in one place.
 
-    ponytail: if the operator curated a `test_prompt` on the tool,
-    we delegate to the LLM-driven generator (services/test_data_generator.py)
-    so the n8n workflow actually executes against plausible values
-    instead of the legacy "sample_<paramname>" placeholders that
-    n8n typically rejects. Otherwise we fall back to the placeholders
-    for backward compat — older tools that pre-date the field keep
-    working unchanged.
+    ponytail: consults the LLM-driven test_data_generator on every
+    click so the n8n workflow executes against plausible values,
+    not the legacy sample_<paramname> placeholders that n8n
+    typically rejects as unprocessable. The generator uses the
+    tool's name + description + parameters schema on its own, so
+    no per-tool prompt is required.
     """
     from STT_server.services.tool_executor import execute_tool, ToolExecutionError, record_tool_result
     from STT_server.services.test_data_generator import (
@@ -724,23 +731,19 @@ async def _test_tool_row(tool: dict, user_id: str) -> dict:
     )
     tool_id = tool.get("id")
     name = tool.get("name", "")
-    test_prompt = (tool.get("test_prompt") or "").strip()
-    if test_prompt:
-        try:
-            sample_args = generate_test_payload(tool, user_id, model=test_data_model)
-        except TestDataUnavailable as exc:
-            return {"success": False, "error": str(exc)}
-    else:
-        # test_data_model lives on the agent_tools row (per_provider)
-        # per-user. The agent_modal sets it when the operator picks a
-        # model in the Integrations Connect modal; the credential save
-        # upserts it into the same encrypted row as the api_key.
-        # tool_def comes from db_get_tool which always returns the
-        # column after migration 013.
-        test_data_model = (tool.get("test_data_model") or "").strip() or "gpt-4o-mini"
-        sample_args = {}
-        for param_name in (tool.get("parameters") or {}).get("required", []):
-            sample_args[param_name] = f"sample_{param_name}"
+    # ponytail: Test always asks the LLM. The previous version of
+    # this function gated the generator on a non-empty test_prompt
+    # on the row and fell back to sample_<param> placeholders
+    # otherwise — n8n rejected those as unprocessable, so every Test
+    # click was a 4xx. test_prompt is now deprecated (see
+    # services/test_data_generator.py: "ignored by this generator"),
+    # so we consult the LLM unconditionally. test_data_model still
+    # defaults to gpt-4o-mini when the operator hasn't picked one.
+    test_data_model = (tool.get("test_data_model") or "").strip() or "gpt-4o-mini"
+    try:
+        sample_args = generate_test_payload(tool, user_id, model=test_data_model)
+    except TestDataUnavailable as exc:
+        return {"success": False, "error": str(exc)}
     try:
         result = await execute_tool(tool["webhook_url"], sample_args, name)
         record_tool_result(tool_id, True, "test")
@@ -800,6 +803,12 @@ class ToolCreate(BaseModel):
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
     kind: Optional[str] = None  # "webhook" (default) | "call_transfer"
     destination: Optional[str] = None  # E.164 for call_transfer
+    # ponytail: which OpenAI model the BE test_data_generator uses
+    # when the operator hits Test on this tool. Pydantic v2's default
+    # extra="ignore" would drop this from the body if it stayed out
+    # of the model, so we declare it here. Empty / None falls back
+    # to gpt-4o-mini in _build_tool_payload.
+    test_data_model: Optional[str] = None
 
 
 @api_router.post("/agents/{agent_id}/tools")
