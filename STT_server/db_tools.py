@@ -150,9 +150,10 @@ def _tool_cols() -> str:
     """
     if not _columns_check_done:
         _ensure_tool_columns()
+    cols = _TOOL_COLS_BASE
     if "credentials" in _TOOL_COLS_EXTRA:
-        return _TOOL_COLS_BASE + "credentials, "
-    return _TOOL_COLS_BASE
+        cols += ", credentials"
+    return cols
 
 
 def _row_to_tool(row: dict) -> dict:

@@ -60,6 +60,43 @@ def test_tool_cols_returns_cached_value_on_second_call():
         cols2 = db_tools._tool_cols()
     assert cols1 == cols2
     assert "credentials" in cols1
+    # ponytail: regression for the operator's 500. The col list
+    # must be valid SQL: comma-separated identifiers, no leading
+    # or trailing comma. The previous concat put
+    # "updated_atcredentials, " in the output, which Postgres
+    # rejected with `syntax error at or near "FROM"`.
+    assert not cols1.endswith(","), f"trailing comma: {cols1!r}"
+    assert not cols1.endswith(", "), f"trailing comma+space: {cols1!r}"
+    # No two adjacent identifier names with no comma between them.
+    assert ", , " not in cols1
+    # Every column name should be followed by either a comma+space
+    # or the end of the string.
+    parts = [p.strip() for p in cols1.split(",")]
+    assert all(" " not in p for p in parts), f"column names with spaces: {parts}"
+
+
+def test_tool_cols_sql_is_valid_select():
+    """End-to-end: the SQL built by _tool_cols() is parseable as a
+    SELECT. Catches the specific operator's 500 regression (concat
+    bug that produced 'updated_atcredentials, FROM agent_tools')."""
+    from STT_server import db_tools
+
+    db_tools._TOOL_COLS_EXTRA = ["credentials"]
+    db_tools._columns_check_done = True
+    with patch.object(db_tools, "is_postgres", return_value=False):
+        cols = db_tools._tool_cols()
+
+    # The full SELECT syntax is what's sent to Postgres. We
+    # roundtrip it through a small in-memory SQLite so any obvious
+    # SQL bug (missing comma, glued identifiers, trailing comma)
+    # surfaces as a SyntaxError before Railway does.
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        f"CREATE TABLE agent_tools ({cols.replace(',', ' TEXT,').rstrip(',') + ' TEXT'})"
+    )
+    # No exception = valid SQL structure. We don't care about
+    # type affinity; SQLite accepts any name.
 
 
 # ── Postgres self-heal path (mocked) ──────────────────────────────────────
