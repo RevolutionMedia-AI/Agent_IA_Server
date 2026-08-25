@@ -1387,16 +1387,21 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         return {"models": models}
                 return {"models": _HARDCODED_STT_MODELS["assemblyai"]}
             if provider_id == "openai":
-                # ponytail: fetch /v1/models live y filtrar transcribe/realtime
-                # en vez de hardcodear 3 modelos. Cuando OpenAI agregue uno
-                # nuevo, aparece automaticamente sin tocar codigo.
+                # ponytail: fetch /v1/models live y filtrar SOLO los
+                # realtime-compatible. Los batch transcribe
+                # (gpt-4o-transcribe, gpt-4o-mini-transcribe,
+                # gpt-4o-transcribe-diarize) NO funcionan con la
+                # Realtime API que usa el agente de voz — OpenAI
+                # los rechaza en /v1/realtime. Antes este filtro
+                # aceptaba "transcribe" en el nombre y los colaba
+                # en el dropdown, dejando al operador con un modelo
+                # que el BE terminaba fallback-eando silenciosamente.
                 if creds:
                     try:
                         models = _fetch_openai_models(creds)
                         stt = [m for m in models
-                               if "transcribe" in m["id"].lower()
-                               or "whisper" in m["id"].lower()
-                               or m["id"].startswith("gpt-4o-realtime")]
+                               if "realtime" in m["id"].lower()
+                               and "transcribe" not in m["id"].lower()]
                         if stt:
                             return {"models": stt}
                     except Exception:

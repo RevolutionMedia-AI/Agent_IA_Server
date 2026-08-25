@@ -443,6 +443,72 @@ async def test_get_settings_llm_options_route_with_saved_model(client, data_dir)
     }
 
 
+# ── OpenAI STT live-fetch filter ──────────────────────────────────────────
+
+
+def _fake_openai_models_response():
+    """Mirror what GET https://api.openai.com/v1/models actually returns.
+    Includes a mix of valid realtime IDs and batch transcribe IDs
+    that the previous filter accidentally let through.
+    """
+    return {
+        "data": [
+            # realtime family — works with /v1/realtime
+            {"id": "gpt-realtime",                 "owned_by": "openai"},
+            {"id": "gpt-4o-realtime-preview",     "owned_by": "openai"},
+            {"id": "gpt-4o-mini-realtime-preview", "owned_by": "openai"},
+            # batch transcribe family — would 400 from /v1/realtime
+            {"id": "gpt-4o-transcribe",             "owned_by": "openai"},
+            {"id": "gpt-4o-mini-transcribe",       "owned_by": "openai"},
+            {"id": "gpt-4o-transcribe-diarize",    "owned_by": "openai"},
+            # legacy / unrelated
+            {"id": "whisper-1",                    "owned_by": "openai"},
+            {"id": "gpt-4o",                       "owned_by": "openai"},
+        ],
+        "object": "list",
+    }
+
+
+def test_list_openai_stt_filters_out_batch_transcribe_models():
+    """Regression: the previous filter accepted any model with
+    "transcribe" in its name, which let batch-only models
+    (gpt-4o-transcribe, gpt-4o-transcribe-diarize, ...) into the
+    STT dropdown. The agent then picked one, the Realtime API
+    rejected it, and the BE silently fell back to gpt-realtime.
+
+    Ponytail: the fix is to require "realtime" in the name AND
+    exclude "transcribe". Realtime-compatible = gpt-realtime,
+    gpt-4o-realtime-preview, gpt-4o-mini-realtime-preview.
+    """
+    import urllib.request
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    fake_body = json.dumps(_fake_openai_models_response()).encode()
+
+    class _FakeResp:
+        def __init__(self, body): self._body = body
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    with patch.object(urllib.request, "urlopen", return_value=_FakeResp(fake_body)):
+        out = list_provider_models("stt", "openai", api_key="sk-test1234567890abcdefABCDEF")
+
+    ids = [m["id"] for m in out["models"]]
+    # Realtime family present.
+    assert "gpt-realtime" in ids
+    assert "gpt-4o-realtime-preview" in ids
+    assert "gpt-4o-mini-realtime-preview" in ids
+    # Batch transcribe family excluded.
+    assert "gpt-4o-transcribe" not in ids
+    assert "gpt-4o-mini-transcribe" not in ids
+    assert "gpt-4o-transcribe-diarize" not in ids
+    # whisper and unrelated chat models excluded.
+    assert "whisper-1" not in ids
+    assert "gpt-4o" not in ids
+
+
 # ── _read_per_user failure logging ────────────────────────────────────────
 
 
