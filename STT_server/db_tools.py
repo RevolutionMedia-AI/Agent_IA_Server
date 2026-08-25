@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -41,24 +42,117 @@ log = logging.getLogger("stt_server.db_tools")
 # JSON file becomes orphaned (delete it manually after one release).
 _AGENT_TOOLS_FILE = Path(__file__).resolve().parent / "data" / "agent_tools.json"
 
-# ponytail: single source of truth for SELECT / UPDATE / INSERT
-# columns. Adding 011's new field is one edit here plus the
-# migration SQL — every read returns it for free.
-_TOOL_COLS = (
+# ponytail: single source of truth for SELECT columns. The base
+# string is the schema as of migration 010 + 013; the optional
+# `credentials` column is appended dynamically based on whether
+# migration 014 has run on the target DB. _tool_cols() runs the
+# self-healing check the first time it's called and caches the
+# result for the rest of the process lifetime so we don't hit
+# information_schema on every request.
+_TOOL_COLS_BASE = (
     "id, user_id, agent_id, name, description, "
     "webhook_url, filler_phrase, parameters, "
     "kind, destination, assignments, function_name, test_data_model, "
-    # ponytail: per-user provider credentials (api_key, account_sid, etc.)
-    # are encrypted Fernet ciphertext stored as JSONB. The row is
-    # distinguished from a real n8n tool row by `id = service_id`
-    # (e.g. "openai", "deepgram") and `agent_id = '__shared__'` —
-    # see migration 014.
-    "credentials, "
     "last_tested_at, last_test_result, last_test_error, last_test_error_at, "
     "last_invoked_at, last_invocation_status, last_invocation_error, "
     "last_invocation_error_at, invocation_count, "
     "created_at, updated_at"
 )
+_TOOL_COLS_EXTRA: list[str] = []  # appended to _TOOL_COLS_BASE when present
+_columns_check_done: bool = False
+_columns_check_lock = threading.Lock()
+
+
+def _ensure_tool_columns() -> None:
+    """Idempotent self-healing schema check.
+
+    Detects whether `agent_tools.credentials` exists on the target DB.
+    If not, runs the ALTER TABLE that migration 014 was supposed to
+    apply. Runs at most once per process — the result is cached in
+    module-level state — so the hot path never hits
+    information_schema.
+
+    ponytail: the operator hit a 500 (`column "credentials" does not
+    exist`) on Railway despite the migration 014 file shipping in
+    the image. start.sh either didn't pick it up, hit the trailing
+    comment in my SQL and aborted silently, or the deploy reused a
+    cached image. Rather than chase the migration runner bug, the
+    BE now self-heals: the first time the credentials path is
+    hit, we confirm the column is present, and apply it if not.
+    Once applied the row is durable and subsequent deploys are
+    no-ops thanks to `IF NOT EXISTS`.
+    """
+    global _TOOL_COLS_EXTRA, _columns_check_done
+    if _columns_check_done:
+        return
+    with _columns_check_lock:
+        if _columns_check_done:
+            return
+        if not is_postgres():
+            # JSON path: no schema to check, every field is supported.
+            _TOOL_COLS_EXTRA = ["credentials"]
+            _columns_check_done = True
+            return
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'agent_tools' "
+                        "AND column_name = 'credentials'"
+                    )
+                    has_credentials = cur.fetchone() is not None
+            if not has_credentials:
+                log.warning(
+                    "[db_tools] agent_tools.credentials column missing — applying "
+                    "migration 014 inline (start.sh didn't run it, or the deploy "
+                    "reused a cached image). One-shot, idempotent."
+                )
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE agent_tools "
+                            "ADD COLUMN IF NOT EXISTS credentials JSONB"
+                        )
+            # Confirm the column is now present (either because it was,
+            # or because we just added it). The second SELECT is cheap
+            # and avoids a false positive if the ALTER silently no-ops.
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'agent_tools' "
+                        "AND column_name = 'credentials'"
+                    )
+                    has_credentials = cur.fetchone() is not None
+            _TOOL_COLS_EXTRA = ["credentials"] if has_credentials else []
+            _columns_check_done = True
+            log.info(
+                "[db_tools] self-heal complete: credentials column %s",
+                "present" if has_credentials else "still missing (next request will retry)",
+            )
+        except Exception as exc:
+            log.error("[db_tools] _ensure_tool_columns failed: %s", exc)
+            # Don't mark done — the next request will retry. Returning
+            # without _TOOL_COLS_EXTRA means the base cols (no
+            # credentials) are used; the broken call will surface
+            # the same column-not-exist error and the operator can
+            # see _ensure_tool_columns' log line in the next deploy.
+            raise
+
+
+def _tool_cols() -> str:
+    """Returns the SELECT column list for the agent_tools table.
+
+    Calls _ensure_tool_columns() on first use, then caches. Includes
+    `credentials` only when the column is known to exist (either it
+    was on the table at boot, or we added it via the self-heal ALTER).
+    """
+    if not _columns_check_done:
+        _ensure_tool_columns()
+    if "credentials" in _TOOL_COLS_EXTRA:
+        return _TOOL_COLS_BASE + "credentials, "
+    return _TOOL_COLS_BASE
 
 
 def _row_to_tool(row: dict) -> dict:
@@ -120,7 +214,7 @@ def list_tools(user_id: str, agent_id: str | None = None) -> list[dict]:
         with conn.cursor() as cur:
             if agent_id is None:
                 cur.execute(
-                    f"SELECT {_TOOL_COLS} FROM agent_tools "
+                    f"SELECT {_tool_cols()} FROM agent_tools "
                     "WHERE user_id = %s ORDER BY created_at DESC",
                     (user_id,),
                 )
@@ -131,7 +225,7 @@ def list_tools(user_id: str, agent_id: str | None = None) -> list[dict]:
                 # without the GIN index this is a sequential scan,
                 # fine for the row counts we expect (handful per user).
                 cur.execute(
-                    f"SELECT {_TOOL_COLS} FROM agent_tools "
+                    f"SELECT {_tool_cols()} FROM agent_tools "
                     "WHERE user_id = %s AND ("
                     "  agent_id = %s OR "
                     "  (agent_id = '__shared__' AND assignments ?| array[%s])"
@@ -157,7 +251,7 @@ def get_tool(tool_id: str, user_id: str) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT {_TOOL_COLS} FROM agent_tools "
+                f"SELECT {_tool_cols()} FROM agent_tools "
                 "WHERE id = %s AND user_id = %s",
                 (tool_id, user_id),
             )
@@ -215,7 +309,7 @@ def create_tool(
             credentials_json = json.dumps(payload.get("credentials")) if payload.get("credentials") is not None else None
             cur.execute(
                 f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name, test_data_model, credentials) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s, %s, %s::jsonb) "
-                f"RETURNING {_TOOL_COLS}",
+                f"RETURNING {_tool_cols()}",
                 (
                     new_id, user_id,
                     payload["agent_id"],
@@ -306,7 +400,7 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
             cur.execute(
                 f"UPDATE agent_tools SET {', '.join(set_clauses)} "
                 "WHERE id = %s AND user_id = %s "
-                f"RETURNING {_TOOL_COLS}",
+                f"RETURNING {_tool_cols()}",
                 values,
             )
             row = cur.fetchone()
@@ -386,7 +480,7 @@ def add_assignment(tool_id: str, user_id: str, agent_id: str) -> dict | None:
                 "updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s "
                 "AND NOT (assignments ?| array[%s]) "
-                f"RETURNING {_TOOL_COLS}",
+                f"RETURNING {_tool_cols()}",
                 (json.dumps([agent_id]), tool_id, user_id, [agent_id]),
             )
             row = cur.fetchone()
@@ -440,7 +534,7 @@ def remove_assignment(tool_id: str, user_id: str, agent_id: str) -> dict | None:
                 "updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s "
                 "AND (assignments ?| array[%s]) "
-                f"RETURNING {_TOOL_COLS}",
+                f"RETURNING {_tool_cols()}",
                 (json.dumps([agent_id]), tool_id, user_id, [agent_id]),
             )
             row = cur.fetchone()

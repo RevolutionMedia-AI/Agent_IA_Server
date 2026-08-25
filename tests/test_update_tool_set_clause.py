@@ -52,7 +52,7 @@ def _make_stub_conn(captured: Captured):
         def __exit__(self, *exc):
             return False
 
-        def execute(self, query: str, params: tuple) -> None:
+        def execute(self, query: str, params=None) -> None:
             captured.queries.append((query, params))
 
         def fetchone(self):
