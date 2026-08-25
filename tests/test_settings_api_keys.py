@@ -37,15 +37,18 @@ from datetime import datetime, timedelta, timezone
 
 @pytest.fixture
 def data_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """Redirect ALL JSON-file IO (users, sessions, tools) to a tmp dir so
-    tests are hermetic and don't touch STT_server/data/."""
+    """Redirect ALL JSON-file IO (users, sessions, tools, settings)
+    to a tmp dir so tests are hermetic and don't touch STT_server/data/."""
     import STT_server.db_users as db_users
     from STT_server.routes import api as api_mod
     from STT_server.services import session_runtime as rt_mod
     from STT_server import db_tools
+    from STT_server import db_settings
 
     d = tmp_path / "data"
     d.mkdir(exist_ok=True)
+    settings_dir = d / "settings"
+    settings_dir.mkdir(exist_ok=True)
     tools_file = d / "agent_tools.json"
     users_file = d / "users.json"
     sessions_file = d / "sessions.json"
@@ -56,6 +59,16 @@ def data_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib
     monkeypatch.setattr(db_tools, "_AGENT_TOOLS_FILE", tools_file, raising=False)
     monkeypatch.setattr(db_users, "USERS_FILE", users_file, raising=False)
     monkeypatch.setattr(db_users, "SESSIONS_FILE", sessions_file, raising=False)
+    # ponytail: settings storage lives in TWO modules with their own
+    # module-level SETTINGS_DIR. routes/api.py has one (for the JSON
+    # fallback in update_settings + _settings_path); db_settings.py
+    # has another (for db_get_settings). Without patching BOTH, a
+    # prior test's PUT writes to one path and the next test's GET
+    # reads from a different path — looks like a test isolation
+    # bug but it's actually two independent module globals.
+    monkeypatch.setattr(api_mod, "SETTINGS_DIR", settings_dir, raising=False)
+    monkeypatch.setattr(db_settings, "SETTINGS_DIR", settings_dir, raising=False)
+    monkeypatch.setattr(db_settings, "DATA_DIR", d, raising=False)
 
     # Seed an admin user.
     users_file.write_text(json.dumps([{
@@ -317,3 +330,192 @@ async def test_upsert_api_key_rejects_bad_format(client, data_dir):
         json={"credentials": {"api_key": "definitely-not-an-openai-key"}},
     )
     assert r.status_code == 422, r.text
+
+
+# ── LLM picker helper + route ───────────────────────────────────────────
+
+
+def test_get_llm_options_returns_all_llm_providers_with_connected_flag():
+    """Every LLM-capable provider from PROVIDER_CATALOG (category='llm'
+    or 'llm' in categories) shows up in the picker. The connected
+    flag is True only for providers with stored credentials. Empty
+    user → all connected flags False; current defaults to the
+    hardcoded 'gpt-4o-mini'."""
+    from STT_server.services.credentials_resolver import (
+        get_llm_options, PROVIDER_CATALOG,
+    )
+
+    out = get_llm_options(None, "gpt-4o-mini")
+    assert out["current"] == {"provider": "openai", "model": "gpt-4o-mini"}
+
+    provider_ids = {p["id"] for p in out["providers"]}
+    # Every LLM provider in the catalog is listed.
+    expected = {
+        s.id for s in PROVIDER_CATALOG
+        if "llm" in (s.categories or (s.category,))
+    }
+    assert provider_ids == expected, (
+        f"missing LLM providers: {expected - provider_ids}; "
+        f"extra: {provider_ids - expected}"
+    )
+
+    # Empty user_id → no per-user keys, all disconnected.
+    for p in out["providers"]:
+        assert p["connected"] is False
+        assert p["models"]  # every LLM provider has at least one model
+        for m in p["models"]:
+            assert {"id", "name", "description"} <= m.keys()
+
+
+def test_get_llm_options_marks_connected_for_users_with_keys():
+    """If the user has a per-user OpenAI key, the openai provider
+    is connected=True. Other providers stay False until the user
+    saves their keys too."""
+    from STT_server.services.credentials_resolver import get_llm_options
+    from STT_server.security.credentials import encrypt_credentials
+    from STT_server import db_tools
+    from unittest.mock import patch
+
+    encrypted = encrypt_credentials({"api_key": "sk-test1234567890abcdefABCDEF"})
+
+    def fake_list_tools(user_id):
+        return [{
+            "id": "openai", "user_id": user_id, "agent_id": "__shared__",
+            "credentials": encrypted,
+        }]
+
+    with patch.object(db_tools, "is_postgres", return_value=False), \
+         patch.object(db_tools, "list_tools", side_effect=fake_list_tools):
+        out = get_llm_options("user-1", "gpt-4o")
+
+    openai = next(p for p in out["providers"] if p["id"] == "openai")
+    assert openai["connected"] is True
+    anthropic = next(p for p in out["providers"] if p["id"] == "anthropic")
+    assert anthropic["connected"] is False
+    # current.provider is inferred from the model name.
+    assert out["current"]["provider"] == "openai"
+    assert out["current"]["model"] == "gpt-4o"
+
+
+def test_get_llm_options_infers_provider_from_unknown_model():
+    """If the operator saved a model id that no longer matches a known
+    catalog (e.g. a model was retired), current.provider is None —
+    the FE renders "Unknown model" or prompts the operator to
+    re-pick. No crash."""
+    from STT_server.services.credentials_resolver import get_llm_options
+    out = get_llm_options(None, "gpt-99-turbo-deluxe")
+    assert out["current"] == {"provider": None, "model": "gpt-99-turbo-deluxe"}
+
+
+async def test_get_settings_llm_options_route(client, data_dir):
+    """The new GET /settings/llm-options route returns the picker
+    payload. With no settings saved yet, current defaults to
+    gpt-4o-mini (matches the BE's hardcoded fallback)."""
+    sessions_path = data_dir / "sessions.json"
+    sess = json.loads(sessions_path.read_text(encoding="utf-8"))
+    token = next(iter(sess.keys()))
+    headers = {"Authorization": f"Bearer {token}"}
+
+    r = await client.get("/settings/llm-options", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current"]["model"] == "gpt-4o-mini"
+    assert body["current"]["provider"] == "openai"
+    assert isinstance(body["providers"], list)
+    assert body["providers"], "expected at least one LLM provider"
+
+
+async def test_get_settings_llm_options_route_with_saved_model(client, data_dir):
+    """PUT /settings with test_data_model is reflected in
+    GET /settings/llm-options.current.model."""
+    sessions_path = data_dir / "sessions.json"
+    sess = json.loads(sessions_path.read_text(encoding="utf-8"))
+    token = next(iter(sess.keys()))
+    headers = {"Authorization": f"Bearer {token}"}
+
+    await client.put("/settings", headers=headers, json={"test_data_model": "claude-haiku-3-5"})
+
+    r = await client.get("/settings/llm-options", headers=headers)
+    body = r.json()
+    assert body["current"] == {
+        "provider": "anthropic",
+        "model": "claude-haiku-3-5",
+    }
+
+
+# ── _read_per_user failure logging ────────────────────────────────────────
+
+
+def test_read_per_user_logs_when_list_tools_fails(caplog):
+    """When db_list_tools raises (e.g., column missing), _read_per_user
+    should log the actual exception instead of silently returning {}.
+
+    Regression: operator hit 500 on Test webhook after a deploy
+    rotated CREDENTIAL_ENCRYPTION_KEY (Railway default = ephemeral
+    key on every container restart). The decrypt failure was being
+    silently swallowed and the operator got 'OpenAI API key not
+    configured' with no log to debug. This test pins the loud-fail
+    behavior so the next rotation surfaces in the logs.
+    """
+    import logging
+    from STT_server.services.credentials_resolver import _read_per_user
+    from unittest.mock import patch
+
+    with caplog.at_level(logging.WARNING, logger="stt_server.security.resolver"):
+        with patch("STT_server.db_tools.list_tools", side_effect=RuntimeError("simulated column missing")):
+            result = _read_per_user("user-1", "openai")
+
+    assert result == {}
+    # The actual exception text is in the log so the operator can
+    # diagnose the missing column / DB outage / key rotation.
+    assert any("list_tools failed" in rec.message and "simulated column missing" in rec.message
+               for rec in caplog.records), \
+        f"expected a WARNING with the exception, got: {[r.message for r in caplog.records]}"
+
+
+def test_read_per_user_logs_when_decrypt_fails(caplog):
+    """When decrypt_credentials raises (e.g., Fernet key rotated
+    across deploys), _read_per_user should log the exception with
+    a hint about re-saving the key, then return {}.
+
+    Regression: this is the operator's exact failure mode — they
+    saved the key with ephemeral key K1, a deploy generated K2,
+    the row's ciphertext was unreadable. The pre-fix code raised
+    the exception up to _resolve_openai_client's bare
+    `except Exception` which turned it into `creds = {}` and the
+    200 response said 'API key not configured'. No log anywhere.
+    """
+    import logging
+    from STT_server.services.credentials_resolver import _read_per_user
+    from unittest.mock import patch, MagicMock
+
+    # Simulate: list_tools returns a row that has ALREADY been
+    # through _row_to_tool (so credentials is a dict of ciphertexts,
+    # not a raw JSONB string). The dict's api_key is a non-decryptable
+    # blob, simulating a row that was encrypted with a Fernet key
+    # the current process no longer has.
+    fake_row = {
+        "id": "openai",
+        "user_id": "user-1",
+        "credentials": {"api_key": "not-a-valid-fernet-token"},
+    }
+    fake_list = MagicMock(return_value=[fake_row])
+
+    import STT_server.services.credentials_resolver as cr_mod
+    cr_mod.log.propagate = True
+    caplog.set_level(logging.WARNING, logger="stt_server.security.resolver")
+
+    with patch("STT_server.db_tools.list_tools", fake_list):
+        result = _read_per_user("user-1", "openai")
+
+    assert result == {}, f"expected {{}}, got {result!r}"
+    matching = [r for r in caplog.records
+                if r.name.startswith("stt_server.security")
+                and r.levelno >= logging.WARNING]
+    assert any("decrypt failed" in r.message for r in matching), (
+        f"expected decrypt failure log, got: "
+        f"{[(r.name, r.message) for r in caplog.records]}"
+    )
+    assert any("re-save" in r.message for r in matching), (
+        "log message should mention re-saving the key"
+    )

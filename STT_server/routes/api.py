@@ -1161,6 +1161,28 @@ def get_settings(auth: dict = Depends(require_auth)):
     return {**defaults, **stored}
 
 
+@api_router.get("/settings/llm-options")
+def get_settings_llm_options(auth: dict = Depends(require_auth)):
+    """LLM provider picker for the Integrations → 'Modelo LLM para los
+    test' section.
+
+    Returns every LLM-capable provider from PROVIDER_CATALOG
+    (regardless of connection status) with the hardcoded model
+    catalog and a `connected` flag derived from the user's
+    credentials. The FE filters to connected providers; the rest
+    render as '(not connected — go to Settings → API)' hints.
+
+    The current selection comes from settings.test_data_model (set
+    via PUT /settings). Empty / unset defaults to "gpt-4o-mini" so
+    the FE can show "currently using: gpt-4o-mini" out of the box
+    for operators who never touched the picker.
+    """
+    from STT_server.services.credentials_resolver import get_llm_options
+    stored = db_get_settings(auth["user_id"]) or {}
+    current_model = (stored.get("test_data_model") or "").strip() or "gpt-4o-mini"
+    return get_llm_options(auth["user_id"], current_model)
+
+
 @api_router.put("/settings")
 def update_settings(data: SettingsUpdate, auth: dict = Depends(require_auth)):
     payload = data.dict(exclude_none=True)

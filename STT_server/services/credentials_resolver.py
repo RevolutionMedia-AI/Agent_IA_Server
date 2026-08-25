@@ -450,13 +450,26 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     Fernet ciphertext dict under the `credentials` JSONB column.
     The legacy `tools_integrations.connected` boolean column is gone
     — presence of a non-null `credentials` IS the connected flag.
+
+    ponytail: previous version swallowed every exception (DB read
+    fail, JSON parse fail, Fernet decrypt fail) and returned {}.
+    The caller falls back to env vars but the operator has no way
+    to tell why the per-user key is missing. Now we log the actual
+    exception so the next time a deploy rotates
+    CREDENTIAL_ENCRYPTION_KEY (or the operator's machine restarts
+    on ephemeral dev mode), the failure is loud instead of silent.
     """
     if not user_id:
         return {}
     try:
         from STT_server.db_tools import list_tools as db_list_tools
         rows = db_list_tools(user_id)
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "[credentials] _read_per_user(%r, %r) list_tools failed: %s "
+            "(treating as no per-user key; falling back to env vars)",
+            user_id, provider_id, exc,
+        )
         return {}
     row = next(
         (r for r in rows
@@ -465,7 +478,21 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     )
     if not row or not row.get("credentials"):
         return {}
-    decrypted = decrypt_credentials(row["credentials"]) or {}
+    try:
+        decrypted = decrypt_credentials(row["credentials"]) or {}
+    except Exception as exc:
+        # ponytail: most common cause is CREDENTIAL_ENCRYPTION_KEY
+        # being rotated (or absent — ephemeral dev mode regenerates
+        # the key on every container start). The row is still on
+        # disk; the operator just needs to re-save the key in
+        # Settings → API to encrypt it with the current key.
+        log.warning(
+            "[credentials] _read_per_user(%r, %r) decrypt failed: %s "
+            "(stale ciphertext — re-save the key in Settings → API "
+            "to encrypt it with the current CREDENTIAL_ENCRYPTION_KEY)",
+            user_id, provider_id, exc,
+        )
+        return {}
     return {k: v for k, v in decrypted.items() if isinstance(v, str) and v}
 
 
@@ -582,6 +609,93 @@ def find_first_configured_provider(user_id: str | None, category: str) -> str | 
         if is_provider_configured(user_id, spec.id):
             return spec.id
     return None
+
+
+# ── LLM picker for the Test data generator ────────────────────────────────
+# ponytail: Settings → API stores the per-user API key as a
+# credentials row in agent_tools (id=service_id, agent_id='__shared__').
+# The /integrations page lists ALL such rows together with real n8n
+# tools, which confuses operators — a saved key shouldn't render as
+# a "tool" with Test / Edit / Delete buttons. The fix on the FE side
+# is to filter credential rows from the tools list and surface them
+# in a dedicated "Modelo LLM para los test" section that powers the
+# test_data_generator's model picker.
+#
+# This helper produces the data that section needs: the LLM-capable
+# providers (filtered from PROVIDER_CATALOG by category=='llm'),
+# each with the hardcoded model catalog and the user's connection
+# status. The FE shows only `connected: true` options; the user
+# picks a model; the BE stores just the model id (the provider is
+# implicit from the model name) in settings.test_data_model.
+
+def _infer_provider_from_model(model: str) -> str | None:
+    """Return the provider id whose hardcoded catalog contains `model`.
+
+    The settings store just the model id (e.g. "gpt-4o-mini"); we
+    need to know which provider the operator chose for the FE's
+    "current selection" badge. Linear scan over the catalogs is fine
+    — the model list is tiny.
+    """
+    if not model:
+        return None
+    for provider_id, models in _HARDCODED_LLM_MODELS.items():
+        if any(m.get("id") == model for m in models):
+            return provider_id
+    return None
+
+
+def get_llm_options(user_id: str | None, current_model: str = "") -> dict:
+    """Return the LLM provider picker payload for the FE.
+
+    Shape:
+      {
+        "current": {"provider": "openai" | None, "model": "gpt-4o-mini"},
+        "providers": [
+          {
+            "id": "openai",
+            "name": "OpenAI",
+            "description": "...",
+            "connected": true,
+            "models": [{"id": "gpt-4o", "name": "gpt-4o", "description": "..."}],
+          },
+          ...
+        ],
+      }
+
+    The list includes every LLM-capable provider from PROVIDER_CATALOG
+    (regardless of connection status) so the FE can show "(not
+    connected — connect in Settings → API)" for the ones the
+    operator hasn't wired up. Connected status is computed from
+    _read_per_user for each provider id.
+    """
+    providers: list[dict] = []
+    for spec in PROVIDER_CATALOG:
+        all_categories = spec.categories if spec.categories else (spec.category,)
+        if "llm" not in all_categories:
+            continue
+        # ponytail: connected is determined from the per-user row
+        # (the agent_tools row with id=spec.id, agent_id='__shared__',
+        # credentials is non-null). is_provider_configured already
+        # merges per-user + env, so a platform env-var fallback also
+        # marks the provider as "connected" — fine for the FE badge.
+        per_user = _read_per_user(user_id, spec.id)
+        connected = bool(per_user)
+        providers.append({
+            "id": spec.id,
+            "name": spec.name,
+            "description": spec.description,
+            "connected": connected,
+            "categories": list(all_categories),
+            "models": list(_HARDCODED_LLM_MODELS.get(spec.id, [])),
+        })
+
+    return {
+        "current": {
+            "provider": _infer_provider_from_model(current_model),
+            "model": current_model,
+        },
+        "providers": providers,
+    }
 
 
 # ── Model discovery per provider ───────────────────────────────────────────
