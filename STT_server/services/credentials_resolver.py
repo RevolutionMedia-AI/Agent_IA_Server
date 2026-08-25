@@ -1074,39 +1074,50 @@ def _fetch_inworld_voices(api_key: str) -> list[dict]:
                 if not vid or vid in seen:
                     continue
                 seen.add(vid)
-                # ponytail: languageCode is the canonical wire form
-                # (BCP-47 like "en-US"). langCode is Inworld's legacy
-                # enum (upper-snake like "EN_US"). We forward both so
-                # the FE can prefer whichever matches its format.
-                language_code = v.get("languageCode") or ""
-                if not language_code:
-                    legacy = v.get("langCode") or ""
-                    # Convert "EN_US" → "en-US" so the FE label is
-                    # consistent with what the live catalog returns
-                    # for non-legacy entries.
-                    if "_" in legacy:
-                        try:
-                            lang, region = legacy.split("_", 1)
-                            language_code = f"{lang.lower()}-{region.upper()}"
-                        except Exception:
-                            language_code = legacy
+                # ponytail: language resolution. Inworld returns
+                # multiple language hints per voice and they're not
+                # always consistent. Priority order, lowest to highest:
+                #   1. legacyCode (legacy "EN_US" enum) — convert to
+                #      BCP-47 ("en-US"). The Inworld live response
+                #      populates this for system voices.
+                #   2. promptLanguages[0] (BCP-47 already, list of
+                #      locales the voice can synthesise). Populated for
+                #      IVC clones and any voice the user customises
+                #      — including ones where the live API omitted
+                #      languageCode. Before this fallback the operator
+                #      saw these clones fall into the "OTHER" bucket
+                #      and couldn't pick them.
+                #   3. live languageCode (BCP-47 directly) — used by
+                #      newer entries; kept for forward-compat.
+                # FE reads (v.raw.languageCode || v.raw.langCode),
+                # so we forward BOTH the converted "languageCode"
+                # AND the raw "langCode" so the FE never has to
+                # guess.
+                raw_lang = v.get("langCode") or ""
+                live_langcode = v.get("languageCode") or ""
+                prompt_langs = v.get("promptLanguages") or []
+                canonical = live_langcode
+                if not canonical and prompt_langs:
+                    canonical = prompt_langs[0]
+                if not canonical and raw_lang and "_" in raw_lang:
+                    try:
+                        lang_part, region_part = raw_lang.split("_", 1)
+                        canonical = f"{lang_part.lower()}-{region_part.upper()}"
+                    except Exception:
+                        canonical = raw_lang
                 keep.append({
                     "id": vid,
                     "name": v.get("displayName") or v.get("name") or vid,
                     "displayName": v.get("displayName") or v.get("name") or vid,
-                    "description": v.get("description", "Inworld voice"),
+                    "description": v.get("description", ""),
                     "gender": v.get("gender", "") or "",
-                    "languageCode": language_code,
-                    "langCode": v.get("langCode", "") or "",
+                    "languageCode": canonical,
+                    "langCode": raw_lang,
                     "categories": list(v.get("categories") or []),
                     "tags": list(v.get("tags") or []),
                     "source": v.get("source", "") or "",
                     "ageGroup": v.get("ageGroup", "") or "",
-                    # ponytail: promptLanguages carries the locales the
-                    # voice can synthesise (may differ from languageCode
-                    # for multilingual voices). Forward it so the FE can
-                    # show "multilingual: en-US, es-MX" if it wants.
-                    "promptLanguages": list(v.get("promptLanguages") or []),
+                    "promptLanguages": prompt_langs,
                 })
             page_token = payload.get("nextPageToken") or ""
             if not page_token:
@@ -1407,7 +1418,13 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                             v["id"]: v for v in _HARDCODED_TTS_VOICES["inworld"]
                         }
                         for voice in live:
-                            catalog_v = catalog_by_id.get(voice["id"])
+                            # Inworld returns the id as "voiceId"
+                            # (camelCase). The keep dict in
+                            # _fetch_inworld_voices normalizes to
+                            # "id", so the lookup is robust either
+                            # way.
+                            voice_id = voice.get("id") or voice.get("voiceId")
+                            catalog_v = catalog_by_id.get(voice_id)
                             if catalog_v and catalog_v.get("language"):
                                 # ponytail: the catalog wins on
                                 # `language` only — every other field

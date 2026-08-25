@@ -696,6 +696,183 @@ def test_inworld_voices_mirror_curated_language_to_languageCode():
     assert "languageCode" not in by_id["Bruno"]
 
 
+def test_inworld_voices_use_promptLanguages_when_langCode_missing():
+    """Ponytail: the Inworld live response for some voices (IVC
+    clones, custom voices) has empty `langCode` but a populated
+    `promptLanguages` array. Before the fix these voices all fell
+    into the FE's "OTHER" bucket because the BE had no fallback.
+    With the new priority order (live languageCode > promptLanguages[0]
+    > legacy langCode converted), every voice ends up in a proper
+    group.
+    """
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    # Inject a real-shape Inworld response that includes:
+    # - a SYSTEM voice with legacy langCode only (Alex, EN_US)
+    # - an IVC clone with promptLanguages only, no langCode (John)
+    # - a multilingual voice with both (Maria, ES_MX + promptLanguages)
+    # - a degenerate case with neither (Orphan, '' langCode, [] prompts)
+    # ponytail: the mocked live list mirrors what
+    # _fetch_inworld_voices' keep dict would produce, so the
+    # test asserts the Inworld TTS branch's curated-mirror
+    # behavior on top of an already-normalized live payload.
+    fake_live = [
+        {
+            "id": "Alex", "voiceId": "Alex",
+            "displayName": "Alex",
+            "name": "workspaces/inworld/voices/Alex",
+            "langCode": "EN_US",
+            "languageCode": "en-US",  # normalized by _fetch_inworld_voices
+            "description": "Energetic mid-range male voice",
+            "gender": "male",
+            "ageGroup": "middle_aged",
+            "tags": ["friendly"],
+            "categories": ["companions"],
+            "source": "SYSTEM",
+            "promptLanguages": ["en-US"],
+        },
+        {
+            "id": "John", "voiceId": "John",
+            "displayName": "John",
+            "name": "workspaces/your_workspace/voices/John",
+            "langCode": "",
+            "languageCode": "en-US",  # via promptLanguages[0] fallback
+            "description": "Cloned voice for narrations.",
+            "gender": "male",
+            "ageGroup": "young_adult",
+            "tags": ["clone"],
+            "categories": [],
+            "source": "IVC",
+            "promptLanguages": ["en-US"],
+        },
+        {
+            "id": "Maria", "voiceId": "Maria",
+            "displayName": "Maria",
+            "name": "workspaces/inworld/voices/Maria",
+            "langCode": "ES_MX",
+            "languageCode": "es-MX",  # via langCode conversion
+            "description": "Warm Spanish voice",
+            "gender": "female",
+            "ageGroup": "middle_aged",
+            "tags": ["warm"],
+            "categories": ["companions"],
+            "source": "SYSTEM",
+            "promptLanguages": ["es-MX", "en-US"],
+        },
+        {
+            "id": "Orphan", "voiceId": "Orphan",
+            "displayName": "Orphan",
+            "name": "workspaces/inworld/voices/Orphan",
+            "langCode": "",
+            "languageCode": "",  # no source, falls to OTHER
+            "description": "",
+            "gender": "",
+            "ageGroup": "",
+            "tags": [],
+            "categories": [],
+            "source": "SYSTEM",
+            "promptLanguages": [],
+        },
+    ]
+
+    with patch(
+        "STT_server.services.credentials_resolver._fetch_inworld_voices",
+        return_value=fake_live,
+    ):
+        out = list_provider_models("tts", "inworld", api_key="sk-test1234567890abcdefABCDEF")
+
+    by_id = {v["id"]: v for v in out["models"]}
+
+    # Alex: langCode "EN_US" → "en-US" (legacy conversion path)
+    assert by_id["Alex"]["languageCode"] == "en-US"
+    assert by_id["Alex"]["langCode"] == "EN_US"
+
+    # John: empty langCode, promptLanguages=["en-US"] → "en-US" via fallback
+    assert by_id["John"]["languageCode"] == "en-US"
+    assert by_id["John"]["langCode"] == ""
+
+    # Maria: langCode "ES_MX" → "es-MX" (legacy conversion)
+    assert by_id["Maria"]["languageCode"] == "es-MX"
+    assert by_id["Maria"]["langCode"] == "ES_MX"
+
+    # Orphan: no langCode, no promptLanguages → empty languageCode
+    # FE puts it in the "OTHER" bucket — correct behavior for
+    # unknown languages.
+    assert by_id["Orphan"]["languageCode"] == ""
+    assert by_id["Orphan"]["langCode"] == ""
+
+    # Description is forwarded from the API (was previously
+    # defaulted to "Inworld voice" when missing).
+    assert by_id["Alex"]["description"] == "Energetic mid-range male voice"
+    assert by_id["John"]["description"] == "Cloned voice for narrations."
+
+
+def test_inworld_voices_pagination_walks_every_page():
+    """Ponytail: the Inworld API paginates with nextPageToken. A
+    223-voice account would never fit in a single response — the
+    BE has to walk every page. Earlier the loop was correct in
+    shape but unbounded on real responses. This test pins the
+    pagination behavior.
+    """
+    from unittest.mock import patch, MagicMock
+    from STT_server.services.credentials_resolver import _fetch_inworld_voices
+
+    page1 = {
+        "voices": [
+            {"voiceId": f"voice-{i}", "name": f"voice-{i}",
+             "langCode": "EN_US", "displayName": f"voice-{i}",
+             "description": "", "tags": [], "categories": [],
+             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "promptLanguages": ["en-US"]}
+            for i in range(100)
+        ],
+        "nextPageToken": "token-1",
+        "totalSize": 223,
+    }
+    page2 = {
+        "voices": [
+            {"voiceId": f"voice-{i+100}", "name": f"voice-{i+100}",
+             "langCode": "EN_US", "displayName": f"voice-{i+100}",
+             "description": "", "tags": [], "categories": [],
+             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "promptLanguages": ["en-US"]}
+            for i in range(100)
+        ],
+        "nextPageToken": "token-2",
+        "totalSize": 223,
+    }
+    page3 = {
+        "voices": [
+            {"voiceId": f"voice-{i+200}", "name": f"voice-{i+200}",
+             "langCode": "EN_US", "displayName": f"voice-{i+200}",
+             "description": "", "tags": [], "categories": [],
+             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "promptLanguages": ["en-US"]}
+            for i in range(23)
+        ],
+        "nextPageToken": "",
+        "totalSize": 223,
+    }
+
+    pages = [page1, page2, page3]
+
+    def fake_urlopen(req, timeout=10):
+        resp = MagicMock()
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda *a: False
+        resp.read = lambda: json.dumps(pages.pop(0)).encode()
+        return resp
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        voices = _fetch_inworld_voices("sk-test1234567890abcdefABCDEF")
+
+    # 223 voices, deduplicated, with canonical language "en-US".
+    assert len(voices) == 223
+    assert {v["id"] for v in voices} == {f"voice-{i}" for i in range(223)}
+    assert all(v["languageCode"] == "en-US" for v in voices)
+
+
 # ── _read_per_user failure logging ────────────────────────────────────────
 
 
