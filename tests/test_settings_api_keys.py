@@ -509,6 +509,129 @@ def test_list_openai_stt_filters_out_batch_transcribe_models():
     assert "gpt-4o" not in ids
 
 
+def _fake_openai_models_full_response():
+    """The full /v1/models response — includes chat, tts, stt,
+    embeddings, image, moderation, realtime, etc. Mirrors what
+    api.openai.com returns as of late 2025.
+    """
+    return {
+        "data": [
+            # chat family — valid for LLM
+            {"id": "gpt-4o",                   "owned_by": "openai"},
+            {"id": "gpt-4o-mini",              "owned_by": "openai"},
+            {"id": "o4-mini",                  "owned_by": "openai"},
+            {"id": "gpt-3.5-turbo-1106",       "owned_by": "openai"},
+            {"id": "gpt-3.5-turbo-0125",       "owned_by": "openai"},
+            # tts family — NOT LLM
+            {"id": "tts-1",                    "owned_by": "openai"},
+            {"id": "tts-1-hd",                 "owned_by": "openai"},
+            {"id": "gpt-4o-mini-tts",          "owned_by": "openai"},
+            # realtime / stt — NOT LLM
+            {"id": "gpt-realtime",              "owned_by": "openai"},
+            {"id": "gpt-4o-realtime-preview",  "owned_by": "openai"},
+            {"id": "gpt-4o-transcribe",        "owned_by": "openai"},
+            {"id": "gpt-4o-mini-transcribe",   "owned_by": "openai"},
+            {"id": "gpt-live-transcribe",      "owned_by": "openai"},
+            # legacy / image / embedding / moderation — NOT LLM
+            {"id": "whisper-1",                "owned_by": "openai"},
+            {"id": "dall-e-3",                 "owned_by": "openai"},
+            {"id": "text-embedding-3-small",   "owned_by": "openai"},
+            {"id": "omni-moderation-latest",    "owned_by": "openai"},
+        ],
+        "object": "list",
+    }
+
+
+def test_list_openai_llm_excludes_tts_stt_embedding_models():
+    """Regression: the LLM picker used to return whatever /v1/models
+    returned. That put gpt-live-transcribe, gpt-realtime-2.1, tts-1,
+    dall-e-3, text-embedding-3-small in the dropdown alongside
+    gpt-4o. Operator picked gpt-live-transcribe (it sounded like
+    an LLM), agent failed to use it as a chat completion model.
+
+    Ponytail: the fix is a per-service filter in list_provider_models
+    that excludes the prefixes/suffixes OpenAI uses for non-chat
+    families. Chat family stays.
+    """
+    import urllib.request
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    fake_body = json.dumps(_fake_openai_models_full_response()).encode()
+
+    class _FakeResp:
+        def __init__(self, body): self._body = body
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    with patch.object(urllib.request, "urlopen", return_value=_FakeResp(fake_body)):
+        out = list_provider_models("llm", "openai", api_key="sk-test1234567890abcdefABCDEF")
+
+    ids = [m["id"] for m in out["models"]]
+    # Chat family present.
+    assert "gpt-4o" in ids
+    assert "gpt-4o-mini" in ids
+    assert "o4-mini" in ids
+    assert "gpt-3.5-turbo-1106" in ids
+    # TTS excluded.
+    assert "tts-1" not in ids
+    assert "tts-1-hd" not in ids
+    assert "gpt-4o-mini-tts" not in ids
+    # STT / realtime excluded (the previous TTS/STT picker bug also
+    # polluted LLM, fix covers both).
+    assert "gpt-realtime" not in ids
+    assert "gpt-4o-realtime-preview" not in ids
+    assert "gpt-4o-transcribe" not in ids
+    assert "gpt-4o-mini-transcribe" not in ids
+    assert "gpt-live-transcribe" not in ids
+    assert "whisper-1" not in ids
+    # Image / embedding / moderation excluded.
+    assert "dall-e-3" not in ids
+    assert "text-embedding-3-small" not in ids
+    assert "omni-moderation-latest" not in ids
+
+
+def test_list_openai_tts_includes_tts_and_realtime_models():
+    """The TTS picker should include tts-1, gpt-4o-mini-tts (TTS
+    family) and gpt-realtime (TTS-capable via Realtime API). It should
+    NOT include chat models or STT models.
+    """
+    import urllib.request
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    fake_body = json.dumps(_fake_openai_models_full_response()).encode()
+
+    class _FakeResp:
+        def __init__(self, body): self._body = body
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    with patch.object(urllib.request, "urlopen", return_value=_FakeResp(fake_body)):
+        out = list_provider_models("tts", "openai", api_key="sk-test1234567890abcdefABCDEF")
+
+    ids = [m["id"] for m in out["models"]]
+    # TTS family present (operator expects these in the dropdown).
+    assert "tts-1" in ids
+    assert "tts-1-hd" in ids
+    assert "gpt-4o-mini-tts" in ids
+    # Realtime (TTS via Realtime API) present.
+    assert "gpt-realtime" in ids
+    assert "gpt-4o-realtime-preview" in ids
+    # Chat / STT / embeddings / moderation / image / legacy excluded.
+    assert "gpt-4o" not in ids
+    assert "gpt-4o-transcribe" not in ids
+    assert "gpt-4o-mini-transcribe" not in ids
+    assert "gpt-live-transcribe" not in ids
+    assert "whisper-1" not in ids
+    assert "dall-e-3" not in ids
+    assert "text-embedding-3-small" not in ids
+    assert "omni-moderation-latest" not in ids
+    assert "gpt-3.5-turbo-1106" not in ids
+
+
 # ── _read_per_user failure logging ────────────────────────────────────────
 
 

@@ -884,9 +884,16 @@ def _fetch_openai_models(api_key: str) -> list[dict]:
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         payload = __import__("json").loads(resp.read().decode("utf-8"))
-    # Filter to chat-style models + Realtime. Skip legacy/embedding/audio-only.
+    # ponytail: coarse filter for clearly-not-a-pickable families
+    # (legacy GPT-3 base models, embeddings, image gen, moderation).
+    # The per-service picker in list_provider_models does the fine
+    # filter (LLM excludes tts/realtime/transcribe; STT excludes
+    # non-realtime; TTS includes only tts/realtime). Don't put
+    # "tts-" or "realtime" here — the per-service filter is the
+    # source of truth, and having the coarse filter eat them would
+    # keep tts-1 / gpt-4o-mini-tts out of the TTS dropdown.
     SKIP_PREFIX = ("davinci", "curie", "babbage", "ada", "text-embedding",
-                   "whisper-", "tts-", "dall-e", "gpt-3.5-turbo-instruct")
+                   "whisper-", "dall-e", "gpt-3.5-turbo-instruct")
     keep = []
     for m in payload.get("data", []):
         mid = m.get("id", "")
@@ -1222,17 +1229,32 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
 
     try:
         if service == "llm":
-                if provider_id == "openai":
-                    # Live fetch when the user has a key. Without a key we
-                    # fall back to the provider's own hardcoded catalog so
-                    # the dropdown is never empty *and never shows the wrong
-                    # provider's models* (the previous Anthropic fallback
-                    # was the source of the dropdown cross-contamination bug).
-                    if creds:
-                        models = _fetch_openai_models(creds)
-                        if models:
-                            return {"models": models}
-                    return {"models": _HARDCODED_LLM_MODELS.get("openai", [])}
+            if provider_id == "openai":
+                # Live fetch when the user has a key. Without a key we
+                # fall back to the provider's own hardcoded catalog so
+                # the dropdown is never empty *and never shows the wrong
+                # provider's models* (the previous Anthropic fallback
+                # was the source of the dropdown cross-contamination bug).
+                if creds:
+                    models = _fetch_openai_models(creds)
+                    if models:
+                        # ponytail: the LLM picker used to return the
+                        # raw fetch — operator could pick gpt-live-transcribe
+                        # or dall-e-3 from the chat completions dropdown
+                        # and only discover the mistake when the agent
+                        # returned a 4xx. Apply the same per-service
+                        # filter here: keep chat models, drop TTS / STT /
+                        # embeddings / images / moderation. "tts" (no
+                        # dash) catches both "tts-1" and "gpt-4o-mini-tts".
+                        llm = [m for m in models
+                               if not any(skip in m["id"].lower() for skip in (
+                                   "tts", "whisper-", "transcribe",
+                                   "embedding", "dall-e", "moderation",
+                                   "search-", "realtime",
+                               ))]
+                        if llm:
+                            return {"models": llm}
+                return {"models": _HARDCODED_LLM_MODELS.get("openai", [])}
                 if provider_id == "anthropic":
                     if creds:
                         # honor custom base_url for token-plan / custom
@@ -1279,9 +1301,20 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
             if provider_id == "openai":
                 if creds:
                     models = _fetch_openai_models(creds)
+                    # ponytail: previous filter was the hardcoded voice
+                    # whitelist PLUS "starts with tts-" — that left
+                    # gpt-4o-mini-tts (suffix variant) and the realtime
+                    # TTS-capable models out, so the operator didn't
+                    # see what they were actually allowed to pick.
+                    # Open the filter to anything that's a real TTS
+                    # model: the hardcoded voices, anything starting
+                    # with "tts-", anything containing "-tts" or
+                    # "realtime".
                     tts_models = [m for m in models
                                   if m["id"] in {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
-                                  or m["id"].startswith("tts-")]
+                                  or m["id"].startswith("tts-")
+                                  or "-tts" in m["id"].lower()
+                                  or "realtime" in m["id"].lower()]
                     if tts_models:
                         return {"models": tts_models}
                 return {"models": _HARDCODED_TTS_VOICES["openai"]}
@@ -1387,15 +1420,10 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         return {"models": models}
                 return {"models": _HARDCODED_STT_MODELS["assemblyai"]}
             if provider_id == "openai":
-                # ponytail: fetch /v1/models live y filtrar SOLO los
-                # realtime-compatible. Los batch transcribe
-                # (gpt-4o-transcribe, gpt-4o-mini-transcribe,
-                # gpt-4o-transcribe-diarize) NO funcionan con la
-                # Realtime API que usa el agente de voz — OpenAI
-                # los rechaza en /v1/realtime. Antes este filtro
-                # aceptaba "transcribe" en el nombre y los colaba
-                # en el dropdown, dejando al operador con un modelo
-                # que el BE terminaba fallback-eando silenciosamente.
+                # Realtime-compatible STT. The previous commit (561f6be)
+                # tightened this to drop batch transcribe; see its
+                # message. The matching LLM / TTS filters for OpenAI
+                # live in their own `if service == ...` blocks above.
                 if creds:
                     try:
                         models = _fetch_openai_models(creds)
@@ -1406,7 +1434,7 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                             return {"models": stt}
                     except Exception:
                         pass
-                return {"models": _HARDCODED_STT_MODELS["openai"]}
+                return {"models": _HARDCODED_STT_MODELS.get("openai", [])}
             if provider_id == "inworld":
                 return {"models": _HARDCODED_STT_MODELS["inworld"]}
             return {"models": []}
