@@ -1239,19 +1239,41 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                     models = _fetch_openai_models(creds)
                     if models:
                         # ponytail: the LLM picker used to return the
-                        # raw fetch — operator could pick gpt-live-transcribe
-                        # or dall-e-3 from the chat completions dropdown
-                        # and only discover the mistake when the agent
-                        # returned a 4xx. Apply the same per-service
-                        # filter here: keep chat models, drop TTS / STT /
-                        # embeddings / images / moderation. "tts" (no
-                        # dash) catches both "tts-1" and "gpt-4o-mini-tts".
-                        llm = [m for m in models
-                               if not any(skip in m["id"].lower() for skip in (
-                                   "tts", "whisper-", "transcribe",
-                                   "embedding", "dall-e", "moderation",
-                                   "search-", "realtime",
-                               ))]
+                        # raw fetch — the operator saw 60+ models
+                        # including legacy gpt-3.5-turbo, gpt-4,
+                        # gpt-4-turbo, dated snapshots
+                        # (gpt-4o-2024-05-13, o1-2024-12-17), and
+                        # everything else in the catalog. Apply a
+                        # current-generation filter:
+                        #  1. Drop TTS / STT / embeddings / images /
+                        #     moderation / search / realtime.
+                        #  2. Keep only the gpt-4o / gpt-4.1 / gpt-5 /
+                        #     o1 / o3 / o4 / o5 families.
+                        #  3. Drop dated snapshots
+                        #     (any name with a -YYYY or -YYYY-MM
+                        #     suffix) — those are deprecated.
+                        import re
+                        _SKIP_TOKENS = (
+                            "tts", "whisper-", "transcribe",
+                            "embedding", "dall-e", "moderation",
+                            "search-", "realtime",
+                        )
+                        _KEEP_PREFIXES = (
+                            "gpt-4o", "gpt-4.1", "gpt-5",
+                            "o1", "o3", "o4", "o5",
+                        )
+                        _DATED_SNAPSHOT = re.compile(r"-\d{4}(-\d{2})?(-preview)?(-light)?$")
+                        llm = []
+                        for m in models:
+                            mid = m["id"]
+                            mid_l = mid.lower()
+                            if any(s in mid_l for s in _SKIP_TOKENS):
+                                continue
+                            if not any(mid.startswith(p) for p in _KEEP_PREFIXES):
+                                continue
+                            if _DATED_SNAPSHOT.search(mid):
+                                continue
+                            llm.append(m)
                         if llm:
                             return {"models": llm}
                 return {"models": _HARDCODED_LLM_MODELS.get("openai", [])}
@@ -1392,8 +1414,18 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                                 # (gender, ageGroup, categories,
                                 # description, languageCode) comes from
                                 # Inworld live, which is the
-                                # authoritative source.
-                                voice["language"] = catalog_v["language"]
+                                # authoritative source. Also mirror the
+                                # curated label to languageCode /
+                                # langCode so the FE groupInworldVoices
+                                # picker's `(v.raw?.languageCode ||
+                                # v.raw?.langCode)` lookup actually finds
+                                # it — otherwise every curated voice falls
+                                # into the "OTHER" bucket and the operator
+                                # loses the en-US / es-MX sub-headers.
+                                lang = catalog_v["language"]
+                                voice["language"] = lang
+                                voice["languageCode"] = lang
+                                voice["langCode"] = lang
                         return {"models": live}
                 # No key or fetch failed — fall back to the curated
                 # 23-voice catalog so the dropdown is never empty

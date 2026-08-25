@@ -569,17 +569,15 @@ def test_list_openai_llm_excludes_tts_stt_embedding_models():
         out = list_provider_models("llm", "openai", api_key="sk-test1234567890abcdefABCDEF")
 
     ids = [m["id"] for m in out["models"]]
-    # Chat family present.
+    # Current-generation chat family present.
     assert "gpt-4o" in ids
     assert "gpt-4o-mini" in ids
     assert "o4-mini" in ids
-    assert "gpt-3.5-turbo-1106" in ids
     # TTS excluded.
     assert "tts-1" not in ids
     assert "tts-1-hd" not in ids
     assert "gpt-4o-mini-tts" not in ids
-    # STT / realtime excluded (the previous TTS/STT picker bug also
-    # polluted LLM, fix covers both).
+    # STT / realtime excluded.
     assert "gpt-realtime" not in ids
     assert "gpt-4o-realtime-preview" not in ids
     assert "gpt-4o-transcribe" not in ids
@@ -590,6 +588,24 @@ def test_list_openai_llm_excludes_tts_stt_embedding_models():
     assert "dall-e-3" not in ids
     assert "text-embedding-3-small" not in ids
     assert "omni-moderation-latest" not in ids
+    # ponytail: legacy / deprecated chat models excluded too. The
+    # current-generation filter (gpt-4o / gpt-4.1 / gpt-5 / o1 / o3 / o4 / o5
+    # prefixes) drops gpt-3.5-turbo-1106 / 0125, gpt-4-0613,
+    # gpt-4-turbo, gpt-5.6-luna, and dated snapshots like
+    # gpt-4o-2024-05-13 / o1-2024-12-17. Operator complained that
+    # the picker was inflated with 60+ models nobody uses.
+    assert "gpt-3.5-turbo-1106" not in ids
+    assert "gpt-3.5-turbo-0125" not in ids
+    assert "gpt-4-0613" not in ids
+    assert "gpt-4" not in ids
+    assert "gpt-4-turbo" not in ids
+    assert "gpt-5.6-luna" not in ids
+    assert "gpt-4o-2024-05-13" not in ids
+    assert "gpt-4-turbo-2024-04-09" not in ids
+    assert "o1-2024-12-17" not in ids
+    assert "o1-pro-2025-03-19" not in ids
+    assert "gpt-4o-2024-08-06" not in ids
+    assert "gpt-4o-2024-11-20" not in ids
 
 
 def test_list_openai_tts_includes_tts_and_realtime_models():
@@ -630,6 +646,54 @@ def test_list_openai_tts_includes_tts_and_realtime_models():
     assert "text-embedding-3-small" not in ids
     assert "omni-moderation-latest" not in ids
     assert "gpt-3.5-turbo-1106" not in ids
+
+
+def test_inworld_voices_mirror_curated_language_to_languageCode():
+    """Regression: the Inworld voice picker used to group every
+    voice under "OTHER" instead of by language (en-US, es-MX). The
+    FE's `groupInworldVoicesByLanguage` looks up
+    `v.raw.languageCode || v.raw.langCode`. The Inworld live API
+    doesn't always return that field — many system voices come
+    back with no language code at all. The BE has a curated
+    catalog with the language label (e.g. "en-US" for
+    Blake/Sarah, "es-MX" for Camila/Cuauhtemoc), and was setting
+    `voice["language"]` — but the FE never looked at `language`,
+    only at `languageCode` / `langCode`. Every curated voice fell
+    into OTHER.
+
+    Fix: the BE mirrors the curated label to `languageCode` and
+    `langCode` so the FE's group lookup actually finds it.
+    """
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    with patch(
+        "STT_server.services.credentials_resolver._fetch_inworld_voices"
+    ) as mocked_fetch:
+        # Live Inworld fetch returns voices WITHOUT languageCode /
+        # langCode — many of Inworld's system voices don't carry
+        # that field. The BE has to fill it from the curated
+        # catalog.
+        mocked_fetch.return_value = [
+            {"id": "Blake",       "name": "Blake"},
+            {"id": "Camila",      "name": "Camila"},
+            {"id": "Cuauhtemoc",  "name": "Cuauhtemoc"},
+            {"id": "Bruno",       "name": "Bruno"},  # NOT in curated
+        ]
+        out = list_provider_models("tts", "inworld", api_key="sk-test1234567890abcdefABCDEF")
+
+    by_id = {v["id"]: v for v in out["models"]}
+    # Curated voices inherit en-US / es-MX.
+    assert by_id["Blake"]["languageCode"] == "en-US"
+    assert by_id["Blake"]["langCode"] == "en-US"
+    assert by_id["Camila"]["languageCode"] == "es-MX"
+    assert by_id["Camila"]["langCode"] == "es-MX"
+    assert by_id["Cuauhtemoc"]["languageCode"] == "es-MX"
+    # Non-curated voices (e.g. Bruno, an IVC clone the operator
+    # added themselves) stay as-is. Without languageCode / langCode
+    # they'd end up in the "OTHER" bucket in the FE — but that's
+    # correct behavior for unknown languages.
+    assert "languageCode" not in by_id["Bruno"]
 
 
 # ── _read_per_user failure logging ────────────────────────────────────────
