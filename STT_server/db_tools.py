@@ -48,6 +48,12 @@ _TOOL_COLS = (
     "id, user_id, agent_id, name, description, "
     "webhook_url, filler_phrase, parameters, "
     "kind, destination, assignments, function_name, test_data_model, "
+    # ponytail: per-user provider credentials (api_key, account_sid, etc.)
+    # are encrypted Fernet ciphertext stored as JSONB. The row is
+    # distinguished from a real n8n tool row by `id = service_id`
+    # (e.g. "openai", "deepgram") and `agent_id = '__shared__'` —
+    # see migration 014.
+    "credentials, "
     "last_tested_at, last_test_result, last_test_error, last_test_error_at, "
     "last_invoked_at, last_invocation_status, last_invocation_error, "
     "last_invocation_error_at, invocation_count, "
@@ -58,23 +64,22 @@ _TOOL_COLS = (
 def _row_to_tool(row: dict) -> dict:
     """Map a DB row to the JSON shape the rest of the BE consumes.
 
-    Ponytail: parameters and assignments are stored as JSONB on disk
-    (so we can index/filter on them later if needed) but exposed to
-    the route layer as plain Python lists / dicts. Without this
-    conversion the FE would see strings instead of structured data
-    on the first call, which would break the JSON Schema editor in
-    JsonSchemaEditor.jsx.
+    Ponytail: parameters, assignments, and credentials are stored as
+    JSONB on disk (so we can index/filter on them later if needed) but
+    exposed to the route layer as plain Python lists / dicts. Without
+    this conversion the FE / resolver would see raw strings instead of
+    structured data on the first call.
     """
     if row is None:
         return None
     out = dict(row)
-    for k in ("parameters", "assignments"):
+    for k in ("parameters", "assignments", "credentials"):
         v = out.get(k)
         if isinstance(v, str):
             try:
                 out[k] = json.loads(v)
             except (json.JSONDecodeError, TypeError):
-                out[k] = {} if k == "parameters" else []
+                out[k] = {} if k == "parameters" else ([] if k == "assignments" else None)
     for k in ("last_tested_at", "last_test_error_at",
               "last_invoked_at", "last_invocation_error_at",
               "created_at", "updated_at"):
@@ -196,6 +201,10 @@ def create_tool(
         }
         new_row["parameters"] = payload.get("parameters") or {}
         new_row["assignments"] = payload.get("assignments") or []
+        # ponytail: keep `credentials` as whatever the caller passed
+        # (None when the caller is creating a real n8n tool; a Fernet
+        # dict when the caller is creating a service-credential row).
+        new_row["credentials"] = payload.get("credentials")
         rows.append(new_row)
         os.makedirs(_AGENT_TOOLS_FILE.parent, exist_ok=True)
         with open(_AGENT_TOOLS_FILE, "w", encoding="utf-8") as f:
@@ -203,8 +212,9 @@ def create_tool(
         return new_row
     with get_conn() as conn:
         with conn.cursor() as cur:
+            credentials_json = json.dumps(payload.get("credentials")) if payload.get("credentials") is not None else None
             cur.execute(
-                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name, test_data_model) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s, %s) "
+                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name, test_data_model, credentials) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s, %s, %s::jsonb) "
                 f"RETURNING {_TOOL_COLS}",
                 (
                     new_id, user_id,
@@ -219,6 +229,7 @@ def create_tool(
                     assignments_json,
                     payload.get("function_name") or "",
                     payload.get("test_data_model") or "gpt-4o-mini",
+                    credentials_json,
                 ),
             )
             row = cur.fetchone()
@@ -271,7 +282,7 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
     #      row's PK with AgentTool.to_dict()'s freshly-minted uuid,
     #      or clobber the original creation timestamp, neither of
     #      which the FE asked for.
-    jsonb_keys = {"parameters", "assignments"}
+    jsonb_keys = {"parameters", "assignments", "credentials"}
     db_managed = {"id", "user_id", "created_at", "updated_at"}
     set_clauses = []
     values: list = []

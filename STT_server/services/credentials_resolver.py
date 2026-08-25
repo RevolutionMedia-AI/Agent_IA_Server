@@ -116,20 +116,10 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 placeholder="sk-...",
                 help="Starts with 'sk-' (or 'sk-proj-' for project keys).",
             ),
-            FieldSpec(
-                name="tts_model", label="TTS model", type="text",
-                required=False,
-                pattern=r"^tts-1$|^tts-1-hd$|^gpt-4o-mini-tts$",
-                placeholder="tts-1",
-                help="OpenAI TTS model. tts-1 = standard, tts-1-hd = higher quality, gpt-4o-mini-tts = cheapest streaming.",
-            ),
-            FieldSpec(
-                name="realtime_model", label="Realtime model", type="text",
-                required=False,
-                pattern=r"^gpt-4o(-[A-Za-z0-9.\-]+)?-realtime(-preview)?(-[0-9]{4}-\d{2}-\d{2})?$|^gpt-realtime(-[0-9]{4}-\d{2}-\d{2})?$",
-                placeholder="gpt-4o-mini-realtime-preview",
-                help="Optional. Per-user Realtime model override; falls back to the agent's stt_model when stt_provider is openai.",
-            ),
+            # ponytail: tts_model / realtime_model pickers removed
+            # from Settings → API. Model selection happens at the
+            # agent level (Dashboard → Agents → New/Edit → LLM/TTS
+            # dropdowns); Settings is now credentials-only.
         ),
         # ponytail: env_fallbacks removed. Per-user only.
         test_fn="STT_server.services.credentials_resolver._test_openai",
@@ -252,20 +242,10 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 min_length=20,
                 placeholder="...",
             ),
-            FieldSpec(
-                name="voice_id", label="Voice ID", type="text",
-                required=False,
-                pattern=r"^[A-Za-z0-9]{10,40}$",
-                placeholder="r8iaJkwUpytwsK5jNHRG",
-                help="Optional voice id; per-user storage only.",
-            ),
-            FieldSpec(
-                name="model_id", label="Model ID", type="text",
-                required=False,
-                pattern=r"^eleven_[A-Za-z0-9_]+$",
-                placeholder="eleven_flash_v2_5",
-                help="Optional model id; per-user storage only.",
-            ),
+            # ponytail: voice_id / model_id pickers removed. Voice /
+            # model selection happens at the agent level (Dashboard
+            # → Agents → TTS voice dropdown); Settings is now
+            # credentials-only.
         ),
         # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_elevenlabs",
@@ -284,25 +264,9 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 min_length=10,
                 placeholder="...",
             ),
-            FieldSpec(
-                name="model_id", label="Model ID", type="text",
-                required=False,
-                pattern=r"^[A-Za-z0-9_\-]{1,40}$",
-                placeholder="mist-v2",
-                help="Optional model id; per-user storage only.",
-            ),
-            FieldSpec(
-                name="speaker_en", label="English speaker", type="text",
-                required=False,
-                pattern=r"^[A-Za-z0-9_\-]{1,40}$",
-                placeholder="Astra",
-            ),
-            FieldSpec(
-                name="speaker_es", label="Spanish speaker", type="text",
-                required=False,
-                pattern=r"^[A-Za-z0-9_\-]{1,40}$",
-                placeholder="celestino",
-            ),
+            # ponytail: model_id / speaker_en / speaker_es pickers
+            # removed. Voice and model selection happens at the
+            # agent level; Settings is now credentials-only.
         ),
         # ponytail: env_fallbacks removed.
         test_fn=None,
@@ -324,13 +288,9 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 min_length=20,
                 placeholder="...",
             ),
-            FieldSpec(
-                name="model", label="STT model", type="text",
-                required=False,
-                pattern=r"^[a-z0-9\-]{1,40}$",
-                placeholder="nova-3",
-                help="Optional model id; per-user storage only.",
-            ),
+            # ponytail: STT model picker removed. Model selection
+            # happens at the agent level (Dashboard → Agents → STT
+            # dropdown); Settings is now credentials-only.
         ),
         # ponytail: env_fallbacks removed.
         test_fn="STT_server.services.credentials_resolver._test_deepgram",
@@ -347,13 +307,9 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
                 min_length=20,
                 help="Raw API key, no Bearer prefix. Shipped verbatim in the Authorization header.",
             ),
-            FieldSpec(
-                name="model", label="STT model", type="text",
-                required=False,
-                pattern=r"^[a-z0-9.\-]{1,40}$",
-                placeholder="best",
-                help="Optional model id; per-user storage only.",
-            ),
+            # ponytail: STT model picker removed. Model selection
+            # happens at the agent level; Settings is now
+            # credentials-only.
         ),
         # ponytail: env_fallbacks removed.
         test_fn=None,
@@ -488,11 +444,12 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     empty dict when the user has nothing stored or decryption fails.
     Never raises — the caller falls back to env vars.
 
-    ponytail: reads from Postgres (`tools_integrations`) via db_tools.
-    The earlier JSON-file path is gone — Railway containers are
-    ephemeral so any file write under STT_server/data/ vanishes on
-    redeploy, which silently broke every per-user key. The FE still
-    POSTs to the same endpoints; only the storage backend moved.
+    ponytail: storage shape lives in db_tools. Per-user service
+    credentials are agent_tools rows keyed by
+    `(user_id, id=provider_id, agent_id='__shared__')` with the
+    Fernet ciphertext dict under the `credentials` JSONB column.
+    The legacy `tools_integrations.connected` boolean column is gone
+    — presence of a non-null `credentials` IS the connected flag.
     """
     if not user_id:
         return {}
@@ -503,7 +460,7 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
         return {}
     row = next(
         (r for r in rows
-         if r.get("id") == provider_id and r.get("connected")),
+         if r.get("id") == provider_id and r.get("credentials")),
         None,
     )
     if not row or not row.get("credentials"):

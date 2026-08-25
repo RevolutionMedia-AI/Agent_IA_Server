@@ -1381,26 +1381,49 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
     )
 
     encrypted = encrypt_credentials(cleaned)
-    # ponytail: test_data_model is the LLM the test_data_generator
-    # uses when the operator hits Test on a tool that has this
-    # provider configured. Default gpt-4o-mini for cost; the FE
-    # modal surfaces the dropdown for gpt-4o / gpt-4-turbo when the
-    # operator wants better reasoning on complex schemas. Optional
-    # in the body so older FE builds keep working.
-    test_data_model = (body.credentials or {}).pop("test_data_model", None)
-    if not isinstance(test_data_model, str) or not test_data_model.strip():
-        test_data_model = "gpt-4o-mini"
-    db_upsert_tool(
-        auth["user_id"],
-        service_id,
-        {
-            "credentials": encrypted,
-            "connected": bool(encrypted),
-            "display_name": spec.name,
-            "category": spec.category,
-            "test_data_model": test_data_model.strip()[:120],
-        },
+    # ponytail: storage shape. Per-user service credentials live as
+    # an agent_tools row keyed by `(user_id, id=service_id)` with
+    # `agent_id='__shared__'` and the encrypted dict under the
+    # `credentials` JSONB column (migration 014 added the column).
+    # The function_name column is reused as the canonical service id
+    # so the runtime has a stable handle; webhook_url / kind /
+    # parameters / etc. stay at their tool-shape defaults and the
+    # resolver ignores them. `connected` is a boolean flag the FE
+    # reads via /settings/api-keys — kept off the table shape since
+    # it's the inverse of "credentials is null".
+    from STT_server.db_tools import (
+        get_tool as db_get_tool,
+        create_tool as db_create_tool,
+        update_tool as db_update_tool,
     )
+    existing = db_get_tool(service_id, auth["user_id"])
+    payload = {
+        "agent_id": "__shared__",
+        "name": spec.name,
+        "description": "",
+        "webhook_url": "",
+        "filler_phrase": "Let me check the system...",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        "kind": "webhook",
+        "destination": None,
+        "assignments": [],
+        "function_name": service_id,
+        "test_data_model": "gpt-4o-mini",
+        "credentials": encrypted,
+    }
+    if existing:
+        # db_update_tool builds the SET clause dynamically from the
+        # payload (skipping DB-managed cols); passing credentials as
+        # a dict lets the JSONB cast in the loop handle it correctly.
+        # `connected` is recomputed server-side in list_api_keys
+        # from the credentials column, so we don't have to write it.
+        db_update_tool(service_id, auth["user_id"], payload)
+    else:
+        db_create_tool(auth["user_id"], payload, tool_id=service_id)
     return {"success": True}
 
 
