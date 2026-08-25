@@ -38,6 +38,7 @@ from STT_server.services.credentials_resolver import (
     resolve_provider,
     test_provider,
     validate_credentials,
+    _build_categorized_models,
 )
 from STT_server.db import is_postgres
 from STT_server.db_agents import (
@@ -1548,9 +1549,9 @@ async def list_models(body: ListModelsRequest, auth: dict = Depends(require_auth
 
     Used by the New Agent modal — after the user picks a provider and
     enters their API key, the FE calls this to populate the secondary
-    dropdown with that provider's actual models. Live fetches are done
-    server-side so we can swallow CORS / network failures and return a
-    graceful fallback.
+    dropdown with that provider's actual models. Live fetches are
+    done server-side so we can swallow CORS / network failures and
+    return a graceful fallback.
     """
     if body.service not in VALID_MODEL_SERVICES:
         raise HTTPException(
@@ -1571,6 +1572,38 @@ async def list_models(body: ListModelsRequest, auth: dict = Depends(require_auth
         auth.get("user_id"),
     )
     return result
+
+
+class CategorizedModelsRequest(BaseModel):
+    """Body for POST /providers/models/categorized. Same auth_key
+    fallback as ListModelsRequest but returns all three service
+    buckets in one shot so the FE doesn't have to know how each
+    provider names its TTS / STT / LLM families internally.
+    """
+    provider: str
+    api_key: str | None = None
+
+
+@api_router.post("/providers/models/categorized")
+async def list_categorized_models(
+    body: CategorizedModelsRequest, auth: dict = Depends(require_auth),
+):
+    """Return one provider's full model catalog bucketed by service
+    (llm / stt / tts). The FE uses this to render the agent
+    picker's three dropdowns in one network round-trip; the contract
+    is identical for every provider so the FE doesn't need a
+    provider-specific mapping (OpenAI's `tts-1` vs Inworld's
+    `voiceId` vs Deepgram's `model`).
+    """
+    if get_provider_spec(body.provider) is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown provider '{body.provider}'",
+        )
+    import asyncio as _aio
+    return await _aio.to_thread(
+        _build_categorized_models,
+        body.provider, body.api_key, auth.get("user_id"),
+    )
 
 
 class TtsPreviewRequest(BaseModel):

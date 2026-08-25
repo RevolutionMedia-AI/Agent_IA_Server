@@ -332,6 +332,221 @@ async def test_upsert_api_key_rejects_bad_format(client, data_dir):
     assert r.status_code == 422, r.text
 
 
+# ── /providers/models/categorized ────────────────────────────────────────
+
+
+def test_format_model_label():
+    from STT_server.services.credentials_resolver import _format_model_label
+    assert _format_model_label("gpt-4.1-mini") == "GPT-4.1 Mini"
+    assert _format_model_label("gpt-4o-mini-transcribe") == "GPT-4o Mini Transcribe"
+    assert _format_model_label("gpt-4o-mini-tts") == "GPT-4o Mini Tts"
+    assert _format_model_label("o3-mini") == "O3 Mini"
+    assert _format_model_label("tts-1") == "Tts 1"
+    assert _format_model_label("nova-2-general") == "Nova 2 General"
+    assert _format_model_label("") == ""
+    assert _format_model_label("gpt") == "GPT"
+    assert _format_model_label("gpt-4o") == "GPT-4o"
+    assert _format_model_label("gpt-realtime") == "GPT-Realtime"
+
+
+def test_classify_openai_model():
+    from STT_server.services.credentials_resolver import _classify_openai_model
+    # LLM family
+    assert _classify_openai_model("gpt-4.1") == "llm"
+    assert _classify_openai_model("gpt-4.1-mini") == "llm"
+    assert _classify_openai_model("gpt-4o") == "llm"
+    assert _classify_openai_model("gpt-5") == "llm"
+    assert _classify_openai_model("o1") == "llm"
+    assert _classify_openai_model("o3-mini") == "llm"
+    assert _classify_openai_model("o4-mini") == "llm"
+    # STT family
+    assert _classify_openai_model("gpt-4o-transcribe") == "stt"
+    assert _classify_openai_model("gpt-4o-mini-transcribe") == "stt"
+    assert _classify_openai_model("whisper-1") == "stt"
+    # TTS family
+    assert _classify_openai_model("tts-1") == "tts"
+    assert _classify_openai_model("tts-1-hd") == "tts"
+    assert _classify_openai_model("gpt-4o-mini-tts") == "tts"
+    # Excluded from LLM (realtime, embedding, etc.)
+    assert _classify_openai_model("gpt-realtime") is None
+    assert _classify_openai_model("gpt-4o-realtime-preview") is None
+    assert _classify_openai_model("text-embedding-3-small") is None
+    assert _classify_openai_model("dall-e-3") is None
+    assert _classify_openai_model("omni-moderation-latest") is None
+    # Out of catalog (no recognized family)
+    assert _classify_openai_model("gpt-3.5-turbo-instruct") is None
+    assert _classify_openai_model("gpt-3.5-turbo-1106") is None
+    assert _classify_openai_model("gpt-3.5-turbo-0125") is None
+    assert _classify_openai_model("gpt-4-0613") is None
+    assert _classify_openai_model("gpt-4") is None
+    assert _classify_openai_model("gpt-4-turbo") is None
+    assert _classify_openai_model("gpt-4o-2024-05-13") is None
+    assert _classify_openai_model("gpt-4-turbo-2024-04-09") is None
+    assert _classify_openai_model("o1-2024-12-17") is None
+    assert _classify_openai_model("o1-pro-2025-03-19") is None
+    assert _classify_openai_model("gpt-4o-2024-08-06") is None
+    assert _classify_openai_model("gpt-4o-2024-11-20") is None
+    assert _classify_openai_model("gpt-5.6-luna") is None
+
+
+def test_build_categorized_models_openai():
+    """End-to-end: with a mocked OpenAI /v1/models response that
+    mixes LLM, STT, TTS and unrelated models, the categorized builder
+    buckets them correctly with {id, label} entries.
+    """
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import _build_categorized_models
+
+    fake_live = [
+        {"id": "gpt-4.1-mini"},
+        {"id": "gpt-4o"},
+        {"id": "o3-mini"},
+        # STT
+        {"id": "gpt-4o-transcribe"},
+        {"id": "gpt-4o-mini-transcribe"},
+        {"id": "whisper-1"},
+        # TTS
+        {"id": "tts-1"},
+        {"id": "tts-1-hd"},
+        {"id": "gpt-4o-mini-tts"},
+        # Realtime — out of LLM
+        {"id": "gpt-realtime"},
+        {"id": "gpt-4o-realtime-preview"},
+        # Other excluded
+        {"id": "dall-e-3"},
+        {"id": "text-embedding-3-small"},
+        {"id": "omni-moderation-latest"},
+        # Legacy / dated
+        {"id": "gpt-3.5-turbo"},
+        {"id": "gpt-4"},
+        {"id": "gpt-4o-2024-05-13"},
+        {"id": "o1-2024-12-17"},
+    ]
+
+    with patch(
+        "STT_server.services.credentials_resolver._fetch_openai_models",
+        return_value=fake_live,
+    ):
+        out = _build_categorized_models("openai", api_key="sk-test", user_id="u1")
+
+    assert out["provider"] == "openai"
+    assert {m["id"] for m in out["models"]["llm"]} == {
+        "gpt-4.1-mini", "gpt-4o", "o3-mini",
+    }
+    assert {m["id"] for m in out["models"]["stt"]} == {
+        "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1",
+    }
+    assert {m["id"] for m in out["models"]["tts"]} == {
+        "tts-1", "tts-1-hd", "gpt-4o-mini-tts",
+    }
+    # Each entry has {id, label}.
+    for bucket in ("llm", "stt", "tts"):
+        for m in out["models"][bucket]:
+            assert "id" in m and "label" in m
+            # Spot-check labels.
+            if m["id"] == "gpt-4.1-mini":
+                assert m["label"] == "GPT-4.1 Mini"
+            if m["id"] == "gpt-4o-mini-transcribe":
+                assert m["label"] == "GPT-4o Mini Transcribe"
+            if m["id"] == "gpt-4o-mini-tts":
+                assert m["label"] == "GPT-4o Mini Tts"
+    # The 6 excluded models (realtime * 2, dall-e, embedding,
+    # moderation, gpt-3.5-turbo, gpt-4, gpt-4o-2024-05-13,
+    # o1-2024-12-17) are NOT in any bucket.
+    all_ids = {m["id"] for b in ("llm", "stt", "tts") for m in out["models"][b]}
+    assert "gpt-realtime" not in all_ids
+    assert "gpt-4o-realtime-preview" not in all_ids
+    assert "dall-e-3" not in all_ids
+    assert "text-embedding-3-small" not in all_ids
+    assert "omni-moderation-latest" not in all_ids
+    assert "gpt-3.5-turbo" not in all_ids
+    assert "gpt-4" not in all_ids
+    assert "gpt-4o-2024-05-13" not in all_ids
+    assert "o1-2024-12-17" not in all_ids
+
+
+def test_build_categorized_models_inworld_uses_curated_voices():
+    """Non-OpenAI providers route through the existing per-service
+    catalog. Inworld has both TTS voices (the live fetch) and an
+    STT model (inworld-stt-1 in the curated hardcoded catalog),
+    so the TTS bucket has the live voices and the STT bucket has
+    the STT model. LLM is empty (Inworld doesn't ship chat models).
+    """
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import _build_categorized_models
+
+    with patch(
+        "STT_server.services.credentials_resolver._fetch_inworld_voices"
+    ) as mocked:
+        mocked.return_value = [
+            {"id": "Blake",      "name": "Blake",      "displayName": "Blake",
+             "langCode": "EN_US", "languageCode": "en-US",
+             "description": "Mid-range English male",
+             "tags": [], "categories": [], "source": "SYSTEM",
+             "gender": "male", "ageGroup": "middle_aged",
+             "promptLanguages": ["en-US"]},
+            {"id": "Camila",     "name": "Camila",     "displayName": "Camila",
+             "langCode": "EN_US", "languageCode": "en-US",
+             "description": "Mexican Spanish female",
+             "tags": [], "categories": [], "source": "SYSTEM",
+             "gender": "female", "ageGroup": "middle_aged",
+             "promptLanguages": ["es-MX"]},
+        ]
+        out = _build_categorized_models(
+            "inworld", api_key="sk-test", user_id="u1",
+        )
+
+    assert out["provider"] == "inworld"
+    # Inworld doesn't ship chat models.
+    assert out["models"]["llm"] == []
+    # STT bucket has the curated inworld-stt-1 model that
+    # list_provider_models("stt", "inworld", ...) returns.
+    stt_ids = {m["id"] for m in out["models"]["stt"]}
+    assert stt_ids == {"inworld/inworld-stt-1"}
+    # TTS bucket has the 2 mocked voices with their ids + labels.
+    tts_ids = {m["id"] for m in out["models"]["tts"]}
+    assert tts_ids == {"Blake", "Camila"}
+    blake = next(m for m in out["models"]["tts"] if m["id"] == "Blake")
+    assert blake["label"] == "Blake"
+
+
+async def test_categorized_models_route(client, data_dir):
+    """End-to-end: POST /providers/models/categorized returns the
+    categorized picker payload for the FE."""
+    sessions_path = data_dir / "sessions.json"
+    sess = json.loads(sessions_path.read_text(encoding="utf-8"))
+    token = next(iter(sess.keys()))
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Unknown provider → 404.
+    r = await client.post(
+        "/providers/models/categorized", headers=headers,
+        json={"provider": "no-such-provider"},
+    )
+    assert r.status_code == 404, r.text
+
+    # OpenAI: with a mocked /v1/models live response.
+    from unittest.mock import patch
+    with patch(
+        "STT_server.services.credentials_resolver._fetch_openai_models",
+        return_value=[
+            {"id": "gpt-4.1-mini"},
+            {"id": "tts-1"},
+            {"id": "gpt-realtime"},
+        ],
+    ):
+        r = await client.post(
+            "/providers/models/categorized", headers=headers,
+            json={"provider": "openai", "api_key": "sk-test1234567890abcdefABCDEF"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "openai"
+    assert {m["id"] for m in body["models"]["llm"]} == {"gpt-4.1-mini"}
+    assert {m["id"] for m in body["models"]["tts"]} == {"tts-1"}
+    assert body["models"]["stt"] == []
+
+
 # ── LLM picker helper + route ───────────────────────────────────────────
 
 

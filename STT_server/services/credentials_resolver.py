@@ -1866,3 +1866,211 @@ def test_provider(
     except Exception as exc:
         ok, message = False, _sanitize_error(str(exc))[:300]
     return {"valid": bool(ok), "message": message, "source": source}
+
+
+# ── Categorized models for the agent picker ──────────────────────────────
+# ponytail: the agent modal used to call POST /providers/models
+# three times — once per service (llm / stt / tts) — every time
+# asking the BE to filter OpenAI's /v1/models live response by a
+# different keyword. The FE had to know each provider's naming
+# convention and the BE did the same work three times. Replaced
+# with a single POST /providers/models/categorized call that
+# returns the provider's full catalog bucketed by service, with
+# the same {id, label} contract for every provider. The FE
+# doesn't need to know that OpenAI names its TTS family `tts-*`
+# and Inworld names its catalog by `voiceId`; it just renders
+# the three buckets.
+
+
+def _format_model_label(model_id: str) -> str:
+    """Render a human-readable label from a model id.
+
+    Examples (operator-facing labels from the picker mockup):
+        "gpt-4.1-mini"            -> "GPT-4.1 Mini"
+        "gpt-4o-mini-transcribe"  -> "GPT-4o Mini Transcribe"
+        "gpt-4o-mini-tts"          -> "GPT-4o Mini Tts"
+        "o3-mini"                 -> "O3 Mini"
+        "tts-1"                    -> "Tts 1"
+        "nova-2-general"           -> "Nova 2 General"
+
+    Two rules:
+      1. "gpt-*" → "GPT-*" (the OpenAI family prefix is always
+         uppercase, regardless of what follows — "gpt-4.1",
+         "gpt-4o", "gpt-realtime", etc.).
+      2. Everything else: split on "-", capitalize the first word
+         (first letter only) and title-case subsequent words. The
+         picker label is for display; the raw id is the lookup
+         key the FE sends back, so the operator can copy paste
+         from the dropdown without losing precision.
+    """
+    if not model_id:
+        return ""
+    if model_id.lower().startswith("gpt"):
+        # ponytail: the OpenAI family prefix is always uppercase.
+        # Handles both "gpt-..." (the typical case) and the bare
+        # "gpt" id (rare; some operator display strings only show
+        # the base family).
+        if model_id.lower() == "gpt":
+            return "GPT"
+        body = model_id[3:]  # strip the "gpt" prefix (3 chars, no dash)
+        # body now starts with "-" if model_id had the dash (e.g.
+        # "gpt-4.1-mini" -> "-4.1-mini"). Split on "-" and
+        # drop the leading empty token so head = "GPT-4.1".
+        words = body.split("-")
+        if words and words[0] == "":
+            words = words[1:]
+        if not words or all(w == "" for w in words):
+            return "GPT"
+        head = "GPT-" + (words[0][:1].upper() + words[0][1:] if words[0] else "")
+        # Subsequent words keep their original case (not title-cased)
+        # so "gpt-realtime" -> "GPT-realtime", "gpt-4.1-mini" -> "GPT-4.1 Mini".
+        # Title-case subsequent words (the user expects
+        # "gpt-4.1-mini" -> "GPT-4.1 Mini" with capital M).
+        rest = " ".join(w[:1].upper() + w[1:] for w in words[1:] if w)
+        joined = (head + " " + rest).strip() if rest else head
+        return joined or "GPT"
+    words = model_id.split("-")
+    if not words or all(w == "" for w in words):
+        return ""
+    head = words[0][:1].upper() + words[0][1:]
+    rest = " ".join(w[:1].upper() + w[1:] for w in words[1:] if w)
+    joined = (head + " " + rest).strip() if rest else head
+    return joined
+
+
+def _classify_openai_model(model_id: str) -> str | None:
+    """Return "llm" / "stt" / "tts" for an OpenAI model id, or None
+    if the id doesn't fit a service.
+
+    Mirrors the operator-supplied classifier (commit message):
+      llm: gpt-4*, gpt-5*, o1*, o3*, o4* — and not in the
+           excludedLLMTerms set (realtime, audio, transcribe, tts,
+           image, embedding, whisper, moderation, search,
+           computer-use, deep-research, codex).
+      stt: id contains "transcribe" or "whisper".
+      tts: id contains "tts" or "speech".
+    """
+    mid = model_id.lower()
+    excluded = (
+        "realtime", "audio", "transcribe", "tts", "image",
+        "embedding", "whisper", "moderation", "search",
+        "computer-use", "deep-research", "codex",
+    )
+    # STT: anything with transcribe or whisper in the name. Apply
+    # this check first because some LLM-prefixed models also include
+    # the word "transcribe" (e.g. gpt-4o-transcribe) and we want
+    # them in the STT bucket, not LLM.
+    if "transcribe" in mid or "whisper" in mid:
+        return "stt"
+    if "tts" in mid or "speech" in mid:
+        return "tts"
+    if mid.startswith(("gpt-4", "gpt-5", "o1", "o3", "o4")):
+        # ponytail: drop dated snapshots (-YYYY-MM-DD, -YYYY-MM,
+        # bare -YYYY) and bare legacy ids ("gpt-4", "gpt-4-turbo",
+        # "gpt-3.5-turbo"). The picker only needs the current-gen
+        # base ids; the operator can pick a snapshot via the BE-side
+        # tools/agent modal override later if they really need one.
+        import re as _re
+        if _re.search(r"-\d{2,4}(-\d{2}){0,2}(-preview|-light)?\Z", mid):
+            return None
+        if mid in ("gpt-4", "gpt-4-turbo", "gpt-3.5-turbo",
+                   "gpt-3.5-turbo-instruct", "gpt-5.6-luna",
+                   "gpt-3.5-turbo-1106", "gpt-3.5-turbo-0125"):
+            return None
+        if not any(term in mid for term in excluded):
+            return "llm"
+    return None
+
+
+def _build_categorized_models(
+    provider_id: str, api_key: str | None, user_id: str | None,
+) -> dict:
+    """Return one provider's full model catalog bucketed by service.
+
+    Shape:
+        {
+            "provider": "<id>",
+            "models": {
+                "llm": [{"id": ..., "label": ...}, ...],
+                "stt": [{"id": ..., "label": ...}, ...],
+                "tts": [{"id": ..., "label": ...}, ...],
+            },
+        }
+
+    For OpenAI the live /v1/models response is fetched and routed
+    through the operator-supplied classifier (gpt-4* / gpt-5* / o1* /
+    o3* / o4* with realtime-audio-transcribe-tts-image-... exclusions
+    for llm; transcribe / whisper for stt; tts / speech for tts).
+    For other providers we route to the existing per-service
+    catalogs (TTS for Inworld / ElevenLabs / Rime / Deepgram
+    Aura; STT for Deepgram / AssemblyAI; LLM for Anthropic /
+    Google Gemini / MiniMax).
+    """
+    spec = get_provider_spec(provider_id)
+    out = {"provider": provider_id, "models": {"llm": [], "stt": [], "tts": []}}
+
+    def _to_entries(items):
+        entries = []
+        for it in items or []:
+            mid = it.get("id") or it.get("voiceId") or ""
+            if not mid:
+                continue
+            entries.append({
+                "id": mid,
+                "label": _format_model_label(mid),
+            })
+        return entries
+
+    if provider_id == "openai":
+        # ponytail: hit /v1/models live with the operator's key
+        # (or stored credential / env fallback), then bucket every
+        # id via _classify_openai_model. Buckets are sorted by id
+        # so the FE picker has a stable order.
+        # Same credential resolution as list_provider_models: inline
+        # api_key, then per-user stored, then platform env.
+        creds = api_key
+        if not creds and user_id:
+            try:
+                from STT_server.services.credentials_resolver import resolve_provider as _rp
+                creds = _rp(user_id, provider_id).get("api_key")
+            except Exception:
+                creds = None
+        if not creds:
+            try:
+                from STT_server.services.credentials_resolver import resolve_provider as _rp
+                creds = _rp(None, provider_id).get("api_key")
+            except Exception:
+                creds = None
+        creds = creds or ""
+        if not creds:
+            return out
+        try:
+            models = _fetch_openai_models(creds)
+        except Exception:
+            return out
+        buckets = {"llm": [], "stt": [], "tts": []}
+        for m in models:
+            mid = m.get("id", "")
+            bucket = _classify_openai_model(mid)
+            if not bucket:
+                continue
+            buckets[bucket].append(mid)
+        for k in buckets:
+            buckets[k].sort()
+        for k, ids in buckets.items():
+            out["models"][k] = _to_entries([{"id": i} for i in ids])
+        return out
+
+    # ponytail: every other provider's catalog lives in the curated
+    # hardcoded table. STT providers go in stt, TTS in tts, LLM in
+    # llm. Voice-only providers (Inworld) put their voices in tts
+    # so the FE can render them in the TTS picker; the FE doesn't
+    # need a separate "voices" bucket because every voice is also a
+    # TTS option. This keeps the contract uniform across providers.
+    for service in ("stt", "tts", "llm"):
+        try:
+            items = list_provider_models(service, provider_id, api_key, user_id).get("models", [])
+        except Exception:
+            items = []
+        out["models"][service] = _to_entries(items)
+    return out
