@@ -156,10 +156,24 @@ def test_session_update_includes_tools_when_assigned():
     tools = payload["session"]["tools"]
     assert len(tools) == 1
     assert tools[0]["type"] == "function"
-    fn = tools[0]["function"]
-    assert fn["name"] == "schedule_meeting"
-    assert fn["description"] == "Schedule a meeting on Google Calendar"
-    assert fn["parameters"]["properties"]["start"]["format"] == "date-time"
+    # ponytail: OpenAI Realtime uses the FLAT schema
+    # {type, name, description, parameters} — NOT the nested
+    # {type, function: {name, ...}} shape that chat-completions
+    # accepts. The previous version shipped with the nested shape
+    # and the server rejected every tool with
+    # `missing_required_parameter: session.tools[0].name` (the error
+    # is checked at `.tools[0].name`, not `.tools[0].function.name`).
+    assert "name" in tools[0], (
+        "Realtime tool schema requires `name` at the top level of the "
+        "tool object, not nested under `function`."
+    )
+    assert "function" not in tools[0], (
+        "Realtime rejects the chat-completions nested `{type, function: {...}}` "
+        "shape — tool definitions must be flat."
+    )
+    assert tools[0]["name"] == "schedule_meeting"
+    assert tools[0]["description"] == "Schedule a meeting on Google Calendar"
+    assert tools[0]["parameters"]["properties"]["start"]["format"] == "date-time"
 
 
 def test_session_update_omits_tools_when_none_assigned():
@@ -208,7 +222,7 @@ def test_session_update_sanitises_function_name_for_legacy_rows():
         "parameters": {"type": "object", "properties": {}},
     }])
     payload = json.loads(_build_session_update_payload(session))
-    fn_name = payload["session"]["tools"][0]["function"]["name"]
+    fn_name = payload["session"]["tools"][0]["name"]
     import re as _re
     assert _re.match(r"^[A-Za-z0-9_-]+$", fn_name), (
         f"function_name '{fn_name}' would be rejected by OpenAI "

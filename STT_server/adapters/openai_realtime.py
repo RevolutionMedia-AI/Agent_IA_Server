@@ -82,15 +82,19 @@ def _build_realtime_tools(session: CallSession) -> list[dict] | None:
     format. Returns None when no tools are assigned — OpenAI accepts
     the field omitted (vs. an empty list, which some servers reject).
 
-    ponytail: the model only emits a `function_call` event for tools
-    listed here. If we never pass the tools, the agent hallucinates
-    the action ("your appointment is scheduled") instead of calling
-    the Google Calendar webhook — the operator sees a confident
-    answer and an empty calendar. Same shape as the chat-completions
-    function block: {type:"function", function:{name, description,
-    parameters}}. function_name is pre-sanitised on save to satisfy
-    OpenAI's `^[a-zA-Z0-9_-]+$` regex; we fall back to the display
-    name sanitiser for legacy rows that pre-date the field.
+    ponytail: the Realtime API uses the FLAT tool schema
+    `{type, name, description, parameters}` — NOT the nested
+    `{type, function: {name, ...}}` shape that chat-completions
+    accepts. The first version of this helper shipped with the
+    nested shape and OpenAI rejected it with
+    `missing_required_parameter: session.tools[0].name` (the error
+    is checked at `.tools[0].name`, not `.tools[0].function.name`).
+    Wire format is the documented difference: realtime inherits
+    the chat-completions field set but uses a flatter object.
+
+    function_name is pre-sanitised on save to satisfy OpenAI's
+    `^[a-zA-Z0-9_-]+$` regex; we fall back to the display-name
+    sanitiser for legacy rows that pre-date the field.
     """
     agent_tools = getattr(session, "agent_tools", None) or []
     if not agent_tools:
@@ -103,13 +107,11 @@ def _build_realtime_tools(session: CallSession) -> list[dict] | None:
         )
         out.append({
             "type": "function",
-            "function": {
-                "name": fn_name,
-                "description": t.get("description", ""),
-                "parameters": t.get(
-                    "parameters", {"type": "object", "properties": {}}
-                ),
-            },
+            "name": fn_name,
+            "description": t.get("description", ""),
+            "parameters": t.get(
+                "parameters", {"type": "object", "properties": {}}
+            ),
         })
     log.info(
         "[TOOLS] Passing %d tools to Realtime for session %s",
