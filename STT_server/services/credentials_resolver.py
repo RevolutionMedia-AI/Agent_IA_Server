@@ -1003,11 +1003,15 @@ def _fetch_inworld_voices(api_key: str) -> list[dict]:
     """GET https://api.inworld.ai/voices/v1/voices — Inworld's public
     voice list endpoint. Auth is Basic with the user's Inworld key.
 
-    Unpaginated: Inworld's documented legacy code path returns the
-    full voice list (≤2000) in a single response when called with no
-    `pageSize` / `pageToken`. Our account sits at ~223 voices, well
-    under the cap. No pagination, no `nextPageToken` cursor — one
-    round-trip is enough.
+    Uses `pageSize=500` (well above our ~223 voices, well below the
+    API's 2000 ceiling) and walks `nextPageToken` if present. Earlier
+    we relied on the "legacy unpaginated" path (no params), but that
+    turned out to be unreliable — some Inworld tenants return a
+    paginated response even with no params, capping the result at the
+    server's default page size and silently hiding voices beyond it.
+    Asking for 500 explicitly removes that ambiguity: a single call
+    covers any realistic account, and the loop is a no-op when the
+    server returns everything in one shot.
 
     Returns the user's accessible voices (account-scoped) with the
     metadata the FE surfaces in the agent modal:
@@ -1029,44 +1033,68 @@ def _fetch_inworld_voices(api_key: str) -> list[dict]:
          entries; kept for forward-compat.
     """
     import urllib.error
+    import urllib.parse
     import urllib.request
     base = "https://api.inworld.ai/voices/v1/voices"
     headers = {"Authorization": f"Basic {api_key}"}
     keep: list[dict] = []
+    seen: set[str] = set()
     try:
-        req = urllib.request.Request(base, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        for v in payload.get("voices", []) or []:
-            vid = v.get("voiceId") or v.get("id", "")
-            if not vid:
-                continue
-            raw_lang = v.get("langCode") or ""
-            live_langcode = v.get("languageCode") or ""
-            prompt_langs = v.get("promptLanguages") or []
-            canonical = live_langcode
-            if not canonical and prompt_langs:
-                canonical = prompt_langs[0]
-            if not canonical and raw_lang and "_" in raw_lang:
-                try:
-                    lang_part, region_part = raw_lang.split("_", 1)
-                    canonical = f"{lang_part.lower()}-{region_part.upper()}"
-                except Exception:
-                    canonical = raw_lang
-            keep.append({
-                "id": vid,
-                "name": v.get("displayName") or v.get("name") or vid,
-                "displayName": v.get("displayName") or v.get("name") or vid,
-                "description": v.get("description", ""),
-                "gender": v.get("gender", "") or "",
-                "languageCode": canonical,
-                "langCode": raw_lang,
-                "categories": list(v.get("categories") or []),
-                "tags": list(v.get("tags") or []),
-                "source": v.get("source", "") or "",
-                "ageGroup": v.get("ageGroup", "") or "",
-                "promptLanguages": prompt_langs,
-            })
+        page_token = ""
+        # ponytail: pagination loop. Hard cap 10 pages × 500 = 5000
+        # voices (well above Inworld's 2000 ceiling). Bail out when
+        # the response carries an empty nextPageToken. URLs are
+        # built with urllib.parse.urlencode so a future token format
+        # that contains reserved chars can't break the request.
+        for _ in range(10):
+            params = {"pageSize": "500"}
+            if page_token:
+                params["pageToken"] = page_token
+            url = base + "?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            for v in payload.get("voices", []) or []:
+                vid = v.get("voiceId") or v.get("id", "")
+                if not vid or vid in seen:
+                    continue
+                seen.add(vid)
+                raw_lang = v.get("langCode") or ""
+                live_langcode = v.get("languageCode") or ""
+                prompt_langs = v.get("promptLanguages") or []
+                canonical = live_langcode
+                if not canonical and prompt_langs:
+                    canonical = prompt_langs[0]
+                if not canonical and raw_lang and "_" in raw_lang:
+                    try:
+                        lang_part, region_part = raw_lang.split("_", 1)
+                        canonical = f"{lang_part.lower()}-{region_part.upper()}"
+                    except Exception:
+                        canonical = raw_lang
+                keep.append({
+                    "id": vid,
+                    "name": v.get("displayName") or v.get("name") or vid,
+                    "displayName": v.get("displayName") or v.get("name") or vid,
+                    "description": v.get("description", ""),
+                    "gender": v.get("gender", "") or "",
+                    "languageCode": canonical,
+                    "langCode": raw_lang,
+                    "categories": list(v.get("categories") or []),
+                    "tags": list(v.get("tags") or []),
+                    "source": v.get("source", "") or "",
+                    "ageGroup": v.get("ageGroup", "") or "",
+                    "promptLanguages": prompt_langs,
+                })
+            page_token = payload.get("nextPageToken") or ""
+            if not page_token:
+                break
+        # ponytail: surface the result count so the operator can see
+        # in the BE logs whether the live fetch returned the expected
+        # ~223 voices or fell back to empty. INFO level — useful for
+        # the "why is the dropdown empty" debug session without
+        # spamming during normal traffic.
+        log.info("[inworld-voices] fetched %d voices (token=%s)",
+                 len(keep), "next" if page_token else "done")
         return keep
     except Exception as exc:
         log.warning("[inworld-voices] fetch failed (key prefix %s...): %s",

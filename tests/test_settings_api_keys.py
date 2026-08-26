@@ -992,20 +992,25 @@ def test_inworld_voices_use_promptLanguages_when_langCode_missing():
     assert by_id["John"]["description"] == "Cloned voice for narrations."
 
 
-def test_inworld_voices_unpaginated_returns_full_list_with_metadata():
-    """Ponytail: Inworld's documented legacy code path returns up to
-    2000 voices in a single response when called with no `pageSize` /
-    `pageToken`. Our account sits at ~223 voices — well under the
-    cap. No pagination: one round-trip is enough.
+def test_inworld_voices_paginates_walk_every_page():
+    """Ponytail: Inworld paginates with nextPageToken. Asking for
+    `pageSize=500` covers any realistic account in one call (223 < 500),
+    but we still walk `nextPageToken` defensively in case the server
+    caps us lower. Earlier we relied on the "legacy unpaginated" path
+    (no params), but that turned out to be unreliable across tenants —
+    some accounts get a paginated response even with no params and
+    silently truncate the catalog. Explicit `pageSize=500` removes the
+    ambiguity.
 
-    Pins the unpaginated behavior + full metadata forwarding so the
-    FE can render the rich Dropdown (description, gender, ageGroup,
-    languageCode, categories, tags, source) and group by language.
+    Pins the pagination-walk behavior + full metadata forwarding so
+    the FE can render the rich Dropdown (description, gender,
+    ageGroup, languageCode, categories, tags, source) and group by
+    language.
     """
     from unittest.mock import patch, MagicMock
     from STT_server.services.credentials_resolver import _fetch_inworld_voices
 
-    response = {
+    page1 = {
         "voices": [
             {"voiceId": f"voice-{i}",
              "name": f"workspaces/inworld/voices/voice-{i}",
@@ -1021,11 +1026,14 @@ def test_inworld_voices_unpaginated_returns_full_list_with_metadata():
         "nextPageToken": "",
     }
 
+    requests_seen: list[str] = []
+
     def fake_urlopen(req, timeout=20):
+        requests_seen.append(req.full_url)
         resp = MagicMock()
         resp.__enter__ = lambda self: self
         resp.__exit__ = lambda *a: False
-        resp.read = lambda: json.dumps(response).encode()
+        resp.read = lambda: json.dumps(page1).encode()
         return resp
 
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
@@ -1043,6 +1051,76 @@ def test_inworld_voices_unpaginated_returns_full_list_with_metadata():
     assert all(v["categories"] == ["companions"] for v in voices)
     assert all(v["tags"] == ["friendly"] for v in voices)
     assert all(v["source"] == "SYSTEM" for v in voices)
+    # First request explicitly asks for pageSize=500. Empty
+    # nextPageToken means no further pages.
+    assert requests_seen == [
+        "https://api.inworld.ai/voices/v1/voices?pageSize=500"
+    ]
+
+
+def test_inworld_voices_paginates_across_multiple_pages():
+    """Defensive coverage: if Inworld returns a non-empty
+    nextPageToken, we walk it and concatenate every page."""
+    from unittest.mock import patch, MagicMock
+    from STT_server.services.credentials_resolver import _fetch_inworld_voices
+
+    page1 = {
+        "voices": [
+            {"voiceId": f"voice-{i}", "name": f"voice-{i}",
+             "langCode": "EN_US", "displayName": f"voice-{i}",
+             "description": "", "tags": [], "categories": [],
+             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "promptLanguages": ["en-US"]}
+            for i in range(100)
+        ],
+        "nextPageToken": "token-1",
+        "totalSize": 223,
+    }
+    page2 = {
+        "voices": [
+            {"voiceId": f"voice-{i+100}", "name": f"voice-{i+100}",
+             "langCode": "EN_US", "displayName": f"voice-{i+100}",
+             "description": "", "tags": [], "categories": [],
+             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "promptLanguages": ["en-US"]}
+            for i in range(100)
+        ],
+        "nextPageToken": "token-2",
+        "totalSize": 223,
+    }
+    page3 = {
+        "voices": [
+            {"voiceId": f"voice-{i+200}", "name": f"voice-{i+200}",
+             "langCode": "EN_US", "displayName": f"voice-{i+200}",
+             "description": "", "tags": [], "categories": [],
+             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "promptLanguages": ["en-US"]}
+            for i in range(23)
+        ],
+        "nextPageToken": "",
+        "totalSize": 223,
+    }
+    pages = [page1, page2, page3]
+    requests_seen: list[str] = []
+
+    def fake_urlopen(req, timeout=20):
+        requests_seen.append(req.full_url)
+        resp = MagicMock()
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda *a: False
+        resp.read = lambda: json.dumps(pages.pop(0)).encode()
+        return resp
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        voices = _fetch_inworld_voices("sk-test1234567890abcdefABCDEF")
+
+    assert len(voices) == 223
+    assert {v["id"] for v in voices} == {f"voice-{i}" for i in range(223)}
+    # Page 1 asks for pageSize=500; subsequent pages pass the cursor
+    # via the pageToken query parameter.
+    assert requests_seen[0] == "https://api.inworld.ai/voices/v1/voices?pageSize=500"
+    assert "pageToken=token-1" in requests_seen[1]
+    assert "pageToken=token-2" in requests_seen[2]
     assert all(v["promptLanguages"] == ["en-US"] for v in voices)
 
 
