@@ -216,3 +216,171 @@ async def test_create_400_when_parameters_schema_invalid(
     )
     assert r.status_code == 400, r.text
     assert "schema" in r.text.lower() or "unknown" in r.text.lower()
+
+
+# ── Provider credentials must not surface in /tools or as assignable
+#    targets — Settings → API saves each provider's key as an
+#    agent_tools row with agent_id="__shared__" but no webhook_url /
+#    destination. The Edit Agent modal's marketplace was rendering
+#    OpenAI / Inworld / ElevenLabs as if they were callable tools.
+#    These tests pin the discriminator on the GET endpoints. ──────────
+
+
+CREDENTIAL_ROW = {
+    "id": "openai",
+    "agent_id": "__shared__",
+    "name": "OpenAI",
+    "description": "",
+    "webhook_url": "",
+    "destination": None,
+    "assignments": [],
+    "kind": "webhook",
+    "function_name": "openai",
+    "credentials": {"api_key": "encrypted-blob"},
+    "user_id": "user-test-001",
+}
+
+
+async def test_list_tools_filters_out_provider_credential_rows(
+    client: AsyncClient, auth_token: str, data_dir, monkeypatch
+) -> None:
+    """A credential row sitting in agent_tools.json (id=provider
+    name, agent_id='__shared__', empty webhook_url, no destination)
+    must NOT show up in the shared tools marketplace — only real
+    operator-defined tools with a URL or destination should appear."""
+    import json
+    import STT_server.db_tools as db_mod
+    from pathlib import Path
+    # ponytail: the data_dir fixture patches api_mod.TOOLS_FILE but
+    # db_tools._AGENT_TOOLS_FILE is the actual path db_get_tool reads.
+    # Patch it here so the test writes/reads from data_dir and never
+    # touches the production STT_server/data/agent_tools.json file.
+    tools_file = data_dir / "agent_tools.json"
+    monkeypatch.setattr(db_mod, "_AGENT_TOOLS_FILE", tools_file, raising=False)
+    tools_file.write_text(
+        json.dumps([CREDENTIAL_ROW]),
+        encoding="utf-8",
+    )
+    r = await client.get("/tools", headers={"Authorization": f"Bearer {auth_token}"})
+    assert r.status_code == 200
+    names = [t["name"] for t in r.json()]
+    assert names == [], (
+        f"credential rows leaked into /tools: {names}. "
+        "GET /tools must filter on (webhook_url or destination)."
+    )
+
+
+async def test_list_agent_tools_filters_out_credential_assigned(
+    client: AsyncClient, auth_token: str, data_dir, monkeypatch
+) -> None:
+    """Even if a credential row got assigned to an agent somehow
+    (legacy data, manual DB edit, etc.), GET /agents/{id}/tools must
+    exclude it from the assigned list — otherwise the FE renders a
+    'credential' as an 'Assigned shared' tool with a working
+    Unassign button that the user clicks, which is the regression
+    we're guarding against."""
+    import json
+    import STT_server.db_tools as db_mod
+    agent_id = "agent-with-credential-attached"
+    row = {
+        **CREDENTIAL_ROW,
+        # Legacy state: someone managed to assign a credential row.
+        "assignments": [agent_id],
+    }
+    tools_file = data_dir / "agent_tools.json"
+    monkeypatch.setattr(db_mod, "_AGENT_TOOLS_FILE", tools_file, raising=False)
+    tools_file.write_text(json.dumps([row]), encoding="utf-8")
+    # Seed the agent row so the auth check passes.
+    import STT_server.db_agents as agents_mod
+    import STT_server.routes.api as api_mod_agents
+    from STT_server.db_agents import create_agent as db_create_agent
+    # Mirror the data_dir patching the conftest already does for
+    # agents so the auth check finds the row we just seeded.
+    agents_file = data_dir / "agents.json"
+    monkeypatch.setattr(api_mod_agents, "AGENTS_FILE", str(agents_file), raising=False)
+    monkeypatch.setattr(agents_mod, "_AGENTS_FILE", agents_file, raising=False)
+    db_create_agent(
+        "user-test-001",
+        {
+            "id": agent_id,
+            "name": "Test",
+            "tts_provider": "",
+            "stt_provider": "",
+            "llm_provider": "",
+            "system_prompt": "",
+        },
+    )
+    r = await client.get(
+        f"/agents/{agent_id}/tools",
+        headers={"Authorization": f"Bearer {auth_token}"},
+    )
+    assert r.status_code == 200
+    ids = [t["id"] for t in r.json()]
+    assert "openai" not in ids, (
+        "credential row leaked into /agents/{id}/tools as an "
+        "assignable 'shared tool' — must filter on "
+        "(webhook_url or destination)."
+    )
+
+
+async def test_assign_rejects_credential_rows(
+    client: AsyncClient, auth_token: str, data_dir, monkeypatch
+) -> None:
+    """POST /agents/{id}/tools/{id}/assign must 400 when the target
+    row is a provider credential, not a real tool. Without this
+    guard an operator (or a stale FE bookmark) could 'assign' OpenAI
+    as a callable function and the agent modal would happily render
+    it under 'Assigned shared'."""
+    import json
+    import STT_server.db_tools as db_mod
+    import STT_server.db_agents as agents_mod
+    import STT_server.routes.api as api_mod_agents
+    agent_id = "agent-x"
+    tools_file = data_dir / "agent_tools.json"
+    monkeypatch.setattr(db_mod, "_AGENT_TOOLS_FILE", tools_file, raising=False)
+    tools_file.write_text(json.dumps([CREDENTIAL_ROW]), encoding="utf-8")
+    agents_file = data_dir / "agents.json"
+    monkeypatch.setattr(api_mod_agents, "AGENTS_FILE", str(agents_file), raising=False)
+    monkeypatch.setattr(agents_mod, "_AGENTS_FILE", agents_file, raising=False)
+    from STT_server.db_agents import create_agent as db_create_agent
+    db_create_agent(
+        "user-test-001",
+        {
+            "id": agent_id, "name": "Test",
+            "tts_provider": "", "stt_provider": "", "llm_provider": "",
+            "system_prompt": "",
+        },
+    )
+    r = await client.post(
+        f"/agents/{agent_id}/tools/openai/assign",
+        headers={"Authorization": f"Bearer {auth_token}"},
+    )
+    assert r.status_code == 400, r.text
+    assert "credentials" in r.text.lower() or "settings" in r.text.lower()
+
+
+async def test_assign_real_tool_still_works(
+    client: AsyncClient, auth_token: str
+) -> None:
+    """Regression guard: the credential-row rejection must not block
+    legitimate shared-tool assignments. A real n8n tool (webhook_url
+    set) should still be assignable end-to-end."""
+    r = await client.post(
+        "/tools", json=VALID_PAYLOAD, headers={"Authorization": f"Bearer {auth_token}"}
+    )
+    assert r.status_code == 200
+    tool_id = r.json()["id"]
+    from STT_server.db_agents import create_agent as db_create_agent
+    db_create_agent(
+        "user-test-001",
+        {
+            "id": "agent-y", "name": "Test",
+            "tts_provider": "", "stt_provider": "", "llm_provider": "",
+            "system_prompt": "",
+        },
+    )
+    r = await client.post(
+        f"/agents/agent-y/tools/{tool_id}/assign",
+        headers={"Authorization": f"Bearer {auth_token}"},
+    )
+    assert r.status_code == 200, r.text

@@ -786,8 +786,20 @@ def list_agent_tools(agent_id: str, auth: dict = Depends(require_auth)):
     the JSONB `?|` operator handles the "shared row whose
     assignments array contains this agent_id" branch in a single
     query.
+
+    ponytail: provider-credential rows (Settings → API saves each
+    provider's key into the same ``agent_tools`` table with
+    ``agent_id='__shared__'``) are filtered out — they have neither
+    a ``webhook_url`` nor a ``destination``, the two fields every real
+    tool carries per ``AgentTool.validate()``. Without this filter the
+    Edit Agent modal's "Assigned shared" / "Available shared" sections
+    would surface OpenAI / Inworld / ElevenLabs alongside the operator's
+    actual n8n tools, which is misleading.
     """
-    return db_list_tools(auth["user_id"], agent_id=agent_id)
+    return [
+        t for t in db_list_tools(auth["user_id"], agent_id=agent_id)
+        if _is_real_tool(t)
+    ]
 
 
 class ToolCreate(BaseModel):
@@ -877,6 +889,18 @@ def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require
             status_code=400,
             detail="Only shared tools can be assigned. Per-agent tools are already available to their agent.",
         )
+    # ponytail: reject provider-credential rows. They share the
+    # `__shared__` agent_id but lack a webhook_url/destination, so
+    # `_is_real_tool()` filters them out. Without this guard an
+    # operator who somehow targeted a credential row would see the
+    # assignment "succeed" (idempotent no-op on the empty
+    # assignments array) but then have a non-functional row in the
+    # agent modal — confusing on top of being wrong.
+    if not _is_real_tool(tool):
+        raise HTTPException(
+            status_code=400,
+            detail="Provider credentials are not assignable tools. Configure the provider in Settings → API instead.",
+        )
     return db_add_assignment(tool_id, auth["user_id"], agent_id) or tool
 
 
@@ -909,12 +933,37 @@ async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(requ
 # let the operator create / edit / delete shared tools independently
 # of any specific agent — the FE mounts them on the /integrations
 # page (navbar entry).
+def _is_real_tool(row: dict) -> bool:
+    """True when the agent_tools row is a real operator-defined tool.
+
+    Provider credentials (Settings → API keys) also live in the same
+    table with ``agent_id='__shared__'`` but they have an empty
+    ``webhook_url`` AND a null ``destination`` — real tools always
+    have one or the other (enforced by ``AgentTool.validate()``). The
+    modal filters "Assigned shared" / "Available shared" on this
+    predicate so credential rows don't show up next to the operator's
+    n8n tools.
+    """
+    if not row:
+        return False
+    return bool(row.get("webhook_url") or row.get("destination"))
+
+
 @api_router.get("/tools")
 def list_shared_tools(auth: dict = Depends(require_auth)):
-    """List all shared n8n tools owned by the current user."""
+    """List all shared n8n tools owned by the current user.
+
+    Excludes provider-credential rows (Settings → API saves each
+    provider's key into the same ``agent_tools`` table with
+    ``agent_id='__shared__'``). They have neither ``webhook_url`` nor
+    ``destination``, the two fields every real tool carries per
+    ``AgentTool.validate()``. Surfacing them next to actual n8n tools
+    in the agent modal's marketplace was misleading — operators were
+    trying to assign OpenAI as a callable tool.
+    """
     return [
         t for t in db_list_tools(auth["user_id"])
-        if t.get("agent_id") == SHARED_TOOL_AGENT_ID
+        if t.get("agent_id") == SHARED_TOOL_AGENT_ID and _is_real_tool(t)
     ]
 
 
