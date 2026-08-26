@@ -77,51 +77,98 @@ def _build_instructions(session: CallSession) -> str:
     return "\n\n".join(parts)
 
 
+def _build_realtime_tools(session: CallSession) -> list[dict] | None:
+    """Convert session.agent_tools into OpenAI Realtime function-calling
+    format. Returns None when no tools are assigned — OpenAI accepts
+    the field omitted (vs. an empty list, which some servers reject).
+
+    ponytail: the model only emits a `function_call` event for tools
+    listed here. If we never pass the tools, the agent hallucinates
+    the action ("your appointment is scheduled") instead of calling
+    the Google Calendar webhook — the operator sees a confident
+    answer and an empty calendar. Same shape as the chat-completions
+    function block: {type:"function", function:{name, description,
+    parameters}}. function_name is pre-sanitised on save to satisfy
+    OpenAI's `^[a-zA-Z0-9_-]+$` regex; we fall back to the display
+    name sanitiser for legacy rows that pre-date the field.
+    """
+    agent_tools = getattr(session, "agent_tools", None) or []
+    if not agent_tools:
+        return None
+    from STT_server.domain.tool import AgentTool as _AgentTool
+    out = []
+    for t in agent_tools:
+        fn_name = t.get("function_name") or _AgentTool._sanitize_function_name(
+            t.get("name", "")
+        )
+        out.append({
+            "type": "function",
+            "function": {
+                "name": fn_name,
+                "description": t.get("description", ""),
+                "parameters": t.get(
+                    "parameters", {"type": "object", "properties": {}}
+                ),
+            },
+        })
+    log.info(
+        "[TOOLS] Passing %d tools to Realtime for session %s",
+        len(out), session.session_key,
+    )
+    return out
+
+
 def _build_session_update_payload(session: CallSession) -> str:
     """Serialize the session.update JSON once. Same payload across
     every fallback attempt in the connection loop below.
     """
-    return json.dumps({
-        "type": "session.update",
-        "session": {
-            # ponytail: OpenAI Realtime API GA schema. The fields
-            # that worked in beta no longer all live at the
-            # session root. The current accepted top-level keys
-            # are: type, output_modalities, instructions, audio,
-            # tools, tool_choice, prompt. Anything else returns
-            # invalid_request_error code=unknown_parameter and
-            # closes the socket.
-            #
-            # If OpenAI renames again, the server returns
-            # unknown_parameter in the WS error event with a clear
-            # `param` field — the dispatcher log below captures it.
-            "type": "realtime",
-            "output_modalities": ["text"],
-            "instructions": _build_instructions(session),
-            "audio": {
-                "input": {
-                    # ponytail: OpenAI Realtime GA expects MIME
-                    # types for audio format. Supported values:
-                    # 'audio/pcm' (16-bit linear), 'audio/pcmu'
-                    # (mu-law), 'audio/pcma' (A-law). Twilio Media
-                    # Streams sends mu-law so we want 'audio/pcmu'.
-                    #
-                    # sample_rate is NOT accepted at format.* in
-                    # GA — it would be unknown_parameter. The
-                    # server infers the rate from the type (audio/pcmu
-                    # → 8000 Hz). Don't try to send it explicitly.
-                    "format": {"type": "audio/pcmu"},
-                    "transcription": {"model": "whisper-1"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                    },
+    # ponytail: build the tools list separately so the session.update
+    # JSON stays readable. tool_choice="auto" lets the model decide
+    # between a plain reply and a function_call — without it the
+    # server defaults to "none" and the agent hallucinates the action.
+    tools = _build_realtime_tools(session)
+    session_dict: dict = {
+        # ponytail: OpenAI Realtime API GA schema. The fields
+        # that worked in beta no longer all live at the
+        # session root. The current accepted top-level keys
+        # are: type, output_modalities, instructions, audio,
+        # tools, tool_choice, prompt. Anything else returns
+        # invalid_request_error code=unknown_parameter and
+        # closes the socket.
+        #
+        # If OpenAI renames again, the server returns
+        # unknown_parameter in the WS error event with a clear
+        # `param` field — the dispatcher log below captures it.
+        "type": "realtime",
+        "output_modalities": ["text"],
+        "instructions": _build_instructions(session),
+        "audio": {
+            "input": {
+                # ponytail: OpenAI Realtime GA expects MIME
+                # types for audio format. Supported values:
+                # 'audio/pcm' (16-bit linear), 'audio/pcmu'
+                # (mu-law), 'audio/pcma' (A-law). Twilio Media
+                # Streams sends mu-law so we want 'audio/pcmu'.
+                #
+                # sample_rate is NOT accepted at format.* in
+                # GA — it would be unknown_parameter. The
+                # server infers the rate from the type (audio/pcmu
+                # → 8000 Hz). Don't try to send it explicitly.
+                "format": {"type": "audio/pcmu"},
+                "transcription": {"model": "whisper-1"},
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500,
                 },
             },
         },
-    })
+    }
+    if tools is not None:
+        session_dict["tools"] = tools
+        session_dict["tool_choice"] = "auto"
+    return json.dumps({"type": "session.update", "session": session_dict})
 
 
 # ── Main entry ───────────────────────────────────────────────────────
@@ -462,6 +509,16 @@ async def _event_receiver(ws, session: CallSession) -> None:
     playback_task: asyncio.Task | None = None
     response_started_at: float | None = None
     current_response_text = ""
+    # ponytail: P4 — tool-call plumbing. OpenAI Realtime emits the
+    # function name + arguments in `response.function_call_arguments.done`
+    # (one event per call). We accumulate them into a per-response
+    # dict keyed by call_id so `response.done` can find every tool
+    # the model invoked, execute them, and ship the results back via
+    # `conversation.item.create` + a fresh `response.create`. Without
+    # this loop the agent hallucinates the action ("your appointment
+    # is scheduled") instead of calling the Google Calendar webhook
+    # — the operator sees a confident answer and an empty calendar.
+    pending_tool_calls: dict[str, dict] = {}
 
     try:
         async for raw_msg in ws:
@@ -560,6 +617,13 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 response_started_at = time.perf_counter()
                 current_response_text = ""
                 pending = ""
+                # ponytail: P4 — every new response starts with an empty
+                # tool-call slate. The previous response's calls were
+                # either executed (and removed) or stayed pending
+                # because the WS closed mid-flight. Resetting here
+                # guarantees we never confuse two consecutive
+                # responses' tool calls.
+                pending_tool_calls = {}
                 text_queue: asyncio.Queue[str | None] = asyncio.Queue(
                     maxsize=TEXT_SEGMENT_QUEUE_MAXSIZE,
                 )
@@ -573,6 +637,28 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 )
                 session.tasks.add(playback_task)
                 playback_task.add_done_callback(session.tasks.discard)
+                continue
+
+            # ponytail: P4 — accumulate the function name + args as
+            # the model emits them. `response.function_call_arguments.done`
+            # carries the final JSON in `arguments`; we stash it under
+            # `call_id` so the `response.done` handler can iterate
+            # over every tool the model invoked and execute them.
+            # Without this we never know the model wants a tool called
+            # and the agent falls back to a hallucinated reply.
+            if etype == "response.function_call_arguments.done":
+                call_id = event.get("call_id") or ""
+                name = event.get("name") or ""
+                arguments = event.get("arguments") or "{}"
+                if call_id and name:
+                    pending_tool_calls[call_id] = {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                    log.info(
+                        "[OPENAI_REALTIME] tool call pending session=%s call_id=%s name=%s args_len=%d",
+                        session.session_key, call_id, name, len(arguments),
+                    )
                 continue
 
             if etype == "response.output_text.delta":
@@ -647,6 +733,128 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 continue
 
             if etype == "response.done":
+                # ponytail: P4 — tool-call branch. If this response was
+                # the model's tool call (no text, just function calls),
+                # execute them now, ship the results back as
+                # `conversation.item` entries, then trigger a fresh
+                # `response.create` so the model can compose the final
+                # reply using the tool output. We deliberately skip
+                # the TTS-playback + history-append + "Turno" log
+                # because there's nothing to speak yet — the real
+                # reply comes from the next response.cycle.
+                if pending_tool_calls:
+                    log.info(
+                            "[OPENAI_REALTIME] response.done with %d tool calls session=%s",
+                            len(pending_tool_calls), session.session_key,
+                        )
+                    # Cancel the current playback_task — it has
+                    # nothing useful to speak (the model's reply was a
+                    # tool call, not text). Avoids a useless
+                    # wait-then-finish cycle.
+                    if playback_task and not playback_task.done():
+                        playback_task.cancel()
+                        try:
+                            await playback_task
+                        except asyncio.CancelledError:
+                            pass
+                    playback_task = None
+
+                    # Execute every pending tool call and feed the
+                    # results back. `record_tool_result` records
+                    # observability for the per-tool panel.
+                    from STT_server.services.tool_executor import execute_tool, record_tool_result
+                    for call_id, tc in pending_tool_calls.items():
+                        tool_name = tc["name"]
+                        try:
+                            args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        # Look up the agent's tool definition so we
+                        # can find the webhook_url + tool_id for the
+                        # observability row.
+                        tool_def = next(
+                            (t for t in (getattr(session, "agent_tools", None) or [])
+                             if t.get("function_name") == tool_name
+                             or t.get("name") == tool_name),
+                            None,
+                        )
+                        webhook_url = (tool_def or {}).get("webhook_url", "")
+                        tool_id = (tool_def or {}).get("id")
+                        if not webhook_url:
+                            log.warning(
+                                "[OPENAI_REALTIME] tool %s has no webhook_url session=%s",
+                                tool_name, session.session_key,
+                            )
+                            output_text = json.dumps({"error": f"tool '{tool_name}' has no webhook_url"})
+                            ok = False
+                            err = "missing webhook_url"
+                        else:
+                            try:
+                                result = await execute_tool(webhook_url, args, tool_name)
+                                log.info(
+                                    "[OPENAI_REALTIME] tool %s ok session=%s result_len=%d",
+                                    tool_name, session.session_key,
+                                    len(str(result)),
+                                )
+                                output_text = json.dumps(result) if not isinstance(result, str) else result
+                                ok = True
+                                err = None
+                            except Exception as exc:
+                                log.exception(
+                                    "[OPENAI_REALTIME] tool %s failed session=%s",
+                                    tool_name, session.session_key,
+                                )
+                                output_text = json.dumps({"error": str(exc)[:500]})
+                                ok = False
+                                err = str(exc)[:200]
+                        if tool_id:
+                            try:
+                                record_tool_result(tool_id, ok, "invocation", error=err)
+                            except Exception:
+                                log.exception("record_tool_result failed for %s", tool_id)
+                        # Feed the result back to OpenAI. Per the
+                        # Realtime API contract: conversation.item.create
+                        # with type=function_call_output + the matching
+                        # call_id. Then a response.create tells the
+                        # model "compose the final answer now".
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": output_text,
+                                },
+                            }))
+                        except Exception:
+                            log.exception(
+                                "Failed to send function_call_output for session=%s call_id=%s",
+                                session.session_key, call_id,
+                            )
+
+                    # Ask the model to continue now that the tool
+                    # output is in its context. Without this explicit
+                    # `response.create` the model stays silent until
+                    # the next user turn — the user just heard silence
+                    # after the appointment request.
+                    try:
+                        await ws.send(json.dumps({"type": "response.create"}))
+                        log.info(
+                            "[OPENAI_REALTIME] response.create after %d tool(s) session=%s",
+                            len(pending_tool_calls), session.session_key,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Failed to send response.create after tools for session=%s",
+                            session.session_key,
+                        )
+                    pending_tool_calls = {}
+                    current_response_text = ""
+                    pending = ""
+                    response_started_at = None
+                    session.response_active = False
+                    continue
+
                 # If we are NOT streaming TTS, enqueue the full reply once.
                 if not REALTIME_TTS_STREAMING:
                     tq = session.realtime_text_queue

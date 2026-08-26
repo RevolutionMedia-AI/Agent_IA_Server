@@ -16,6 +16,7 @@ UnboundLocalError. The fix was to keep the import at module top —
 this test pins that.
 """
 import inspect
+import json
 import re
 
 
@@ -91,3 +92,126 @@ def test_event_receiver_no_any_local_common_imports():
         f"Python scoping, breaking every earlier reference. Offending "
         f"lines: {offenders}"
     )
+
+
+# ── Tool-calling plumbing (P4) ──────────────────────────────────────
+# The Realtime adapter used to send the model a session.update
+# without a `tools` field. The model had no way to call the Google
+# Calendar webhook the operator assigned to the agent, so it
+# hallucinated the action ("your appointment is scheduled") and
+# the calendar stayed empty. These tests pin the contract that
+# fixes that — `_build_session_update_payload` MUST include the
+# tools in OpenAI's function-call format so the model sees them.
+
+
+class _StubSession:
+    """Minimal CallSession stand-in for the payload builder.
+
+    The builder reads `agent_tools` (for the tools block),
+    `session_key` (for the log line), `custom_prompt`,
+    `collected_data`, `history`, and `agent_id` (via
+    _build_instructions). Everything else we leave None.
+    """
+
+
+def _session_with_tools(tools: list[dict]) -> _StubSession:
+    s = _StubSession()
+    s.agent_tools = tools
+    s.session_key = "test-session"
+    s.custom_prompt = "You are a helpful assistant."
+    s.collected_data = {}
+    s.history = []
+    s.agent_id = "agent-test"
+    s.preferred_language = "en"
+    return s
+
+
+def test_session_update_includes_tools_when_assigned():
+    """The session.update payload MUST include a `tools` array when
+    the agent has any. Without it the model can't emit function_call
+    events and the agent hallucinates the action."""
+    from STT_server.adapters.openai_realtime import _build_session_update_payload
+
+    session = _session_with_tools([{
+        "id": "tool-google-calendar",
+        "name": "schedule_meeting",
+        "function_name": "schedule_meeting",
+        "description": "Schedule a meeting on Google Calendar",
+        "webhook_url": "https://n8n.example.com/webhook/cal",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start": {"type": "string", "format": "date-time"},
+            },
+            "required": ["title", "start"],
+        },
+    }])
+    payload = json.loads(_build_session_update_payload(session))
+
+    assert "tools" in payload["session"], (
+        "session.update missing `tools` — model has no way to call the "
+        "agent's tools and will hallucinate the action."
+    )
+    tools = payload["session"]["tools"]
+    assert len(tools) == 1
+    assert tools[0]["type"] == "function"
+    fn = tools[0]["function"]
+    assert fn["name"] == "schedule_meeting"
+    assert fn["description"] == "Schedule a meeting on Google Calendar"
+    assert fn["parameters"]["properties"]["start"]["format"] == "date-time"
+
+
+def test_session_update_omits_tools_when_none_assigned():
+    """When the agent has no tools, the session.update MUST omit
+    the `tools` key (not pass an empty list). Some OpenAI server
+    versions reject empty tool arrays as `invalid_request_error`,
+    so we test the omit-on-empty contract directly."""
+    from STT_server.adapters.openai_realtime import _build_session_update_payload
+
+    session = _session_with_tools([])
+    payload = json.loads(_build_session_update_payload(session))
+    assert "tools" not in payload["session"], (
+        "session.update must omit `tools` when the agent has none — "
+        "empty arrays are rejected by some OpenAI server versions."
+    )
+    assert "tool_choice" not in payload["session"]
+
+
+def test_session_update_sets_tool_choice_auto_when_tools_present():
+    """`tool_choice` defaults to `none` on the Realtime API. Without
+    `tool_choice=auto` the model is forbidden from calling tools
+    even if they're listed. Force it on whenever tools are present."""
+    from STT_server.adapters.openai_realtime import _build_session_update_payload
+
+    session = _session_with_tools([{
+        "id": "t1", "name": "do_thing", "function_name": "do_thing",
+        "description": "", "webhook_url": "https://x",
+        "parameters": {"type": "object", "properties": {}},
+    }])
+    payload = json.loads(_build_session_update_payload(session))
+    assert payload["session"].get("tool_choice") == "auto"
+
+
+def test_session_update_sanitises_function_name_for_legacy_rows():
+    """Legacy rows (pre function_name column) need the display name
+    sanitised to satisfy OpenAI's `^[a-zA-Z0-9_-]+$` regex. Otherwise
+    the server returns `invalid_request_error` on session.update."""
+    from STT_server.adapters.openai_realtime import _build_session_update_payload
+
+    session = _session_with_tools([{
+        "id": "t-legacy",
+        "name": "Schedule Meeting! 2024",
+        # no function_name — fallback path
+        "description": "Old-style tool",
+        "webhook_url": "https://n8n.example.com/webhook/x",
+        "parameters": {"type": "object", "properties": {}},
+    }])
+    payload = json.loads(_build_session_update_payload(session))
+    fn_name = payload["session"]["tools"][0]["function"]["name"]
+    import re as _re
+    assert _re.match(r"^[A-Za-z0-9_-]+$", fn_name), (
+        f"function_name '{fn_name}' would be rejected by OpenAI "
+        f"(regex violation on session.update)."
+    )
+    assert " " not in fn_name and "!" not in fn_name
