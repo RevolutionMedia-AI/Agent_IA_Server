@@ -3,6 +3,16 @@
 # Exact pins preferred; >=,<,* ranges only for fast-moving SDKs (twilio, openai).
 
 cryptography==49.0.0  # Fernet encryption for per-user provider credentials at rest
+# ponytail: tzdata ships the IANA timezone database (tzdb) for
+# Python's stdlib `zoneinfo`. The python:3.11-slim base image
+# doesn't include /usr/share/zoneinfo, so ZoneInfo("America/Tijuana")
+# would raise `No time zone found with key America/Tijuana` and the
+# runtime would compute `+00:00` for every timezone. The agent modal
+# then tells the LLM to emit ISO 8601 datetimes with a +00:00 offset
+# and the calendar event lands N hours off from what the operator
+# asked for (the 4 AM vs 11 AM symptom on Railway). Adding tzdata as
+# a pip dep keeps the runtime reproducible without OS-level installs.
+tzdata>=2024.2
 fastapi==0.138.0
 numpy==2.4.6
 openai==2.43.0

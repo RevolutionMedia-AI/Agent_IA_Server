@@ -15,9 +15,11 @@ earlier reference (barge-in cleanup, the finally block) raises
 UnboundLocalError. The fix was to keep the import at module top —
 this test pins that.
 """
+import datetime
 import inspect
 import json
 import re
+from unittest.mock import patch
 
 
 def test_enqueue_helper_imported_exactly_once_at_module_top():
@@ -114,7 +116,7 @@ class _StubSession:
     """
 
 
-def _session_with_tools(tools: list[dict]) -> _StubSession:
+def _session_with_tools(tools: list[dict], *, user_id: str | None = None) -> _StubSession:
     s = _StubSession()
     s.agent_tools = tools
     s.session_key = "test-session"
@@ -123,6 +125,7 @@ def _session_with_tools(tools: list[dict]) -> _StubSession:
     s.history = []
     s.agent_id = "agent-test"
     s.preferred_language = "en"
+    s.user_id = user_id
     return s
 
 
@@ -229,3 +232,165 @@ def test_session_update_sanitises_function_name_for_legacy_rows():
         f"(regex violation on session.update)."
     )
     assert " " not in fn_name and "!" not in fn_name
+
+
+# ── Timezone-aware datetimes (T6) ────────────────────────────────────
+# The operator reported the calendar event landed at 4 AM when the
+# user requested 11 AM. Root cause: the LLM emitted a naive ISO
+# string (`2024-09-04T11:00:00`) — n8n treated it as UTC and Google
+# Calendar displayed in Tijuana time (UTC-7) = 4 AM. The fix is to
+# inject the operator's IANA timezone + a concrete offset into the
+# system prompt so the model emits `2024-09-04T11:00:00-07:00`.
+# These tests pin that the directive ships and uses the right
+# example offset for common timezones.
+
+
+class _FakeSettings:
+    def __init__(self, tz: str | None):
+        self.tz = tz
+
+    def get(self, key, default=None):
+        return self.tz if key == "timezone" else default
+
+
+def _patch_settings(tz: str | None):
+    return patch(
+        "STT_server.adapters.openai_realtime._resolve_user_timezone",
+        return_value=tz,
+    )
+
+
+def test_instructions_include_timezone_directive_for_known_tz():
+    """When the user has a timezone in /settings, the system
+    instructions must include an explicit "use this offset in any
+    datetime" directive. Without it the LLM emits naive ISO
+    strings and the calendar event lands at the wrong wall time."""
+    from STT_server.adapters.openai_realtime import _build_instructions
+
+    session = _StubSession()
+    session.custom_prompt = "You are a helpful assistant."
+    session.session_key = "s"
+    session.collected_data = {}
+    session.history = []
+    session.agent_id = "a"
+    session.user_id = "user-1"
+
+    with _patch_settings("America/Mexico_City"):
+        prompt = _build_instructions(session)
+
+    # The directive must mention the IANA name so the LLM has a
+    # ground truth to anchor its reasoning against (not just an
+    # offset, which could come from anywhere).
+    assert "America/Mexico_City" in prompt, (
+        "system prompt missing the operator's IANA timezone — the "
+        "LLM has no anchor for the offset."
+    )
+    # The directive must include a concrete offset example so the
+    # LLM doesn't have to compute the offset from the IANA name
+    # (which it's famously bad at).
+    assert "-07:00" in prompt or "-06:00" in prompt, (
+        "system prompt missing a concrete UTC offset example for "
+        "Mexico_City (Tijuana is UTC-7 in summer, UTC-6 in winter)."
+    )
+    # Must explicitly forbid naive datetimes — the exact failure
+    # mode that produced the 4 AM event.
+    assert "naive" in prompt.lower() and "offset" in prompt.lower(), (
+        "system prompt must warn the LLM about naive datetimes and "
+        "demand an explicit offset."
+    )
+
+
+def test_instructions_skip_timezone_directive_when_user_has_no_timezone():
+    """When the operator hasn't picked a timezone in /settings
+    (anonymous call, admin test, legacy row), the directive is
+    skipped — we don't want to inject a wrong default that the
+    LLM would treat as truth."""
+    from STT_server.adapters.openai_realtime import _build_instructions
+
+    session = _StubSession()
+    session.custom_prompt = "You are a helpful assistant."
+    session.session_key = "s"
+    session.collected_data = {}
+    session.history = []
+    session.agent_id = "a"
+    session.user_id = None
+
+    with _patch_settings(None):
+        prompt = _build_instructions(session)
+
+    assert "OPERATOR TIMEZONE" not in prompt, (
+        "system prompt injected a timezone directive even though "
+        "the user has no timezone configured — would train the LLM "
+        "to emit the wrong offset."
+    )
+
+
+def test_instructions_offset_for_eastern_timezone():
+    """Ponytail: the directive must compute the right offset for
+    other IANA zones too, not just hard-code -07:00. Eastern time
+    is UTC-4 in summer (EDT) / UTC-5 in winter (EST) — we don't
+    hard-code the sign."""
+    from STT_server.adapters.openai_realtime import _build_instructions
+
+    session = _StubSession()
+    session.custom_prompt = "You are a helpful assistant."
+    session.session_key = "s"
+    session.collected_data = {}
+    session.history = []
+    session.agent_id = "a"
+    session.user_id = "user-1"
+
+    with _patch_settings("America/New_York"):
+        prompt = _build_instructions(session)
+
+    assert "America/New_York" in prompt
+    # Eastern is UTC-4 (EDT) in summer, UTC-5 (EST) in winter.
+    # Accept either — never the wrong sign.
+    assert ("-04:00" in prompt) or ("-05:00" in prompt), (
+        f"system prompt missing a valid Eastern offset; got: {prompt!r}"
+    )
+
+
+def test_resolve_user_timezone_returns_settings_value():
+    """Direct unit test for _resolve_user_timezone — the helper that
+    looks up the user's tz in db_settings."""
+    from STT_server.adapters import openai_realtime
+
+    with patch(
+        "STT_server.db_settings.get_settings",
+        return_value={"timezone": "Asia/Tokyo", "name": "test"},
+    ):
+        tz = openai_realtime._resolve_user_timezone("user-1")
+    assert tz == "Asia/Tokyo"
+
+
+def test_resolve_user_timezone_returns_none_when_no_settings():
+    from STT_server.adapters import openai_realtime
+
+    with patch("STT_server.db_settings.get_settings", return_value=None):
+        tz = openai_realtime._resolve_user_timezone("user-1")
+    assert tz is None
+
+
+def test_resolve_user_timezone_returns_none_when_no_user_id():
+    from STT_server.adapters import openai_realtime
+
+    # No user_id — admin test endpoint or anonymous session.
+    # The directive should be skipped, not crash.
+    tz = openai_realtime._resolve_user_timezone(None)
+    assert tz is None
+
+
+def test_resolve_user_timezone_swallows_db_errors():
+    """Settings lookup failure must NOT break session start — we
+    return None and the operator gets no a directive (better than
+    blocking the call). Logged at WARNING so the operator sees
+    the underlying cause in BE logs."""
+    from STT_server.adapters import openai_realtime
+
+    with patch(
+        "STT_server.db_settings.get_settings",
+        side_effect=RuntimeError("simulated DB outage"),
+    ):
+        tz = openai_realtime._resolve_user_timezone("user-1")
+    assert tz is None

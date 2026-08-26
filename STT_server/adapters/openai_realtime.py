@@ -54,6 +54,46 @@ def _build_instructions(session: CallSession) -> str:
     log.info("[REALTIME] Using custom_prompt for session=%s (len=%d)", session.session_key, len(custom_prompt))
     parts = [custom_prompt.strip()]
 
+    # ponytail: pin the user's timezone so the LLM emits
+    # timezone-aware datetimes when calling tools. Without this
+    # block, the model emits naive ISO strings like
+    # `2024-09-04T11:00:00`; downstream n8n Calendar nodes treat
+    # those as UTC and the event lands 7h late in Tijuana. We
+    # pull the timezone the user picked in /settings and append
+    # an explicit directive to the system prompt so the model
+    # follows it on every tool call. Default "America/Mexico_City"
+    # matches the platform's primary audience.
+    user_tz = _resolve_user_timezone(getattr(session, "user_id", None))
+    if user_tz:
+        # ponytail: derive the offset the operator would type for
+        # their timezone at runtime. We're not enforcing DST — the
+        # IANA name + the model's knowledge of the local civil
+        # time handles that implicitly. The hard requirement is
+        # "include the offset in any datetime you emit", which the
+        # offset string makes explicit.
+        from datetime import datetime as _dt
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _tzinfo = _ZI(user_tz)
+            _offset = _dt.now(_tzinfo).utcoffset()
+            _offset_minutes = int(_offset.total_seconds() // 60)
+            _offset_sign = '+' if _offset_minutes >= 0 else '-'
+            _offset_abs_min = abs(_offset_minutes)
+            _offset_str = (
+                f"{_offset_sign}{_offset_abs_min // 60:02d}:{_offset_abs_min % 60:02d}"
+            )
+        except Exception:
+            _offset_str = "+00:00"  # naive fallback — caller sees no example offset
+        parts.append(
+            f"OPERATOR TIMEZONE: {user_tz} (current UTC offset {_offset_str}). "
+            f"When you call any tool with a `datetime` parameter, you MUST emit an ISO 8601 "
+            f"string that INCLUDES the timezone offset — e.g. "
+            f"`2024-09-04T11:00:00{_offset_str}`. "
+            f"Never emit a naive datetime (without an offset). Naive datetimes are interpreted "
+            f"as UTC by downstream systems and the event lands at the wrong wall-clock time "
+            f"in the operator's calendar."
+        )
+
     if session.collected_data:
         collected = ", ".join(f"{k}: {v}" for k, v in session.collected_data.items())
         parts.append(
@@ -75,6 +115,32 @@ def _build_instructions(session: CallSession) -> str:
         )
 
     return "\n\n".join(parts)
+
+
+def _resolve_user_timezone(user_id: str | None) -> str | None:
+    """Look up the timezone the user picked in /settings (Settings → API
+    → IANA tz like 'America/Mexico_City'). Returns None when no
+    user_id is on the session — the realtime instructions builder
+    silently skips the timezone directive in that case.
+
+    The lookup is best-effort: any DB error or missing row returns
+    None rather than blocking session start. Settings are an
+    advisory field on the agent, not a hard dependency.
+    """
+    if not user_id:
+        return None
+    try:
+        from STT_server.db_settings import get_settings as _db_get_settings
+        settings = _db_get_settings(user_id) or {}
+        return settings.get("timezone") or None
+    except Exception as exc:
+        log.warning(
+            "[REALTIME] timezone lookup failed for user=%s: %s — "
+            "agent will not get the timezone directive and may emit "
+            "naive datetimes",
+            user_id, exc,
+        )
+        return None
 
 
 def _build_realtime_tools(session: CallSession) -> list[dict] | None:
