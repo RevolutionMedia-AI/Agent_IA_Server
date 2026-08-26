@@ -525,8 +525,17 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     # launch_reply_pipeline (OpenAI Realtime handles the LLM
                     # itself on the same WS). Anti-loop, replace-current,
                     # order-escalation, and memory deduplication all run.
+                    #
+                    # Note: `enqueue_nowait_with_drop` is imported at
+                    # module top (line 28) and reused here. An earlier
+                    # version of this block did a local `from ... import`
+                    # inside the try — Python treats that as an
+                    # assignment to a local name and makes the symbol
+                    # local to the entire function, so any earlier call
+                    # site (lines 447, 755) raised UnboundLocalError. The
+                    # bare reference below resolves to the module-level
+                    # import.
                     try:
-                        from STT_server.services.common import enqueue_nowait_with_drop
                         enqueue_nowait_with_drop(
                             session.transcript_queue,
                             {
