@@ -363,6 +363,17 @@ class AgentCreate(BaseModel):
     tts_model: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # ponytail: per-agent runtime overrides (006_agent_runtime_params.sql).
+    # 2026-08-26 regression: the FE was sending these on every save
+    # but the Pydantic schema didn't declare them, so Pydantic
+    # silently dropped the fields. The values never reached the DB
+    # row and the operator saw "I set 0.2 but it resets to blank
+    # every save". All three are Optional with None = "inherit the
+    # platform default" so a brand-new agent without explicit knobs
+    # is fine.
+    llm_temperature: Optional[float] = None
+    llm_max_tokens: Optional[int] = None
+    tts_speed: Optional[float] = None
     # Idle / silence detection (008_agent_idle_settings.sql). All optional —
     # None on every field = fall back to the global IDLE_SILENCE_TIMEOUT_SEC.
     # When idle_enabled=True the monitor plays the prompt messages at the
@@ -414,6 +425,21 @@ class AgentUpdate(BaseModel):
     tts_model: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # ponytail: per-agent runtime overrides (006_agent_runtime_params.sql).
+    # 2026-08-26 regression: the FE was sending these on every save
+    # but the Pydantic schema didn't declare them, so Pydantic
+    # silently dropped the fields. The values never reached the DB
+    # row and the operator saw "I set 0.2 but it resets to blank
+    # every save". Same as AgentCreate: Optional with None = "inherit
+    # the platform default" so the modal can send `null` to clear
+    # a knob and the BE drops it (preserve previous value? no — the
+    # FE explicitly sends `null` only when the user clears the input,
+    # so the user expects the DB to be cleared too). The exclude_none
+    # in update_agent means a null is treated as "don't touch the
+    # column"; the FE must include the field if it wants to clear it.
+    llm_temperature: Optional[float] = None
+    llm_max_tokens: Optional[int] = None
+    tts_speed: Optional[float] = None
     # Idle / silence detection — see AgentCreate above.
     idle_enabled: Optional[bool] = None
     idle_first_timeout_sec: Optional[int] = None
