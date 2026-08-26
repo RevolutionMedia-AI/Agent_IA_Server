@@ -739,49 +739,11 @@ _HARDCODED_TTS_VOICES = {
         {"id": "aura-orion-en",   "name": "Orion (en)",   "description": "Male, narrative"},
         {"id": "aura-athena-en",  "name": "Athena (en)",  "description": "Female, professional"},
     ],
-    # ponytail: voices curated for THIS deployment's Inworld account.
-    # English by default; only Camila, Mayte, Cuauhtemoc ship
-    # Mexican Spanish. Hardcoded so the dropdown can show
-    # `Spanish (Mexico)` vs default even when the live fetch
-    # (GET /voices/v1/voices) is unavailable (no key uploaded yet,
-    # network down, or account key rejected). When the live fetch
-    # DOES return a voice, we merge it in with the live entry winning
-    # on id collisions, so the FE shows the user's account-scoped
-    # voices plus this baseline.
-    #
-    # To add a new voice, drop a {id, name, language, description}
-    # tuple below. The live merge will only override by id, so
-    # anything we hardcode that Inworld does not return stays
-    # available.
-    "inworld": [
-        {"id": "Blake",       "name": "Blake",       "language": "en-US", "description": "English voice"},
-        {"id": "Sarah",       "name": "Sarah",       "language": "en-US", "description": "English voice"},
-        {"id": "Jason",       "name": "Jason",       "language": "en-US", "description": "English voice"},
-        {"id": "Nate",        "name": "Nate",        "language": "en-US", "description": "English voice"},
-        {"id": "Luna",        "name": "Luna",        "language": "en-US", "description": "English voice"},
-        {"id": "Simon",       "name": "Simon",       "language": "en-US", "description": "English voice"},
-        {"id": "Hades",       "name": "Hades",       "language": "en-US", "description": "English voice"},
-        {"id": "Reed",        "name": "Reed",        "language": "en-US", "description": "English voice"},
-        {"id": "Hana",        "name": "Hana",        "language": "en-US", "description": "English voice"},
-        {"id": "Olivia",      "name": "Olivia",      "language": "en-US", "description": "English voice"},
-        {"id": "Tyles",       "name": "Tyles",       "language": "en-US", "description": "English voice"},
-        {"id": "Mark",        "name": "Mark",        "language": "en-US", "description": "English voice"},
-        {"id": "Clive",       "name": "Clive",       "language": "en-US", "description": "English voice"},
-        {"id": "Ashley",      "name": "Ashley",      "language": "en-US", "description": "English voice"},
-        {"id": "Aarav",       "name": "Aarav",       "language": "en-US", "description": "English voice"},
-        {"id": "Theodore",    "name": "Theodore",    "language": "en-US", "description": "English voice"},
-        {"id": "Eleanor",     "name": "Eleanor",     "language": "en-US", "description": "English voice"},
-        {"id": "Sophie",      "name": "Sophie",      "language": "en-US", "description": "English voice"},
-        {"id": "Alain",       "name": "Alain",       "language": "en-US", "description": "English voice"},
-        {"id": "Wei",         "name": "Wei",         "language": "en-US", "description": "English voice"},
-        # Mexican Spanish (the only three Inworld ships for es-MX
-        # on this account). The FE surfaces these with a
-        # `Spanish (Mexico)` label so the operator can find them
-        # when the agent prompt is bilingual or pure Spanish.
-        {"id": "Camila",      "name": "Camila",      "language": "es-MX", "description": "Mexican Spanish voice"},
-        {"id": "Mayte",       "name": "Mayte",       "language": "es-MX", "description": "Mexican Spanish voice"},
-        {"id": "Cuauhtemoc",  "name": "Cuauhtemoc",  "language": "es-MX", "description": "Mexican Spanish voice"},
-    ],
+    # ponytail: no curated Inworld list. The live catalog from
+    # GET /voices/v1/voices is authoritative; if the fetch fails,
+    # the agent modal returns an empty list + an actionable error so
+    # the operator knows to check their API key (see
+    # list_provider_models → provider_id == "inworld").
 }
 
 _HARDCODED_STT_MODELS = {
@@ -1040,91 +1002,76 @@ def _fetch_rime_voices() -> list[dict]:
 def _fetch_inworld_voices(api_key: str) -> list[dict]:
     """GET https://api.inworld.ai/voices/v1/voices — Inworld's public
     voice list endpoint. Auth is Basic with the user's Inworld key.
+
+    Unpaginated: Inworld's documented legacy code path returns the
+    full voice list (≤2000) in a single response when called with no
+    `pageSize` / `pageToken`. Our account sits at ~223 voices, well
+    under the cap. No pagination, no `nextPageToken` cursor — one
+    round-trip is enough.
+
     Returns the user's accessible voices (account-scoped) with the
     metadata the FE surfaces in the agent modal:
-      id, name, description, displayName,
+      id, name, displayName, description,
       gender (male|female|neutral|''),
       languageCode (BCP-47, e.g. "en-US") and langCode (legacy enum
         like "EN_US"),
       categories (e.g. ["companions", "enterprise"]),
       tags, source (SYSTEM|IVC|PVC), ageGroup.
-    Walks every page so the curated hardcoded catalog gets a complete
-    view (the unpaginated call is capped at 2000; realistic accounts
-    never hit that, but the loop is cheap).
-    Falls back to the hardcoded catalog on network / auth failure.
+
+    Language priority (lowest → highest):
+      1. legacy langCode ("EN_US") — converted to BCP-47 ("en-US").
+      2. promptLanguages[0] (BCP-47 already, list of locales the
+         voice can synthesise). Populated for IVC clones and any
+         voice the user customises — including ones where the live
+         API omitted languageCode. Before this fallback the operator
+         saw these clones fall into the FE's "OTHER" bucket.
+      3. live languageCode (BCP-47 directly) — used by newer
+         entries; kept for forward-compat.
     """
     import urllib.error
     import urllib.request
     base = "https://api.inworld.ai/voices/v1/voices"
     headers = {"Authorization": f"Basic {api_key}"}
     keep: list[dict] = []
-    seen: set[str] = set()
     try:
-        page_token = ""
-        # ponytail: pagination loop. Hard cap at 50 pages × 100 = 5000
-        # voices (well above Inworld's 2000 ceiling). Bail out when the
-        # response carries an empty nextPageToken.
-        for _ in range(50):
-            url = base + ("?pageSize=100" if not page_token else f"?pageSize=100&pageToken={page_token}")
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            for v in payload.get("voices", []) or []:
-                vid = v.get("voiceId") or v.get("id", "")
-                if not vid or vid in seen:
-                    continue
-                seen.add(vid)
-                # ponytail: language resolution. Inworld returns
-                # multiple language hints per voice and they're not
-                # always consistent. Priority order, lowest to highest:
-                #   1. legacyCode (legacy "EN_US" enum) — convert to
-                #      BCP-47 ("en-US"). The Inworld live response
-                #      populates this for system voices.
-                #   2. promptLanguages[0] (BCP-47 already, list of
-                #      locales the voice can synthesise). Populated for
-                #      IVC clones and any voice the user customises
-                #      — including ones where the live API omitted
-                #      languageCode. Before this fallback the operator
-                #      saw these clones fall into the "OTHER" bucket
-                #      and couldn't pick them.
-                #   3. live languageCode (BCP-47 directly) — used by
-                #      newer entries; kept for forward-compat.
-                # FE reads (v.raw.languageCode || v.raw.langCode),
-                # so we forward BOTH the converted "languageCode"
-                # AND the raw "langCode" so the FE never has to
-                # guess.
-                raw_lang = v.get("langCode") or ""
-                live_langcode = v.get("languageCode") or ""
-                prompt_langs = v.get("promptLanguages") or []
-                canonical = live_langcode
-                if not canonical and prompt_langs:
-                    canonical = prompt_langs[0]
-                if not canonical and raw_lang and "_" in raw_lang:
-                    try:
-                        lang_part, region_part = raw_lang.split("_", 1)
-                        canonical = f"{lang_part.lower()}-{region_part.upper()}"
-                    except Exception:
-                        canonical = raw_lang
-                keep.append({
-                    "id": vid,
-                    "name": v.get("displayName") or v.get("name") or vid,
-                    "displayName": v.get("displayName") or v.get("name") or vid,
-                    "description": v.get("description", ""),
-                    "gender": v.get("gender", "") or "",
-                    "languageCode": canonical,
-                    "langCode": raw_lang,
-                    "categories": list(v.get("categories") or []),
-                    "tags": list(v.get("tags") or []),
-                    "source": v.get("source", "") or "",
-                    "ageGroup": v.get("ageGroup", "") or "",
-                    "promptLanguages": prompt_langs,
-                })
-            page_token = payload.get("nextPageToken") or ""
-            if not page_token:
-                break
+        req = urllib.request.Request(base, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        for v in payload.get("voices", []) or []:
+            vid = v.get("voiceId") or v.get("id", "")
+            if not vid:
+                continue
+            raw_lang = v.get("langCode") or ""
+            live_langcode = v.get("languageCode") or ""
+            prompt_langs = v.get("promptLanguages") or []
+            canonical = live_langcode
+            if not canonical and prompt_langs:
+                canonical = prompt_langs[0]
+            if not canonical and raw_lang and "_" in raw_lang:
+                try:
+                    lang_part, region_part = raw_lang.split("_", 1)
+                    canonical = f"{lang_part.lower()}-{region_part.upper()}"
+                except Exception:
+                    canonical = raw_lang
+            keep.append({
+                "id": vid,
+                "name": v.get("displayName") or v.get("name") or vid,
+                "displayName": v.get("displayName") or v.get("name") or vid,
+                "description": v.get("description", ""),
+                "gender": v.get("gender", "") or "",
+                "languageCode": canonical,
+                "langCode": raw_lang,
+                "categories": list(v.get("categories") or []),
+                "tags": list(v.get("tags") or []),
+                "source": v.get("source", "") or "",
+                "ageGroup": v.get("ageGroup", "") or "",
+                "promptLanguages": prompt_langs,
+            })
         return keep
     except Exception as exc:
-        log.info("[inworld-voices] fetch failed: %s", _sanitize_error(str(exc))[:200])
+        log.warning("[inworld-voices] fetch failed (key prefix %s...): %s",
+                    api_key[:6] if api_key else "(empty)",
+                    _sanitize_error(str(exc))[:200])
         return []
 
 
@@ -1397,58 +1344,27 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_TTS_VOICES["deepgram"]}
             if provider_id == "inworld":
-                # ponytail: return the FULL Inworld catalog from
-                # GET /voices/v1/voices (~269 SYSTEM voices + any
-                # IVC / PVC clones on the account). The previous
-                # implementation filtered against a hardcoded 23-voice
-                # curated subset — that hid Bruno, Marie, Alistair,
-                # and every other persona the operator asked for.
-                # The hardcoded list is still useful as a last-resort
-                # fallback when no API key is available and the live
-                # fetch fails.
+                # ponytail: show exactly what Inworld returns. The
+                # live catalog (~223 SYSTEM voices + any IVC / PVC
+                # clones on the account) is authoritative — never
+                # blend it with a stale curated subset. If the fetch
+                # fails (no key, auth error, network), return empty
+                # + an actionable error so the operator sees the gap
+                # and fixes it.
                 if creds:
                     live = _fetch_inworld_voices(creds)
                     if live:
-                        # Build a lookup from the curated catalog so a
-                        # voice that's also in the hardcoded list
-                        # inherits the curated `language` label
-                        # (e.g. the FE used to render 'Spanish
-                        # (Mexico)' instead of the bare 'es-MX').
-                        catalog_by_id = {
-                            v["id"]: v for v in _HARDCODED_TTS_VOICES["inworld"]
-                        }
-                        for voice in live:
-                            # Inworld returns the id as "voiceId"
-                            # (camelCase). The keep dict in
-                            # _fetch_inworld_voices normalizes to
-                            # "id", so the lookup is robust either
-                            # way.
-                            voice_id = voice.get("id") or voice.get("voiceId")
-                            catalog_v = catalog_by_id.get(voice_id)
-                            if catalog_v and catalog_v.get("language"):
-                                # ponytail: the catalog wins on
-                                # `language` only — every other field
-                                # (gender, ageGroup, categories,
-                                # description, languageCode) comes from
-                                # Inworld live, which is the
-                                # authoritative source. Also mirror the
-                                # curated label to languageCode /
-                                # langCode so the FE groupInworldVoices
-                                # picker's `(v.raw?.languageCode ||
-                                # v.raw?.langCode)` lookup actually finds
-                                # it — otherwise every curated voice falls
-                                # into the "OTHER" bucket and the operator
-                                # loses the en-US / es-MX sub-headers.
-                                lang = catalog_v["language"]
-                                voice["language"] = lang
-                                voice["languageCode"] = lang
-                                voice["langCode"] = lang
                         return {"models": live}
-                # No key or fetch failed — fall back to the curated
-                # 23-voice catalog so the dropdown is never empty
-                # (the FE degrades gracefully when gender / categories
-                # are missing — chips just don't render).
-                return {"models": _HARDCODED_TTS_VOICES["inworld"]}
+                    # Live fetch returned empty (auth failure, network,
+                    # or zero voices on the account). Bubble the empty
+                    # state to the FE. The modal's Dropdown degrades to
+                    # a free-text voice input when `models` is empty, so
+                    # the operator can still pick a voice by id.
+                    return {"models": [], "error": "Inworld voice catalog unavailable — check your API key or try again."}
+                # No API key provided. The agent can't synthesise TTS
+                # without one, so don't fabricate a dropdown from a
+                # stale list.
+                return {"models": [], "error": "Inworld API key not configured."}
             return {"models": []}
 
         if service == "stt":
@@ -2010,15 +1926,35 @@ def _build_categorized_models(
     out = {"provider": provider_id, "models": {"llm": [], "stt": [], "tts": []}}
 
     def _to_entries(items):
+        # ponytail: the categorized picker is a uniform contract
+        # across every provider, so each entry gets {id, label} at
+        # minimum. Inworld voices come from the live catalog with
+        # rich per-voice metadata (description, gender, languageCode,
+        # categories, tags, source) — we forward those fields so the
+        # FE can render the rich 3-line Dropdown with the language
+        # grouping. Other providers' curated catalogs don't carry
+        # per-model metadata beyond name/description, so only
+        # Inworld hits this branch.
         entries = []
         for it in items or []:
             mid = it.get("id") or it.get("voiceId") or ""
             if not mid:
                 continue
-            entries.append({
+            entry = {
                 "id": mid,
                 "label": _format_model_label(mid),
-            })
+            }
+            if "voiceId" in it or "displayName" in it:
+                # Inworld voice. Forward the metadata the picker
+                # needs for the rich Dropdown + language grouping.
+                for f in (
+                    "description", "gender", "languageCode",
+                    "langCode", "categories", "tags",
+                    "source", "ageGroup", "displayName", "name",
+                ):
+                    if it.get(f) not in (None, "", []):
+                        entry[f] = it[f]
+            entries.append(entry)
         return entries
 
     if provider_id == "openai":
@@ -2062,11 +1998,15 @@ def _build_categorized_models(
         return out
 
     # ponytail: every other provider's catalog lives in the curated
-    # hardcoded table. STT providers go in stt, TTS in tts, LLM in
-    # llm. Voice-only providers (Inworld) put their voices in tts
-    # so the FE can render them in the TTS picker; the FE doesn't
-    # need a separate "voices" bucket because every voice is also a
-    # TTS option. This keeps the contract uniform across providers.
+    # hardcoded table (openai/rime/elevenlabs/deepgram for TTS,
+    # deepgram/assemblyai/openai/inworld for STT, anthropic/gemini/
+    # MiniMax for LLM). Inworld's TTS bucket is fetched live — when
+    # the fetch fails the bucket is empty + an error is bubbled to
+    # the caller. Voice-only providers (Inworld) put their voices
+    # in tts so the FE can render them in the TTS picker; the FE
+    # doesn't need a separate "voices" bucket because every voice is
+    # also a TTS option. This keeps the contract uniform across
+    # providers.
     for service in ("stt", "tts", "llm"):
         try:
             items = list_provider_models(service, provider_id, api_key, user_id).get("models", [])

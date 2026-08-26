@@ -508,6 +508,23 @@ def test_build_categorized_models_inworld_uses_curated_voices():
     assert tts_ids == {"Blake", "Camila"}
     blake = next(m for m in out["models"]["tts"] if m["id"] == "Blake")
     assert blake["label"] == "Blake"
+    # ponytail: the Inworld TTS entry must forward the rich per-voice
+    # metadata the FE needs for the rich 3-line Dropdown (description,
+    # languageCode, gender, categories). Without this the picker
+    # rendered only "{id}" labels with no description / no language
+    # grouping. The previous version of _to_entries dropped every
+    # field except {id, label}, so the live response's
+    # `description` / `languageCode` (which carry the Inworld data the
+    # operator needs) never made it to the FE.
+    assert blake["description"] == "Mid-range English male"
+    assert blake["languageCode"] == "en-US"
+    assert blake["gender"] == "male"
+    assert blake["source"] == "SYSTEM"
+    # The non-Inworld curated entry (the STT model) must NOT carry
+    # those fields - it's an Inworld-specific path.
+    stt_blake = next(m for m in out["models"]["stt"] if m["id"] == "inworld/inworld-stt-1")
+    assert "description" not in stt_blake
+    assert "languageCode" not in stt_blake
 
 
 async def test_categorized_models_route(client, data_dir):
@@ -863,54 +880,6 @@ def test_list_openai_tts_includes_tts_and_realtime_models():
     assert "gpt-3.5-turbo-1106" not in ids
 
 
-def test_inworld_voices_mirror_curated_language_to_languageCode():
-    """Regression: the Inworld voice picker used to group every
-    voice under "OTHER" instead of by language (en-US, es-MX). The
-    FE's `groupInworldVoicesByLanguage` looks up
-    `v.raw.languageCode || v.raw.langCode`. The Inworld live API
-    doesn't always return that field — many system voices come
-    back with no language code at all. The BE has a curated
-    catalog with the language label (e.g. "en-US" for
-    Blake/Sarah, "es-MX" for Camila/Cuauhtemoc), and was setting
-    `voice["language"]` — but the FE never looked at `language`,
-    only at `languageCode` / `langCode`. Every curated voice fell
-    into OTHER.
-
-    Fix: the BE mirrors the curated label to `languageCode` and
-    `langCode` so the FE's group lookup actually finds it.
-    """
-    from unittest.mock import patch
-    from STT_server.services.credentials_resolver import list_provider_models
-
-    with patch(
-        "STT_server.services.credentials_resolver._fetch_inworld_voices"
-    ) as mocked_fetch:
-        # Live Inworld fetch returns voices WITHOUT languageCode /
-        # langCode — many of Inworld's system voices don't carry
-        # that field. The BE has to fill it from the curated
-        # catalog.
-        mocked_fetch.return_value = [
-            {"id": "Blake",       "name": "Blake"},
-            {"id": "Camila",      "name": "Camila"},
-            {"id": "Cuauhtemoc",  "name": "Cuauhtemoc"},
-            {"id": "Bruno",       "name": "Bruno"},  # NOT in curated
-        ]
-        out = list_provider_models("tts", "inworld", api_key="sk-test1234567890abcdefABCDEF")
-
-    by_id = {v["id"]: v for v in out["models"]}
-    # Curated voices inherit en-US / es-MX.
-    assert by_id["Blake"]["languageCode"] == "en-US"
-    assert by_id["Blake"]["langCode"] == "en-US"
-    assert by_id["Camila"]["languageCode"] == "es-MX"
-    assert by_id["Camila"]["langCode"] == "es-MX"
-    assert by_id["Cuauhtemoc"]["languageCode"] == "es-MX"
-    # Non-curated voices (e.g. Bruno, an IVC clone the operator
-    # added themselves) stay as-is. Without languageCode / langCode
-    # they'd end up in the "OTHER" bucket in the FE — but that's
-    # correct behavior for unknown languages.
-    assert "languageCode" not in by_id["Bruno"]
-
-
 def test_inworld_voices_use_promptLanguages_when_langCode_missing():
     """Ponytail: the Inworld live response for some voices (IVC
     clones, custom voices) has empty `langCode` but a populated
@@ -1023,69 +992,119 @@ def test_inworld_voices_use_promptLanguages_when_langCode_missing():
     assert by_id["John"]["description"] == "Cloned voice for narrations."
 
 
-def test_inworld_voices_pagination_walks_every_page():
-    """Ponytail: the Inworld API paginates with nextPageToken. A
-    223-voice account would never fit in a single response — the
-    BE has to walk every page. Earlier the loop was correct in
-    shape but unbounded on real responses. This test pins the
-    pagination behavior.
+def test_inworld_voices_unpaginated_returns_full_list_with_metadata():
+    """Ponytail: Inworld's documented legacy code path returns up to
+    2000 voices in a single response when called with no `pageSize` /
+    `pageToken`. Our account sits at ~223 voices — well under the
+    cap. No pagination: one round-trip is enough.
+
+    Pins the unpaginated behavior + full metadata forwarding so the
+    FE can render the rich Dropdown (description, gender, ageGroup,
+    languageCode, categories, tags, source) and group by language.
     """
     from unittest.mock import patch, MagicMock
     from STT_server.services.credentials_resolver import _fetch_inworld_voices
 
-    page1 = {
+    response = {
         "voices": [
-            {"voiceId": f"voice-{i}", "name": f"voice-{i}",
+            {"voiceId": f"voice-{i}",
+             "name": f"workspaces/inworld/voices/voice-{i}",
              "langCode": "EN_US", "displayName": f"voice-{i}",
-             "description": "", "tags": [], "categories": [],
-             "source": "SYSTEM", "gender": "", "ageGroup": "",
+             "description": f"Voice {i} description",
+             "tags": ["friendly"], "categories": ["companions"],
+             "source": "SYSTEM", "gender": "female",
+             "ageGroup": "middle_aged",
              "promptLanguages": ["en-US"]}
-            for i in range(100)
+            for i in range(223)
         ],
-        "nextPageToken": "token-1",
         "totalSize": 223,
-    }
-    page2 = {
-        "voices": [
-            {"voiceId": f"voice-{i+100}", "name": f"voice-{i+100}",
-             "langCode": "EN_US", "displayName": f"voice-{i+100}",
-             "description": "", "tags": [], "categories": [],
-             "source": "SYSTEM", "gender": "", "ageGroup": "",
-             "promptLanguages": ["en-US"]}
-            for i in range(100)
-        ],
-        "nextPageToken": "token-2",
-        "totalSize": 223,
-    }
-    page3 = {
-        "voices": [
-            {"voiceId": f"voice-{i+200}", "name": f"voice-{i+200}",
-             "langCode": "EN_US", "displayName": f"voice-{i+200}",
-             "description": "", "tags": [], "categories": [],
-             "source": "SYSTEM", "gender": "", "ageGroup": "",
-             "promptLanguages": ["en-US"]}
-            for i in range(23)
-        ],
         "nextPageToken": "",
-        "totalSize": 223,
     }
 
-    pages = [page1, page2, page3]
-
-    def fake_urlopen(req, timeout=10):
+    def fake_urlopen(req, timeout=20):
         resp = MagicMock()
         resp.__enter__ = lambda self: self
         resp.__exit__ = lambda *a: False
-        resp.read = lambda: json.dumps(pages.pop(0)).encode()
+        resp.read = lambda: json.dumps(response).encode()
         return resp
 
     with patch("urllib.request.urlopen", side_effect=fake_urlopen):
         voices = _fetch_inworld_voices("sk-test1234567890abcdefABCDEF")
 
-    # 223 voices, deduplicated, with canonical language "en-US".
     assert len(voices) == 223
     assert {v["id"] for v in voices} == {f"voice-{i}" for i in range(223)}
+    # Full metadata forwarded: description, gender, ageGroup, languageCode,
+    # langCode, categories, tags, source, promptLanguages.
+    assert all(v["description"] == f"Voice {i} description" for i, v in enumerate(voices))
+    assert all(v["gender"] == "female" for v in voices)
+    assert all(v["ageGroup"] == "middle_aged" for v in voices)
     assert all(v["languageCode"] == "en-US" for v in voices)
+    assert all(v["langCode"] == "EN_US" for v in voices)
+    assert all(v["categories"] == ["companions"] for v in voices)
+    assert all(v["tags"] == ["friendly"] for v in voices)
+    assert all(v["source"] == "SYSTEM" for v in voices)
+    assert all(v["promptLanguages"] == ["en-US"] for v in voices)
+
+
+def test_list_provider_models_inworld_no_key_returns_empty_with_error():
+    """No API key → empty list + actionable error.
+
+    Regression: the previous code returned a 23-voice curated
+    fallback that masked the missing-key state and let the operator
+    pick voices their account could never synthesise.
+    """
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    out = list_provider_models("tts", "inworld", api_key=None, user_id=None)
+    assert out["models"] == []
+    assert "API key" in out.get("error", "")
+
+
+def test_list_provider_models_inworld_fetch_fails_returns_empty_with_error(monkeypatch):
+    """Live fetch returns empty (auth failure, network, etc.) →
+    empty list + actionable error. Never the 23-voice curated
+    fallback that hid the real failure from the operator.
+    """
+    from STT_server.services.credentials_resolver import list_provider_models
+
+    monkeypatch.setattr(
+        "STT_server.services.credentials_resolver._fetch_inworld_voices",
+        lambda api_key: [],
+    )
+    out = list_provider_models(
+        "tts", "inworld", api_key="sk-test1234567890abcdefABCDEF",
+    )
+    assert out["models"] == []
+    assert "catalog unavailable" in out.get("error", "")
+
+
+def test_inworld_voices_logs_warning_on_failure(caplog):
+    """Failure must log at WARNING (not INFO) with the API key
+    prefix so operators can see WHY the fetch failed.
+
+    Regression: the previous INFO-level log was buried in the noise
+    — operators couldn't tell whether the empty modal was a missing
+    key, a bad key, or a network blip.
+    """
+    import logging
+    from unittest.mock import patch
+    from STT_server.services.credentials_resolver import _fetch_inworld_voices
+
+    def fake_urlopen(req, timeout=20):
+        raise RuntimeError("simulated 401 unauthorized")
+
+    import STT_server.services.credentials_resolver as cr_mod
+    cr_mod.log.propagate = True
+    caplog.set_level(logging.WARNING, logger="stt_server.security.resolver")
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        voices = _fetch_inworld_voices("sk-test1234567890abcdefABCDEF")
+
+    assert voices == []
+    assert any(
+        "fetch failed" in rec.message and "sk-tes" in rec.message
+        for rec in caplog.records
+    ), f"expected WARNING with key prefix, got: {[r.message for r in caplog.records]}"
 
 
 # ── _read_per_user failure logging ────────────────────────────────────────
