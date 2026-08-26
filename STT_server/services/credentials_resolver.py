@@ -1039,6 +1039,13 @@ def _fetch_inworld_voices(api_key: str) -> list[dict]:
     headers = {"Authorization": f"Basic {api_key}"}
     keep: list[dict] = []
     seen: set[str] = set()
+    # ponytail: classify the failure so the operator can act on the
+    # real cause. The Inworld support team asks "did the request
+    # return 401/403, was it rate-limited, or did the workspace just
+    # have no voices assigned yet?" — surface that distinction in the
+    # log and let the FE render a specific message.
+    failure_kind: str | None = None
+    failure_detail: str = ""
     try:
         page_token = ""
         # ponytail: pagination loop. Hard cap 10 pages × 500 = 5000
@@ -1095,11 +1102,62 @@ def _fetch_inworld_voices(api_key: str) -> list[dict]:
         # spamming during normal traffic.
         log.info("[inworld-voices] fetched %d voices (token=%s)",
                  len(keep), "next" if page_token else "done")
+        if not keep:
+            # Empty workspace: the key authenticated but the account
+            # has no voices assigned yet (new workspace, brand new
+            # account, or the key only has read-scope on a sub-set).
+            # The voice catalog endpoint returns 200 OK + an empty list
+            # in this case — easy to misread as a fetch error.
+            failure_kind = "empty_workspace"
+            failure_detail = (
+                "Inworld returned 200 OK with no voices. Your API key "
+                "authenticated but the workspace has no voices assigned "
+                "yet (new account, or the key doesn't have access to the "
+                "workspace's voice pool). Check https://studio.inworld.ai "
+                "→ Workspace → Voices."
+            )
+            log.warning(
+                "[inworld-voices] empty workspace — key prefix %s... authenticated but 0 voices returned. "
+                "Most common cause: new Inworld workspace with no voices provisioned, or the key has "
+                "limited scope (e.g. read-only on a sub-workspace). Verify in the Inworld Studio.",
+                api_key[:6] if api_key else "(empty)",
+            )
         return keep
+    except urllib.error.HTTPError as exc:
+        # 401/403 = bad key or missing scope; 429 = rate limit; 5xx = Inworld
+        # outage. The body is usually a small JSON with `error`/`message`.
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        if exc.code in (401, 403):
+            failure_kind = "auth"
+            failure_detail = (
+                f"Inworld rejected the key with HTTP {exc.code} (auth/scope). "
+                f"Body: {body or '(empty)'}"
+            )
+        elif exc.code == 429:
+            failure_kind = "rate_limit"
+            failure_detail = (
+                f"Inworld rate-limited the request (HTTP 429). Body: {body or '(empty)'}"
+            )
+        else:
+            failure_kind = f"http_{exc.code}"
+            failure_detail = (
+                f"Inworld returned HTTP {exc.code}. Body: {body or '(empty)'}"
+            )
+        log.warning(
+            "[inworld-voices] fetch failed (key prefix %s...): %s",
+            api_key[:6] if api_key else "(empty)", failure_detail,
+        )
+        return []
     except Exception as exc:
+        failure_kind = "exception"
+        failure_detail = _sanitize_error(str(exc))[:200]
         log.warning("[inworld-voices] fetch failed (key prefix %s...): %s",
                     api_key[:6] if api_key else "(empty)",
-                    _sanitize_error(str(exc))[:200])
+                    failure_detail)
         return []
 
 
@@ -1384,11 +1442,22 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                     if live:
                         return {"models": live}
                     # Live fetch returned empty (auth failure, network,
-                    # or zero voices on the account). Bubble the empty
-                    # state to the FE. The modal's Dropdown degrades to
-                    # a free-text voice input when `models` is empty, so
-                    # the operator can still pick a voice by id.
-                    return {"models": [], "error": "Inworld voice catalog unavailable — check your API key or try again."}
+                    # or zero voices on the account). The detailed
+                    # reason was already logged inside _fetch_inworld_voices
+                    # with the failure_kind classification (auth / rate_limit /
+                    # empty_workspace / network). Here we surface a
+                    # concise, action-oriented message so the operator
+                    # can act without grepping BE logs.
+                    return {
+                        "models": [],
+                        "error": (
+                            "Inworld voice catalog is empty for this key — "
+                            "either the key lacks scope, the workspace has "
+                            "no voices yet, or the request was rate-limited. "
+                            "Check Settings → API for the test result, then "
+                            "verify the Inworld Studio workspace has voices."
+                        ),
+                    }
                 # No API key provided. The agent can't synthesise TTS
                 # without one, so don't fabricate a dropdown from a
                 # stale list.
@@ -1729,7 +1798,16 @@ def _test_inworld(creds: dict[str, str]) -> tuple[bool, str]:
     here because that requires picking a valid voice_id from the user's
     workspace, and we don't know which ones they have at validation time.
     If the key authenticates against the voices list endpoint, the key
-    is good; if it doesn't, the response body tells us exactly why."""
+    is good; if it doesn't, the response body tells us exactly why.
+
+    ponytail: also surface the voice count. An empty workspace returns
+    200 OK + `{"voices": []}` — a key that authenticates but has no
+    voices is operationally broken for the operator (the dropdown will
+    be empty) so we mark it invalid. Without this check the operator
+    sees "key valid" in /settings but the agent modal still can't pick
+    a voice — the exact symptom from the 2026-08-26 incident.
+    """
+    import json
     import urllib.error
     import urllib.request
     key = creds.get("api_key")
@@ -1741,7 +1819,29 @@ def _test_inworld(creds: dict[str, str]) -> tuple[bool, str]:
             headers={"Authorization": f"Basic {key}"},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200, f"HTTP {resp.status}"
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}"
+            # The auth check alone isn't enough — an empty workspace
+            # would silently pass. Sample the first page so we can
+            # warn the operator before they save the key.
+            try:
+                payload = json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                payload = {}
+            voices = payload.get("voices") or []
+            total = payload.get("totalSize")
+            if total == 0 or (voices == [] and total is None):
+                return False, (
+                    "authenticated but the Inworld workspace has 0 "
+                    "voices assigned — the dropdown will be empty. "
+                    "Open https://studio.inworld.ai → Workspace → Voices "
+                    "and provision at least one voice, or use a key "
+                    "with access to a populated workspace."
+                )
+            return True, (
+                f"HTTP 200, {total if total is not None else len(voices)} "
+                f"voice(s) accessible"
+            )
     except urllib.error.HTTPError as exc:
         err_body = ""
         try:

@@ -1153,7 +1153,66 @@ def test_list_provider_models_inworld_fetch_fails_returns_empty_with_error(monke
         "tts", "inworld", api_key="sk-test1234567890abcdefABCDEF",
     )
     assert out["models"] == []
-    assert "catalog unavailable" in out.get("error", "")
+    # The exact error string was rewritten in 2026-08-26 to be
+    # action-oriented (the previous "Inworld voice catalog unavailable
+    # — check your API key or try again" was too vague).
+    assert "voice catalog is empty" in out.get("error", "")
+
+
+def test_list_provider_models_inworld_empty_workspace_logs_kind(monkeypatch, caplog):
+    """When the Inworld API returns 200 OK with no voices (empty
+    workspace), the BE must classify this as a distinct failure kind
+    — not a generic 'fetch failed'. The operator needs to know to
+    provision voices in the Inworld Studio, not regenerate the API
+    key. Pins the empty_workspace branch of _fetch_inworld_voices."""
+    import logging
+    from STT_server.services import credentials_resolver as cr
+
+    def fake_urlopen(req, timeout=20):
+        # Return a well-formed 200 with an empty voices array. The
+        # user's key authenticated; the workspace just has no voices.
+        import json as _j
+        resp = type("R", (), {})()
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda *a: False
+        resp.read = lambda: _j.dumps({"voices": [], "totalSize": 0, "nextPageToken": ""}).encode()
+        return resp
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    voices = cr._fetch_inworld_voices("sk-anything")
+
+    assert voices == [], (
+        "empty workspace should return [] (operator provisions voices "
+        "in the Inworld Studio, not regenerates the key)"
+    )
+
+
+def test_list_provider_models_inworld_auth_error_classified(monkeypatch):
+    """When the Inworld API returns 401/403, _fetch_inworld_voices
+    must surface the auth error (not a generic failure) so the FE
+    can render 'wrong key or scope' instead of the misleading 'empty
+    workspace' message. Regression for the 2026-08-26 incident
+    where the operator's stored key was rejected for an unknown
+    reason and we couldn't tell why from the logs."""
+    import urllib.error as ue
+    from STT_server.services import credentials_resolver as cr
+
+    def fake_urlopen(req, timeout=20):
+        raise ue.HTTPError(
+            req.full_url, 403, "Forbidden", {}, None,
+        )
+
+    captured = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        cr.log, "warning", lambda *a, **kw: captured.append((a, kw))
+    )
+    voices = cr._fetch_inworld_voices("sk-bad-key")
+    assert voices == []
+    # The warning should mention 403 (so a grep finds the auth issue).
+    assert any("403" in str(msg) for msg, _ in captured), (
+        f"auth error not classified in log: {captured}"
+    )
 
 
 def test_inworld_voices_logs_warning_on_failure(caplog):
@@ -1183,6 +1242,43 @@ def test_inworld_voices_logs_warning_on_failure(caplog):
         "fetch failed" in rec.message and "sk-tes" in rec.message
         for rec in caplog.records
     ), f"expected WARNING with key prefix, got: {[r.message for r in caplog.records]}"
+
+
+def test_test_inworld_rejects_empty_workspace():
+    """The /test endpoint must NOT mark an empty workspace as a
+    valid key. A key that authenticates but returns 0 voices would
+    leave the agent modal's dropdown empty — the exact symptom
+    the operator reported on 2026-08-26. The test endpoint is
+    the operator's only signal that "the key works but the
+    workspace is empty"; returning valid=True here would let bad
+    state persist silently.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+    from STT_server.services.credentials_resolver import _test_inworld
+
+    def fake_urlopen(req, timeout=15):
+        resp = MagicMock()
+        resp.status = 200  # real response.status check
+        resp.read.return_value = json.dumps(
+            {"voices": [], "totalSize": 0, "nextPageToken": ""}
+        ).encode()
+        # Make the context manager return the response itself,
+        # not the status attribute (MagicMock default is to return
+        # the status attribute because of how __enter__ is recorded).
+        resp.__enter__ = lambda self: resp
+        resp.__exit__ = lambda *a: False
+        return resp
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        ok, msg = _test_inworld({"api_key": "sk-good-auth-but-empty"})
+
+    assert ok is False, (
+        f"empty workspace must NOT validate as a healthy key — got ok={ok!r} msg={msg!r}"
+    )
+    assert "0 voices" in msg.lower() or "no voices" in msg.lower() or "empty" in msg.lower(), (
+        f"rejection reason should mention empty workspace; got msg={msg!r}"
+    )
 
 
 # ── _read_per_user failure logging ────────────────────────────────────────
