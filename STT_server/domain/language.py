@@ -659,8 +659,157 @@ def _find_next_segment_boundary(buffer: str, segments_so_far: list[str]) -> int 
 
 
 def sanitize_tts_text(text: str, max_len: int = 1500, allowed_punct: set[str] | None = None) -> str:
-    """Sanitize text intended for TTS playback."""
-    # Sanitization disabled — return the original text unchanged to avoid
-    # audio corruption issues. This function remains as a no-op so callers
-    # that reference it keep working without modification.
-    return text
+    """Sanitize text intended for TTS playback before handing it to
+    Inworld TTS.
+
+    Two responsibilities:
+      1. Strip Markdown presentation syntax that Inworld would
+         otherwise READ ALOUD as literal asterisks / underscores /
+         backticks / tildes / hash signs. Real-world example: the LLM
+         says "Hola *mundo*" → without sanitization Inworld reads
+         "asterisco mundo asterisco" instead of "mundo".
+      2. Allowlist non-verbal cues per agent and cap their count so
+         a runaway LLM can't emit a dozen `[breathe]` in one reply.
+
+    CRITICAL: this function MUST preserve semantic content. The
+    previous "strip all `_` and `#`" proposal was unsafe — it would
+    silently corrupt `ulises_test@gmail.com` to `ulisestest@gmail.com`
+    and `customer_id_123` to `customerid123`. We strip Markdown
+    syntax ONLY when the surrounding characters confirm it (paired
+    markers with no whitespace between marker and content).
+
+    Inworld's inline markup `<break ... />` and `[breathe]` / `[sigh]`
+    / etc. is preserved verbatim — the segmenter (commit 1) protects
+    it from being cut mid-tag, and the LLM hint (commit 4) tells the
+    model when each tag is appropriate.
+
+    Returns the sanitized text, capped at `max_len` characters
+    (Inworld handles up to ~10k chars per call; 1500 is a defensive
+    ceiling for runaway responses).
+    """
+    if not text:
+        return text
+
+    # Non-verbal allowlist for the Laboratorio C.G.O. agent — the
+    # only ones the LLM hint currently encourages. Add new tags here
+    # when the prompt introduces them; the sanitizer rejects anything
+    # outside this list so a runaway LLM can't drop `[laugh]` or
+    # `[cough]` into a customer-service reply.
+    _NONVERBAL_ALLOWLIST = {"breathe", "sigh"}
+    _NONVERBAL_MAX = 2  # Emergency cap. Prompt targets 0-1.
+
+    s = text
+
+    # ── Markdown stripping (contextual, semantic-safe) ───────────────
+    # Only strip when we can confirm it's Markdown by paired markers
+    # tight against the content (no whitespace between marker and
+    # word). This protects ulises_test@gmail.com (single `_` between
+    # letters) and customer_id_123 (single `_` between word and
+    # number) — neither matches the pattern of Markdown emphasis,
+    # which has the marker glued to the word with no whitespace.
+    s = _strip_markdown_emphasis(s)
+
+    # Strip leading `#` Markdown headers (a line starting with `# `
+    # at the beginning of a line is a header, never data). Anywhere
+    # else `#` is preserved (data might contain hashes).
+    s = _strip_leading_hashes(s)
+
+    # Strip backticks used as inline code (paired). Markdown code spans
+    # always wrap content tight against the backticks. Backticks inside
+    # data (like email templates) are rarely wrapped as code spans.
+    s = _strip_inline_code(s)
+
+    # Strip strikethrough (paired `~~word~~`). Less common in
+    # customer-service output but the LLM occasionally writes them.
+    s = _strip_strikethrough(s)
+
+    # ── Non-verbal allowlist + cap ───────────────────────────────────
+    s = _enforce_nonverbal_allowlist(s, _NONVERBAL_ALLOWLIST, _NONVERBAL_MAX)
+
+    # Truncate as a final safety net (very rare — Inworld handles
+    # 10k+ chars fine; this is for runaway LLM outputs).
+    if len(s) > max_len:
+        s = s[:max_len]
+
+    return s
+
+
+# ── Markdown stripping helpers ────────────────────────────────────
+# Each helper is narrowly scoped: it only strips a specific Markdown
+# construct when the surrounding characters CONFIRM it's Markdown
+# (paired markers with no whitespace between marker and content).
+# Real customer data (emails, IDs, phone numbers) uses these
+# characters without the Markdown pairing — they survive untouched.
+
+
+def _strip_markdown_emphasis(s: str) -> str:
+    """Strip **bold**, *italic*, __bold__, _italic_ but ONLY when the
+    markers are glued to content with no whitespace between marker
+    and word. `*italic*` becomes `italic`. `* star*` (space after the
+    opening marker) is left alone — that pattern reads as "asterisk,
+    space, word" not as Markdown."""
+    # **bold** — paired double-asterisk, always bold
+    s = re.sub(r"\*\*([^*\s][^*\n]*?)\*\*", r"\1", s)
+    # __bold__ — paired double-underscore
+    s = re.sub(r"__([^_\s][^_\n]*?)__", r"\1", s)
+    # *italic* — paired single-asterisk, no whitespace inside markers
+    s = re.sub(r"(?<!\*)\*([^*\s][^*\n]*?)\*(?!\*)", r"\1", s)
+    # _italic_ — paired single-underscore, no whitespace inside markers
+    # (and not adjacent to another underscore, which would be the
+    # double-underscore bold pattern). `ulises_test@gmail.com`
+    # doesn't match because the underscores have letters on both
+    # sides AND another underscore nearby — it's data, not italic.
+    s = re.sub(r"(?<!\w)_(\S[^_\n]*?)_(?!\w)", r"\1", s)
+    return s
+
+
+def _strip_leading_hashes(s: str) -> str:
+    """Strip `#`, `##`, `###` headers at the START of a line. Real
+    data rarely starts a line with `#` followed by space; Markdown
+    headers always do. `customer_id_#123` mid-string is preserved."""
+    return re.sub(r"(?m)^\s*#{1,6}\s+", "", s)
+
+
+def _strip_inline_code(s: str) -> str:
+    """Strip `inline code` (paired single backticks). Backticks are
+    rare in customer-service speech — if the LLM produces one, it's
+    Markdown."""
+    return re.sub(r"`([^`\n]+)`", r"\1", s)
+
+
+def _strip_strikethrough(s: str) -> str:
+    """Strip ~~strikethrough~~ (paired double-tildes)."""
+    return re.sub(r"~~([^~\n]+)~~", r"\1", s)
+
+
+def _enforce_nonverbal_allowlist(s: str, allowlist: set[str], max_count: int) -> str:
+    """Drop any `[tag]` that's not in the allowlist, and cap the
+    total count of allowed tags. Anything not in the form `[word]`
+    is preserved untouched.
+
+    Allowed tags stay in place up to `max_count`. The LLM hint guides
+    the model toward 0-1 tags per turn; the cap is an emergency
+    guard against a runaway reply like
+    `[breathe] hola [sigh] [breathe] [laugh] [cough]`.
+    """
+    allowed: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        tag = match.group(1).lower()
+        if tag in allowlist and len(allowed) < max_count:
+            allowed.append(tag)
+            return match.group(0)  # preserve the original case
+        if tag in allowlist:
+            # Past the cap — drop silently. Operator sees the cap
+            # log at the Inworld call site.
+            return ""
+        # Not in allowlist — drop. The LLM hint lists only
+        # allowed tags, anything else is LLM hallucination.
+        return ""
+
+    # Pattern: [tag] — inner content may include spaces (e.g.
+    # "[clear throat]") but not other brackets or periods (those
+    # delimit different things — punctuation outside a tag, or a
+    # nested `[...]` we'd want to treat separately). We match the
+    # inner tag and lowercase it for the allowlist check.
+    return re.sub(r"\[([^\[\]\.]+)\]", _replace, s)
