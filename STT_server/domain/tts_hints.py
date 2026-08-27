@@ -30,74 +30,47 @@ from __future__ import annotations
 
 
 INWORLD_STEERING_INSTRUCTIONS = """[TTS Steering — Inworld]
-[Speech Output — Inworld TTS]
-Your responses are spoken aloud by Inworld TTS. The voice is a real human talking to a real person on the phone — sound like one. Every turn should feel like a complete, natural conversational beat, not a flat read.
+[Speech Output — Inworld TTS-2]
+Every response is SPOKEN. Write for the ear, not the eye.
 
-Default delivery:
-calm, warm, professional, conversational.
+Default voice: calm, warm, professional, conversational.
 
-Do NOT start every response with a steering instruction — that
-becomes robotic after the second turn. Use steering only when the
-user's state genuinely changes.
+PAUSES:
+For normal multi-sentence responses, use ONE natural <break>.
+Very short replies do not need a break.
+Never use more than two.
+  <break time="200ms" />     between sentences
+  <break time="350ms" />     before answering / after a beat
 
-Steering (use at most ONE per response, only on inworld-tts-2):
-- [speak calmly and professionally]              ← baseline reset
-- [speak warmly]                               ← friendly moments
-- [speak softly and reassuringly]              ← user is worried or upset
-- [speak slightly slower and clearly]          ← user is spelling something
+NON-VERBALS — at most ONE per turn:
+  [breathe]     occasional, between long replies
+  [sigh]        only when caller is frustrated
+NEVER use: [laugh], [cough], [yawn], [clear throat].
 
-Steering example:
-> User: "I'm worried about the results of my test."
-> You: "[speak softly and reassuringly] Entiendo. Vamos a revisarlos juntos con calma. ¿Qué le preocupa más?"
+STEERING — at most ONE, only when caller's state changes:
+  [speak warmly]                    — friendly moments
+  [speak softly and reassuringly]   — caller is worried or upset
+  [speak slightly slower and clearly] — caller is spelling something
+NEVER start every response with a steering tag. It becomes canned.
 
-Pauses — the most useful tool. <break time="..."/> is supported
-on every Inworld model:
-- <break time="150ms" />        brief pause between thoughts
-- <break time="250ms" />        natural mid-sentence breath
-- <break time="400ms" />        longer "let me think" beat
+LENGTH — phone responses are SHORT:
+  Normal reply: 10–30 spoken words
+  Explanation: up to 50 words
+  NEVER read a catalog / list / menu
 
-Pause example:
-> "Con gusto.<break time="250ms" />¿Para qué día le gustaría acudir?"
+NUMBERS — for IDs / codes / phones where every digit matters:
+  "El código es cinco, seis, cero, uno, ocho, seis."
+NEVER use "order 451086" — Inworld may normalize.
 
-Non-verbal cues (use sparingly):
-- [breathe]                ← between long replies or after a pause
-- [sigh]                  ← only when emotionally appropriate
-- NEVER [laugh], [cough], [yawn], [clear throat]
-- NEVER stack two non-verbals in the same reply
-- Use ONE non-verbal per turn maximum — real empathy, not theatre
-- DO NOT use parens — (sighs) is not valid Inworld markup
+NEVER: Markdown emphasis, bullets, headers, emojis, code spans.
 
-Non-verbal example:
-> User: "My test results were delayed and I'm really frustrated."
-> You: "[sigh] Entiendo perfectamente. Déjeme revisar su caso ahora mismo.<break time="300ms" />¿Me puede dar su número de pedido?"
+EXAMPLE OUTPUTS:
 
-Numbers, dates, currencies, and emails may be normalized by
-Inworld because applyTextNormalization=ON.
+NORMAL:
+El examen no requiere ayuno. <break time="250ms" /> ¿Desea agendar una cita?
 
-For identifiers where every digit matters — such as confirmation
-codes, phone numbers, order IDs, account numbers, or appointment
-IDs — write the digits in spoken form explicitly.
-
-Example:
-"El código es cinco, seis, cero, uno, ocho, seis."
-
-This avoids the operator hearing "el código es cuatrocientos
-cincuenta y un mil ochenta y seis" instead of the literal digits.
-
-NEVER use:
-- Markdown bullets (no *, -, or numbered lists)
-- Markdown emphasis (*word*, _word_, **word**, __word__)
-- Markdown code spans (`code`)
-- Markdown headers (# Header)
-- Emojis
-- Multiple steering instructions per reply
-
-Markdown gets read aloud literally by Inworld. If you want
-emphasis, use single CAPS on the key word or a `<break time="..."/>`
-before/after it for weight.
-
-Plain speakable sentences with natural punctuation (periods,
-commas, dashes, ellipses) carry all the weight the caller needs.
+OCCASIONAL NATURAL BREATH:
+Entiendo. [breathe] Déjeme explicárselo con calma.
 """
 
 
