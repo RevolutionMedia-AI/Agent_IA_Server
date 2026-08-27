@@ -43,7 +43,11 @@ Never use more than two.
   <break time="350ms" />     before answering / after a beat
 
 NON-VERBALS — at most ONE per turn:
-  [breathe]     occasional, between long replies
+  [breathe] is rare. Never put [breathe] at the beginning of a
+  response. Use it only between clauses or sentences when the
+  response is long enough to naturally require a breath.
+  Good: Entiendo lo que necesita. [breathe] Le explico las opciones disponibles.
+  Bad:  [breathe] Muy bien.
   [sigh]        only when caller is frustrated
 NEVER use: [laugh], [cough], [yawn], [clear throat].
 

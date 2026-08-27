@@ -813,3 +813,52 @@ def _enforce_nonverbal_allowlist(s: str, allowlist: set[str], max_count: int) ->
     # nested `[...]` we'd want to treat separately). We match the
     # inner tag and lowercase it for the allowlist check.
     return re.sub(r"\[([^\[\]\.]+)\]", _replace, s)
+
+
+def format_for_tts(text: str) -> str:
+    """Deterministic speech formatter — inserts a single <break>
+    for multi-sentence replies.
+
+    Two responsibilities:
+      1. The LLM is no longer asked to emit <break> (it doesn't do
+         it reliably — 0 occurrences in the last production call).
+         Pauses are structural, not emotional, so the backend can
+         insert them deterministically without understanding intent.
+      2. Keep [breathe], [sigh], and [speak ...] as LLM decisions
+         — those ARE emotional and must stay contextual.
+
+    Rules:
+      - If the text already contains "<break", leave it alone
+        (the LLM did emit a pause — respect it).
+      - If the text has fewer than 2 sentences, don't insert
+        anything (a single short reply like "De acuerdo. ¿Qué día
+        le gustaría acudir?" doesn't need a break).
+      - If 2+ sentences, insert ONE <break time="250ms" /> after
+        the first declarative sentence (the first `.!?` followed
+        by whitespace). Max one per reply — more would sound
+        stuttered on a phone call.
+
+    The segmenter (commit 1) protects <break ... /> from being
+    cut mid-tag, so the inserted break survives streaming intact.
+
+    Returns the text with at most one break inserted, or the
+    original text if no insertion was appropriate.
+    """
+    if not text or "<break" in text:
+        return text
+
+    # Count sentences: split on sentence terminators followed by
+    # whitespace. Filter empties so "Hello. " (trailing space)
+    # doesn't count as a phantom second sentence.
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    if len(sentences) < 2:
+        return text
+
+    # Insert after the first sentence. Use 250ms — the natural
+    # mid-sentence breath the Inworld docs recommend for
+    # conversational pauses. 200ms is also valid; 250ms is the
+    # slightly more audible variant that survives MULAW 8 kHz
+    # encoding without getting swallowed.
+    first = sentences[0]
+    rest = " ".join(sentences[1:])
+    return f"{first} <break time=\"250ms\" /> {rest}"

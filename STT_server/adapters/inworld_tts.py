@@ -206,30 +206,24 @@ async def stream_tts_segment(
             "speakingRate": speaking_rate,
         },
     }).encode("utf-8")
-    # ponytail: TTS_INWORLD_BODY observability log. Fires under
-    # TTS_DEBUG_LOG (env var) so production logs stay free of PII
-    # (emails, IDs, full names). Operators enable TTS_DEBUG_LOG=1
-    # when chasing a TTS issue. The log carries the same session +
-    # generation + seg_idx the upstream TTS_RAW_SEGMENT and
-    # TTS_SANITIZED_SEGMENT logs use, so an operator can join the
-    # three lines with a single grep on session + gen + seg.
-    from STT_server.services.turn_manager import (
-        TTS_DEBUG_LOG as _tts_debug,
-        TTS_DEBUG_TEXT_CHARS as _tts_chars,
+    # ponytail: TTS_INWORLD_BODY observability log. Truncated to
+    # 500 chars so PII doesn't blow up the pipeline. Carries the
+    # same session + generation + seg_idx the upstream
+    # TTS_RAW_SEGMENT and TTS_SANITIZED_SEGMENT logs use, so an
+    # operator can join the three (now four with FORMATTED) lines
+    # with a single grep on session + gen + seg.
+    log.info(
+        "[TTS_INWORLD_BODY] session=%s gen=%d seg=%d text_len=%d voice=%r model=%r speakingRate=%.2f deliveryMode=%s body=%r",
+        getattr(session, "session_key", "?"),
+        generation,
+        seg_idx,
+        len(text),
+        voice_id,
+        model_id,
+        speaking_rate,
+        "BALANCED",
+        body.decode("utf-8")[:500],
     )
-    if _tts_debug:
-        log.info(
-            "[TTS_INWORLD_BODY] session=%s gen=%d seg=%d text_len=%d voice=%r model=%r speakingRate=%.2f deliveryMode=%s body=%s",
-            getattr(session, "session_key", "?"),
-            generation,
-            seg_idx,
-            len(text),
-            voice_id,
-            model_id,
-            speaking_rate,
-            "BALANCED",
-            body.decode("utf-8")[:_tts_chars],
-        )
 
     url = "https://api.inworld.ai/tts/v1/voice:stream"
     headers = {

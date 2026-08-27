@@ -203,25 +203,47 @@ async def play_tts_from_text_queue(
         # shows the text straight from the streaming segmenter,
         # BEFORE `sanitize_tts_text` has a chance to strip Markdown
         # or filter non-verbals. `TTS_SANITIZED_SEGMENT` shows what
-        # we actually hand to Inworld. Default off (PII risk —
-        # operator enables with `TTS_DEBUG_LOG=1` while chasing a
-        # TTS issue). Both capped at 200 chars.
-        if TTS_DEBUG_LOG:
-            log.info(
-                "[TTS_RAW_SEGMENT] session=%s gen=%d seg=%d text=%r",
-                session.session_key, generation, seg_idx,
-                text[:TTS_DEBUG_TEXT_CHARS],
-            )
+        # we actually hand to Inworld. `TTS_FORMATTED_SEGMENT` shows
+        # the result after the deterministic <break> insertion. All
+        # three capped at 200 chars (truncated) so PII doesn't blow
+        # up the log pipeline. The full text is in `session.history`
+        # if anyone needs the raw output.
+        log.info(
+            "[TTS_RAW_SEGMENT] session=%s gen=%d seg=%d text=%r",
+            session.session_key, generation, seg_idx,
+            text[:TTS_DEBUG_TEXT_CHARS],
+        )
         try:
             safe_text = sanitize_tts_text(text)
         except Exception:
             safe_text = text
-        if TTS_DEBUG_LOG:
+        log.info(
+            "[TTS_SANITIZED_SEGMENT] session=%s gen=%d seg=%d text=%r",
+            session.session_key, generation, seg_idx,
+            safe_text[:TTS_DEBUG_TEXT_CHARS],
+        )
+        # ponytail: deterministic break insertion. The LLM is no
+        # longer asked to emit <break> (it doesn't do it reliably —
+        # 0 occurrences in the last production call). Pauses are
+        # structural, not emotional, so the backend inserts ONE
+        # <break time="250ms" /> after the first declarative
+        # sentence when the reply has 2+ sentences. Single-sentence
+        # replies (e.g. "De acuerdo. ¿Qué día le gustaría acudir?")
+        # stay break-free. The hint now tells the LLM to leave
+        # pauses to the formatter; the LLM only owns [breathe],
+        # [sigh], and [speak ...] (which ARE emotional/contextual).
+        from STT_server.domain.language import format_for_tts
+        try:
+            formatted = format_for_tts(safe_text)
+        except Exception:
+            formatted = safe_text
+        if formatted != safe_text:
             log.info(
-                "[TTS_SANITIZED_SEGMENT] session=%s gen=%d seg=%d text=%r",
+                "[TTS_FORMATTED_SEGMENT] session=%s gen=%d seg=%d text=%r",
                 session.session_key, generation, seg_idx,
-                safe_text[:TTS_DEBUG_TEXT_CHARS],
+                formatted[:TTS_DEBUG_TEXT_CHARS],
             )
+            safe_text = formatted
 
         if not safe_text:
             # If sanitization removed all characters, fall back to the original
