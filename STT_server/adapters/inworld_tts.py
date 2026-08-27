@@ -142,60 +142,79 @@ async def stream_tts_segment(
     # official doc; we clamp to 1.5 here so a future code path that
     # writes 1.8 doesn't silently degrade the audio).
     _speed = getattr(session, "tts_speed", None)
-    # ponytail: bumped default from 1.0 to 1.15 per operator feedback
-    # ("the TTS sounds slow and lumbering on the call"). 1.15 is
-    # still within Inworld's natural-speech band (≤1.5 per docs) and
-    # does not trigger the "too fast" denoise heuristics. Per-agent
-    # overrides via session.tts_speed still apply on top.
-    speaking_rate = max(0.5, min(1.5, _speed if _speed is not None else 1.15))
-    # ponytail: Steering is only honored by inworld-tts-2 (full
-    # support). On 1.5-mini / 1.5-max the tags are silently ignored
-    # or rendered inconsistently, so we gate the flag to tts-2. The
-    # agent's per-provider TTS hint (STT_server/domain/tts_hints.py)
-    # matches this — the LLM is told to only emit square-bracket
-    # tags ([laugh], [sigh]) and to expect them to work only on
-    # tts-2.
-    steering_enabled = model_id == "inworld-tts-2"
-    # ponytail: the previous body only had audioConfig. Inworld's
-    # TTS also accepts top-level fields:
-    # - language (BCP-47) → drives pronunciation normalization for
-    #   numbers / dates / order IDs. Default 'es' matches the agent
-    #   prompt's expected locale.
-    # - applyTextNormalization=ON → Inworld expands "order 451086"
-    #   into speakable words instead of letter-by-letter.
-    # - enhanceGeneration=false → server-side denoise pass disabled.
-    #   Was producing "puff" artifacts and occasional word clipping on
-    #   the streaming chunks for inworld-tts-2 in Spanish — the
-    #   post-process inserts synthetic breath between words and
-    #   sometimes cuts phonemes. Re-enable per-voice if a specific
-    #   voice profile benefits from it.
+    if _speed is not None and _speed > 1.10:
+        # ponytail: 2026-08-26 TTS markup work. Now that the LLM hint
+        # produces real <break time="..." /> and [breathe] pauses, a
+        # speakingRate > 1.10 makes everything BETWEEN the pauses
+        # 10-15% faster. The result is the agent sounds "rushed into
+        # STOP → rushed → STOP" instead of "speaks naturally → micro
+        # pause → speaks naturally". Inworld defaults to 1.0 in its
+        # Python SDK for the same reason. We log a warning when an
+        # operator pushes the rate above 1.10 so the markup work
+        # doesn't get silently undone by an old setting.
+        log.info(
+            "[INWORLD_TTS] session=%s speakingRate=%.2f (>1.10 — "
+            "markup pauses may be compressed; A/B test with 1.0–1.05)",
+            getattr(session, "session_key", "?"), _speed,
+        )
+    # ponytail: 2026-08-26 — bumped default from 1.15 down to 1.0.
+    # The previous 1.15 was set when the agent's replies were flat
+    # prose with no markup pauses. Now that the LLM hint asks for
+    # <break time="..." /> and [breathe] tags, 1.0 lets those pauses
+    # land at their natural duration. Per-agent overrides via
+    # session.tts_speed still apply on top — operators can dial up
+    # to 1.05 if 1.0 sounds slow in production.
+    speaking_rate = max(0.5, min(1.5, _speed if _speed is not None else 1.0))
+    # ponytail: 2026-08-26 — removed the fake `Steering: true` field.
+    # Inworld's HTTP API for /tts/v1/voice and /tts/v1/voice:stream
+    # does NOT accept an `audioConfig.Steering` flag. The actual
+    # steering control is inline in the `text` field (the LLM hint
+    # tells the model to emit tags like [speak calmly, professionally]
+    # and the steering is applied via those). The previous version
+    # set `Steering: true` for tts-2 only; Inworld silently ignored
+    # it (the field isn't in the schema). Removing makes the wire
+    # payload match the documented contract.
+    #
+    # ponytail: 2026-08-26 — added `deliveryMode: "BALANCED"` as a
+    # top-level field. Inworld's official docs (and the Python SDK
+    # default) use BALANCED for conversational agents — it's the
+    # natural setting for a customer-service voice. TTS-2 also
+    # accepts EXPRESSIVE for higher variability, but we deliberately
+    # start at BALANCED so call-to-call consistency is high (no
+    # surprise voice changes between operator audits). Operators
+    # can override per-agent in a future iteration.
     language_code = (getattr(session, "preferred_language", None) or "es").strip().lower()
     body = json.dumps({
         "text": text,
         "voiceId": voice_id,
         "modelId": model_id,
         "language": language_code,
+        "deliveryMode": "BALANCED",
         "applyTextNormalization": "ON",
         "enhanceGeneration": False,
         "audioConfig": {
             "audioEncoding": "MULAW",
             "sampleRateHertz": 8000,
             "speakingRate": speaking_rate,
-            "Steering": steering_enabled,
         },
     }).encode("utf-8")
     # ponytail: one-shot INFO log of the request body so the operator
-    # can confirm Steering: True is actually being sent. If the LLM
-    # is generating "(sighs)" / "(pause)" / etc. in its reply but
-    # Inworld is not applying them, the body log will show
-    # `"Steering": true` — the bug then is on Inworld's side, not ours.
+    # can confirm deliveryMode is actually being sent (top-level,
+    # not nested in audioConfig — the documented Inworld shape).
+    # The log also surfaces speakingRate so a manual tweak is visible
+    # without opening devtools. If a future change re-nests
+    # deliveryMode into audioConfig by mistake, the next Inworld
+    # call will 4xx and this log line is the first place the operator
+    # will look.
     log.info(
-        "[INWORLD_TTS] request session=%s gen=%s text_len=%d voice=%r model=%r body=%s",
+        "[INWORLD_TTS] request session=%s gen=%s text_len=%d voice=%r model=%r speakingRate=%.2f deliveryMode=%s body=%s",
         getattr(session, "session_key", "?"),
         generation,
         len(text),
         voice_id,
         model_id,
+        speaking_rate,
+        "BALANCED",
         body.decode("utf-8"),
     )
 
@@ -318,13 +337,13 @@ async def stream_tts_segment(
                         "voiceId": DEFAULT_VOICE_ID,
                         "modelId": model_id,
                         "language": language_code,
+                        "deliveryMode": "BALANCED",
                         "applyTextNormalization": "ON",
                         "enhanceGeneration": False,
                         "audioConfig": {
                             "audioEncoding": "MULAW",
                             "sampleRateHertz": 8000,
                             "speakingRate": speaking_rate,
-                            "Steering": steering_enabled,
                         },
                     }).encode("utf-8")
                     req2 = urllib.request.Request(url, data=fallback_body, headers=headers, method="POST")
