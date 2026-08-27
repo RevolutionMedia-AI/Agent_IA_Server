@@ -505,6 +505,38 @@ def split_tts_segments(text: str, max_chars: int = 700, short_text_threshold: in
 
 
 def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str], str]:
+    """Split a streaming LLM reply into segments safe to send to TTS
+    one at a time.
+
+    ponytail: state-machine segmenter. Punctuation INSIDE Inworld's
+    inline markup tags (`<break ... />` for pauses, `[breathe]`,
+    `[sigh]`, `[laugh]`, `[speak calmly, ...]` for steering and
+    non-verbals) is INVISIBLE to the segmenter. Without this guard
+    the previous version cut at `.!?` anywhere, which silently
+    destroyed markup:
+      - `[sigh.] ¿Cómo está?` → `[sigh.` + `] ¿Cómo está?` →
+        Inworld discards segment 1 (unclosed bracket) and segment 2
+        reads "] ¿Cómo está?" literally. Caller never hears the sigh.
+      - `<break time="300ms"> Hola. ¿Cómo?` → `<break time="300ms"` +
+        `> Hola. ¿Cómo?` → second segment is malformed XML.
+
+    States:
+      NORMAL            → punctuation counts as a cut point.
+      INSIDE_SQUARE     → skip punctuation until ']'. Tracks depth for
+                         defensive nested-tag support (Inworld doesn't
+                         nest, but a malformed LLM output might).
+      INSIDE_ANGLE      → skip punctuation until '>'. Same depth
+                         handling for `<break ... />` style markup.
+
+    Markup that doesn't close within `_MARKUP_MAX_CHARS` characters
+    gets force-exited back to NORMAL so a malformed LLM reply
+    (e.g. "texto con [tag incompleto") doesn't deadlock the segmenter
+    waiting for a `]` that never comes.
+
+    Cuts on punctuation still respect the previous min_punct / max_chars
+    thresholds so a 30-word reply ships as one Inworld round-trip
+    (no per-segment connect/auth latency).
+    """
     remainder = buffer
     segments: list[str] = []
 
@@ -519,31 +551,11 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
         return [], ""
 
     while remainder:
-        cut_index: int | None = None
-        # ponytail: previous defaults were min_punct=5/15 and
-        # max_chars=200/200. A typical 194-char reply was being cut
-        # into 3 segments because every ".!?" past the 15-char prefix
-        # triggered a cut — each segment became a sequential Inworld
-        # TTS round-trip (~700ms each, ~2.1s total per turn). The new
-        # thresholds (min_punct=100/200) let the segmenter wait until
-        # 100+ chars of real sentence before cutting on punctuation,
-        # so most customer-service replies (< 280 chars) ship as a
-        # single TTS call. Inworld handles 400-char inputs fine.
-        is_first = len(segments) == 0
-        min_punct = 100 if is_first else 200
-        max_chars = STREAMING_FIRST_SEGMENT_CHARS if is_first else STREAMING_SEGMENT_MAX_CHARS
-
-        for index, char in enumerate(remainder):
-            if char in ".!?\n" and index >= min_punct:
-                cut_index = index + 1
-                break
-
-        if cut_index is None and len(remainder) >= max_chars:
-            cut_index = remainder.rfind(" ", 0, max_chars)
-            if cut_index <= 0:
-                cut_index = max_chars
-
+        cut_index = _find_next_segment_boundary(remainder, segments)
         if cut_index is None:
+            # No boundary found inside the buffer. `force=True` is the
+            # final-flush path (response.done with no more chunks
+            # coming) — emit whatever is left as the last segment.
             break
 
         segment = remainder[:cut_index].strip()
@@ -556,6 +568,94 @@ def pop_streaming_segments(buffer: str, force: bool = False) -> tuple[list[str],
         remainder = ""
 
     return segments, remainder
+
+
+# ponytail: helper for pop_streaming_segments. Walks the buffer char by
+# char tracking the markup state. Returns the cut index (exclusive —
+# the char at that index is NOT included in the segment) or None if
+# no boundary is reachable inside the buffer.
+#
+# State machine:
+#   NORMAL          — punctuation triggers a cut (after the existing
+#                      min_punct / max_chars thresholds).
+#   INSIDE_SQUARE    — `[` opened, waiting for `]`. Any `.!?\n` inside
+#                      is ignored — that's the whole point of this
+#                      rewrite (without it, `[sigh.] ¿Cómo?` cut at the
+#                      `.` inside the tag and orphaned `]` in the next
+#                      segment).
+#   INSIDE_ANGLE     — `<` opened, waiting for `>`. Same logic.
+#
+# Markup that doesn't close within `_MARKUP_MAX_CHARS` chars is
+# force-exited to NORMAL. A real Inworld tag is < 60 chars
+# (`<break time="999ms" />`); the cap is set to 200 as a defensive
+# ceiling for pathological inputs.
+_MARKUP_MAX_CHARS = 200
+
+
+def _find_next_segment_boundary(buffer: str, segments_so_far: list[str]) -> int | None:
+    """Return the exclusive index of the next cut point, or None."""
+    state = "NORMAL"
+    bracket_depth = 0
+    inside_chars = 0
+    is_first = len(segments_so_far) == 0
+    min_punct = 100 if is_first else 200
+    max_chars = STREAMING_FIRST_SEGMENT_CHARS if is_first else STREAMING_SEGMENT_MAX_CHARS
+
+    for index, char in enumerate(buffer):
+        if state == "NORMAL":
+            if char == "[":
+                state = "INSIDE_SQUARE"
+                bracket_depth = 1
+                inside_chars = 0
+            elif char == "<":
+                state = "INSIDE_ANGLE"
+                bracket_depth = 1
+                inside_chars = 0
+            elif char in ".!?\n" and index >= min_punct:
+                return index + 1
+            elif char in ".!?\n" and len(buffer) >= max_chars:
+                # Already at the character cap; cut even below the
+                # min_punct threshold so we don't run forever.
+                space = buffer.rfind(" ", 0, max_chars)
+                if space > 0:
+                    return space + 1
+                return max_chars
+        elif state == "INSIDE_SQUARE":
+            inside_chars += 1
+            if inside_chars > _MARKUP_MAX_CHARS:
+                # Defensive: malformed LLM output like "texto con [tag
+                # incompleto" — give up on the tag and resume NORMAL.
+                state = "NORMAL"
+                bracket_depth = 0
+                inside_chars = 0
+                continue
+            if char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth -= 1
+                if bracket_depth <= 0:
+                    state = "NORMAL"
+                    inside_chars = 0
+        elif state == "INSIDE_ANGLE":
+            inside_chars += 1
+            if inside_chars > _MARKUP_MAX_CHARS:
+                # Defensive: "texto con <break incompleto" — same
+                # recovery as INSIDE_SQUARE.
+                state = "NORMAL"
+                bracket_depth = 0
+                inside_chars = 0
+                continue
+            if char == "<":
+                bracket_depth += 1
+            elif char == ">":
+                bracket_depth -= 1
+                if bracket_depth <= 0:
+                    state = "NORMAL"
+                    inside_chars = 0
+
+    # No boundary reachable inside the buffer. Caller waits for more
+    # chunks (or flushes on `force=True`).
+    return None
 
 
 def sanitize_tts_text(text: str, max_len: int = 1500, allowed_punct: set[str] | None = None) -> str:
