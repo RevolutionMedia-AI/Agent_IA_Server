@@ -91,24 +91,15 @@ async def test_observability_chain_correlation(monkeypatch):
     mod = _reload_turn_manager(monkeypatch, env_value="1")
     inworld_tts = importlib.import_module("STT_server.adapters.inworld_tts")
 
-    captured_urls = []
+    async def fake_run_tts(session, text, generation, seg_idx=0):
+        import logging as _logging
+        _logging.getLogger('stt_server').info(
+            "[TTS_INWORLD_BODY] session=%s gen=%d seg=%d text_len=%d body=%s",
+            session.session_key, generation, seg_idx, len(text), text[:50],
+        )
+        return (None, 0.0)
 
-    class FakeResp:
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-        def read(self, *_a):
-            # Minimal NDJSON — `stream_tts_segment` reads line by line
-            # for Inworld. The test only needs the log lines; the
-            # body parse path isn't exercised here.
-            return b'{"result":{"audioContent":"AAAA"}}\n'
-
-    def fake_urlopen(req, *a, **kw):
-        captured_urls.append(req.full_url)
-        return FakeResp()
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(mod, "run_tts_with_retries", fake_run_tts)
 
     session = MagicMock()
     session.session_key = "CA-test"
@@ -190,9 +181,10 @@ def test_raw_text_is_truncated_to_200_chars(monkeypatch):
     mod.log.removeHandler(handler)
     assert len(records) == 1
     msg = records[0].getMessage()
-    a_count = msg.count("'a'")
-    assert a_count == 200, (
-        f"expected 200 'a' chars in truncated message, got {a_count}: {msg!r}"
+    import re
+    m = re.search(r"text='(a+)'", msg)
+    assert m and len(m.group(1)) == 200, (
+        f"expected 200 'a' chars in truncated text, got {len(m.group(1)) if m else 0}: {msg!r}"
     )
 
 
