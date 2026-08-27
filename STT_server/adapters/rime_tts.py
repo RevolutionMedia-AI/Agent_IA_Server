@@ -234,6 +234,7 @@ async def stream_tts_segment(
     text: str,
     generation: int,
     emit_item,
+    seg_idx: int = 0,
 ) -> tuple[float | None, float]:
     """Stream TTS audio from Rime via WebSocket, emitting mulaw chunks as they arrive."""
     # ponytail: AudioFrameProcessor is the single owner of frame buffering.

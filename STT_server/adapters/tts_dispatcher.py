@@ -58,28 +58,34 @@ async def stream_tts_segment(
     text: str,
     generation: int,
     emit_item,
+    seg_idx: int = 0,
 ) -> tuple[float | None, float]:
     """Stream TTS audio using the session's configured provider.
 
     Dispatches to the appropriate adapter's ``stream_tts_segment`` function.
+
+    `seg_idx` is forwarded to the adapter so the TTS observability
+    chain (`TTS_RAW_SEGMENT` → `TTS_SANITIZED_SEGMENT` →
+    `TSS_INWORLD_BODY`) can join on the same value across the three
+    log sites.
     """
     provider = _resolve_provider(session)
     log.info(
-        "[TTS] Dispatching to provider='%s' session=%s gen=%s text_len=%d",
-        provider, session.session_key, generation, len(text),
+        "[TTS] Dispatching to provider='%s' session=%s gen=%s seg=%d text_len=%d",
+        provider, session.session_key, generation, seg_idx, len(text),
     )
 
     if provider == "elevenlabs":
         from STT_server.adapters.elevenlabs_tts import stream_tts_segment as _elevenlabs
-        return await _elevenlabs(session, text, generation, emit_item)
+        return await _elevenlabs(session, text, generation, emit_item, seg_idx=seg_idx)
 
     if provider == "rime":
         from STT_server.adapters.rime_tts import stream_tts_segment as _rime
-        return await _rime(session, text, generation, emit_item)
+        return await _rime(session, text, generation, emit_item, seg_idx=seg_idx)
 
     if provider == "inworld":
         from STT_server.adapters.inworld_tts import stream_tts_segment as _inworld
-        return await _inworld(session, text, generation, emit_item)
+        return await _inworld(session, text, generation, emit_item, seg_idx=seg_idx)
 
     # ponytail: HTTP-only providers (no streaming adapter) get an inline
     # implementation here. They collect one response and emit it as a

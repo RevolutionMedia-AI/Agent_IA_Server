@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import time
 
@@ -24,6 +25,20 @@ from STT_server.config import (
     TTS_MAX_RETRIES,
     TTS_RETRY_BACKOFF_MS,
 )
+# ponytail: 2026-08-26 TTS markup observability. The TTS pipeline has
+# three steps that mutate the text — gpt-realtime output, the
+# sanitize pass, and the Inworld request body. To debug "why is
+# the agent's TTS so flat?" we need to see what each step actually
+# saw. Default off — PII (emails, IDs, full names) shouldn't land
+# in production logs. Operators enable with TTS_DEBUG_LOG=1 when
+# chasing a TTS issue.
+TTS_DEBUG_LOG = os.getenv("TTS_DEBUG_LOG", "false").strip().lower() in {
+    "true", "1", "yes",
+}
+# ponytail: cap RAW/SANITIZED text dumps at 200 chars so a runaway
+# 2000-char LLM reply doesn't blow up the log pipeline. The full
+# text is in `session.history` if anyone needs the raw output.
+TTS_DEBUG_TEXT_CHARS = 200
 from STT_server.domain.language import (
     detect_language,
     extract_structured_data,
@@ -51,17 +66,27 @@ from STT_server.services.thread_pool import to_thread as _to_thread
 log = logging.getLogger("stt_server")
 
 
-async def run_tts_with_retries(session: CallSession, text: str, generation: int) -> tuple[float | None, float]:
+async def run_tts_with_retries(
+    session: CallSession,
+    text: str,
+    generation: int,
+    seg_idx: int = 0,
+) -> tuple[float | None, float]:
     """Run one TTS segment with bounded retries.
 
     Important: we avoid wrapping the whole streaming call in wait_for(),
     because cancellation truncates audio mid-stream. The adapter itself
     handles TTFB/idle timeouts.
+
+    `seg_idx` is the segment counter from the streaming queue — passed
+    through so the Inworld adapter's debug log can join
+    `TTS_RAW_SEGMENT` / `TTS_SANITIZED_SEGMENT` (logged here) to
+    `TTS_INWORLD_BODY` (logged in inworld_tts.py) by the same value.
     """
     attempts = max(0, TTS_MAX_RETRIES) + 1
     for attempt in range(1, attempts + 1):
         try:
-            return await stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item))
+            return await stream_tts_segment(session, text, generation, lambda item: emit_playback_item(session, item), seg_idx=seg_idx)
         except (asyncio.TimeoutError, TimeoutError):
             log.warning(
                 "TTS timeout en %s (attempt %s/%s, text_len=%s)",
@@ -158,6 +183,13 @@ async def play_tts_from_text_queue(
     text_queue: asyncio.Queue[str | None],
 ) -> list[tuple[float | None, float]]:
     metrics: list[tuple[float | None, float]] = []
+    # ponytail: local counter for the TTS observability chain
+    # (`TTS_RAW_SEGMENT` → `TTS_SANITIZED_SEGMENT` →
+    # `TTS_INWORLD_BODY`). The streaming segmenter doesn't assign
+    # IDs — the queue is a flat FIFO — so we count segments per
+    # generation here. The same `seg=N` value travels through all
+    # three logs so an operator can `grep` for the matching pair.
+    seg_idx = 0
 
     while True:
         text = await text_queue.get()
@@ -166,11 +198,31 @@ async def play_tts_from_text_queue(
         if generation != session.active_generation:
             break
 
-        # Sanitize text segments coming from LLMs or other producers
+        seg_idx += 1
+        # ponytail: 2026-08-26 observability chain — `TTS_RAW_SEGMENT`
+        # shows the text straight from the streaming segmenter,
+        # BEFORE `sanitize_tts_text` has a chance to strip Markdown
+        # or filter non-verbals. `TTS_SANITIZED_SEGMENT` shows what
+        # we actually hand to Inworld. Default off (PII risk —
+        # operator enables with `TTS_DEBUG_LOG=1` while chasing a
+        # TTS issue). Both capped at 200 chars.
+        if TTS_DEBUG_LOG:
+            log.info(
+                "[TTS_RAW_SEGMENT] session=%s gen=%d seg=%d text=%r",
+                session.session_key, generation, seg_idx,
+                text[:TTS_DEBUG_TEXT_CHARS],
+            )
         try:
             safe_text = sanitize_tts_text(text)
         except Exception:
             safe_text = text
+        if TTS_DEBUG_LOG:
+            log.info(
+                "[TTS_SANITIZED_SEGMENT] session=%s gen=%d seg=%d text=%r",
+                session.session_key, generation, seg_idx,
+                safe_text[:TTS_DEBUG_TEXT_CHARS],
+            )
+
         if not safe_text:
             # If sanitization removed all characters, fall back to the original
             # text so we don't silently drop spoken content.
@@ -179,11 +231,9 @@ async def play_tts_from_text_queue(
                 session.session_key,
             )
             safe_text = text
-        if safe_text != text:
-            log.info("[TTS] Sanitized streaming segment for %s: %.120r -> %.120r", session.session_key, text[:120], safe_text[:120])
 
         try:
-            metric = await run_tts_with_retries(session, safe_text, generation)
+            metric = await run_tts_with_retries(session, safe_text, generation, seg_idx=seg_idx)
             metrics.append(metric)
         except asyncio.TimeoutError:
             break

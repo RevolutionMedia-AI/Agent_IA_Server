@@ -91,7 +91,15 @@ async def stream_tts_segment(
     text: str,
     generation: int,
     emit_item,
+    seg_idx: int = 0,
 ) -> tuple[float | None, float]:
+    """Stream one TTS segment to Inworld.
+
+    seg_idx is the segment counter from the streaming queue -
+    surfaced in the TTS_INWORLD_BODY debug log so an operator
+    can join it with the matching TTS_RAW_SEGMENT and
+    TTS_SANITIZED_SEGMENT lines from the turn_manager layer.
+    """
     api_key = _resolve_api_key(session)
     if not api_key:
         raise RuntimeError("Inworld API key not configured.")
@@ -198,25 +206,30 @@ async def stream_tts_segment(
             "speakingRate": speaking_rate,
         },
     }).encode("utf-8")
-    # ponytail: one-shot INFO log of the request body so the operator
-    # can confirm deliveryMode is actually being sent (top-level,
-    # not nested in audioConfig — the documented Inworld shape).
-    # The log also surfaces speakingRate so a manual tweak is visible
-    # without opening devtools. If a future change re-nests
-    # deliveryMode into audioConfig by mistake, the next Inworld
-    # call will 4xx and this log line is the first place the operator
-    # will look.
-    log.info(
-        "[INWORLD_TTS] request session=%s gen=%s text_len=%d voice=%r model=%r speakingRate=%.2f deliveryMode=%s body=%s",
-        getattr(session, "session_key", "?"),
-        generation,
-        len(text),
-        voice_id,
-        model_id,
-        speaking_rate,
-        "BALANCED",
-        body.decode("utf-8"),
+    # ponytail: TTS_INWORLD_BODY observability log. Fires under
+    # TTS_DEBUG_LOG (env var) so production logs stay free of PII
+    # (emails, IDs, full names). Operators enable TTS_DEBUG_LOG=1
+    # when chasing a TTS issue. The log carries the same session +
+    # generation + seg_idx the upstream TTS_RAW_SEGMENT and
+    # TTS_SANITIZED_SEGMENT logs use, so an operator can join the
+    # three lines with a single grep on session + gen + seg.
+    from STT_server.services.turn_manager import (
+        TTS_DEBUG_LOG as _tts_debug,
+        TTS_DEBUG_TEXT_CHARS as _tts_chars,
     )
+    if _tts_debug:
+        log.info(
+            "[TTS_INWORLD_BODY] session=%s gen=%d seg=%d text_len=%d voice=%r model=%r speakingRate=%.2f deliveryMode=%s body=%s",
+            getattr(session, "session_key", "?"),
+            generation,
+            seg_idx,
+            len(text),
+            voice_id,
+            model_id,
+            speaking_rate,
+            "BALANCED",
+            body.decode("utf-8")[:_tts_chars],
+        )
 
     url = "https://api.inworld.ai/tts/v1/voice:stream"
     headers = {
