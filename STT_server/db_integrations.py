@@ -1,0 +1,558 @@
+"""Postgres-backed CRUD for the integrations table.
+
+Mirror of db_tools.py: the JSON file under STT_server/data/ is only
+used as a one-time backfill source on first boot (this file does NOT
+backfill — there is no legacy integrations.json, the table is new in
+migration 015). Subsequent reads/writes all go through Postgres when
+DATABASE_URL is set.
+
+Shape returned by list_/get_/create_/update_:
+  {
+    "id":           "int-abcd1234",
+    "user_id":      "user-...",
+    "agent_id":     "__shared__" | "agent-<uuid8>",
+    "provider":     "zendesk",
+    "name":         "RevolutionMedia Support",
+    "configuration": {"subdomain": "revolutionmedia", ...},   # plain JSONB
+    "credentials_encrypted": bytes | None,                    # Fernet ciphertext
+    "credentials_cipher":    "fernet-v1",
+    "connection_status":     "unknown" | "connected" | "failed",
+    "last_tested_at":        ISO8601 | None,
+    "last_test_message":     "..." | None,
+    "created_at":            ISO8601,
+    "updated_at":            ISO8601,
+  }
+
+Credentials are stored encrypted (BYTEA) and decrypted only by the
+internal endpoint /internal/integrations/{id}/credentials which
+requires the service token. The /integrations endpoints NEVER return
+credentials, even masked.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import uuid
+from pathlib import Path
+
+from STT_server.db import get_conn, is_postgres
+
+log = logging.getLogger("stt_server.db_integrations")
+
+# ponytail: JSON-file fallback for local dev. Same single-writer
+# assumption as db_tools — concurrent tool create + integration
+# delete can race because there's no DB transaction; production runs
+# Postgres so the JSON file is essentially unused outside of tests.
+_DATA_DIR = Path(__file__).resolve().parent / "data"
+_INTEGRATIONS_FILE = _DATA_DIR / "integrations.json"
+
+
+# ── Schema self-heal ───────────────────────────────────────────────────────
+
+_INTEGRATIONS_COLS_BASE = (
+    "id, user_id, agent_id, provider, name, configuration, "
+    "credentials_encrypted, credentials_cipher, connection_status, "
+    "last_tested_at, last_test_message, created_at, updated_at"
+)
+# credentials_encrypted lands as BYTEA; we kept `cipher` as a separate
+# TEXT column so future migrations (rotating Fernet keys, switching to
+# KMS) can mark old rows without overwriting data.
+_columns_check_done: bool = False
+_columns_check_lock = threading.Lock()
+
+
+def _ensure_integrations_table() -> None:
+    """Idempotent self-heal: confirms `integrations` table exists with
+    all expected columns. Runs ALTERs inline if migration 015 didn't
+    apply (cached-image / start.sh miss).
+
+    Same pattern as db_tools._ensure_tool_columns — the FE will hit a
+    500 with "relation does not exist" if the migration runner
+    skipped, so we self-heal rather than chase the runner.
+    """
+    global _columns_check_done
+    if _columns_check_done:
+        return
+    with _columns_check_lock:
+        if _columns_check_done:
+            return
+        if not is_postgres():
+            _columns_check_done = True
+            return
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'integrations'"
+                    )
+                    present = {row[0] for row in cur.fetchall()}
+            if not present:
+                log.warning(
+                    "[db_integrations] integrations table missing — applying 015 inline"
+                )
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "CREATE TABLE IF NOT EXISTS integrations ("
+                            "  id                    TEXT        PRIMARY KEY,"
+                            "  user_id               TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                            "  agent_id              TEXT        NOT NULL DEFAULT '__shared__',"
+                            "  provider              TEXT        NOT NULL,"
+                            "  name                  TEXT        NOT NULL,"
+                            "  configuration         JSONB       NOT NULL DEFAULT '{}'::jsonb,"
+                            "  credentials_encrypted BYTEA,"
+                            "  credentials_cipher    TEXT        NOT NULL DEFAULT 'fernet-v1',"
+                            "  connection_status     TEXT        NOT NULL DEFAULT 'unknown',"
+                            "  last_tested_at        TIMESTAMPTZ,"
+                            "  last_test_message     TEXT,"
+                            "  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+                            "  updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                            ")"
+                        )
+                        cur.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_integrations_user_agent "
+                            "ON integrations (user_id, agent_id)"
+                        )
+                        cur.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_integrations_provider "
+                            "ON integrations (user_id, provider)"
+                        )
+            else:
+                # Table exists; confirm every column we expect. If a
+                # partial migration left some columns off, ADD them.
+                # Safe under IF NOT EXISTS so it's idempotent.
+                expected = {
+                    "agent_id": "TEXT NOT NULL DEFAULT '__shared__'",
+                    "provider": "TEXT NOT NULL",
+                    "name": "TEXT NOT NULL",
+                    "configuration": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+                    "credentials_encrypted": "BYTEA",
+                    "credentials_cipher": "TEXT NOT NULL DEFAULT 'fernet-v1'",
+                    "connection_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                    "last_tested_at": "TIMESTAMPTZ",
+                    "last_test_message": "TEXT",
+                    "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+                    "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+                }
+                missing = {k: v for k, v in expected.items() if k not in present}
+                if missing:
+                    log.warning(
+                        "[db_integrations] columns missing, applying ALTER: %s",
+                        list(missing.keys()),
+                    )
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            for col, decl in missing.items():
+                                cur.execute(
+                                    f"ALTER TABLE integrations "
+                                    f"ADD COLUMN IF NOT EXISTS {col} {decl}"
+                                )
+            _columns_check_done = True
+        except Exception as exc:
+            log.error("[db_integrations] _ensure_integrations_table failed: %s", exc)
+            raise
+
+
+def _integrations_cols() -> str:
+    if not _columns_check_done:
+        _ensure_integrations_table()
+    return _INTEGRATIONS_COLS_BASE
+
+
+# ── Row mapper ──────────────────────────────────────────────────────────────
+
+def _row_to_integration(row: dict | None) -> dict | None:
+    """DB row → wire shape.
+
+    Ponytail: configuration is stored as JSONB and exposed as a plain
+    dict. credentials_encrypted is BYTEA on disk but exposed as raw
+    bytes (callers in /internal/integrations/{id}/credentials pass
+    them through to decrypt_credentials). The /integrations endpoints
+    in routes/api.py strip both fields before returning to the FE.
+    """
+    if row is None:
+        return None
+    out = dict(row)
+    if isinstance(out.get("configuration"), str):
+        try:
+            out["configuration"] = json.loads(out["configuration"])
+        except (json.JSONDecodeError, TypeError):
+            out["configuration"] = {}
+    if not isinstance(out.get("configuration"), dict):
+        out["configuration"] = {}
+    for k in ("last_tested_at", "created_at", "updated_at"):
+        if hasattr(out.get(k), "isoformat"):
+            out[k] = out[k].isoformat() + "Z"
+    return out
+
+
+# ── CRUD ────────────────────────────────────────────────────────────────────
+
+def list_integrations(user_id: str, agent_id: str | None = None) -> list[dict]:
+    """List integrations for one user.
+
+    agent_id filter:
+      * None  → every integration the user owns
+      * '__shared__' → only the user's shared integrations
+      * 'agent-<uuid8>' → that agent's private integrations + shared ones
+        (matches db_tools.list_tools' shared/private merge so the FE
+        can list a per-agent view without two round-trips).
+    """
+    if not is_postgres():
+        return _list_integrations_json(user_id, agent_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if agent_id is None:
+                cur.execute(
+                    f"SELECT {_integrations_cols()} FROM integrations "
+                    "WHERE user_id = %s ORDER BY created_at DESC",
+                    (user_id,),
+                )
+            elif agent_id == "__shared__":
+                cur.execute(
+                    f"SELECT {_integrations_cols()} FROM integrations "
+                    "WHERE user_id = %s AND agent_id = '__shared__' "
+                    "ORDER BY created_at DESC",
+                    (user_id,),
+                )
+            else:
+                cur.execute(
+                    f"SELECT {_integrations_cols()} FROM integrations "
+                    "WHERE user_id = %s AND (agent_id = '__shared__' OR agent_id = %s) "
+                    "ORDER BY created_at DESC",
+                    (user_id, agent_id),
+                )
+            return [_row_to_integration(r) for r in cur.fetchall()]
+
+
+def get_integration(integration_id: str, user_id: str) -> dict | None:
+    """Fetch a single integration by id. Ownership scoped by user_id so
+    a token from user A can't read user B's row."""
+    if not is_postgres():
+        rows = _list_integrations_json(user_id, agent_id=None)
+        for r in rows:
+            if r.get("id") == integration_id:
+                return r
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_integrations_cols()} FROM integrations "
+                "WHERE id = %s AND user_id = %s",
+                (integration_id, user_id),
+            )
+            row = cur.fetchone()
+            return _row_to_integration(row) if row else None
+
+
+def get_integration_by_id(integration_id: str) -> dict | None:
+    """Fetch a single integration by id WITHOUT user ownership scoping.
+
+    Used by the internal endpoint /internal/integrations/{id}/credentials
+    that authenticates via the shared service token (no user_id
+    available). The endpoint's caller (n8n) is trusted — the service
+    token is the auth. NEVER expose this lookup behind a user-bearer
+    guard.
+    """
+    if not is_postgres():
+        for rows_owner in _walk_all_integrations_json():
+            for r in rows_owner:
+                if r.get("id") == integration_id:
+                    return r
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_integrations_cols()} FROM integrations WHERE id = %s",
+                (integration_id,),
+            )
+            row = cur.fetchone()
+            return _row_to_integration(row) if row else None
+
+
+def _walk_all_integrations_json():
+    """Yields the full list of integrations across all users. Used by
+    get_integration_by_id's JSON-fallback path. In practice this is
+    only the local-dev file — production runs Postgres."""
+    yield _read_integrations_file()
+
+
+def create_integration(
+    user_id: str,
+    payload: dict,
+    *,
+    credentials_encrypted: bytes | None = None,
+    cipher: str = "fernet-v1",
+) -> dict:
+    """Insert a new integration row.
+
+    payload must include: provider, name, agent_id, configuration.
+    credentials_encrypted is a Fernet ciphertext (BYTES, not str).
+    Pass None when the user is creating a row but hasn't filled the
+    password fields yet (rare — the FE usually submits them together).
+    """
+    new_id = payload.get("id") or f"int-{uuid.uuid4().hex[:8]}"
+    configuration = payload.get("configuration") or {}
+    if not is_postgres():
+        rows = _read_integrations_file()
+        new_row = {
+            "id": new_id,
+            "user_id": user_id,
+            "credentials_cipher": cipher,
+            "connection_status": payload.get("connection_status") or "unknown",
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+            **payload,
+        }
+        new_row["configuration"] = configuration
+        new_row["credentials_encrypted"] = credentials_encrypted
+        rows.append(new_row)
+        _write_integrations_file(rows)
+        return new_row
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO integrations ("
+                "  id, user_id, agent_id, provider, name, configuration, "
+                "  credentials_encrypted, credentials_cipher, connection_status, "
+                "  last_tested_at, last_test_message, created_at, updated_at"
+                ") VALUES ("
+                "  %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, NOW(), NOW()"
+                f") RETURNING {_integrations_cols()}",
+                (
+                    new_id, user_id,
+                    payload["agent_id"],
+                    payload["provider"],
+                    payload["name"],
+                    json.dumps(configuration),
+                    credentials_encrypted,
+                    cipher,
+                    payload.get("connection_status") or "unknown",
+                    payload.get("last_tested_at"),
+                    payload.get("last_test_message"),
+                ),
+            )
+            row = cur.fetchone()
+    return _row_to_integration(row)
+
+
+def update_integration(
+    integration_id: str,
+    user_id: str,
+    payload: dict,
+    *,
+    credentials_encrypted: bytes | None = None,
+) -> dict | None:
+    """Patch an integration row.
+
+    payload keys:
+      * name             → replace
+      * agent_id         → replace
+      * configuration    → replace (full dict; no merge — the FE re-sends
+                            the whole object so we don't need partial-merge)
+      * credentials_encrypted (bytes) → caller-encrypted blob (already
+                            merged: empty/missing values for individual
+                            fields kept the existing encrypted value,
+                            so what's passed here is the new full blob
+                            or None to keep existing)
+      * connection_status / last_tested_at / last_test_message → as-is
+
+    Ponytail: the credentials merge happens in routes/api.py BEFORE
+    calling update_integration — that layer is the one that knows
+    "this field is empty → keep, this field is non-empty → replace
+    encrypted value". db_integrations just stores the resulting blob.
+    """
+    if not is_postgres():
+        rows = _read_integrations_file()
+        updated = None
+        db_managed = {"id", "user_id", "created_at"}
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                for k, v in payload.items():
+                    if k in db_managed:
+                        continue
+                    r[k] = v
+                if credentials_encrypted is not None:
+                    r["credentials_encrypted"] = credentials_encrypted
+                r["updated_at"] = _now_iso()
+                updated = r
+                break
+        if updated is None:
+            return None
+        _write_integrations_file(rows)
+        return updated
+    set_clauses: list[str] = []
+    values: list = []
+    if "name" in payload:
+        set_clauses.append("name = %s")
+        values.append(payload["name"])
+    if "agent_id" in payload:
+        set_clauses.append("agent_id = %s")
+        values.append(payload["agent_id"])
+    if "configuration" in payload:
+        set_clauses.append("configuration = %s::jsonb")
+        values.append(json.dumps(payload["configuration"] or {}))
+    if "connection_status" in payload:
+        set_clauses.append("connection_status = %s")
+        values.append(payload["connection_status"])
+    if "last_tested_at" in payload:
+        set_clauses.append("last_tested_at = %s")
+        values.append(payload["last_tested_at"])
+    if "last_test_message" in payload:
+        set_clauses.append("last_test_message = %s")
+        values.append(payload["last_test_message"])
+    if credentials_encrypted is not None:
+        set_clauses.append("credentials_encrypted = %s")
+        values.append(credentials_encrypted)
+    if not set_clauses:
+        return get_integration(integration_id, user_id)
+    set_clauses.append("updated_at = NOW()")
+    values.extend([integration_id, user_id])
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE integrations SET {', '.join(set_clauses)} "
+                "WHERE id = %s AND user_id = %s "
+                f"RETURNING {_integrations_cols()}",
+                values,
+            )
+            row = cur.fetchone()
+    return _row_to_integration(row) if row else None
+
+
+def delete_integration(integration_id: str, user_id: str) -> tuple[bool, str | None]:
+    """Delete an integration. Returns (success, error_message).
+
+    On Postgres: RESTRICT — count dependent tools inside the same
+    transaction as the DELETE so a concurrent tool create can't sneak
+    in between the count and the delete. If count > 0, returns
+    (False, "<n> tools depend on this integration"); the caller maps
+    that to 409 Conflict with the same message.
+
+    Ponytail: there is NO real FK on agent_tools.integration_id (the
+    JSON-file fallback can't enforce referential integrity), so the
+    transactional count + delete here is what stands between the
+    operator and orphan tools. The index on agent_tools.integration_id
+    (migration 016) keeps the count cheap.
+    """
+    if not is_postgres():
+        # ponytail: JSON-file path. Single-writer assumption; a
+        # concurrent tool create + integration delete CAN race. This
+        # is documented — production runs Postgres.
+        rows = _read_integrations_file()
+        target = next(
+            (r for r in rows if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id),
+            None,
+        )
+        if target is None:
+            return False, None
+        tools_file = _DATA_DIR / "agent_tools.json"
+        dep_count = 0
+        if tools_file.exists():
+            try:
+                with open(tools_file, "r", encoding="utf-8") as f:
+                    tools = json.load(f) or []
+                dep_count = sum(
+                    1 for t in tools
+                    if isinstance(t, dict) and t.get("integration_id") == integration_id
+                )
+            except (json.JSONDecodeError, IOError, OSError):
+                dep_count = 0
+        if dep_count > 0:
+            return False, f"{dep_count} tools depend on this integration"
+        rows = [r for r in rows if not (isinstance(r, dict) and r.get("id") == integration_id)]
+        _write_integrations_file(rows)
+        return True, None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # COUNT inside the same transaction as the DELETE so a
+            # concurrent tool create can't land between the two. The
+            # default isolation level (READ COMMITTED on Postgres)
+            # is enough for this — the COUNT acquires a row-level
+            # shared lock implicitly through the FOR UPDATE on the
+            # integration row below.
+            cur.execute(
+                "SELECT COUNT(*) FROM agent_tools WHERE integration_id = %s",
+                (integration_id,),
+            )
+            (dep_count,) = cur.fetchone()
+            if dep_count > 0:
+                return False, f"{dep_count} tools depend on this integration"
+            cur.execute(
+                "DELETE FROM integrations WHERE id = %s AND user_id = %s",
+                (integration_id, user_id),
+            )
+            return cur.rowcount > 0, None
+
+
+def count_dependent_tools(integration_id: str, user_id: str | None = None) -> int:
+    """Count tools pointing at this integration. user_id is optional —
+    when provided, only counts tools the user owns (consistent with
+    the ownership scoping every other helper uses)."""
+    if not is_postgres():
+        tools_file = _DATA_DIR / "agent_tools.json"
+        if not tools_file.exists():
+            return 0
+        try:
+            with open(tools_file, "r", encoding="utf-8") as f:
+                tools = json.load(f) or []
+        except (json.JSONDecodeError, IOError, OSError):
+            return 0
+        return sum(
+            1 for t in tools
+            if isinstance(t, dict)
+            and t.get("integration_id") == integration_id
+            and (user_id is None or t.get("user_id") == user_id)
+        )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if user_id is None:
+                cur.execute(
+                    "SELECT COUNT(*) FROM agent_tools WHERE integration_id = %s",
+                    (integration_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) FROM agent_tools "
+                    "WHERE integration_id = %s AND user_id = %s",
+                    (integration_id, user_id),
+                )
+            (n,) = cur.fetchone()
+            return int(n or 0)
+
+
+# ── JSON-file fallback (local dev / tests) ──────────────────────────────────
+
+def _list_integrations_json(user_id: str, agent_id: str | None) -> list[dict]:
+    rows = _read_integrations_file()
+    out = [r for r in rows if isinstance(r, dict) and r.get("user_id") == user_id]
+    if agent_id is None:
+        return out
+    if agent_id == "__shared__":
+        return [r for r in out if r.get("agent_id") == "__shared__"]
+    return [r for r in out if r.get("agent_id") in ("__shared__", agent_id)]
+
+
+def _read_integrations_file() -> list[dict]:
+    if not _INTEGRATIONS_FILE.exists():
+        return []
+    try:
+        with open(_INTEGRATIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or []
+    except (json.JSONDecodeError, IOError, OSError) as exc:
+        log.warning("[db_integrations] JSON load failed (%s): %s", type(exc).__name__, exc)
+        return []
+
+
+def _write_integrations_file(rows: list[dict]) -> None:
+    os.makedirs(_INTEGRATIONS_FILE.parent, exist_ok=True)
+    with open(_INTEGRATIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

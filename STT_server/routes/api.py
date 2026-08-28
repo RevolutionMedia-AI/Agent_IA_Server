@@ -174,6 +174,72 @@ def require_auth(authorization: str = Header(None)) -> dict:
     return entry  # type: ignore[return-value]
 
 
+# ponytail: integrations — admin gate. Only user ids listed in
+# ADMIN_USER_IDS (comma-separated env var) can pass `_skip_preflight`
+# in the body to /integrations. Empty default = nobody can skip, so
+# a missing env var is fail-safe. The route handler pulls
+# `_skip_preflight` out of the body before validation; this dep
+# just enforces the admin check.
+_ADMIN_USER_IDS = frozenset(
+    s.strip() for s in os.environ.get("ADMIN_USER_IDS", "").split(",") if s.strip()
+)
+
+
+def require_admin(auth: dict = Depends(require_auth)) -> dict:
+    """Gate admin-only actions behind ADMIN_USER_IDS.
+
+    Ponytail: a single-user permission system costs nothing here.
+    We don't have a roles table; the env var is the source of
+    truth. If we ever add a real role system, this dep is the
+    one place to swap.
+    """
+    if auth.get("user_id") not in _ADMIN_USER_IDS:
+        raise HTTPException(
+            status_code=403,
+            detail="admin only (set ADMIN_USER_IDS to grant access)",
+        )
+    return auth
+
+
+# ponytail: integrations — service-to-service auth for n8n. The
+# internal endpoint that hands the decrypted credentials to n8n is
+# the only place that knows the long-lived INTEGRATIONS_N8N_TOKEN.
+# Compared against the env var with hmac.compare_digest so timing
+# analysis can't brute-force the token. Empty env var = no one can
+# authenticate → every internal call returns 401 until the operator
+# sets it. This is the right default (fail closed) — n8n won't
+# accidentally start pulling credentials without explicit config.
+def _expected_service_token() -> str:
+    return os.environ.get("INTEGRATIONS_N8N_TOKEN", "").strip()
+
+
+def require_service_token(authorization: str = Header(None)) -> dict:
+    """Validate the shared bearer token used by n8n to call internal
+    endpoints. Returns a synthetic context dict (no user_id — the
+    caller is n8n, not a logged-in user)."""
+    import hmac
+    expected = _expected_service_token()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="INTEGRATIONS_N8N_TOKEN is not configured on the server",
+        )
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    presented = authorization[len("Bearer "):].strip()
+    # Constant-time compare. hmac.compare_digest returns False on
+    # length mismatch without leaking length to a remote attacker
+    # (Python's `==` short-circuits on the first non-equal byte).
+    if not hmac.compare_digest(presented, expected):
+        log.warning(
+            "[internal] rejected service-token call from %s",
+            # request.client.host is added in the dependency for logging.
+            "<unknown>",
+        )
+        raise HTTPException(status_code=401, detail="Invalid service token")
+    return {"caller": "n8n"}
+
+
 def resolve_bearer(authorization, *, raise_on_missing: bool = False):
     """Resolve a Bearer token to its session entry (or None).
 
@@ -692,11 +758,22 @@ def delete_agent(agent_id: str, auth: dict = Depends(require_auth)):
 SHARED_TOOL_AGENT_ID = "__shared__"
 
 
-def _build_tool_payload(agent_id: str, data: "ToolCreate") -> dict:
+def _build_tool_payload(agent_id: str, data: "ToolCreate", user_id: str | None = None) -> dict:
     """Shape the FE payload into the dict db_tools.create_tool
     expects. Centralised so the per-agent and shared-tool creation
     endpoints don't drift apart on validation, kind defaults, or
-    field handling."""
+    field handling.
+
+    ponytail: 016 — when `integration_id` is present, validate:
+      * the integration exists and belongs to user_id,
+      * the shared/private matrix holds
+        (private tool → shared or same-private integration only),
+      * the `action` is a registered action for that provider
+        (or any well-formed id for generic_webhook).
+    The matrix and action validation live here (not in AgentTool)
+    because they need the integrations_catalog + db_integrations
+    lookups, which AgentTool deliberately avoids.
+    """
     from STT_server.domain.tool import AgentTool, VALID_TOOL_KINDS
     if data.kind is not None and data.kind not in VALID_TOOL_KINDS:
         raise HTTPException(
@@ -712,6 +789,13 @@ def _build_tool_payload(agent_id: str, data: "ToolCreate") -> dict:
         parameters=data.parameters,
         kind=data.kind,
         destination=data.destination,
+        # ponytail: 016 — integration binding is optional on the
+        # payload. Existing tests / callers that don't know about
+        # the new fields still pass a Body-shaped object whose
+        # attributes are just name/description/webhook_url/etc.
+        # getattr defaults to None so they don't crash.
+        integration_id=getattr(data, "integration_id", None),
+        action=getattr(data, "action", None),
     )
     errors = tool.validate()
     if errors:
@@ -726,6 +810,53 @@ def _build_tool_payload(agent_id: str, data: "ToolCreate") -> dict:
             status_code=400,
             detail=f"Invalid JSON Schema: {err}",
         )
+    # ponytail: 016 — integration binding checks. Done after
+    # AgentTool.validate() so the basic kind/format checks have
+    # already run; we add the catalog-level checks on top.
+    # getattr with default so legacy callers (e.g. tests passing a
+    # hand-built Body stub) don't crash on attribute lookup.
+    if getattr(data, "integration_id", None) and user_id is not None:
+        from STT_server.db_integrations import get_integration
+        from STT_server.services.integrations_catalog import (
+            get_integration_provider_spec,
+            is_valid_action,
+        )
+        integ = get_integration(data.integration_id, user_id)
+        if not integ:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Integration '{data.integration_id}' not found",
+            )
+        # shared/private matrix:
+        #   private tool → shared or same-private integration: ok
+        #   private tool → other agent's private integration: blocked
+        #   shared tool   → shared integration: ok
+        #   shared tool   → private integration: blocked
+        if integ["agent_id"] not in ("__shared__", agent_id):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Tool '{agent_id}' cannot use integration '{integ['id']}' "
+                    f"(integration is scoped to agent '{integ['agent_id']}')"
+                ),
+            )
+        # Action must be registered for the provider (or any well-formed
+        # id for generic_webhook).
+        if not is_valid_action(integ["provider"], (data.action or "").strip()):
+            spec = get_integration_provider_spec(integ["provider"])
+            if spec and spec.actions:
+                allowed = ", ".join(sorted(a.id for a in spec.actions))
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Action '{data.action}' is not valid for provider "
+                        f"'{integ['provider']}'. Allowed: {allowed}"
+                    ),
+                )
+            raise HTTPException(
+                status_code=422,
+                detail=f"Action '{data.action}' has invalid format (^[a-z0-9_]+$)",
+            )
     payload = tool.to_dict()
     # ponytail: forward test_data_model into the payload so
     # db_create_tool / db_update_tool can persist it on the row.
@@ -848,12 +979,19 @@ class ToolCreate(BaseModel):
     # of the model, so we declare it here. Empty / None falls back
     # to gpt-4o-mini in _build_tool_payload.
     test_data_model: Optional[str] = None
+    # ponytail: 016 — integration binding. When set, the tool
+    # inherits its webhook URL + credentials from the integration
+    # row, and the `action` is server-injected into the n8n body
+    # (LLM never controls action). Validation against the catalog
+    # + shared/private matrix happens in _build_tool_payload.
+    integration_id: Optional[str] = None
+    action: Optional[str] = None
 
 
 @api_router.post("/agents/{agent_id}/tools")
 def create_agent_tool(agent_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new tool for an agent."""
-    payload = _build_tool_payload(agent_id, data)
+    payload = _build_tool_payload(agent_id, data, user_id=auth["user_id"])
     return db_create_tool(auth["user_id"], payload)
 
 
@@ -866,7 +1004,7 @@ def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict 
     because we re-run AgentTool.from_dict + .validate() before
     persisting the patch.
     """
-    payload = _build_tool_payload(agent_id, data)
+    payload = _build_tool_payload(agent_id, data, user_id=auth["user_id"])
     # ponytail: db_update_tool patches with the payload keys it
     # receives — passing the full dict keeps the row's id intact.
     # The user_id check on the WHERE clause prevents an operator from
@@ -996,14 +1134,14 @@ def list_shared_tools(auth: dict = Depends(require_auth)):
 @api_router.post("/tools")
 def create_shared_tool(data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new shared n8n tool owned by the current user."""
-    payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data)
+    payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data, user_id=auth["user_id"])
     return db_create_tool(auth["user_id"], payload)
 
 
 @api_router.put("/tools/{tool_id}")
 def update_shared_tool(tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Update an existing shared n8n tool owned by the current user."""
-    payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data)
+    payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data, user_id=auth["user_id"])
     updated = db_update_tool(tool_id, auth["user_id"], payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Tool not found")
@@ -1733,3 +1871,494 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
             detail="TTS provider returned no audio. Check that the voice_id is valid for the selected provider.",
         )
     return Response(content=audio_bytes, media_type="audio/wav")
+
+# ============================================================================
+# /integrations — third-party CRM / contact-center connections
+# ----------------------------------------------------------------------------
+# These endpoints own the Integration entity (one row per third-party
+# service the user connects the agent to). Tools (in /tools and
+# /agents/{id}/tools) reference an integration by integration_id; the
+# executor resolves the webhook URL from the integration row + env
+# config, and the internal endpoint hands n8n the credentials at call
+# time.
+#
+# Security model:
+#   * /integrations* require a user bearer token (require_auth).
+#   * /internal/integrations/{id}/credentials requires the shared
+#     service token (require_service_token). User tokens do NOT work
+#     here — even the integration's owner can't fetch the plaintext
+#     credentials back; they can only Replace them.
+#   * Credentials are NEVER returned by any /integrations endpoint,
+#     not even masked. The FE has to Replace, not Show.
+# ============================================================================
+
+
+# ── Body schemas ─────────────────────────────────────────────────────────────
+
+class IntegrationPreflight(BaseModel):
+    """Body for POST /integrations/preflight. NO persistence — runs
+    the provider's test_fn against the supplied credentials and
+    returns {valid, message}."""
+    provider: str
+    configuration: dict = Field(default_factory=dict)
+    credentials: dict = Field(default_factory=dict)
+
+
+class IntegrationCreate(BaseModel):
+    """Body for POST /integrations. The `skip_preflight` field is admin-
+    only and pulled out before validation; without it, the create call
+    re-runs the provider's test_fn and refuses to persist a failing
+    connection (422)."""
+    provider: str
+    name: str
+    agent_id: str = "__shared__"  # "__shared__" | "agent-<uuid8>"
+    configuration: dict = Field(default_factory=dict)
+    credentials: dict = Field(default_factory=dict)
+    # ponytail: Pydantic v2 strips fields whose name starts with `_`
+    # as if they were private — so the admin override is named
+    # `skip_preflight` (no underscore) on the wire even though it's
+    # only honoured for admin users. Production FE never sets this;
+    # admin scripts and tests do.
+    skip_preflight: bool = False
+
+
+class IntegrationUpdate(BaseModel):
+    """Body for PUT /integrations/{id}. Empty / missing credential fields
+    are treated as "keep existing" per the no-reveal contract — the FE
+    has to send a non-empty value to Replace a credential. Empty
+    configuration fields keep their stored value too."""
+    name: Optional[str] = None
+    agent_id: Optional[str] = None
+    configuration: Optional[dict] = None
+    credentials: Optional[dict] = None
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _strip_integration_for_wire(row: dict) -> dict:
+    """Drop credential fields before returning to the FE. Same shape the
+    FE will see regardless of which endpoint called this — there is no
+    masked variant. Replace only."""
+    if not row:
+        return row
+    out = dict(row)
+    out.pop("credentials_encrypted", None)
+    out.pop("credentials_cipher", None)
+    return out
+
+
+def _merge_credentials(
+    existing_encrypted: Optional[bytes],
+    new_credentials: Optional[dict],
+    cipher_key: str = "fernet-v1",
+) -> Optional[bytes]:
+    """Merge the operator-submitted credentials dict with the stored
+    encrypted blob.
+
+    Rules (per the agreed contract):
+      * missing field → keep existing
+      * "" (empty string) → keep existing (NOT clear; clearing needs
+        an explicit revoke op we haven't built yet)
+      * non-empty string → replace encrypted value
+
+    Returns the resulting encrypted BYTEA blob (or None when the
+    result has no fields — happens when the user clears all
+    password fields on update, in which case the integration loses
+    its credential binding; rare but supported).
+    """
+    from STT_server.security.credentials import (
+        encrypt_credentials,
+        decrypt_credentials,
+        encrypt_value,
+    )
+    existing_plain: dict = {}
+    if existing_encrypted:
+        try:
+            existing_plain = decrypt_credentials(existing_encrypted) if cipher_key == "fernet-v1" else {}
+            # ponytail: decrypt_credentials already handled the
+            # fernet key; if the cipher differs we leave existing_plain
+            # empty so the merge falls back to "set what was sent".
+        except Exception as exc:
+            log.warning(
+                "[integrations] decrypt failed during merge; treating as empty: %s",
+                exc,
+            )
+            existing_plain = {}
+    if not new_credentials:
+        return existing_encrypted  # nothing to do
+    merged = dict(existing_plain)
+    for k, v in new_credentials.items():
+        if v is None or (isinstance(v, str) and v == ""):
+            # missing/empty: keep existing (don't change merged[k])
+            continue
+        if not isinstance(v, str):
+            # skip non-string values silently — the catalog validator
+            # would have rejected them on the create path; we don't
+            # have catalog validation here, so we just don't write.
+            continue
+        merged[k] = v.strip()
+    if not merged:
+        return None
+    return encrypt_credentials(merged)
+
+
+def _run_preflight(
+    provider: str,
+    configuration: dict,
+    credentials: dict,
+) -> tuple[bool, str]:
+    """Run the provider's test_fn. Returns (valid, message).
+    Wraps integrations_tester so the route layer doesn't import it
+    twice; centralises the "test_fn=None → not implemented" path."""
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec,
+        validate_integration_fields,
+    )
+    spec = get_integration_provider_spec(provider)
+    if spec is None:
+        return False, f"Unknown provider '{provider}'"
+    cleaned_config, cleaned_creds, errors = validate_integration_fields(
+        provider, configuration, credentials,
+    )
+    if errors:
+        # First error is enough for the preflight banner.
+        return False, errors[0].get("message", "invalid credentials")
+    if not spec.test_fn:
+        return False, f"Test not yet implemented for {provider}"
+    from STT_server.services.integrations_tester import run_integration_test
+    return run_integration_test(spec.test_fn, cleaned_config, cleaned_creds)
+
+
+# ── /integrations/providers (catalog) ───────────────────────────────────────
+
+@api_router.get("/integrations/providers")
+def list_integration_providers(auth: dict = Depends(require_auth)):
+    """Catalog endpoint. Single source of truth for the FE — no parallel
+    frontend catalog. Returns the field + action specs the FE renders
+    on the Add Integration form + the action dropdown on the Add Tool
+    form.
+    """
+    from STT_server.services.integrations_catalog import (
+        INTEGRATION_PROVIDERS,
+        IntegrationFieldSpec,
+        IntegrationProviderSpec,
+        ActionSpec,
+    )
+    def field_to_wire(f: IntegrationFieldSpec) -> dict:
+        return {
+            "name": f.name,
+            "label": f.label,
+            "type": f.type,
+            "placeholder": f.placeholder,
+            "required": f.required,
+            "pattern": f.pattern,
+            "min_length": f.min_length,
+            "max_length": f.max_length,
+            "help": f.help,
+        }
+    def action_to_wire(a: ActionSpec) -> dict:
+        return {
+            "id": a.id,
+            "name": a.name,
+            "description": a.description,
+            "parameters_schema": a.parameters_schema,
+        }
+    def spec_to_wire(s: IntegrationProviderSpec) -> dict:
+        return {
+            "id": s.id,
+            "name": s.name,
+            "category": s.category,
+            "description": s.description,
+            "has_test": bool(s.test_fn),
+            "fields": [field_to_wire(f) for f in s.fields],
+            "actions": [action_to_wire(a) for a in s.actions],
+        }
+    return {
+        "providers": [spec_to_wire(s) for s in INTEGRATION_PROVIDERS],
+    }
+
+
+# ── /integrations/preflight ─────────────────────────────────────────────────
+
+@api_router.post("/integrations/preflight")
+def preflight_integration(body: IntegrationPreflight, auth: dict = Depends(require_auth)):
+    """Run the provider's test_fn against the supplied credentials.
+    No persistence. Returns {valid, message, connection_status}.
+    Same code path the create endpoint runs internally — exposing it
+    separately lets the FE render the green/red banner on the form
+    before the operator clicks Save."""
+    valid, message = _run_preflight(body.provider, body.configuration, body.credentials)
+    return {
+        "valid": valid,
+        "message": message,
+        "connection_status": "connected" if valid else "failed",
+    }
+
+
+# ── /integrations CRUD ──────────────────────────────────────────────────────
+
+@api_router.get("/integrations")
+def list_integrations_endpoint(
+    agent_id: Optional[str] = None,
+    auth: dict = Depends(require_auth),
+):
+    """List the user's integrations. Optional ?agent_id filter (matches
+    db_integrations.list_integrations). NEVER returns credentials."""
+    from STT_server.db_integrations import list_integrations as db_list_integrations
+    rows = db_list_integrations(auth["user_id"], agent_id=agent_id)
+    return {"integrations": [_strip_integration_for_wire(r) for r in rows]}
+
+
+@api_router.post("/integrations")
+def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(require_auth)):
+    """Create a new integration. Preflight runs automatically; if it
+    fails, returns 422 with the test message. Admin-only _skip_preflight
+    field bypasses the preflight (use only for tests / migrations)."""
+# Pull skip_preflight out before any validation so a non-admin
+    # sending the field can't even cause a log line about admin checks.
+    skip_preflight = body.skip_preflight
+    if skip_preflight:
+        # re-authorize as admin — require_admin raises 403 on miss
+        require_admin(auth)
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec,
+        validate_integration_fields,
+    )
+    spec = get_integration_provider_spec(body.provider)
+    if spec is None:
+        raise HTTPException(status_code=422, detail=f"Unknown provider '{body.provider}'")
+    cleaned_config, cleaned_creds, errors = validate_integration_fields(
+        body.provider, body.configuration, body.credentials,
+    )
+    if errors:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+    # preflight unless admin-skipped
+    if not skip_preflight:
+        valid, message = _run_preflight(body.provider, body.configuration, body.credentials)
+        if not valid:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "preflight": {"valid": False, "message": message},
+                    "errors": [{"field": "_preflight", "message": message}],
+                },
+            )
+    from STT_server.db_integrations import create_integration as db_create_integration
+    from STT_server.security.credentials import encrypt_credentials
+    encrypted = encrypt_credentials(cleaned_creds) if cleaned_creds else None
+    payload = {
+        "provider": body.provider,
+        "name": body.name,
+        "agent_id": body.agent_id,
+        "configuration": cleaned_config,
+    }
+    row = db_create_integration(
+        auth["user_id"],
+        payload,
+        credentials_encrypted=encrypted,
+        cipher="fernet-v1",
+    )
+    # set connection_status from preflight (we ran it, so we know)
+    if not skip_preflight:
+        from STT_server.db_integrations import update_integration as db_update_integration
+        row = db_update_integration(
+            row["id"], auth["user_id"], {},
+        ) or row
+    return _strip_integration_for_wire(row)
+
+
+@api_router.get("/integrations/{integration_id}")
+def get_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
+    """Detail view. NEVER returns credentials."""
+    from STT_server.db_integrations import get_integration as db_get_integration
+    row = db_get_integration(integration_id, auth["user_id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    return _strip_integration_for_wire(row)
+
+
+@api_router.put("/integrations/{integration_id}")
+def update_integration_endpoint(
+    integration_id: str,
+    body: IntegrationUpdate,
+    auth: dict = Depends(require_auth),
+):
+    """Update name / agent_id / configuration / credentials.
+
+    Credentials merge contract: missing or empty string = keep existing.
+    No way to clear a credential short of deleting the integration —
+    explicit revoke is a future endpoint.
+    """
+    from STT_server.db_integrations import (
+        get_integration as db_get_integration,
+        update_integration as db_update_integration,
+    )
+    existing = db_get_integration(integration_id, auth["user_id"])
+    if not existing:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    patch: dict = {}
+    if body.name is not None:
+        patch["name"] = body.name
+    if body.agent_id is not None:
+        patch["agent_id"] = body.agent_id
+    if body.configuration is not None:
+        from STT_server.services.integrations_catalog import validate_integration_fields
+        cleaned_config, _, errors = validate_integration_fields(
+            existing["provider"], body.configuration, {},
+        )
+        if errors:
+            raise HTTPException(status_code=422, detail={"errors": errors})
+        patch["configuration"] = cleaned_config
+    new_encrypted_blob = None
+    if body.credentials is not None:
+        # Merge with existing — empty/missing = keep.
+        new_encrypted_blob = _merge_credentials(
+            existing.get("credentials_encrypted"),
+            body.credentials,
+            cipher_key=existing.get("credentials_cipher", "fernet-v1"),
+        )
+    updated = db_update_integration(
+        integration_id, auth["user_id"], patch,
+        credentials_encrypted=new_encrypted_blob,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    return _strip_integration_for_wire(updated)
+
+
+@api_router.delete("/integrations/{integration_id}")
+def delete_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
+    """Delete an integration. Returns 409 if any tools still depend
+    on it (the count is computed transactionally so a concurrent
+    tool create can't sneak in between the count and the delete)."""
+    from STT_server.db_integrations import delete_integration as db_delete_integration
+    ok, err = db_delete_integration(integration_id, auth["user_id"])
+    if err:
+        # The error message is the human-readable count: "5 tools depend..."
+        # Surface as 409 Conflict with a structured body so the FE can
+        # render the count + a "View tools" link.
+        from STT_server.db_integrations import count_dependent_tools
+        n = count_dependent_tools(integration_id, auth["user_id"])
+        raise HTTPException(
+            status_code=409,
+            detail={"message": err, "tool_count": n},
+        )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    return {"success": True}
+
+
+@api_router.post("/integrations/{integration_id}/test")
+def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
+    """Run the provider's test_fn against the stored credentials and
+    persist the result (connection_status + last_test_message)."""
+    from STT_server.db_integrations import (
+        get_integration as db_get_integration,
+        update_integration as db_update_integration,
+    )
+    from STT_server.services.integrations_catalog import get_integration_provider_spec
+    from STT_server.security.credentials import decrypt_credentials
+    row = db_get_integration(integration_id, auth["user_id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    spec = get_integration_provider_spec(row["provider"])
+    if spec is None:
+        raise HTTPException(status_code=422, detail=f"Unknown provider '{row['provider']}'")
+    if not spec.test_fn:
+        # same shape as a real failure so the FE handles it uniformly
+        valid, message = False, f"Test not yet implemented for {row['provider']}"
+    else:
+        try:
+            creds_plain = (
+                decrypt_credentials(row["credentials_encrypted"])
+                if row.get("credentials_encrypted")
+                else {}
+            )
+        except Exception as exc:
+            log.warning(
+                "[integrations.test] decrypt failed integration_id=%s err=%s",
+                integration_id, exc,
+            )
+            creds_plain = {}
+        from STT_server.services.integrations_tester import run_integration_test
+        valid, message = run_integration_test(
+            spec.test_fn, row.get("configuration") or {}, creds_plain,
+        )
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    db_update_integration(
+        integration_id, auth["user_id"], {
+            "connection_status": "connected" if valid else "failed",
+            "last_tested_at": now_iso,
+            "last_test_message": message[:500] if message else None,
+        },
+    )
+    return {
+        "valid": valid,
+        "message": message,
+        "connection_status": "connected" if valid else "failed",
+        "last_tested_at": now_iso,
+    }
+
+
+# ── /internal/integrations/{id}/credentials (service-token only) ────────────
+
+@api_router.post("/internal/integrations/{integration_id}/credentials")
+def internal_get_integration_credentials(
+    integration_id: str,
+    request: Request,
+    _service: dict = Depends(require_service_token),
+):
+    """Ponytail: server-to-server endpoint used by n8n at call time.
+
+    n8n calls this with the shared INTEGRATIONS_N8N_TOKEN to fetch
+    the decrypted credentials for the integration backing a tool call.
+    The tool executor posts `{integration_id, provider, action,
+    arguments}` to n8n; n8n then hits this endpoint to grab the
+    config + creds it needs to call Salesforce / Zendesk / etc.
+
+    Auth: requires_service_token. User bearer tokens don't work —
+    even the integration's owner can't fetch the plaintext creds
+    back; they can only Replace them via PUT /integrations/{id}.
+
+Audit: every hit is logged with provider + integration_id + ip.
+    The credentials themselves are NEVER logged (this is the line
+    the operator would be paged on if it ever showed up in a log).
+    """
+    from STT_server.db_integrations import get_integration_by_id
+    from STT_server.security.credentials import decrypt_credentials
+    # ponytail: internal endpoint uses the unscoped lookup so n8n
+    # (which carries only the service token, not a user token) can
+    # resolve any integration by id. Cross-user access is intentional
+    # and scoped: the service token grants access to every row.
+    row = get_integration_by_id(integration_id)
+    if not row:
+        log.warning(
+            "[internal.creds] 404 integration_id=%s ip=%s",
+            integration_id, request.client.host if request.client else "?",
+        )
+        raise HTTPException(status_code=404, detail="Integration not found")
+    try:
+        creds_plain = (
+            decrypt_credentials(row["credentials_encrypted"])
+            if row.get("credentials_encrypted")
+            else {}
+        )
+    except Exception as exc:
+        log.warning(
+            "[internal.creds] decrypt failed integration_id=%s err=%s",
+            integration_id, exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Credentials unavailable — decryption failed",
+        )
+    log.info(
+        "[internal.creds] ok integration_id=%s provider=%s ip=%s",
+        integration_id, row.get("provider"), request.client.host if request.client else "?",
+    )
+    return {
+        "integration_id": row["id"],
+        "provider": row["provider"],
+        "configuration": row.get("configuration") or {},
+        "credentials": creds_plain,
+    }

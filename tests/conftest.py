@@ -22,6 +22,16 @@ from httpx import ASGITransport, AsyncClient
 # Ensure config imports cleanly before any app code runs. PUBLIC_URL is
 # required at module load; tests don't need telephony so any URL works.
 os.environ.setdefault("PUBLIC_URL", "http://localhost:8080")
+# ponytail: 016 — encryption key for the new `integrations` table's
+# credentials_encrypted column. The encryption module refuses to
+# start without it in production; tests run as dev so we set one
+# eagerly. Tests don't care about the key value, just that it's
+# stable across the run.
+os.environ.setdefault(
+    "CREDENTIAL_ENCRYPTION_KEY",
+    "oahqImB7aGYfEFxfWIJLZzJs27YSYAgr5rHUyc3gIRU=",
+)
+os.environ.setdefault("ENVIRONMENT", "test")
 
 import STT_server.db_users as db_users  # noqa: E402
 import STT_server.routes.api as api_mod  # noqa: E402

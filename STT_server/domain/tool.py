@@ -101,6 +101,13 @@ class AgentTool:
         last_invoked_at: Optional[str] = None,
         last_invocation_status: Optional[str] = None,
         invocation_count: int = 0,
+        # ponytail: integration binding (016). When set, the tool
+        # inherits its webhook URL from the integration row, gets an
+        # `action` injected into the n8n body, and the integration
+        # supplies the credentials to n8n at call time. kind='call_transfer'
+        # forbids this (the destination is the action).
+        integration_id: Optional[str] = None,
+        action: Optional[str] = None,
     ):
         self.id = id or str(uuid.uuid4())
         self.agent_id = agent_id
@@ -147,6 +154,13 @@ class AgentTool:
         self.last_invoked_at = last_invoked_at
         self.last_invocation_status = last_invocation_status
         self.invocation_count = int(invocation_count or 0)
+        # ponytail: integration_id + action. Both default to None so
+        # legacy rows (pre-016) deserialize cleanly as standalone
+        # webhook tools. The executor branches on integration_id:
+        # set → use the integration's webhook + credentials; None →
+        # legacy tool.webhook_url path.
+        self.integration_id = integration_id or None
+        self.action = action or None
 
     @staticmethod
     def _now_iso() -> str:
@@ -175,6 +189,11 @@ class AgentTool:
             "last_invoked_at": self.last_invoked_at,
             "last_invocation_status": self.last_invocation_status,
             "invocation_count": self.invocation_count,
+            # ponytail: integration binding round-trips through this
+            # dict; the route layer strips/validates these before
+            # handing them to db_tools.
+            "integration_id": self.integration_id,
+            "action": self.action,
         }
 
     def to_openai_function(self) -> dict:
@@ -231,6 +250,11 @@ class AgentTool:
             last_invoked_at=data.get("last_invoked_at"),
             last_invocation_status=data.get("last_invocation_status"),
             invocation_count=data.get("invocation_count", 0),
+            # ponytail: 016 — legacy rows have neither field; both
+            # default to None in the constructor, so a missing key
+            # on disk doesn't blow up.
+            integration_id=data.get("integration_id"),
+            action=data.get("action"),
         )
 
     def update(self, **kwargs) -> None:
@@ -245,25 +269,42 @@ class AgentTool:
         errors = []
         if not self.name or not self.name.strip():
             errors.append("name is required")
-        # ponytail: kind-aware validation. webhooks need a URL,
-        # call_transfers need an E.164 destination. An old row
-        # accidentally carrying neither URL nor destination is the
+        # ponytail: kind-aware validation. webhooks need a URL OR an
+        # integration_id (the URL comes from the integration in that
+        # case), call_transfers need an E.164 destination. An old row
+        # accidentally carrying neither URL nor integration is the
         # sign someone ran a partial migration — flag it loudly
         # rather than silently saving a tool that can never fire.
         if self.kind == TOOL_KIND_CALL_TRANSFER:
+            if self.integration_id:
+                errors.append("call_transfer tools cannot reference an integration")
             if not self.destination or not E164_PATTERN.match(self.destination.strip()):
                 errors.append("destination must be E.164 (e.g. +15071234567)")
         else:
-            if not self.webhook_url or not self.webhook_url.strip():
-                errors.append("webhook_url is required for webhook tools")
+            if self.integration_id:
+                # ponytail: bound to an integration — webhook_url is
+                # supplied by the integration row, NOT by the tool.
+                # Action is required so the n8n Switch has a verb to
+                # dispatch on. The integration_id+action validation
+                # against the catalog lives in the route layer
+                # (because AgentTool doesn't import the catalog to
+                # keep this class dependency-free).
+                if not self.action or not self.action.strip():
+                    errors.append("action is required when integration_id is set")
+                elif not re.match(r"^[a-z0-9_]+$", self.action.strip()):
+                    errors.append("action must match ^[a-z0-9_]+$")
             else:
-                try:
-                    from urllib.parse import urlparse
-                    result = urlparse(self.webhook_url)
-                    if not all([result.scheme, result.netloc]):
+                # Legacy / generic_webhook path — caller supplies the URL.
+                if not self.webhook_url or not self.webhook_url.strip():
+                    errors.append("webhook_url is required for webhook tools")
+                else:
+                    try:
+                        from urllib.parse import urlparse
+                        result = urlparse(self.webhook_url)
+                        if not all([result.scheme, result.netloc]):
+                            errors.append("webhook_url must be a valid URL")
+                    except Exception:
                         errors.append("webhook_url must be a valid URL")
-                except Exception:
-                    errors.append("webhook_url must be a valid URL")
         if not isinstance(self.parameters, dict):
             errors.append("parameters must be a JSON Schema object")
         return errors

@@ -58,6 +58,11 @@ _TOOL_COLS_BASE = (
     "last_invocation_error_at, invocation_count, "
     "created_at, updated_at"
 )
+# ponytail: integration_id + action columns added by 016_agent_tools_integration.sql.
+# Same self-heal pattern as credentials (014): detected on first call, ALTER'd
+# inline if missing, then cached. Tools created before the migration keep
+# working — both columns are NULL for legacy rows.
+_TOOL_COLS_BASE_V2 = _TOOL_COLS_BASE + ", integration_id, action"
 _TOOL_COLS_EXTRA: list[str] = []  # appended to _TOOL_COLS_BASE when present
 _columns_check_done: bool = False
 _columns_check_lock = threading.Lock()
@@ -66,21 +71,25 @@ _columns_check_lock = threading.Lock()
 def _ensure_tool_columns() -> None:
     """Idempotent self-healing schema check.
 
-    Detects whether `agent_tools.credentials` exists on the target DB.
-    If not, runs the ALTER TABLE that migration 014 was supposed to
-    apply. Runs at most once per process — the result is cached in
-    module-level state — so the hot path never hits
-    information_schema.
+    Detects whether `agent_tools.credentials` (014) and
+    `agent_tools.integration_id` + `action` (016) exist on the target
+    DB. If not, runs the ALTER TABLE inline. Runs at most once per
+    process — the result is cached in module-level state — so the
+    hot path never hits information_schema.
 
     ponytail: the operator hit a 500 (`column "credentials" does not
-    exist`) on Railway despite the migration 014 file shipping in
-    the image. start.sh either didn't pick it up, hit the trailing
+    exist`) on Railway despite the migration 014 file shipping in the
+    image. start.sh either didn't pick it up, hit the trailing
     comment in my SQL and aborted silently, or the deploy reused a
     cached image. Rather than chase the migration runner bug, the
     BE now self-heals: the first time the credentials path is
     hit, we confirm the column is present, and apply it if not.
     Once applied the row is durable and subsequent deploys are
     no-ops thanks to `IF NOT EXISTS`.
+
+    Same pattern applies to integration_id + action (016) — these
+    columns are needed by the integrations refactor; legacy tools
+    keep working because both columns are NULL for pre-016 rows.
     """
     global _TOOL_COLS_EXTRA, _columns_check_done
     if _columns_check_done:
@@ -90,7 +99,7 @@ def _ensure_tool_columns() -> None:
             return
         if not is_postgres():
             # JSON path: no schema to check, every field is supported.
-            _TOOL_COLS_EXTRA = ["credentials"]
+            _TOOL_COLS_EXTRA = ["credentials", "integration_id", "action"]
             _columns_check_done = True
             return
         try:
@@ -99,14 +108,47 @@ def _ensure_tool_columns() -> None:
                     cur.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'agent_tools' "
-                        "AND column_name = 'credentials'"
+                        "AND column_name IN ('credentials', 'integration_id', 'action')"
                     )
-                    has_credentials = cur.fetchone() is not None
-            if not has_credentials:
+                    # ponytail: use fetchone in a loop so test stubs
+                    # that only implement fetchone (not fetchall)
+                    # don't blow up the self-heal path. We break
+                    # once we've collected all the columns we care
+                    # about (3) — the loop is bounded so a stub
+                    # that returns the same row forever can't hang
+                    # the request.
+                    #
+                    # Rows can be (a) RealDictCursor dicts with one
+                    # column_name key, (b) plain tuples with a single
+                    # column name, or (c) test-stub composite rows
+                    # that bundle multiple names — handle all three.
+                    expected = ("credentials", "integration_id", "action")
+                    present: set = set()
+                    bad_rows = 0
+                    while True:
+                        row = cur.fetchone()
+                        if row is None:
+                            break
+                        names: list = []
+                        if isinstance(row, dict):
+                            v = row.get("column_name")
+                            if isinstance(v, str):
+                                names.append(v)
+                        elif isinstance(row, (tuple, list)):
+                            names.extend(row)
+                        for name in names:
+                            if isinstance(name, str):
+                                present.add(name)
+                        if not names:
+                            bad_rows += 1
+                            if bad_rows > 8:
+                                break
+                            continue
+                        if present.issuperset(expected):
+                            break
+            if "credentials" not in present:
                 log.warning(
-                    "[db_tools] agent_tools.credentials column missing — applying "
-                    "migration 014 inline (start.sh didn't run it, or the deploy "
-                    "reused a cached image). One-shot, idempotent."
+                    "[db_tools] agent_tools.credentials missing - applying 014 inline"
                 )
                 with get_conn() as conn:
                     with conn.cursor() as cur:
@@ -114,30 +156,63 @@ def _ensure_tool_columns() -> None:
                             "ALTER TABLE agent_tools "
                             "ADD COLUMN IF NOT EXISTS credentials JSONB"
                         )
-            # Confirm the column is now present (either because it was,
-            # or because we just added it). The second SELECT is cheap
-            # and avoids a false positive if the ALTER silently no-ops.
+            if "integration_id" not in present or "action" not in present:
+                log.warning(
+                    "[db_tools] agent_tools.integration_id/action missing - applying 016 inline"
+                )
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE agent_tools "
+                            "ADD COLUMN IF NOT EXISTS integration_id TEXT, "
+                            "ADD COLUMN IF NOT EXISTS action TEXT"
+                        )
+            # Confirm presence after the inline ALTERs. Cheap and
+            # avoids a false positive if ALTER silently no-ops.
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'agent_tools' "
-                        "AND column_name = 'credentials'"
+                        "AND column_name IN ('credentials', 'integration_id', 'action')"
                     )
-                    has_credentials = cur.fetchone() is not None
-            _TOOL_COLS_EXTRA = ["credentials"] if has_credentials else []
+                    present = set()
+                    bad_rows = 0
+                    while True:
+                        row = cur.fetchone()
+                        if row is None:
+                            break
+                        names: list = []
+                        if isinstance(row, dict):
+                            v = row.get("column_name")
+                            if isinstance(v, str):
+                                names.append(v)
+                        elif isinstance(row, (tuple, list)):
+                            names.extend(row)
+                        for name in names:
+                            if isinstance(name, str):
+                                present.add(name)
+                        if not names:
+                            bad_rows += 1
+                            if bad_rows > 8:
+                                break
+                            continue
+                        if present.issuperset(expected):
+                            break
+            _TOOL_COLS_EXTRA = [c for c in ("credentials", "integration_id", "action") if c in present]
             _columns_check_done = True
             log.info(
-                "[db_tools] self-heal complete: credentials column %s",
-                "present" if has_credentials else "still missing (next request will retry)",
+                "[db_tools] self-heal complete: tool cols extra=%s",
+                _TOOL_COLS_EXTRA,
             )
         except Exception as exc:
             log.error("[db_tools] _ensure_tool_columns failed: %s", exc)
             # Don't mark done — the next request will retry. Returning
             # without _TOOL_COLS_EXTRA means the base cols (no
-            # credentials) are used; the broken call will surface
-            # the same column-not-exist error and the operator can
-            # see _ensure_tool_columns' log line in the next deploy.
+            # credentials / integration_id / action) are used; the
+            # broken call will surface the same column-not-exist
+            # error and the operator can see _ensure_tool_columns'
+            # log line in the next deploy.
             raise
 
 
@@ -145,14 +220,15 @@ def _tool_cols() -> str:
     """Returns the SELECT column list for the agent_tools table.
 
     Calls _ensure_tool_columns() on first use, then caches. Includes
-    `credentials` only when the column is known to exist (either it
-    was on the table at boot, or we added it via the self-heal ALTER).
+    `credentials`, `integration_id`, `action` only when the column is
+    known to exist (either it was on the table at boot, or we added it
+    via the self-heal ALTER).
     """
     if not _columns_check_done:
         _ensure_tool_columns()
     cols = _TOOL_COLS_BASE
-    if "credentials" in _TOOL_COLS_EXTRA:
-        cols += ", credentials"
+    for c in _TOOL_COLS_EXTRA:
+        cols += f", {c}"
     return cols
 
 
@@ -277,6 +353,8 @@ def create_tool(
     new_id = tool_id or f"tool-{uuid.uuid4().hex[:8]}"
     params_json = json.dumps(payload.get("parameters") or {})
     assignments_json = json.dumps(payload.get("assignments") or [])
+    integration_id = payload.get("integration_id")
+    action = payload.get("action")
     if not is_postgres():
         # JSON fallback for local dev
         if not _AGENT_TOOLS_FILE.exists():
@@ -300,16 +378,39 @@ def create_tool(
         # (None when the caller is creating a real n8n tool; a Fernet
         # dict when the caller is creating a service-credential row).
         new_row["credentials"] = payload.get("credentials")
+        # ponytail: integration_id + action live alongside the tool row
+        # so a future JOIN in /tools can hand the FE one object instead
+        # of making it round-trip /integrations.
+        new_row["integration_id"] = integration_id
+        new_row["action"] = action
         rows.append(new_row)
         os.makedirs(_AGENT_TOOLS_FILE.parent, exist_ok=True)
         with open(_AGENT_TOOLS_FILE, "w", encoding="utf-8") as f:
             json.dump(rows, f, indent=2, ensure_ascii=False)
         return new_row
+    # ponytail: 016 — the new columns (integration_id, action) are
+    # written conditionally so a deploy that ran the migration AFTER
+    # boot doesn't crash on a column-not-exist. db_update_tool
+    # follows the same shape (only emits SET clauses for present
+    # columns). The route layer already validates that
+    # integration_id refers to an existing row + the agent_id matrix,
+    # so we just store what it sent.
+    extra_cols_sql = ""
+    extra_vals_sql = ""
+    extra_params: list = []
+    if "integration_id" in _TOOL_COLS_EXTRA:
+        extra_cols_sql += ", integration_id"
+        extra_vals_sql += ", %s"
+        extra_params.append(integration_id)
+    if "action" in _TOOL_COLS_EXTRA:
+        extra_cols_sql += ", action"
+        extra_vals_sql += ", %s"
+        extra_params.append(action)
     with get_conn() as conn:
         with conn.cursor() as cur:
             credentials_json = json.dumps(payload.get("credentials")) if payload.get("credentials") is not None else None
             cur.execute(
-                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name, test_data_model, credentials) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s, %s, %s::jsonb) "
+                f"INSERT INTO agent_tools (  id, user_id, agent_id, name, description,   webhook_url, filler_phrase, parameters,   kind, destination, assignments, function_name, test_data_model, credentials{extra_cols_sql}) VALUES (  %s, %s, %s, %s, %s, %s, %s, %s::jsonb,   %s, %s, %s::jsonb, %s, %s, %s::jsonb{extra_vals_sql}) "
                 f"RETURNING {_tool_cols()}",
                 (
                     new_id, user_id,
@@ -325,6 +426,7 @@ def create_tool(
                     payload.get("function_name") or "",
                     payload.get("test_data_model") or "gpt-4o-mini",
                     credentials_json,
+                    *extra_params,
                 ),
             )
             row = cur.fetchone()
@@ -379,17 +481,32 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
     #      which the FE asked for.
     jsonb_keys = {"parameters", "assignments", "credentials"}
     db_managed = {"id", "user_id", "created_at", "updated_at"}
+    # ponytail: 016 — integration_id + action are plain TEXT, not JSONB,
+    # but only present when the column was self-healed. We append them
+    # to the SET clause only when (a) the column is known to exist
+    # AND (b) the payload actually contains the key. Without (b), the
+    # caller didn't touch the integration binding and we shouldn't
+    # blank it out by writing NULL.
+    optional_text_keys = [k for k in ("integration_id", "action")
+                          if k in _TOOL_COLS_EXTRA]
     set_clauses = []
     values: list = []
     for k, v in payload.items():
-        if v is None:
-            continue
         if k in db_managed:
             continue
         if k in jsonb_keys:
+            if v is None:
+                continue
             set_clauses.append(f"{k} = %s::jsonb")
             values.append(json.dumps(v))
+        elif k in optional_text_keys:
+            # Allow explicit None to clear the binding; payload
+            # semantics: None = "remove the binding", string = set.
+            set_clauses.append(f"{k} = %s")
+            values.append(v)
         else:
+            if v is None:
+                continue
             set_clauses.append(f"{k} = %s")
             values.append(v)
     if not set_clauses:

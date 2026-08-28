@@ -15,6 +15,71 @@ from STT_server.db_tools import get_tool as db_get_tool, update_tool as db_updat
 log = logging.getLogger(__name__)
 
 
+# ponytail: 016 — fields the LLM MUST NOT control. If any of these
+# show up in the tool_call arguments (because someone misconfigures
+# the function description, or a prompt-injection attack slips one
+# past OpenAI's parser), we strip them before the body goes to n8n.
+# action + provider are dispatched by the BE; integration_id /
+# webhook_url / credentials are server-injected from the DB.
+_FORBIDDEN_LLM_KEYS = frozenset({
+    "action", "provider", "integration_id", "webhook_url", "credentials",
+})
+
+
+def _resolve_integration_webhook(integration: dict) -> str:
+    """Resolve the URL the executor will POST to for an integration-bound tool.
+
+    Precedence:
+      1. INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__<PROVIDER> env var (uppercased)
+      2. INTEGRATIONS_N8N_WEBHOOK (single router, used for all official
+         providers — the user's n8n Switch node dispatches by `action`)
+      3. integration.configuration["webhook_url"] (only valid for
+         provider="generic_webhook" — official providers don't carry a URL)
+
+    Returns "" when no URL can be resolved; the caller raises
+    ToolExecutionError on empty so the LLM gets a clear failure.
+    """
+    provider = (integration.get("provider") or "").strip().upper()
+    override = os.environ.get(f"INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__{provider}", "").strip()
+    if override:
+        return override
+    base = os.environ.get("INTEGRATIONS_N8N_WEBHOOK", "").strip()
+    if base:
+        return base
+    # Fallback: only generic_webhook is allowed to surface its own URL.
+    if integration.get("provider") == "generic_webhook":
+        return (integration.get("configuration") or {}).get("webhook_url", "") or ""
+    return ""
+
+
+def _redact_url(url: str) -> str:
+    """Ponytail: SEC — never leak a generic_webhook URL into a client
+    error. Keeps the host (and port, if any), redacts path/query so
+    a logged error in Railway (or bubbled up to the FE) doesn't
+    reveal the tokenized path token an operator embedded for access
+    control."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if not host:
+            return "****"
+        netloc = host
+        if parsed.port is not None:
+            netloc = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{netloc}/****"
+    except Exception:
+        return "****"
+
+
+def _strip_forbidden_args(arguments: Optional[dict]) -> dict:
+    """Drop keys the LLM must not control before passing to n8n."""
+    if not isinstance(arguments, dict):
+        return {}
+    return {k: v for k, v in arguments.items() if k not in _FORBIDDEN_LLM_KEYS}
+
+
 # ponytail: SSRF allow-list for tool webhook URLs. The user can override
 # via the TOOL_WEBHOOK_ALLOW_HOSTS env var (comma-separated hostnames)
 # when they actually need to reach an internal n8n on a private
@@ -204,9 +269,16 @@ class ToolExecutor:
             ToolExecutionError: If the webhook call fails or times out,
                 or the URL fails SSRF validation.
         """
+        # ponytail: 016 — strip LLM-controlled forbidden keys before
+        # the body leaves our process. The execution body itself
+        # (server-injected action / provider / integration_id) is
+        # built by the route layer that calls execute() with the
+        # already-resolved integration context; here we just defend
+        # against stray arguments leaking through.
+        sanitized_args = _strip_forbidden_args(arguments)
         payload = {
             "tool_name": tool_name,
-            "arguments": arguments,
+            "arguments": sanitized_args,
         }
 
         # ponytail: SSRF guard. Run BEFORE any DNS / network call so a
@@ -217,7 +289,7 @@ class ToolExecutor:
         except ToolExecutionError as exc:
             log.warning(
                 "[ToolExecutor] SSRF rejected tool '%s' url=%s err=%s",
-                tool_name, webhook_url, exc,
+                tool_name, _redact_url(webhook_url), exc,
             )
             raise
 
@@ -225,7 +297,7 @@ class ToolExecutor:
             "[ToolExecutor] Executing tool '%s' host=%s args_keys=%s",
             tool_name,
             urlparse(webhook_url).hostname or "<unknown>",
-            list(arguments.keys()) if isinstance(arguments, dict) else type(arguments).__name__,
+            list(sanitized_args.keys()) if isinstance(sanitized_args, dict) else type(sanitized_args).__name__,
         )
 
         try:
@@ -245,7 +317,8 @@ class ToolExecutor:
 
                 if response.status_code >= 400:
                     raise ToolExecutionError(
-                        f"n8n webhook returned HTTP {response.status_code}: {response.text[:200]}"
+                        f"n8n webhook returned HTTP {response.status_code}: "
+                        f"{response.text[:200]}"
                     )
 
                 try:
@@ -290,6 +363,77 @@ async def execute_tool(
     """Convenience function to execute a tool using the singleton executor."""
     executor = get_tool_executor()
     return await executor.execute(webhook_url, arguments, tool_name)
+
+
+# ponytail: 016 — single entry point used by turn_manager after
+# loading a tool + (optionally) its integration. Server-injects
+# action / provider / integration_id into the n8n body so the LLM
+# never controls them. Resolves the webhook URL from the
+# integration row (env vars or configuration.webhook_url for
+# generic_webhook) and falls back to tool.webhook_url for legacy
+# rows that pre-date the integration_id column.
+async def execute_tool_call(
+    tool: dict,
+    user_id: str,
+    llm_arguments: Optional[dict],
+) -> dict:
+    """Execute one tool call, integration-aware.
+
+    Args:
+        tool: agent_tools row dict (must include id, webhook_url,
+            integration_id, action, function_name).
+        user_id: the calling user (owns the tool row).
+        llm_arguments: arguments emitted by the LLM. Forbidden keys
+            are stripped defensively before the body goes out.
+
+    Returns:
+        The JSON response from n8n as a dict.
+
+    Raises:
+        ToolExecutionError: when the integration is missing /
+        revoked, no webhook URL can be resolved, or the HTTP call
+        fails.
+    """
+    integration = None
+    if tool.get("integration_id"):
+        from STT_server.db_integrations import get_integration as db_get_integration
+        integration = db_get_integration(tool["integration_id"], user_id)
+        if not integration:
+            raise ToolExecutionError(
+                f"Integration '{tool['integration_id']}' missing or revoked"
+            )
+    # Resolve the webhook URL: integration-aware path first, legacy
+    # tool.webhook_url as fallback.
+    url = _resolve_integration_webhook(integration) if integration else (tool.get("webhook_url") or "")
+    if not url:
+        raise ToolExecutionError(f"Tool '{tool.get('id')}' has no webhook URL")
+    sanitized_args = _strip_forbidden_args(llm_arguments)
+    body: dict = {
+        "tool_name": tool.get("function_name") or tool.get("name") or "",
+        "arguments": sanitized_args,
+    }
+    # ponytail: server-injected fields. The LLM doesn't control any
+    # of these — they come from the BE lookup of the tool row + its
+    # integration. The n8n Switch node keys off `action`.
+    if integration:
+        body["integration_id"] = integration["id"]
+        body["provider"] = integration["provider"]
+        if tool.get("action"):
+            body["action"] = tool["action"]
+    elif tool.get("action"):
+        # Degraded: tool carries an action but no integration
+        # binding. Still useful — the n8n Switch can dispatch on it.
+        body["action"] = tool["action"]
+    executor = get_tool_executor()
+    # We pass the resolved URL directly to .execute(), which strips
+    # a second time (defense in depth) and posts the body.
+    try:
+        return await executor.execute(url, body, body["tool_name"])
+    except ToolExecutionError as exc:
+        # Redact the URL in the message so the FE / logs don't leak
+        # a tokenized generic_webhook path. The class allows us to
+        # wrap + re-raise cleanly.
+        raise ToolExecutionError(str(exc)) from None
 
 
 # ponytail: call_transfer executor. Lives next to execute_tool so both

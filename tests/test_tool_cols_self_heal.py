@@ -150,13 +150,23 @@ def _make_stub_get_conn(cursor: _ScriptedCursor):
 def test_postgres_path_self_heals_when_credentials_column_missing():
     """Simulate: information_schema says no credentials column. The
     self-heal runs ALTER TABLE, then re-checks, then caches.
-    Subsequent calls do NOT hit information_schema again."""
+    Subsequent calls do NOT hit information_schema again.
+
+    ponytail: 016 — the self-heal now also handles integration_id +
+    action. The fixture says "all three missing" so two ALTERs run,
+    one for credentials and one for the new pair.
+    """
     from STT_server import db_tools
 
     cursor = _ScriptedCursor(
         fetchone_results=[
-            None,                  # first info_schema → no creds col
-            ("credentials",),      # post-ALTER confirm → col present
+            None,                       # first info_schema → none present
+            ("credentials",),           # post-ALTER confirm creds col added
+            ("integration_id",),        # ... but new cols not yet there
+            ("action",),                # ... ditto
+            ("credentials",             # final confirm: all three present
+             "integration_id",
+             "action"),
         ],
     )
 
@@ -171,21 +181,24 @@ def test_postgres_path_self_heals_when_credentials_column_missing():
     assert db_tools._columns_check_done is True
     assert "credentials" in db_tools._TOOL_COLS_EXTRA
 
-    # Three SQL statements ran: info_schema SELECT, ALTER TABLE,
-    # info_schema SELECT (verify).
+    # Two ALTERs run (one for credentials, one for integration_id + action),
+    # each followed by a re-check. The fixture feeds back partial state
+    # to mirror the production race.
     alter_calls = [q for q, _ in cursor.executed if "ALTER TABLE" in q.upper()]
-    assert len(alter_calls) == 1, f"expected 1 ALTER, got {len(alter_calls)}: {cursor.executed}"
+    assert len(alter_calls) == 2, f"expected 2 ALTERs, got {len(alter_calls)}: {cursor.executed}"
     assert "credentials JSONB" in alter_calls[0]
+    assert "integration_id" in alter_calls[1] and "action" in alter_calls[1]
 
 
 def test_postgres_path_no_alter_when_credentials_column_present():
-    """If the column is already there, the self-heal is a no-op. No
-    ALTER issued; the confirm SELECT still runs (cheap, defensive
+    """If all the columns are already there, the self-heal is a no-op.
+    No ALTER issued; the confirm SELECT still runs (cheap, defensive
     against a half-applied ALTER on a previous deploy)."""
     from STT_server import db_tools
 
+    # Static row returns all three column names on every fetchone call.
     cursor = _ScriptedCursor(
-        fetchone_static=("credentials",),  # both checks return same row
+        fetchone_static=("credentials", "integration_id", "action"),
     )
 
     db_tools._TOOL_COLS_EXTRA = []
@@ -211,7 +224,7 @@ def test_postgres_path_second_call_does_not_re_check():
     from STT_server import db_tools
 
     cursor = _ScriptedCursor(
-        fetchone_static=("credentials",),  # first call: col present
+        fetchone_static=("credentials", "integration_id", "action"),
     )
 
     db_tools._TOOL_COLS_EXTRA = []
