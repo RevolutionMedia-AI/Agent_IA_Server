@@ -88,7 +88,29 @@ def _ensure_integrations_table() -> None:
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'integrations'"
                     )
-                    present = {row[0] for row in cur.fetchall()}
+                    # ponytail: use fetchone in a loop with both
+                    # dict + tuple row handling so this works under
+                    # RealDictCursor (psycopg2 with cursor_factory=
+                    # RealDictCursor — what Railway's prod uses) and
+                    # the plain tuple cursors used in tests. The
+                    # earlier `cur.fetchall()` + `row[0]` shape threw
+                    # KeyError: 0 in production the first time the
+                    # endpoint was hit.
+                    present: set = set()
+                    while True:
+                        row = cur.fetchone()
+                        if row is None:
+                            break
+                        if isinstance(row, dict):
+                            v = row.get("column_name")
+                            if isinstance(v, str):
+                                present.add(v)
+                        else:
+                            try:
+                                present.add(row[0])
+                            except (KeyError, TypeError, IndexError):
+                                # Mock or unexpected shape; skip.
+                                pass
             if not present:
                 log.warning(
                     "[db_integrations] integrations table missing — applying 015 inline"
