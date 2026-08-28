@@ -24,12 +24,17 @@ import STT_server.services.playback_service as playback_service
 from STT_server.adapters.rime_tts import stream_tts_segment
 
 
-async def fake_send_twilio_media(ws, stream_sid, mulaw_audio: bytes) -> None:
+async def fake_send_twilio_media(
+    ws, stream_sid, mulaw_audio: bytes, call_sid: str = "", generation: int = 0
+) -> None:
     """Fake sender: append raw mulaw bytes to disk (one file per session/generation)."""
     # In this test harness we rely on playback_service's own
     # SAVE_TWILIO_FRAMES behavior to capture frames. Avoid writing here
     # as playback_loop already appends frames when SAVE_TWILIO_FRAMES=1,
     # which would otherwise duplicate frames in the capture file.
+    # call_sid / generation are accepted (for parity with the real
+    # send_twilio_media signature) and ignored — the forensic A/B
+    # capture hooks fire inside the real implementation, not here.
     await asyncio.sleep(0.001)
 
 

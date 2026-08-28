@@ -275,6 +275,18 @@ async def stream_tts_segment(
                         continue
                     if not audio:
                         continue
+                    # ponytail: 2026-08-28 forensic A/B capture — write
+                    # the raw μ-law bytes Inworld returned, BEFORE any
+                    # AudioFrameProcessor touches them. Pair with the B
+                    # capture inside send_twilio_media; sha256(A) vs
+                    # sha256(B) per generation locates exactly where a
+                    # byte-level artifact enters. No-op when
+                    # TTS_AUDIO_CAPTURE_DIR is unset.
+                    from STT_server.services.audio_capture import capture_a
+                    capture_a(
+                        getattr(session, "call_sid", "") or "",
+                        generation, audio, seg_idx,
+                    )
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started) * 1000
                         # ponytail: stamp TTS_FIRST_BYTE on the first audio
@@ -378,6 +390,16 @@ async def stream_tts_segment(
                                 continue
                             if not audio:
                                 continue
+                            # ponytail: 2026-08-28 forensic A/B capture
+                            # on the fallback path too — the bytes are
+                            # still Inworld's, just from a different
+                            # voice. Tagged with the same generation so
+                            # the per-gen diff still holds.
+                            from STT_server.services.audio_capture import capture_a
+                            capture_a(
+                                getattr(session, "call_sid", "") or "",
+                                generation, audio, seg_idx,
+                            )
                             # ponytail: stamp TTS_FIRST_BYTE on the first
                             # audio byte from the fallback (main path may
                             # not have produced any if it 404'd on connect).

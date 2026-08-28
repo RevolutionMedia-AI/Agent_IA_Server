@@ -90,7 +90,25 @@ def summarize_twilio_sequence(session) -> None:
     )
 
 
-async def send_twilio_media(ws: WebSocket, stream_sid: str, mulaw_audio: bytes) -> None:
+async def send_twilio_media(
+    ws: WebSocket,
+    stream_sid: str,
+    mulaw_audio: bytes,
+    call_sid: str = "",
+    generation: int = 0,
+) -> None:
+    # ponytail: 2026-08-28 forensic A/B capture — write the exact
+    # 160-byte μ-law frame about to be base64-encoded + sent on
+    # the WS. Pair with the A capture (raw Inworld bytes) in
+    # inworld_tts.py: sha256(A) == sha256(B) per generation means
+    # the pipeline never touched the bytes; any divergence
+    # pinpoints the stage that mutated the audio. No-op when
+    # TTS_AUDIO_CAPTURE_DIR is unset (the default). Best-effort:
+    # a write failure logs once and disables capture for this
+    # (call, gen, stage) — NEVER blocks the WS send.
+    if call_sid and mulaw_audio:
+        from STT_server.services.audio_capture import capture_b
+        capture_b(call_sid, generation, mulaw_audio)
     payload = base64.b64encode(mulaw_audio).decode("ascii")
     await ws.send_json(
         {

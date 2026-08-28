@@ -1,182 +1,372 @@
-"""Audio capture helpers for the 2026-08-14 A/B test.
+"""Audio capture helpers for the 2026-08-28 forensic A/B capture.
 
-The 2026-08-14 audio review concluded the artifacts are NOT in
-WhatsApp / AMR but are introduced by the live pipeline. To pinpoint
-WHERE, the operator needs three captures per call:
+Pinpoints where audio artifacts appear by capturing:
 
-  A — bytes the TTS adapter produced (post-resample, post-μ-law
-      encode, in the exact order it emitted them).
-  B — bytes the runtime sends to Twilio (post-frame_proc, the
-      exact 160-byte frames paced out).
-  C — the AMR recording from Twilio / carrier.
+  A — bytes from Inworld (post base64-decode, BEFORE AudioFrameProcessor)
+  B — bytes to Twilio   (inside send_twilio_media, BEFORE base64-encode)
 
-This module writes A and B to disk when ``TTS_AUDIO_CAPTURE_DIR``
-is set. C comes from Twilio's recording system and is unrelated
-to the runtime.
+Storage target:
+  - When ``DATABASE_URL`` is set (production / Railway): writes go to
+    Postgres via an async background queue so DB latency never sits
+    on the live WS send.
+  - When ``DATABASE_URL`` is unset (local dev): writes go to
+    per-call/per-gen files under ``TTS_AUDIO_CAPTURE_DIR`` (same
+    layout as before — fallback for devs without a DB handy).
 
-Design rules:
-  - Best-effort. A write failure logs once and disables capture
-    for the rest of the call. NEVER crash the live path on a
-    disk-full or permission error.
-  - Per-callSid append-only. A new callSid opens a new file. The
-    operator diffs them with ffmpeg / sox offline.
-  - No locks. Append mode on POSIX is atomic for O(1024)-byte
-    writes; Windows append mode is similarly OK for the sizes we
-    emit (~160 B per frame). If concurrent writes become an issue
-    we add a per-callSid lock, but the current call model is one
-    writer per call.
-  - Lazy-import pathlib inside the function so import time
-    stays cheap when the env var is unset (the common case).
+Master switch: ``TTS_AUDIO_CAPTURE_DIR``. Set to any non-empty value
+to enable; unset (or empty) to disable (no-op). The DB-vs-file
+backend is picked automatically from ``DATABASE_URL`` — the operator
+only flips ONE env var to turn the whole forensic chain on.
+
+Best-effort: a write failure logs once and disables capture for the
+relevant scope (a (call, gen, stage) tuple in DB mode, the whole
+callSid in file mode). NEVER crash the live path.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import queue
 import threading
+import time
 from pathlib import Path
 from typing import IO
 
 
 log = logging.getLogger("stt_server.audio_capture")
 
-# Per-callSid open file handles. Key = callSid, value = {"A":
-# open handle, "B": open handle}. Cleared on close (operator
-# drops the file via process exit; not a hot-path concern).
-_HANDLES: dict[str, dict[str, IO[bytes]]] = {}
+# ─── File mode (local-dev fallback) ──────────────────────────────
+
+# Per (callSid, generation) open file handles. Key = (callSid, gen),
+# value = {"inworld": binary fh, "inworld_jsonl": text fh,
+#          "twilio": binary fh, "twilio_jsonl": text fh}. Lazy:
+# only stages that were actually written open handles.
+_HANDLES: dict[tuple[str, int], dict[str, IO]] = {}
 _HANDLES_LOCK = threading.Lock()
 
-# Tracks callSids we've already logged a write error for, so a
-# disk-full situation doesn't produce 8000 log lines per call.
-_ERROR_LOGGED: set[str] = set()
+_ERROR_LOGGED: set[tuple[str, int, str]] = set()
+_DIR_FAILED: set[str] = set()
 
 
-def _open_locked(call_sid: str, capture_dir: str) -> dict[str, IO[bytes]] | None:
-    """Open (lazily) the per-call A and B capture files. Returns
-    None when the env var is unset, the directory is missing, or
-    a previous write already failed for this callSid.
+def _capture_dir() -> str:
+    return os.environ.get("TTS_AUDIO_CAPTURE_DIR", "").strip()
 
-    Caller MUST hold ``_HANDLES_LOCK``.
-    """
-    if not capture_dir:
+
+def _use_db() -> bool:
+    # ponytail: keep JSON-only deployments free of psycopg2 import.
+    from STT_server.db import is_postgres
+    return is_postgres()
+
+
+def _paths(call_sid: str, generation: int, capture_dir: str) -> dict[str, Path]:
+    base = Path(capture_dir) / call_sid
+    gen = f"gen-{generation}"
+    return {
+        "inworld": base / f"{gen}-inworld.mulaw",
+        "inworld_jsonl": base / f"{gen}-inworld.jsonl",
+        "twilio": base / f"{gen}-twilio.mulaw",
+        "twilio_jsonl": base / f"{gen}-twilio.jsonl",
+    }
+
+
+def _open_locked(
+    call_sid: str, generation: int, stage: str, capture_dir: str
+) -> tuple[IO, IO] | None:
+    if call_sid in _DIR_FAILED:
         return None
-    if call_sid in _ERROR_LOGGED:
-        return None
-    existing = _HANDLES.get(call_sid)
-    if existing is not None:
-        return existing
+    key = (call_sid, generation)
+    handles = _HANDLES.setdefault(key, {})
+    bin_key = stage
+    json_key = f"{stage}_jsonl"
+    bin_fh = handles.get(bin_key)
+    json_fh = handles.get(json_key)
+    if bin_fh is not None and json_fh is not None:
+        return bin_fh, json_fh
     try:
-        base = Path(capture_dir)
+        base = Path(capture_dir) / call_sid
         base.mkdir(parents=True, exist_ok=True)
-        handles: dict[str, IO[bytes]] = {}
-        for label in ("A", "B"):
-            path = base / f"{label}_inworld_{call_sid}.mulaw" if label == "A" else base / f"{label}_twilio_{call_sid}.mulaw"
-            # 'ab' = append-binary, buffering=0 so writes hit disk
-            # before the function returns (a slow disk doesn't
-            # backpressure the WS send).
-            handles[label] = open(path, "ab", buffering=0)
-        _HANDLES[call_sid] = handles
-        log.info(
-            "[AUDIO_CAPTURE] enabled for call_sid=%s dir=%s "
-            "files: %s, %s",
-            call_sid, capture_dir,
-            base / f"A_inworld_{call_sid}.mulaw",
-            base / f"B_twilio_{call_sid}.mulaw",
-        )
-        return handles
     except Exception as exc:
         log.warning(
-            "[AUDIO_CAPTURE] open failed for call_sid=%s dir=%s err=%s; "
+            "[AUDIO_CAPTURE] mkdir failed for call_sid=%s dir=%s err=%s; "
             "disabling capture for this call",
             call_sid, capture_dir, exc,
         )
-        _ERROR_LOGGED.add(call_sid)
+        _DIR_FAILED.add(call_sid)
+        return None
+    paths = _paths(call_sid, generation, capture_dir)
+    try:
+        if bin_fh is None:
+            bin_fh = open(paths[bin_key], "ab", buffering=0)
+            handles[bin_key] = bin_fh
+        if json_fh is None:
+            json_fh = open(paths[json_key], "a", encoding="utf-8", buffering=1)
+            handles[json_key] = json_fh
+        return bin_fh, json_fh
+    except Exception as exc:
+        log.warning(
+            "[AUDIO_CAPTURE] open failed for call_sid=%s gen=%d stage=%s err=%s; "
+            "disabling capture for this (call, gen, stage)",
+            call_sid, generation, stage, exc,
+        )
+        _ERROR_LOGGED.add((call_sid, generation, stage))
         return None
 
 
-def capture_a(call_sid: str, mulaw_bytes: bytes, capture_dir: str | None = None) -> None:
-    """Append *mulaw_bytes* (post-resample, post-μ-law) to the A
-    capture file for this call. No-op when capture is disabled.
-    """
-    _capture(call_sid, mulaw_bytes, "A", capture_dir)
-
-
-def capture_b(call_sid: str, mulaw_bytes: bytes, capture_dir: str | None = None) -> None:
-    """Append *mulaw_bytes* (a single 160-byte Twilio frame, exactly
-    what is being base64-encoded and sent on the WS) to the B
-    capture file for this call. No-op when capture is disabled.
-    """
-    _capture(call_sid, mulaw_bytes, "B", capture_dir)
-
-
-def _capture(call_sid: str, mulaw_bytes: bytes, label: str, capture_dir: str | None) -> None:
-    # ponytail: keep this fast in the no-op case (the default).
-    # The check is one os.environ access; everything else is gated.
-    if capture_dir is None:
-        capture_dir = os.environ.get("TTS_AUDIO_CAPTURE_DIR", "").strip()
-    if not capture_dir or not call_sid or not mulaw_bytes:
+def _write_file(
+    call_sid: str,
+    generation: int,
+    stage: str,
+    mulaw_bytes: bytes,
+    sha: str,
+    seg_idx: int | None,
+    capture_dir: str,
+) -> None:
+    err_key = (call_sid, generation, stage)
+    if err_key in _ERROR_LOGGED:
         return
     with _HANDLES_LOCK:
-        handles = _open_locked(call_sid, capture_dir)
-        if handles is None:
-            return
-        fh = handles.get(label)
-        if fh is None:
-            return
-    # Write OUTSIDE the lock so a slow disk doesn't block the WS send.
+        result = _open_locked(call_sid, generation, stage, capture_dir)
+    if result is None:
+        return
+    bin_fh, json_fh = result
     try:
-        fh.write(mulaw_bytes)
+        bin_fh.write(mulaw_bytes)
     except Exception as exc:
         log.warning(
-            "[AUDIO_CAPTURE] write failed for call_sid=%s label=%s err=%s; "
-            "disabling capture for this call",
-            call_sid, label, exc,
+            "[AUDIO_CAPTURE] write failed for call_sid=%s gen=%d stage=%s err=%s; "
+            "disabling capture for this (call, gen, stage)",
+            call_sid, generation, stage, exc,
         )
-        with _HANDLES_LOCK:
-            _ERROR_LOGGED.add(call_sid)
-            try:
-                fh.close()
-            except Exception:
-                pass
-            _HANDLES.pop(call_sid, None)
+        _ERROR_LOGGED.add(err_key)
+        return
+    record = {
+        "session": call_sid,
+        "gen": generation,
+        "stage": stage,
+        "seg": seg_idx,
+        "byte_count": len(mulaw_bytes),
+        "sha256": sha,
+        "ts": time.time(),
+    }
+    try:
+        json_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        json_fh.flush()
+    except Exception as exc:
+        log.warning(
+            "[AUDIO_CAPTURE] jsonl write failed for call_sid=%s gen=%d stage=%s err=%s; "
+            "disabling sidecar for this (call, gen, stage)",
+            call_sid, generation, stage, exc,
+        )
+        _ERROR_LOGGED.add(err_key)
+
+
+# ─── DB mode (async background writer) ───────────────────────────
+
+# Records the worker drains into Postgres. Daemon thread, single
+# worker: order preservation across the queue is guaranteed and a
+# single insert path is easier to reason about. maxsize 20k covers
+# 6 s × 50 frames/s × 2 sides × 2 writes each ≈ 1200 records/call
+# with plenty of headroom for barge-in replays.
+_capture_queue: queue.Queue = queue.Queue(maxsize=20000)
+_worker_started = False
+_worker_lock = threading.Lock()
+
+
+def _ensure_worker() -> None:
+    """Lazy-start a daemon thread that drains the capture queue into
+    Postgres. Safe to call from any thread, idempotent."""
+    global _worker_started
+    if _worker_started:
+        return
+    with _worker_lock:
+        if _worker_started:
+            return
+        t = threading.Thread(
+            target=_drain_worker,
+            name="audio-capture-writer",
+            daemon=True,
+        )
+        t.start()
+        _worker_started = True
+
+
+def _drain_worker() -> None:
+    """Pop records from the queue and INSERT into audio_capture.
+    Never raises: a failed insert logs once and continues."""
+    from STT_server.db_audio_capture import insert_capture
+    while True:
+        record = _capture_queue.get()
+        try:
+            insert_capture(**record)
+        except Exception:
+            log.exception(
+                "[AUDIO_CAPTURE] worker insert failed call_sid=%s gen=%d stage=%s",
+                record.get("call_sid"),
+                record.get("generation"),
+                record.get("stage"),
+            )
+        finally:
+            _capture_queue.task_done()
+
+
+def _enqueue_db(
+    call_sid: str,
+    generation: int,
+    stage: str,
+    mulaw_bytes: bytes,
+    sha: str,
+    seg_idx: int | None,
+) -> None:
+    _ensure_worker()
+    record = {
+        "call_sid": call_sid,
+        "generation": generation,
+        "stage": stage,
+        "seg": seg_idx,
+        "byte_count": len(mulaw_bytes),
+        "sha256": sha,
+        "payload": mulaw_bytes,
+    }
+    try:
+        _capture_queue.put_nowait(record)
+    except queue.Full:
+        log.warning(
+            "[AUDIO_CAPTURE] queue full call_sid=%s gen=%d stage=%s; dropping",
+            call_sid, generation, stage,
+        )
+
+
+# ─── Public API ──────────────────────────────────────────────────
+
+
+def _capture(
+    call_sid: str,
+    generation: int,
+    mulaw_bytes: bytes,
+    stage: str,
+    seg_idx: int | None,
+    capture_dir: str | None,
+) -> None:
+    # ponytail: keep this fast in the no-op case (the default).
+    if capture_dir is None:
+        capture_dir = _capture_dir()
+    if not capture_dir or not call_sid or not mulaw_bytes:
+        return
+    sha = hashlib.sha256(mulaw_bytes).hexdigest()
+    if _use_db():
+        _enqueue_db(call_sid, generation, stage, mulaw_bytes, sha, seg_idx)
+        return
+    _write_file(call_sid, generation, stage, mulaw_bytes, sha, seg_idx, capture_dir)
+
+
+def capture_a(
+    call_sid: str,
+    generation: int,
+    mulaw_bytes: bytes,
+    seg_idx: int = 0,
+    capture_dir: str | None = None,
+) -> None:
+    """Append raw Inworld μ-law bytes (post base64-decode, BEFORE
+    AudioFrameProcessor) to the A capture for this (callSid, gen).
+
+    No-op when ``TTS_AUDIO_CAPTURE_DIR`` is unset (the default)."""
+    _capture(call_sid, generation, mulaw_bytes, "inworld", seg_idx, capture_dir)
+
+
+def capture_b(
+    call_sid: str,
+    generation: int,
+    mulaw_bytes: bytes,
+    capture_dir: str | None = None,
+) -> None:
+    """Append a single 160-byte Twilio frame (BEFORE base64-encode
+    inside ``send_twilio_media``) to the B capture for this
+    (callSid, gen).
+
+    No-op when ``TTS_AUDIO_CAPTURE_DIR`` is unset."""
+    _capture(call_sid, generation, mulaw_bytes, "twilio", None, capture_dir)
 
 
 def close_all() -> None:
-    """Flush + close every open capture file. Called from
-    session_runtime.cleanup_session so the B file sees the last
-    frame of the call. Idempotent."""
+    """Flush + close capture files (file mode) AND wait briefly for
+    the DB queue to drain (DB mode). Idempotent.
+
+    Called from session cleanup so the last frame of the call lands
+    in storage before the session row closes."""
     with _HANDLES_LOCK:
-        for sid, handles in list(_HANDLES.items()):
-            for label, fh in handles.items():
+        for handles in _HANDLES.values():
+            for fh in handles.values():
                 try:
                     fh.flush()
                     fh.close()
                 except Exception:
                     pass
         _HANDLES.clear()
+        _DIR_FAILED.clear()
+        _ERROR_LOGGED.clear()
+    # Drain the DB queue with a bounded wait. The worker is a daemon
+    # thread so anything left after the cap is silently dropped when
+    # the process exits — acceptable for a forensic diagnostic.
+    if _worker_started:
+        deadline = time.monotonic() + 2.0
+        while not _capture_queue.empty() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+
+def capture_queue_size() -> int:
+    """Diagnostic: how many records are pending the DB worker.
+    Useful for the call summary."""
+    return _capture_queue.qsize()
 
 
 if __name__ == "__main__":
-    # Smoke: capture to a tmp dir, verify the file gets the bytes.
+    # Smoke: file-mode layout + bytes + JSONL. DB mode is exercised
+    # by the unit tests with a mocked insert function.
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["TTS_AUDIO_CAPTURE_DIR"] = tmp
-        capture_a("CA-test-A", b"\xff" * 160)
-        capture_b("CA-test-A", b"\x00" * 160)
-        capture_a("CA-test-A", b"\x01" * 320)
-        capture_b("CA-test-A", b"\x02" * 160)
-        # Different callSid opens a separate file pair.
-        capture_a("CA-test-B", b"\xaa" * 160)
-        capture_b("CA-test-B", b"\xbb" * 160)
-        # Force-flush.
+        capture_a("CA-test-A", 1, b"\xff" * 160, seg_idx=0)
+        capture_a("CA-test-A", 1, b"\x01" * 320, seg_idx=1)
+        capture_b("CA-test-A", 1, b"\x00" * 160)
+        capture_b("CA-test-A", 1, b"\x02" * 160)
+        capture_a("CA-test-A", 2, b"\x99" * 160)
+        capture_b("CA-test-A", 2, b"\xaa" * 160)
+        capture_a("CA-test-B", 1, b"\x55" * 160)
+        capture_b("CA-test-B", 1, b"\x66" * 160)
         close_all()
-        a_path = Path(tmp) / "A_inworld_CA-test-A.mulaw"
-        b_path = Path(tmp) / "B_twilio_CA-test-A.mulaw"
-        assert a_path.read_bytes() == b"\xff" * 160 + b"\x01" * 320
-        assert b_path.read_bytes() == b"\x00" * 160 + b"\x02" * 160
-        # Other call's files are separate.
-        a_b = Path(tmp) / "A_inworld_CA-test-B.mulaw"
-        b_b = Path(tmp) / "B_twilio_CA-test-B.mulaw"
-        assert a_b.read_bytes() == b"\xaa" * 160
-        assert b_b.read_bytes() == b"\xbb" * 160
+
+        base_a = Path(tmp) / "CA-test-A"
+        a1 = base_a / "gen-1-inworld.mulaw"
+        a1j = base_a / "gen-1-inworld.jsonl"
+        b1 = base_a / "gen-1-twilio.mulaw"
+        b1j = base_a / "gen-1-twilio.jsonl"
+        assert a1.read_bytes() == b"\xff" * 160 + b"\x01" * 320
+        assert b1.read_bytes() == b"\x00" * 160 + b"\x02" * 160
+        assert (base_a / "gen-2-inworld.mulaw").read_bytes() == b"\x99" * 160
+        assert (base_a / "gen-2-twilio.mulaw").read_bytes() == b"\xaa" * 160
+        base_b = Path(tmp) / "CA-test-B"
+        assert (base_b / "gen-1-inworld.mulaw").read_bytes() == b"\x55" * 160
+        assert (base_b / "gen-1-twilio.mulaw").read_bytes() == b"\x66" * 160
+
+        lines = a1j.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+        rec0 = json.loads(lines[0])
+        rec1 = json.loads(lines[1])
+        assert rec0["session"] == "CA-test-A"
+        assert rec0["gen"] == 1
+        assert rec0["stage"] == "inworld"
+        assert rec0["seg"] == 0
+        assert rec0["byte_count"] == 160
+        assert rec0["sha256"] == hashlib.sha256(b"\xff" * 160).hexdigest()
+        assert rec1["seg"] == 1
+        assert rec1["byte_count"] == 320
+
+        lines_b = b1j.read_text(encoding="utf-8").strip().splitlines()
+        for r in (json.loads(x) for x in lines_b):
+            assert r["stage"] == "twilio"
+            assert r["seg"] is None
+
         print("audio_capture: OK")

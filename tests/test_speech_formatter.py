@@ -41,3 +41,20 @@ def test_preserves_nonverbals():
     out = format_for_tts(text)
     assert "[breathe]" in out
     assert "<break" in out
+
+
+def test_disable_expressive_markup_short_circuits(monkeypatch):
+    """TTS_DISABLE_EXPRESSIVE_MARKUP=true bypasses the formatter
+    entirely — the text returns unchanged so the operator can
+    isolate "is the artifact from the model, the delivery, the
+    speed, or the markup?" without refactoring the call site.
+    """
+    monkeypatch.setenv("TTS_DISABLE_EXPRESSIVE_MARKUP", "true")
+    text = "Con gusto. El perfil de lípidos mide colesterol. Requiere ayuno."
+    assert format_for_tts(text) == text
+    # Single-sentence + nonverbals too: formatter is OFF.
+    text2 = "Entiendo. [breathe] Le explico las opciones."
+    assert format_for_tts(text2) == text2
+    # Restore default behavior so the rest of the suite is unaffected.
+    monkeypatch.delenv("TTS_DISABLE_EXPRESSIVE_MARKUP", raising=False)
+    assert "<break" in format_for_tts(text)

@@ -844,6 +844,16 @@ def format_for_tts(text: str) -> str:
     Returns the text with at most one break inserted, or the
     original text if no insertion was appropriate.
     """
+    # ponytail: 2026-08-28 forensic baseline — short-circuit the
+    # entire formatter when TTS_DISABLE_EXPRESSIVE_MARKUP is set.
+    # The current audio-quality investigation needs a CLEAN baseline
+    # where the backend doesn't insert <break>, doesn't route
+    # through [breathe]/[sigh]/[speak ...], and lets the LLM hint
+    # stand alone (or be disabled via the LLM hint itself). Read
+    # inside the function so import time stays cheap when unset.
+    import os
+    if os.environ.get("TTS_DISABLE_EXPRESSIVE_MARKUP", "").strip().lower() in ("1", "true", "yes", "on"):
+        return text
     if not text or "<break" in text:
         return text
 
