@@ -134,6 +134,7 @@ def _ensure_integrations_table() -> None:
                             "  oauth_scope            TEXT,"
                             "  oauth_state_hash       TEXT,"
                             "  oauth_state_expires_at TIMESTAMPTZ,"
+                            "  oauth_code_verifier_encrypted BYTEA,"
                             "  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
                             "  updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()"
                             ")"
@@ -168,6 +169,15 @@ def _ensure_integrations_table() -> None:
                     "oauth_scope": "TEXT",
                     "oauth_state_hash": "TEXT",
                     "oauth_state_expires_at": "TIMESTAMPTZ",
+                    # ponyy: 018 added the PKCE code_verifier column.
+                    # Listed here so the self-heal recreates it on
+                    # deploys where the migration file itself failed
+                    # to apply (e.g. UTF-8 BOM at the start of the
+                    # .sql makes Postgres reject the whole script).
+                    # Without this the /oauth/start UPDATE would 500
+                    # with "column oauth_code_verifier_encrypted
+                    # does not exist" forever.
+                    "oauth_code_verifier_encrypted": "BYTEA",
                     "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                     "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                 }

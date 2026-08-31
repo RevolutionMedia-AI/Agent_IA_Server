@@ -330,6 +330,34 @@ def test_scalar_handles_both_cursor_shapes():
     assert _scalar(("oops",)) == 0
 
 
+def test_migration_018_has_no_utf8_bom():
+    """Regression: migration 018 was originally written with a
+    UTF-8 BOM at the start of the file, which Postgres rejected
+    as 'syntax error at or near \\ufeff' and the migration never
+    applied. The /oauth/start UPDATE then crashed with
+    'column oauth_code_verifier_encrypted does not exist'.
+
+    This test pins the file's first three bytes to NOT be a BOM
+    so a future edit doesn't reintroduce the same bug. (The other
+    ~20 migration files were checked too — only 018 had it.)"""
+    # tests/ is a sibling of db/. Go up two from this test file.
+    import pathlib
+    here = pathlib.Path(__file__).resolve()
+    repo_root = here.parents[1]  # .../Agent_IA_Server
+    path = repo_root / "db" / "migrations" / "018_integrations_oauth_verifier.sql"
+    with open(path, "rb") as f:
+        head = f.read(3)
+    assert head != b"\xef\xbb\xbf", (
+        "migration 018 has a UTF-8 BOM at the start; Postgres will "
+        "fail to apply it with 'syntax error at or near \\ufeff' and "
+        "the column won't be created. Strip the BOM."
+    )
+    with open(path, "r", encoding="utf-8") as f:
+        body = f.read()
+    assert "oauth_code_verifier_encrypted" in body
+    assert "BYTEA" in body
+
+
 def test_oauth_start_persists_verifier_as_bytes_not_dict():
     """Regression: the operator got a 500 with
     'psycopg2.ProgrammingError: can't adapt type dict' on
