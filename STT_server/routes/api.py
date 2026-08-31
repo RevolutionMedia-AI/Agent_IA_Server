@@ -30,6 +30,7 @@ log = logging.getLogger("stt_server.routes.api")
 
 from STT_server.security.credentials import (
     encrypt_credentials, decrypt_credentials, decrypt_value,
+    encrypt_value,
 )
 from STT_server.services.credentials_resolver import (
     PROVIDER_CATALOG,
@@ -2476,8 +2477,13 @@ def oauth_start_endpoint(
     # authorize URL. Encrypt the verifier at rest — the row is
     # fetched by the callback handler to send the original back
     # to Salesforce in the token exchange.
+    #
+    # Use `encrypt_value` (not `encrypt_credentials`!) — the latter
+    # returns a dict, but the column is BYTEA and psycopg2 can't
+    # adapt a dict to bytes. The verifier is a single string; we
+    # store it raw, not wrapped in a one-key dict.
     code_verifier, code_challenge = generate_pkce()
-    code_verifier_encrypted = encrypt_credentials({"code_verifier": code_verifier})
+    code_verifier_encrypted = encrypt_value(code_verifier)
     updated = start_oauth_flow(
         integration_id, auth["user_id"], state_hash,
         code_verifier_encrypted=code_verifier_encrypted,
@@ -2567,7 +2573,7 @@ def oauth_salesforce_callback_endpoint(
     verifier_encrypted = integ.pop("_oauth_code_verifier_encrypted", None)
     if verifier_encrypted:
         try:
-            code_verifier_plain = decrypt_credentials(verifier_encrypted).get("code_verifier")
+              code_verifier_plain = decrypt_value(verifier_encrypted)
         except Exception as exc:
             log.warning("[oauth.callback] verifier decrypt failed integration_id=%s err=%s",
                         integration_id, exc)

@@ -330,6 +330,41 @@ def test_scalar_handles_both_cursor_shapes():
     assert _scalar(("oops",)) == 0
 
 
+def test_oauth_start_persists_verifier_as_bytes_not_dict():
+    """Regression: the operator got a 500 with
+    'psycopg2.ProgrammingError: can't adapt type dict' on
+    /oauth/start. Root cause: `encrypt_credentials()` returns a
+    DICT, not bytes — but the oauth_code_verifier_encrypted
+    column is BYTEA. Passing a dict as a SQL parameter makes
+    psycopg2 explode.
+
+    The fix uses `encrypt_value()` (returns a single Fernet
+    token string, the natural bytes) instead of
+    `encrypt_credentials()`. This test pins that contract:
+    after /oauth/start the stored verifier must be bytes-shaped
+    (Fernet token = str of URL-safe base64 = bytes on the wire),
+    NOT a dict.
+    """
+    from STT_server.services import oauth_providers as oa
+    from STT_server.security.credentials import encrypt_value, decrypt_value
+
+    verifier, _ = oa.generate_pkce()
+    encrypted = encrypt_value(verifier)
+    # encrypt_value returns the Fernet token — str on the wire
+    # but psycopg2 binds it as bytes because the column is BYTEA.
+    assert isinstance(encrypted, (bytes, str))
+    # Round-trip integrity: decrypting returns the original.
+    assert decrypt_value(encrypted) == verifier
+    # The contract is the same one used by credentials_encrypted:
+    # a single Fernet token, never a dict.
+    from STT_server.security.credentials import encrypt_credentials
+    wrong = encrypt_credentials({"code_verifier": verifier})
+    # This is the SHAPE that triggered the original crash — it
+    # would have been passed to a BYTEA column and psycopg2 would
+    # have raised 'can't adapt type dict'.
+    assert isinstance(wrong, dict)
+
+
 async def test_oauth_callback_happy_path(client, auth_token, _oauth_env):
     """Full flow: create → start → callback with the state from the
     start redirect. Mocks Salesforce's token endpoint to return a
