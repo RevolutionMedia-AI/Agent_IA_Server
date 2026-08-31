@@ -85,11 +85,24 @@ def decrypt_value(token):
     problem. We log the error and raise so the caller can fail closed
     rather than silently falling back to the raw token as if it were a
     credential.
+
+    ponyy: BYTEA columns (oauth_code_verifier_encrypted,
+    credentials_encrypted) come back as `memoryview`/`bytes` from
+    psycopg2, not `str`. The old `str(token).encode("ascii")` path
+    turned `b'gAAAA...'` into `b"b'gAAAA...'"` (note the extra
+    `b'` prefix), which always fails with `Incorrect padding`.
+    Handle `bytes`/`memoryview` by decoding directly.
     """
     if token is None or token == "":
         return token
     try:
-        return _get_fernet().decrypt(str(token).encode("ascii")).decode("utf-8")
+        if isinstance(token, memoryview):
+            token = token.tobytes()
+        if isinstance(token, bytes):
+            token_bytes = token
+        else:
+            token_bytes = str(token).encode("ascii")
+        return _get_fernet().decrypt(token_bytes).decode("utf-8")
     except Exception as exc:
         log.exception(
             "decrypt_value failed — CREDENTIAL_ENCRYPTION_KEY may be rotated, "
