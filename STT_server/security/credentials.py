@@ -125,7 +125,24 @@ def decrypt_credentials(creds):
     ponytail: SEC-014 — decrypt_value now raises on failure, so this
     propagates the error instead of silently passing the raw stored
     value through as a credential (fail-open).
+
+    ponytail: BYTEA columns come back as `memoryview`/`bytes` from
+    psycopg2, not `dict`. The write path stores
+    `Binary(json.dumps(encrypted_dict).encode('utf-8'))` for BYTEA,
+    so on read we get the JSON string bytes. Handle that by
+    decoding + json.loads before decrypting each value. The JSON-file
+    fallback already stores the dict directly, so both shapes are
+    handled.
     """
+    # Handle BYTEA read: bytes/memoryview containing JSON string of the encrypted dict.
+    if isinstance(creds, (bytes, bytearray, memoryview)):
+        try:
+            if isinstance(creds, memoryview):
+                creds = creds.tobytes()
+            s = creds.decode("utf-8") if isinstance(creds, (bytes, bytearray)) else str(creds)
+            creds = __import__("json").loads(s)
+        except Exception:
+            return {}
     if not isinstance(creds, dict):
         return {}
     return {k: decrypt_value(v) for k, v in creds.items()}

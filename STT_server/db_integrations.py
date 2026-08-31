@@ -899,14 +899,29 @@ def _complete_oauth_flow_cursor(
     # consume UPDATE already NULLed oauth_state_hash; this is the
     # second half of the cleanup. Verifier is single-use by design
     # (RFC 7636) so it must NOT survive the callback.
+    # ponytail: psycopg2 can't adapt a dict for BYTEA — the caller
+    # passes the dict from encrypt_credentials, which must be
+    # serialized to JSON bytes first. Use Binary for the BYTEA
+    # column and Json for the JSONB column (the previous
+    # json.dumps() + ::jsonb cast also works, but Json() is the
+    # canonical psycopg2 adapter for dict->jsonb and handles
+    # escaping correctly).
+    from psycopg2.extras import Json
+    from psycopg2 import Binary
+    # credentials_encrypted is a dict like {"access_token": "gAAAA..."}.
+    # Serialize to JSON bytes for the BYTEA column.
+    if isinstance(credentials_encrypted, dict):
+        credentials_encrypted = Binary(json.dumps(credentials_encrypted).encode("utf-8"))
+    elif isinstance(credentials_encrypted, str):
+        credentials_encrypted = Binary(credentials_encrypted.encode("utf-8"))
     cur.execute(
         f"UPDATE integrations SET credentials_encrypted = %s, "
-        "configuration = %s::jsonb, oauth_scope = %s, "
+        "configuration = %s, oauth_scope = %s, "
         "oauth_code_verifier_encrypted = NULL, "
         "connection_status = %s, updated_at = NOW() "
         "WHERE id = %s AND user_id = %s "
         f"RETURNING {_integrations_cols()}",
-        (credentials_encrypted, json.dumps(configuration),
+        (credentials_encrypted, Json(configuration),
          scope, connection_status, integration_id, user_id),
     )
     row = cur.fetchone()
