@@ -271,12 +271,7 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
             _a("create_lead", "Create Lead"),
             _a("update_opportunity", "Update Opportunity"),
         ),
-        test_fn=None,  # OAuth: preflight is skipped (no test_fn). The
-                       # refresh-on-read in /internal/.../credentials
-                       # keeps the token fresh; the test button on the
-                       # detail view is a soft "verify the row is
-                       # still here" check (re-checks row + decrypt
-                       # round-trip), not a network probe.
+        test_fn="STT_server.services.integrations_tester._test_salesforce",
         auth_type="oauth",
         oauth_label="Connect Salesforce",
         oauth_default_scopes=("api", "refresh_token"),

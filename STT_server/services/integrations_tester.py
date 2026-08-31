@@ -98,11 +98,40 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
         return False, _sanitize_error(str(exc))
 
 
+# ponytail: Salesforce OAuth test. Hits the instance's REST API with the
+# stored access_token. Lightweight, no side-effects, and the endpoint
+# exists on every Salesforce org (including sandboxes).
+def _test_salesforce(configuration: dict, credentials: dict) -> tuple[bool, str]:
+    instance_url = (configuration.get("instance_url") or "").strip().rstrip("/")
+    access_token = (credentials.get("access_token") or "").strip()
+    if not instance_url or not access_token:
+        return False, "missing instance_url or access_token (reconnect Salesforce)"
+    # Salesforce's userinfo endpoint is the cheapest auth check — it validates the
+    # Bearer token and returns the user/org, no data mutation. Fallback to the
+    # limits endpoint if userinfo 404s on an old API version.
+    for path in ("/services/oauth2/userinfo", "/services/data/v59.0/limits"):
+        url = f"{instance_url}{path}"
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                ok = 200 <= resp.status < 300
+                return ok, f"HTTP {resp.status} · {path}"
+        except urllib.error.HTTPError as exc:
+            # 401/403 → token invalid/expired, don't try fallback — surface immediately
+            if exc.code in (401, 403):
+                return False, f"HTTP {exc.code} — token invalid or expired (reconnect Salesforce)"
+            # 404 on userinfo (very old org) → try limits
+            if exc.code == 404 and path == "/services/oauth2/userinfo":
+                continue
+            return False, f"HTTP {exc.code}"
+        except Exception as exc:
+            return False, _sanitize_error(str(exc))
+    return False, "Salesforce test failed"
+
+
 # ponytail: every official provider gets an explicit stub so adding a
 # real test later is a one-line change at the matching INTEGRATION_PROVIDERS
 # entry, not a code-search hunt.
-def _test_salesforce(configuration: dict, credentials: dict) -> tuple[bool, str]:
-    return _stub("salesforce")
 
 
 def _test_dynamics365(configuration: dict, credentials: dict) -> tuple[bool, str]:
