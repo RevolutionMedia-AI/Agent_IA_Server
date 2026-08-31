@@ -2206,6 +2206,24 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
         "agent_id": body.agent_id,
         "configuration": cleaned_config,
     }
+    # ponytail: idempotency guard — if the FE double-submits (double-click before
+    # disabled propagates, StrictMode double-invoke, retry), don't create a second row.
+    # Same provider+name+agent for same user within the debounce window is a duplicate.
+    # We check for a recent row instead of adding a DB unique constraint because legitimate
+    # duplicates with same name but different intent should still be allowed after the window.
+    from STT_server.db_integrations import list_integrations as db_list_integrations
+    existing = [r for r in db_list_integrations(auth["user_id"]) if r["provider"] == body.provider and r["name"] == body.name and r["agent_id"] == body.agent_id]
+    # If a row with same key was created within last 5s, treat as dedup and return it (200 not 201)
+    if existing:
+        from datetime import datetime, timezone as _tz
+        for cand in existing:
+            try:
+                created = datetime.fromisoformat(cand["created_at"].replace("Z", "+00:00"))
+                if (datetime.now(_tz.utc) - created).total_seconds() < 5:
+                    return _strip_integration_for_wire(cand)
+            except Exception:
+                pass
+
     row = db_create_integration(
         auth["user_id"],
         payload,
@@ -2213,16 +2231,13 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
         cipher="fernet-v1",
     )
     if auth_type == "oauth":
-        # Mark pending immediately so the FE detail view + provider
-        # card reflect that the OAuth dance is in progress.
+        # Mark pending so the FE immediately shows the OAuth card as pending.
+        # No second insert — the row above is the one.
         from STT_server.db_integrations import mark_integration_status as db_mark
         db_mark(row["id"], auth["user_id"], "pending")
-        row = db_create_integration(
-            auth["user_id"],
-            payload,
-            credentials_encrypted=encrypted,
-            cipher="fernet-v1",
-        ) or row
+        # Re-read to return the updated status without creating a duplicate row
+        from STT_server.db_integrations import get_integration as db_get_integration
+        row = db_get_integration(row["id"], auth["user_id"]) or row
     elif not skip_preflight:
         from STT_server.db_integrations import update_integration as db_update_integration
         row = db_update_integration(
