@@ -140,6 +140,82 @@ async def test_oauth_start_rejects_non_oauth_provider(client, auth_token, _oauth
     assert resp.status_code == 422
 
 
+async def test_oauth_start_returns_503_when_env_missing(
+    client, auth_token, monkeypatch
+):
+    """A deployment that doesn't set SALESFORCE_* env vars still
+    starts clean (no fail-closed at boot). The /oauth/start handler
+    surfaces a 503 with the missing env var named so the operator
+    can fix the deploy without a code change."""
+    # Drop the env vars set by the autouse fixture.
+    monkeypatch.delenv("SALESFORCE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SALESFORCE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("SALESFORCE_REDIRECT_URI", raising=False)
+    # Re-import the module so the lazy registry rebuilds against
+    # the empty env. The OAuth provider IS in the catalog
+    # (static), just not configured.
+    from STT_server.services import oauth_providers as oa
+    oa._OAUTH_PROVIDERS.clear()
+    # Create a Salesforce integration via direct DB write — POST
+    # /integrations would 422 because the preflight requires env
+    # (it doesn't, but the OAuth path uses a different code path
+    # from /oauth/start, and we're testing /oauth/start here).
+    from STT_server.db_integrations import create_integration as db_create_integration
+    integ = db_create_integration(
+        "user-test-001",
+        {
+            "provider": "salesforce",
+            "name": "Misconfigured",
+            "agent_id": "__shared__",
+            "configuration": {},
+        },
+    )
+    iid = integ["id"]
+    resp = await client.get(
+        f"/integrations/{iid}/oauth/start",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["error"] == "oauth_not_configured"
+    assert "missing_env_vars" in detail
+    assert "SALESFORCE_CLIENT_ID" in detail["missing_env_vars"]
+    assert "SALESFORCE_REDIRECT_URI" in detail["missing_env_vars"]
+
+
+def test_consume_oauth_state_is_atomic():
+    """Unit test: consume_oauth_state on a row clears the state hash
+    in the same UPDATE that returns the row. A second call with the
+    same hash returns None — the replay is rejected."""
+    from STT_server.db_integrations import (
+        create_integration as db_create_integration,
+        consume_oauth_state,
+        get_integration_by_oauth_state,
+    )
+    from STT_server.services.oauth_providers import hash_state
+    integ = db_create_integration(
+        "user-test-001",
+        {"provider": "salesforce", "name": "Test", "agent_id": "__shared__", "configuration": {}},
+    )
+    # Plant a state hash + expiry manually (start_oauth_flow would
+    # do this via a separate path, but we want to test the consume
+    # in isolation).
+    from STT_server.db_integrations import start_oauth_flow
+    state_hash = "deadbeef" * 8
+    start_oauth_flow(integ["id"], "user-test-001", state_hash)
+    # First consume: should return the row + clear the hash.
+    consumed = consume_oauth_state(state_hash)
+    assert consumed is not None
+    assert consumed["id"] == integ["id"]
+    # Second consume with the same hash: must return None.
+    again = consume_oauth_state(state_hash)
+    assert again is None
+    # The diagnostic-only lookup also returns None now.
+    diag = get_integration_by_oauth_state(state_hash)
+    assert diag is None
+
+
 async def test_oauth_callback_happy_path(client, auth_token, _oauth_env):
     """Full flow: create → start → callback with the state from the
     start redirect. Mocks Salesforce's token endpoint to return a

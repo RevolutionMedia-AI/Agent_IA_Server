@@ -7,17 +7,24 @@ the BE never holds a username/password.
 
 Salesforce is the only OAuth provider in V1. The registry is shaped so
 the next provider (Dynamics 365, Google, HubSpot) drops in by adding an
-entry to `_OAUTH_PROVIDERS` and reading its own env vars; the route layer
-+ the catalog entry stay untouched.
+entry to `_OAUTH_PROVIDERS` and reading its own env vars; the route
+layer + the catalog entry stay untouched.
 
-Boot contract (fail-closed):
-  Each OAuth provider declares the env vars it REQUIRES. The boot
-  validator runs at module import and raises RuntimeError on the first
-  missing var, naming the provider so the deploy logs are actionable.
-  We don't fall back to env-less mode — a missing SALESFORCE_CLIENT_ID
-  means the OAuth flow literally cannot complete; better to crash the
-  container than to serve a half-built integration that 500s on the
-  first click.
+Boot contract (LAZY):
+  Providers are NOT validated at boot. A deployment that doesn't use
+  Salesforce shouldn't have to set SALESFORCE_* env vars just to
+  start. Instead:
+    * /integrations/providers lists every provider as available
+      (the catalog is static — what you build with is what ships).
+    * /oauth/start checks env vars at call time. If they're missing,
+      it returns 503 with a clear message naming the missing variable.
+    * /internal/integrations/{id}/credentials returns 503 if the
+      provider is misconfigured (so n8n never gets a half-broken
+      credential blob).
+  Trade-off: a misconfigured deploy doesn't crash, but the operator
+  discovers the misconfiguration the first time they click Connect
+  on Salesforce instead of at deploy time. The error message names
+  the missing variable, so the fix is one env var set + restart.
 """
 from __future__ import annotations
 
@@ -85,8 +92,7 @@ _OPTIONAL_ENV = {"SALESFORCE_SCOPES": "api refresh_token"}
 
 
 def _build_salesforce_config() -> OAuthConfig:
-    """Reads SALESFORCE_* env vars. The boot validator runs first; this
-    assumes they're present. The redirect_uri defaults to
+    """Reads SALESFORCE_* env vars. The redirect_uri defaults to
     `${PUBLIC_URL}/integrations/salesforce/oauth/callback` when the
     explicit env var is missing — only relevant in dev where PUBLIC_URL
     is set. Production should set REDIRECT_URI explicitly to the public
@@ -116,55 +122,60 @@ def _build_salesforce_config() -> OAuthConfig:
     )
 
 
-_OAUTH_PROVIDERS: dict[str, OAuthConfig] = {
-    "salesforce": _build_salesforce_config(),
-}
+# ponyy: registry is empty at boot. Providers are built lazily on
+# first call to get_oauth_config — that means a deployment that
+# doesn't use Salesforce can start without setting SALESFORCE_*
+# env vars at all. The first /oauth/start for salesforce surfaces
+# the misconfiguration (via 503), not a container crash.
+_OAUTH_PROVIDERS: dict[str, OAuthConfig] = {}
+
+
+def _ensure_provider_built(provider_id: str) -> None:
+    """Lazy provider registry: build the OAuthConfig from env on first
+    call. A deployment that doesn't touch a given OAuth provider
+    never reads its env vars, never crashes, and never builds the
+    registry for it. The first /oauth/start for the provider is
+    what surfaces the misconfiguration (with a 503 + actionable
+    message) instead of crashing the container at boot.
+    """
+    if provider_id in _OAUTH_PROVIDERS:
+        return
+    if provider_id == "salesforce":
+        _OAUTH_PROVIDERS["salesforce"] = _build_salesforce_config()
+    else:
+        raise KeyError(f"Provider '{provider_id}' is not registered as OAuth")
 
 
 def get_oauth_config(provider_id: str) -> OAuthConfig:
-    cfg = _OAUTH_PROVIDERS.get(provider_id)
-    if cfg is None:
-        raise KeyError(f"Provider '{provider_id}' is not registered as OAuth")
-    return cfg
+    _ensure_provider_built(provider_id)
+    return _OAUTH_PROVIDERS[provider_id]
 
 
 def known_oauth_providers() -> list[str]:
-    return list(_OAUTH_PROVIDERS.keys())
+    return ["salesforce"]
 
 
-# ── Boot validator ───────────────────────────────────────────────────────────
+def _required_env_vars(provider_id: str) -> tuple[str, ...]:
+    """Env vars each provider needs. The route layer uses this to
+    build the 503 message at call time. Keeping the lookup in this
+    module means adding a provider only touches the registry + this
+    helper — no FE or route changes."""
+    if provider_id == "salesforce":
+        return ("SALESFORCE_CLIENT_ID", "SALESFORCE_CLIENT_SECRET", "SALESFORCE_REDIRECT_URI")
+    return ()
 
 
-def validate_oauth_env() -> None:
-    """Run at module import. Fails closed if any registered OAuth
-    provider is missing its required env vars.
+def validate_oauth_env(provider_id: str) -> tuple[bool, tuple[str, ...]]:
+    """Returns (ok, missing_vars_tuple). ok=False means the OAuth flow
+    for this provider can't complete and the route should 503.
 
-    Called once during STT_server startup (the BE imports this module
-    early enough). Crash with a clear message rather than serve a
-    broken OAuth flow.
+    Called at request time (not at boot). The boot no longer crashes
+    on missing env vars — a deployment that doesn't use Salesforce
+    can start clean.
     """
-    missing: list[tuple[str, tuple[str, ...]]] = []
-    for provider_id in _OAUTH_PROVIDERS.keys():
-        if provider_id == "salesforce":
-            req = _REQUIRED_ENV
-        else:
-            # Future providers: each registers its own list. Default to
-            # env vars named `<PROVIDER>_CLIENT_ID` + `_CLIENT_SECRET`
-            # + `_REDIRECT_URI` if we add a registry helper.
-            req = ()
-        absent = [v for v in req if not os.environ.get(v, "").strip()]
-        if absent:
-            missing.append((provider_id, tuple(absent)))
-    if missing:
-        lines = "\n".join(
-            f"  {pid}: missing {', '.join(vars_)}"
-            for pid, vars_ in missing
-        )
-        raise RuntimeError(
-            "OAuth provider env vars missing — refusing to start.\n"
-            + lines
-            + "\nSet these env vars on the backend service and redeploy."
-        )
+    needed = _required_env_vars(provider_id)
+    missing = tuple(v for v in needed if not os.environ.get(v, "").strip())
+    return (not missing, missing)
 
 
 # ── State token ─────────────────────────────────────────────────────────────

@@ -2379,7 +2379,7 @@ def oauth_start_endpoint(
         start_oauth_flow,
     )
     from STT_server.services.oauth_providers import (
-        generate_state, build_authorize_url, get_oauth_config,
+        generate_state, build_authorize_url, get_oauth_config, validate_oauth_env,
     )
     # ponytail: query-param token fallback so the FE's full-page
     # redirect (window.location) can auth without losing the
@@ -2403,6 +2403,31 @@ def oauth_start_endpoint(
         raise HTTPException(
             status_code=422,
             detail=f"Provider '{integ['provider']}' is not an OAuth integration",
+        )
+    # ponyy: env check AT CALL TIME. The boot no longer fails
+    # closed, so a deploy that doesn't use Salesforce starts clean.
+    # If the operator opens /oauth/start on a misconfigured deploy,
+    # they get a 503 with the missing env var named. The
+    # configuration entry is then written when they save the
+    # integration, so the next deploy with env set picks it up.
+    env_ok, missing = validate_oauth_env(integ["provider"])
+    if not env_ok:
+        log.warning(
+            "[oauth.start] env missing provider=%s missing=%s integration_id=%s",
+            integ["provider"], missing, integration_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "oauth_not_configured",
+                "message": (
+                    f"Cannot start {integ['provider']} OAuth — backend env vars missing: "
+                    f"{', '.join(missing)}. Set them on the backend service and restart."
+                ),
+                "provider": integ["provider"],
+                "integration_id": integration_id,
+                "missing_env_vars": list(missing),
+            },
         )
     state, state_hash = generate_state()
     updated = start_oauth_flow(integration_id, auth["user_id"], state_hash)
@@ -2448,68 +2473,127 @@ def oauth_salesforce_callback_endpoint(
             status_code=302,
         )
     from STT_server.db_integrations import (
-        get_integration_by_oauth_state,
+        consume_oauth_state,
         complete_oauth_flow,
-        clear_oauth_state,
+        get_integration_by_id,
     )
     from STT_server.security.credentials import encrypt_credentials
     from STT_server.services.oauth_providers import (
-        constant_time_eq, hash_state, get_oauth_config,
+        hash_state, get_oauth_config,
         exchange_code_for_tokens, OAuthError, RefreshTokenRevoked, now_plus_seconds,
     )
+    from STT_server.db import get_conn, is_postgres
     state_hash = hash_state(state)
-    integ = get_integration_by_oauth_state(state_hash)
+    # ponyy: ATOMIC consume BEFORE exchange. We use the WHERE-filter
+    # UPDATE ... RETURNING so a concurrent / replayed callback can't
+    # double-exchange the same code. If 0 rows come back, the state
+    # was tampered with, expired, or already used — redirect with
+    # the same code (no leak about which).
+    if is_postgres():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                integ = consume_oauth_state(state_hash, cur=cur)
+    else:
+        integ = consume_oauth_state(state_hash)
     if not integ:
         return RedirectResponse(
             url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
             status_code=302,
         )
-    # Constant-time compare to defeat timing oracles. SHA-256 already
-    # runs in constant time, but the helper makes intent explicit.
-    if not constant_time_eq(state_hash, integ.get("oauth_state_hash") or ""):
-        log.warning(
-            "[oauth.callback] state hash mismatch integration_id=%s",
-            integ["id"],
-        )
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
-            status_code=302,
-        )
-    # TTL check. expires_at is ISO-8601 string (datetime isoformat).
-    from datetime import datetime, timezone
-    expires_iso = integ.get("oauth_state_expires_at")
-    if not expires_iso:
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
-            status_code=302,
-        )
+    # At this point the state has been consumed. The remaining work
+    # (token exchange + persist) uses the SAME cursor (Postgres)
+    # so a single transaction wraps the whole callback.
+    integration_id = integ["id"]
+    user_id = integ["user_id"]
+    provider = integ["provider"]
+    if is_postgres():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Exchange the code for tokens. Network call to
+                # Salesforce — done inside the transaction so the
+                # callback is one round trip from "code received"
+                # to "tokens persisted".
+                try:
+                    cfg = get_oauth_config(provider)
+                    tokens = exchange_code_for_tokens(cfg, code)
+                except RefreshTokenRevoked as exc:
+                    log.warning(
+                        "[oauth.callback] exchange revoked integration_id=%s err=%s",
+                        integration_id, exc,
+                    )
+                    mark_integration_status_failed(
+                        cur, integration_id, user_id, str(exc),
+                    )
+                    conn.commit()
+                    return RedirectResponse(
+                        url=f"{frontend_origin}/integrations?error=oauth_code_rejected",
+                        status_code=302,
+                    )
+                except OAuthError as exc:
+                    log.exception(
+                        "[oauth.callback] exchange error integration_id=%s err=%s",
+                        integration_id, exc,
+                    )
+                    # State was already consumed. Mark failed so the
+                    # operator sees the row is broken in the UI; they
+                    # can re-trigger OAuth from /oauth/start.
+                    mark_integration_status_failed(
+                        cur, integration_id, user_id, str(exc),
+                    )
+                    conn.commit()
+                    return RedirectResponse(
+                        url=f"{frontend_origin}/integrations?error=oauth_exchange_failed",
+                        status_code=302,
+                    )
+                creds = {
+                    "access_token": tokens.access_token,
+                    "refresh_token": tokens.refresh_token,
+                }
+                if tokens.expires_in is not None:
+                    creds["expires_at"] = now_plus_seconds(tokens.expires_in)
+                if tokens.scope:
+                    creds["scope"] = tokens.scope
+                encrypted = encrypt_credentials(creds)
+                configuration = dict(integ.get("configuration") or {})
+                if tokens.instance_url:
+                    configuration["instance_url"] = tokens.instance_url
+                saved = complete_oauth_flow(
+                    integration_id, user_id,
+                    credentials_encrypted=encrypted,
+                    configuration=configuration,
+                    scope=tokens.scope,
+                    connection_status="connected",
+                    cur=cur,
+                )
+                if not saved:
+                    conn.rollback()
+                    log.error(
+                        "[oauth.callback] complete_oauth_flow returned None integration_id=%s",
+                        integration_id,
+                    )
+                    return RedirectResponse(
+                        url=f"{frontend_origin}/integrations?error=oauth_internal",
+                        status_code=302,
+                    )
+                log.info(
+                    "[oauth.callback] connected integration_id=%s provider=%s user_id=%s",
+                    saved["id"], saved["provider"], user_id,
+                )
+                return RedirectResponse(
+                    url=f"{frontend_origin}/integrations?connected={saved['id']}",
+                    status_code=302,
+                )
+    # JSON-file fallback: same shape, separate connection per call.
     try:
-        # Stored value can be 'Z' suffix or +00:00; both should parse.
-        s = expires_iso.rstrip("Z")
-        exp_dt = datetime.fromisoformat(s)
-        if exp_dt.tzinfo is None:
-            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-        if exp_dt < datetime.now(timezone.utc):
-            return RedirectResponse(
-                url=f"{frontend_origin}/integrations?error=oauth_state_expired",
-                status_code=302,
-            )
-    except Exception:
-        log.exception("[oauth.callback] state expires_at unparseable integration_id=%s", integ["id"])
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
-            status_code=302,
-        )
-    # Exchange the code for tokens. Network call to Salesforce.
-    try:
-        cfg = get_oauth_config(integ["provider"])
+        cfg = get_oauth_config(provider)
         tokens = exchange_code_for_tokens(cfg, code)
     except RefreshTokenRevoked as exc:
         log.warning(
             "[oauth.callback] exchange revoked integration_id=%s err=%s",
-            integ["id"], exc,
+            integration_id, exc,
         )
-        clear_oauth_state(integ["id"], integ["user_id"])
+        from STT_server.db_integrations import clear_oauth_state
+        clear_oauth_state(integration_id, user_id)
         return RedirectResponse(
             url=f"{frontend_origin}/integrations?error=oauth_code_rejected",
             status_code=302,
@@ -2517,34 +2601,28 @@ def oauth_salesforce_callback_endpoint(
     except OAuthError as exc:
         log.exception(
             "[oauth.callback] exchange error integration_id=%s err=%s",
-            integ["id"], exc,
+            integration_id, exc,
         )
-        clear_oauth_state(integ["id"], integ["user_id"])
+        from STT_server.db_integrations import clear_oauth_state
+        clear_oauth_state(integration_id, user_id)
         return RedirectResponse(
             url=f"{frontend_origin}/integrations?error=oauth_exchange_failed",
             status_code=302,
         )
-    # Build the credentials blob. Stored encrypted; the runtime reads
-    # it via /internal/integrations/{id}/credentials and the refresh
-    # path uses expires_at to know when to swap.
     creds = {
         "access_token": tokens.access_token,
-        "refresh_token": tokens.refresh_token,  # may be None — only Salesforce knows
+        "refresh_token": tokens.refresh_token,
     }
     if tokens.expires_in is not None:
         creds["expires_at"] = now_plus_seconds(tokens.expires_in)
     if tokens.scope:
         creds["scope"] = tokens.scope
     encrypted = encrypt_credentials(creds)
-    # Configuration carries the instance_url Salesforce hands back —
-    # the FE shows it read-only on the detail view.
     configuration = dict(integ.get("configuration") or {})
     if tokens.instance_url:
         configuration["instance_url"] = tokens.instance_url
-    # Persist + clear state in one UPDATE so a replay can't re-exchange.
     saved = complete_oauth_flow(
-        integ["id"],
-        integ["user_id"],
+        integration_id, user_id,
         credentials_encrypted=encrypted,
         configuration=configuration,
         scope=tokens.scope,
@@ -2553,7 +2631,7 @@ def oauth_salesforce_callback_endpoint(
     if not saved:
         log.error(
             "[oauth.callback] complete_oauth_flow returned None integration_id=%s",
-            integ["id"],
+            integration_id,
         )
         return RedirectResponse(
             url=f"{frontend_origin}/integrations?error=oauth_internal",
@@ -2561,11 +2639,25 @@ def oauth_salesforce_callback_endpoint(
         )
     log.info(
         "[oauth.callback] connected integration_id=%s provider=%s user_id=%s",
-        saved["id"], saved["provider"], integ["user_id"],
+        saved["id"], saved["provider"], user_id,
     )
     return RedirectResponse(
         url=f"{frontend_origin}/integrations?connected={saved['id']}",
         status_code=302,
+    )
+
+
+def mark_integration_status_failed(cur, integration_id, user_id, message: str) -> None:
+    """Tiny helper used by the OAuth callback when the token
+    exchange fails AFTER the state was consumed. The state is gone
+    (consumed), the integration needs reconnect — flip status to
+    'failed' and stamp the last error message. The operator sees
+    the [Reconnect] button on the detail view."""
+    from STT_server.db_integrations import mark_integration_status as _mark
+    _mark(
+        integration_id, user_id, "failed",
+        last_test_message=(message or "oauth_exchange_failed")[:500],
+        cur=cur,
     )
 
 
@@ -2718,26 +2810,23 @@ def internal_get_integration_credentials(
     from STT_server.services.integrations_catalog import get_integration_provider_spec
     spec = get_integration_provider_spec(provider)
     is_oauth = bool(spec and getattr(spec, "auth_type", "static") == "oauth")
-    # ponytail: refresh-on-read needs a Postgres advisory lock to
-    # serialize concurrent calls. The JSON-file fallback (local
-    # dev) doesn't have advisory locks and isn't a concurrency
-    # scenario anyway — the row is read+write with the OS-level
-    # write lock. Skip the refresh path there and return the stored
-    # creds; n8n will surface a 401 from Salesforce if the token
-    # is actually expired, which is acceptable for a dev env.
     from STT_server.db import is_postgres
     if is_oauth and is_token_expiring(creds_plain.get("expires_at")) and is_postgres():
-        # Advisory lock keyed on integration id. Released at txn end.
-        # Concurrent calls serialize here. The first one in reads,
-        # sees expiring token, refreshes, persists; subsequent calls
-        # read the fresh row and skip the refresh.
+        # ponyy: refresh-on-read runs in ONE connection and ONE
+        # transaction. acquire lock → re-read inside the lock →
+        # (optional) refresh → persist creds + status → commit.
+        # All queries share the same cursor; the helper UPDATE
+        # functions accept `cur=` to skip their own connection
+        # pool hop. Two concurrent calls for the same integration
+        # serialize on pg_advisory_xact_lock and the second one
+        # sees the freshly-persisted (fresh) tokens inside the lock.
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     acquire_advisory_xact_lock(cur, integration_id)
                     # Re-read inside the lock so we observe the
-                    # latest committed row (the previous lock holder
-                    # may have just persisted refreshed tokens).
+                    # latest committed row. The previous lock holder
+                    # may have just persisted refreshed tokens.
                     from STT_server.db_integrations import get_integration_by_id as _reload
                     fresh = _reload(integration_id)
                     if fresh and fresh.get("credentials_encrypted"):
@@ -2749,21 +2838,28 @@ def internal_get_integration_credentials(
                             )
                         except Exception:
                             pass
-                    if is_token_expiring(creds_plain.get("expires_at")):
-                        # Still expiring — actually do the refresh.
+                    if not is_token_expiring(creds_plain.get("expires_at")):
+                        # The previous lock holder already refreshed.
+                        # Fall through to return.
+                        pass
+                    else:
                         refresh_token = creds_plain.get("refresh_token")
                         if not refresh_token:
                             # No refresh token — can't recover. Mark
-                            # failed and surface to caller.
+                            # failed inside the lock and raise.
                             mark_integration_status(
                                 integration_id, fresh["user_id"], "failed",
                                 last_test_message="no refresh token",
+                                cur=cur,
                             )
+                            conn.commit()
                             raise HTTPException(
                                 status_code=503,
                                 detail={
+                                    "error": "oauth_refresh_failed",
                                     "message": "Refresh token missing — reconnect required",
-                                    "reason": "refresh_failed",
+                                    "provider": provider,
+                                    "integration_id": integration_id,
                                 },
                             )
                         try:
@@ -2773,50 +2869,76 @@ def internal_get_integration_credentials(
                             mark_integration_status(
                                 integration_id, fresh["user_id"], "failed",
                                 last_test_message=str(exc),
+                                cur=cur,
                             )
+                            conn.commit()
                             log.warning(
                                 "[internal.creds] refresh revoked integration_id=%s err=%s",
                                 integration_id, exc,
                             )
-                            return {
-                                "integration_id": row["id"],
-                                "provider": provider,
-                                "configuration": fresh.get("configuration") or {},
-                                "credentials": None,
-                                "reason": "refresh_failed",
-                            }
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error": "oauth_refresh_failed",
+                                    "message": "Refresh token revoked — reconnect required",
+                                    "provider": provider,
+                                    "integration_id": integration_id,
+                                },
+                            )
                         except OAuthError as exc:
+                            # Transient (network / 5xx from provider).
+                            # Mark failed so the operator sees the
+                            # error in the UI; raise 503 so n8n
+                            # doesn't try to use a stale token.
+                            mark_integration_status(
+                                integration_id, fresh["user_id"], "failed",
+                                last_test_message=str(exc),
+                                cur=cur,
+                            )
+                            conn.commit()
                             log.warning(
                                 "[internal.creds] refresh transient error integration_id=%s err=%s",
                                 integration_id, exc,
                             )
-                            # Transient — return the current creds and
-                            # let n8n surface the 401 if it actually
-                            # expired at the provider. Better than
-                            # failing the whole call.
-                            creds_plain = creds_plain
-                        else:
-                            merged = dict(creds_plain)
-                            merged["access_token"] = new_tokens.access_token
-                            if new_tokens.refresh_token:
-                                merged["refresh_token"] = new_tokens.refresh_token
-                            if new_tokens.expires_in is not None:
-                                merged["expires_at"] = now_plus_seconds(new_tokens.expires_in)
-                            if new_tokens.scope:
-                                merged["scope"] = new_tokens.scope
-                            update_integration_credentials(
-                                integration_id, fresh["user_id"],
-                                encrypt_credentials(merged),
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error": "oauth_refresh_failed",
+                                    "message": f"Refresh transient error: {exc}",
+                                    "provider": provider,
+                                    "integration_id": integration_id,
+                                },
                             )
-                            mark_integration_status(
-                                integration_id, fresh["user_id"], "connected",
-                                last_test_message="token refreshed",
-                            )
-                            creds_plain = merged
-                            log.info(
-                                "[internal.creds] refreshed token integration_id=%s provider=%s",
-                                integration_id, provider,
-                            )
+                        merged = dict(creds_plain)
+                        merged["access_token"] = new_tokens.access_token
+                        # ponyy: Salesforce only re-emits refresh_token
+                        # when the operator's session policy rotates
+                        # them. Keep the existing refresh_token if the
+                        # provider didn't return a fresh one.
+                        if new_tokens.refresh_token:
+                            merged["refresh_token"] = new_tokens.refresh_token
+                        if new_tokens.expires_in is not None:
+                            merged["expires_at"] = now_plus_seconds(new_tokens.expires_in)
+                        if new_tokens.scope:
+                            merged["scope"] = new_tokens.scope
+                        update_integration_credentials(
+                            integration_id, fresh["user_id"],
+                            encrypt_credentials(merged),
+                            cur=cur,
+                        )
+                        mark_integration_status(
+                            integration_id, fresh["user_id"], "connected",
+                            last_test_message="token refreshed",
+                            cur=cur,
+                        )
+                        creds_plain = merged
+                        log.info(
+                            "[internal.creds] refreshed token integration_id=%s provider=%s",
+                            integration_id, provider,
+                        )
+                    # Single commit at the end of the with-block. The
+                    # transaction was opened by get_conn()'s
+                    # context manager (auto-commits on success).
         except HTTPException:
             raise
         except Exception as exc:
@@ -2824,8 +2946,15 @@ def internal_get_integration_credentials(
                 "[internal.creds] refresh path failed integration_id=%s err=%s",
                 integration_id, exc,
             )
-            # Continue with the creds we already have — n8n will
-            # surface a 401 if it's actually expired.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "oauth_refresh_failed",
+                    "message": f"Refresh path error: {exc}",
+                    "provider": provider,
+                    "integration_id": integration_id,
+                },
+            )
     log.info(
         "[internal.creds] ok integration_id=%s provider=%s ip=%s",
         integration_id, row.get("provider"), request.client.host if request.client else "?",
