@@ -184,6 +184,44 @@ async def test_oauth_start_returns_503_when_env_missing(
     assert "SALESFORCE_REDIRECT_URI" in detail["missing_env_vars"]
 
 
+async def test_oauth_start_redirects_to_login_on_invalid_token(
+    client, _oauth_env
+):
+    """When the operator's session token is missing / expired /
+    malformed, the BE must NOT 401 the browser (which renders as
+    a blank error page). It should 302 to the FE's /login with
+    ?reason=session_expired so the operator can re-auth and pick
+    up where they left off.
+
+    We deliberately do NOT pass the auth_token fixture here — the
+    real FE flow is `window.location.assign(BE URL + ?token=...)`
+    which sends NO Authorization header. The BE has to handle
+    the `?token=` query param as the sole auth signal.
+    """
+    resp = await client.get(
+        "/integrations/int-anything/oauth/start?token=invalid_token_here",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    location = resp.headers["location"]
+    # Redirects to the FE's /login with the reason + next hint.
+    assert "/login" in location
+    assert "reason=session_expired" in location
+    assert "next=" in location
+
+
+async def test_oauth_start_401_when_no_token_at_all(client, _oauth_env):
+    """No `?token=` AND no Authorization header → 401. No way to
+    recover (the operator typed the URL by hand or copy-pasted it
+    without a token) — the BE doesn't know who to redirect to
+    /login as. 401 with a clear message is the right answer."""
+    resp = await client.get(
+        "/integrations/int-anything/oauth/start",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 401
+
+
 def test_consume_oauth_state_is_atomic():
     """Unit test: consume_oauth_state on a row clears the state hash
     in the same UPDATE that returns the row. A second call with the

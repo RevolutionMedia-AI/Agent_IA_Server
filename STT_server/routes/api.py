@@ -175,6 +175,24 @@ def require_auth(authorization: str = Header(None)) -> dict:
     return entry  # type: ignore[return-value]
 
 
+# ponyy: the OAuth start endpoint is the one route that needs to
+# handle BOTH the Bearer header (direct API call) and the
+# `?token=` query param (window.location navigation from the FE).
+# When the operator's session token is expired/missing AND they
+# clicked Connect, we want a friendly redirect to /login (not a
+# 401 page that the browser renders as HTML). require_auth would
+# raise 401 immediately and bypass the route's redirect logic, so
+# the route uses this non-raising variant and decides what to do
+# when there's no auth at all.
+def require_auth_optional(authorization: str = Header(None)) -> dict | None:
+    """Like require_auth but returns None instead of raising 401.
+    Use this on routes that have a graceful fallback (e.g. the
+    OAuth start endpoint redirects to /login when auth is missing
+    AND a `?token=` was supplied; with no auth at all the route
+    surfaces its own 401 with a useful message)."""
+    return resolve_bearer(authorization, raise_on_missing=False)
+
+
 # ponytail: integrations — admin gate. Only user ids listed in
 # ADMIN_USER_IDS (comma-separated env var) can pass `_skip_preflight`
 # in the body to /integrations. Empty default = nobody can skip, so
@@ -2351,7 +2369,7 @@ def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_
 def oauth_start_endpoint(
     integration_id: str,
     token: Optional[str] = None,
-    auth: Optional[dict] = Depends(require_auth),
+    auth: Optional[dict] = Depends(require_auth_optional),
 ):
     """Generate a fresh OAuth state, persist its hash, redirect the
     operator to the provider's authorize URL.
@@ -2392,6 +2410,30 @@ def oauth_start_endpoint(
         except Exception:
             auth = None
     if auth is None:
+        # ponytail: window.location navigations can't carry an
+        # Authorization header — they go through `?token=`. If
+        # that token is missing / expired / malformed, returning
+        # 401 leaves the operator stuck on a blank error page
+        # (the browser renders the body as HTML). Redirect to
+        # the FE's /login with a `?reason=` so the login form can
+        # show a "session expired" snackbar; the operator
+        # re-authenticates and retries.
+        frontend_origin = os.environ.get("FRONTEND_ORIGIN", "").strip().rstrip("/")
+        if not frontend_origin:
+            frontend_origin = "http://localhost:5173"
+        if token:
+            # Operator sent a token but it didn't authenticate.
+            # Most common cause: session expired (the token in
+            # localStorage was issued > 7 days ago). Send them
+            # to /login with a clear reason so the form can show
+            # a snackbar. Without a token, fall through to 401 —
+            # no way to recover, the operator probably typed the
+            # URL by hand.
+            sep = "&" if "?" in frontend_origin else "?"
+            return RedirectResponse(
+                url=f"{frontend_origin}/login?reason=session_expired&next=/integrations/{integration_id}",
+                status_code=302,
+            )
         raise HTTPException(
             status_code=401,
             detail="Not authenticated (Bearer header or ?token= required)",
