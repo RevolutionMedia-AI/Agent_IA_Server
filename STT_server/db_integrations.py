@@ -703,6 +703,12 @@ def start_oauth_flow(
     operator to log in to Salesforce and approve, short enough that
     a stolen state can't be replayed for long.
     """
+    # ponyy: ensure the PKCE column exists. Migration 018 had a UTF-8 BOM
+    # that Postgres rejected, so the column is missing on deploys that
+    # already ran the migration. The self-heal in _ensure_integrations_table
+    # will add it if missing (idempotent). Without this, the UPDATE below
+    # 500s with UndefinedColumn.
+    _ensure_integrations_table()
     from datetime import datetime, timezone, timedelta
     if not is_postgres():
         rows = _read_integrations_file()
