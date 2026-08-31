@@ -2436,7 +2436,14 @@ def oauth_start_endpoint(
         # re-authenticates and retries.
         frontend_origin = os.environ.get("FRONTEND_ORIGIN", "").strip().rstrip("/")
         if not frontend_origin:
-            frontend_origin = "http://localhost:5173"
+            frontend_origin = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
+        if not frontend_origin:
+            allowed = os.environ.get("ALLOWED_ORIGINS", "")
+            if allowed:
+                frontend_origin = allowed.split(",")[0].strip().rstrip("/")
+        if not frontend_origin:
+            env_label = os.environ.get("ENVIRONMENT", "production").strip().lower()
+            frontend_origin = "http://localhost:5173" if env_label in ("development", "dev", "local", "test") else "https://agentiafrontend-production.up.railway.app"
         if token:
             # Operator sent a token but it didn't authenticate.
             # Most common cause: session expired (the token in
@@ -2530,8 +2537,14 @@ def oauth_salesforce_callback_endpoint(
     """
     frontend_origin = os.environ.get("FRONTEND_ORIGIN", "").strip().rstrip("/")
     if not frontend_origin:
-        # Best-effort fallback for local dev (FE on :5173).
-        frontend_origin = "http://localhost:5173"
+        frontend_origin = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
+    if not frontend_origin:
+        allowed = os.environ.get("ALLOWED_ORIGINS", "")
+        if allowed:
+            frontend_origin = allowed.split(",")[0].strip().rstrip("/")
+    if not frontend_origin:
+        env_label = os.environ.get("ENVIRONMENT", "production").strip().lower()
+        frontend_origin = "http://localhost:5173" if env_label in ("development", "dev", "local", "test") else "https://agentiafrontend-production.up.railway.app"
     if error:
         log.warning("[oauth.callback] provider error=%s desc=%s", error, error_description)
         sep = "&" if "?" in frontend_origin else "?"
