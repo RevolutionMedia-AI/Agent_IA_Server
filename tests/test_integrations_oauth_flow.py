@@ -254,6 +254,59 @@ def test_consume_oauth_state_is_atomic():
     assert diag is None
 
 
+def test_pkce_pair_format():
+    """PKCE per RFC 7636:
+      * verifier is the raw token (43-128 base64url chars)
+      * challenge is base64url(SHA256(verifier)) with padding stripped
+    Salesforce's External Client Apps require this on the authorize URL
+    AND the matching verifier on the token-exchange POST. Without
+    it the call 400s with "missing required code challenge"."""
+    from STT_server.services.oauth_providers import generate_pkce
+    verifier, challenge = generate_pkce()
+    # verifier: ascii, 64 url-safe base64 chars per the call.
+    assert isinstance(verifier, str)
+    assert all(c.isalnum() or c in "-_" for c in verifier)
+    # challenge is base64url(SHA256(verifier)) per §4.2.
+    import base64
+    import hashlib
+    expected = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    assert challenge == expected
+    # Two consecutive calls produce different verifiers (replay
+    # protection is the whole point of the random 64 bytes).
+    v2, _ = generate_pkce()
+    assert verifier != v2
+
+
+def test_pkce_url_includes_challenge():
+    """Salesforce's authorize call must include code_challenge +
+    code_challenge_method=S256. Without these the call 400s."""
+    from STT_server.services.oauth_providers import (
+        build_authorize_url, get_oauth_config, generate_state, generate_pkce,
+    )
+    from urllib.parse import parse_qs, urlparse
+    state, _ = generate_state()
+    _, challenge = generate_pkce()
+    url = build_authorize_url(get_oauth_config("salesforce"), state, code_verifier=state + "_verifier")
+    # The state in the URL is different from the verifier — the verifier
+    # is sent as code_challenge, not state. We re-build with the real
+    # verifier so the challenge matches.
+    _, real_verifier = generate_pkce()
+    url = build_authorize_url(get_oauth_config("salesforce"), state, code_verifier=real_verifier)
+    qs = parse_qs(urlparse(url).query)
+    assert qs["response_type"] == ["code"]
+    assert qs["code_challenge_method"] == ["S256"]
+    assert "code_challenge" in qs
+    # The challenge must match the verifier the caller knows about.
+    import base64
+    import hashlib
+    expected = base64.urlsafe_b64encode(
+        hashlib.sha256(real_verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    assert qs["code_challenge"][0] == expected
+
+
 def test_scalar_handles_both_cursor_shapes():
     """The disconnect crash on production ('invalid literal for
     int() with base 10: count') came from a tuple cursor path

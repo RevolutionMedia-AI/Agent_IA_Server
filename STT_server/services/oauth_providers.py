@@ -28,6 +28,7 @@ Boot contract (LAZY):
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import logging
@@ -206,6 +207,35 @@ def constant_time_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("ascii"), b.encode("ascii"))
 
 
+# ── PKCE (RFC 7636) ──────────────────────────────────────────────────────────
+# ponyy: Salesforce Connected Apps default to "Require Proof Key for
+# Code Exchange (PKCE) Extension for the Authorization Code Flow"
+# on External Client Apps. Without `code_challenge` + `code_challenge
+# _method=S256` on the authorize URL, the call 400s with
+# "missing required code challenge". The verifier itself must be
+# sent in the token-exchange POST.
+
+def _code_challenge_from_verifier(code_verifier: str) -> str:
+    """RFC 7636 §4.2: base64url(SHA256(verifier)) with padding stripped."""
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def generate_pkce() -> tuple[str, str]:
+    """Generate a PKCE pair. Returns (code_verifier, code_challenge).
+
+    Per RFC 7636 §4.1, the verifier is 43-128 chars of
+    unreserved base64url alphabet. secrets.token_urlsafe(64) gives
+    ~86 base64url chars — well within the spec.
+
+    The challenge is base64url(SHA256(verifier)) with padding
+    stripped (§4.2). Salesforce's PKCE verifier requires SHA-256;
+    plain (no challenge) is rejected.
+    """
+    code_verifier = secrets.token_urlsafe(64)
+    return code_verifier, _code_challenge_from_verifier(code_verifier)
+
+
 # ── Authorize URL ───────────────────────────────────────────────────────────
 
 
@@ -214,10 +244,20 @@ def build_authorize_url(
     state: str,
     scopes: Optional[tuple[str, ...]] = None,
     extra_params: Optional[dict] = None,
+    code_verifier: Optional[str] = None,
 ) -> str:
     """Build the provider's authorize URL. `state` is the raw token
     (not the hash) — the provider echoes it back, we hash on the way
-    in. `scopes` defaults to the config's default_scopes."""
+    in. `scopes` defaults to the config's default_scopes.
+
+    ponyy: PKCE. If `code_verifier` is provided, the URL also
+    includes `code_challenge` + `code_challenge_method=S256`. The
+    verifier itself is NOT sent in the authorize URL — it's stored
+    on the integration row and sent in the token-exchange call on
+    the callback. Salesforce's Connected App defaults to "Require
+    PKCE for the Authorization Code flow" — without these params,
+    the call 400s with "missing required code challenge".
+    """
     effective_scopes = scopes if scopes is not None else config.default_scopes
     params = {
         "response_type": "code",
@@ -226,12 +266,15 @@ def build_authorize_url(
         "scope": " ".join(effective_scopes),
         "state": state,
     }
+    if code_verifier:
+        # RFC 7636 §4.2: the challenge is the base64url-encoded
+        # SHA-256 of the verifier (no padding). The verifier is the
+        # random 32-43 char string; the challenge is derived.
+        challenge = _code_challenge_from_verifier(code_verifier)
+        params["code_challenge"] = challenge
+        params["code_challenge_method"] = "S256"
     if extra_params:
         params.update(extra_params)
-    # ponytail: Salesforce uses 'scope' (space-separated). Some
-    # providers use 'scopes' (array). We standardize on 'scope' here;
-    # add a provider-specific override if a future OAuth provider
-    # needs a different parameter name.
     sep = "&" if "?" in config.authorize_url else "?"
     return f"{config.authorize_url}{sep}{urllib.parse.urlencode(params)}"
 
@@ -302,21 +345,30 @@ def _oauth_error_kind(payload: dict) -> str:
 # ── Token exchange ──────────────────────────────────────────────────────────
 
 
-def exchange_code_for_tokens(config: OAuthConfig, code: str) -> OAuthTokenResponse:
+def exchange_code_for_tokens(
+    config: OAuthConfig, code: str, code_verifier: Optional[str] = None,
+) -> OAuthTokenResponse:
     """POST to the provider's token endpoint with `grant_type=authorization_code`.
     Returns the parsed token response. Raises OAuthError on transport
     failure; raises RefreshTokenRevoked if the response explicitly says
-    the code was rejected."""
-    payload = _http_post_form(
-        config.token_url,
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": config.client_id,
-            "client_secret": config.client_secret,
-            "redirect_uri": config.redirect_uri,
-        },
-    )
+    the code was rejected.
+
+    ponyy: PKCE. If `code_verifier` is passed, we include it in the
+    POST body — that's the second half of RFC 7636. The challenge
+    was sent in the authorize URL; the verifier is sent here. If
+    the challenge was sent but the verifier is missing (or wrong),
+    Salesforce 400s with "invalid grant" / "invalid code_verifier".
+    """
+    body = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": config.client_id,
+        "client_secret": config.client_secret,
+        "redirect_uri": config.redirect_uri,
+    }
+    if code_verifier:
+        body["code_verifier"] = code_verifier
+    payload = _http_post_form(config.token_url, body)
     if "error" in payload:
         kind = _oauth_error_kind(payload)
         msg = payload.get("error_description") or payload.get("error")

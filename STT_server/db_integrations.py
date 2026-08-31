@@ -671,6 +671,8 @@ def start_oauth_flow(
     integration_id: str,
     user_id: str,
     state_hash: str,
+    *,
+    code_verifier_encrypted: bytes | None = None,
     ttl_seconds: int = 600,
 ) -> dict | None:
     """Persist the OAuth state hash + expiry on the integration row.
@@ -678,6 +680,14 @@ def start_oauth_flow(
     Sets connection_status='pending' (the operator hasn't completed
     the dance yet). Returns the refreshed row so the caller can
     surface the new status without an extra round-trip.
+
+    `code_verifier_encrypted` is the PKCE verifier encrypted with
+    Fernet (same key as `credentials_encrypted`). Salesforce's
+    External Client Apps require it in the token-exchange POST. We
+    only need the original value, never its hash — the verifier is
+    a bearer secret, so it's encrypted at rest. NULL when the
+    provider doesn't require PKCE (defensive; in V1 only
+    Salesforce exists and it does require PKCE).
 
     `ttl_seconds` defaults to 10 minutes — long enough for the
     operator to log in to Salesforce and approve, short enough that
@@ -690,6 +700,7 @@ def start_oauth_flow(
             if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
                 r["oauth_state_hash"] = state_hash
                 r["oauth_state_expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+                r["oauth_code_verifier_encrypted"] = code_verifier_encrypted
                 r["connection_status"] = "pending"
                 r["updated_at"] = _now_iso()
                 _write_integrations_file(rows)
@@ -700,11 +711,11 @@ def start_oauth_flow(
             expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
             cur.execute(
                 f"UPDATE integrations SET oauth_state_hash = %s, "
-                "oauth_state_expires_at = %s, connection_status = 'pending', "
-                "updated_at = NOW() "
+                "oauth_state_expires_at = %s, oauth_code_verifier_encrypted = %s, "
+                "connection_status = 'pending', updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s "
                 f"RETURNING {_integrations_cols()}",
-                (state_hash, expires, integration_id, user_id),
+                (state_hash, expires, code_verifier_encrypted, integration_id, user_id),
             )
             row = cur.fetchone()
     return _row_to_integration(row) if row else None
@@ -772,10 +783,13 @@ def consume_oauth_state(state_hash: str, cur=None) -> dict | None:
         rows = _read_integrations_file()
         for r in rows:
             if isinstance(r, dict) and r.get("oauth_state_hash") == state_hash:
+                verifier = r.get("oauth_code_verifier_encrypted")
                 r["oauth_state_hash"] = None
                 r["oauth_state_expires_at"] = None
                 r["updated_at"] = _now_iso()
                 _write_integrations_file(rows)
+                if verifier is not None:
+                    r["_oauth_code_verifier_encrypted"] = verifier
                 return r
         return None
     with get_conn() as conn:
@@ -784,16 +798,30 @@ def consume_oauth_state(state_hash: str, cur=None) -> dict | None:
 
 
 def _consume_oauth_state_cursor(state_hash: str, cur) -> dict | None:
+    # ponyy: we also need to return the encrypted code_verifier so
+    # the callback handler can decrypt it and pass the plaintext to
+    # the token-exchange POST. The verifier is a bearer secret —
+    # we keep it encrypted on the row and only decrypt at the
+    # exact moment we need to send it to Salesforce.
     cur.execute(
         "UPDATE integrations "
         "SET oauth_state_hash = NULL, oauth_state_expires_at = NULL, updated_at = NOW() "
         "WHERE oauth_state_hash = %s "
         "AND oauth_state_expires_at > NOW() "
-        f"RETURNING {_integrations_cols()}",
+        f"RETURNING {_integrations_cols()}, oauth_code_verifier_encrypted",
         (state_hash,),
     )
     row = cur.fetchone()
-    return _row_to_integration(row) if row else None
+    if row is None:
+        return None
+    # The verifier lives in the same RETURNING row but is NOT in
+    # _integrations_cols (intentionally — it's transient). Extract
+    # it before passing the rest through _row_to_integration.
+    verifier_encrypted = row.get("oauth_code_verifier_encrypted")
+    integ = _row_to_integration(row)
+    if integ is not None:
+        integ["_oauth_code_verifier_encrypted"] = verifier_encrypted
+    return integ
 
 
 def complete_oauth_flow(
@@ -830,6 +858,7 @@ def complete_oauth_flow(
                 r["oauth_scope"] = scope
                 r["oauth_state_hash"] = None
                 r["oauth_state_expires_at"] = None
+                r["oauth_code_verifier_encrypted"] = None
                 r["connection_status"] = connection_status
                 r["updated_at"] = _now_iso()
                 _write_integrations_file(rows)
@@ -850,9 +879,14 @@ def _complete_oauth_flow_cursor(
     *, credentials_encrypted: bytes, configuration: dict, scope: str | None,
     connection_status: str, cur,
 ) -> dict | None:
+    # ponyy: clear oauth_code_verifier_encrypted here too. The
+    # consume UPDATE already NULLed oauth_state_hash; this is the
+    # second half of the cleanup. Verifier is single-use by design
+    # (RFC 7636) so it must NOT survive the callback.
     cur.execute(
         f"UPDATE integrations SET credentials_encrypted = %s, "
         "configuration = %s::jsonb, oauth_scope = %s, "
+        "oauth_code_verifier_encrypted = NULL, "
         "connection_status = %s, updated_at = NOW() "
         "WHERE id = %s AND user_id = %s "
         f"RETURNING {_integrations_cols()}",
@@ -878,6 +912,7 @@ def clear_oauth_state(integration_id: str, user_id: str) -> None:
             if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
                 r["oauth_state_hash"] = None
                 r["oauth_state_expires_at"] = None
+                r["oauth_code_verifier_encrypted"] = None
                 r["updated_at"] = _now_iso()
                 changed = True
                 break
@@ -888,7 +923,8 @@ def clear_oauth_state(integration_id: str, user_id: str) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE integrations SET oauth_state_hash = NULL, "
-                "oauth_state_expires_at = NULL, updated_at = NOW() "
+                "oauth_state_expires_at = NULL, oauth_code_verifier_encrypted = NULL, "
+                "updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s",
                 (integration_id, user_id),
             )

@@ -2397,7 +2397,7 @@ def oauth_start_endpoint(
         start_oauth_flow,
     )
     from STT_server.services.oauth_providers import (
-        generate_state, build_authorize_url, get_oauth_config, validate_oauth_env,
+        generate_state, generate_pkce, build_authorize_url, get_oauth_config, validate_oauth_env,
     )
     # ponytail: query-param token fallback so the FE's full-page
     # redirect (window.location) can auth without losing the
@@ -2472,11 +2472,20 @@ def oauth_start_endpoint(
             },
         )
     state, state_hash = generate_state()
-    updated = start_oauth_flow(integration_id, auth["user_id"], state_hash)
+    # ponyy: PKCE. Generate a verifier + challenge for the
+    # authorize URL. Encrypt the verifier at rest — the row is
+    # fetched by the callback handler to send the original back
+    # to Salesforce in the token exchange.
+    code_verifier, code_challenge = generate_pkce()
+    code_verifier_encrypted = encrypt_credentials({"code_verifier": code_verifier})
+    updated = start_oauth_flow(
+        integration_id, auth["user_id"], state_hash,
+        code_verifier_encrypted=code_verifier_encrypted,
+    )
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to start OAuth flow")
     cfg = get_oauth_config(integ["provider"])
-    authorize_url = build_authorize_url(cfg, state)
+    authorize_url = build_authorize_url(cfg, state, code_verifier=code_verifier)
     return RedirectResponse(url=authorize_url, status_code=302)
 
 
@@ -2519,7 +2528,7 @@ def oauth_salesforce_callback_endpoint(
         complete_oauth_flow,
         get_integration_by_id,
     )
-    from STT_server.security.credentials import encrypt_credentials
+    from STT_server.security.credentials import encrypt_credentials, decrypt_credentials
     from STT_server.services.oauth_providers import (
         hash_state, get_oauth_config,
         exchange_code_for_tokens, OAuthError, RefreshTokenRevoked, now_plus_seconds,
@@ -2548,6 +2557,20 @@ def oauth_salesforce_callback_endpoint(
     integration_id = integ["id"]
     user_id = integ["user_id"]
     provider = integ["provider"]
+    # ponyy: PKCE. The verifier was returned from consume_oauth_state
+    # as a key on the row (`_oauth_code_verifier_encrypted`).
+    # Decrypt it now so we can send the original to Salesforce in
+    # the token-exchange POST. Missing verifier (legacy row from
+    # before migration 018) → exchange without PKCE — falls back
+    # to the no-PKCE path, which works on non-PKCE Connected Apps.
+    code_verifier_plain = None
+    verifier_encrypted = integ.pop("_oauth_code_verifier_encrypted", None)
+    if verifier_encrypted:
+        try:
+            code_verifier_plain = decrypt_credentials(verifier_encrypted).get("code_verifier")
+        except Exception as exc:
+            log.warning("[oauth.callback] verifier decrypt failed integration_id=%s err=%s",
+                        integration_id, exc)
     if is_postgres():
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -2557,7 +2580,7 @@ def oauth_salesforce_callback_endpoint(
                 # to "tokens persisted".
                 try:
                     cfg = get_oauth_config(provider)
-                    tokens = exchange_code_for_tokens(cfg, code)
+                    tokens = exchange_code_for_tokens(cfg, code, code_verifier=code_verifier_plain)
                 except RefreshTokenRevoked as exc:
                     log.warning(
                         "[oauth.callback] exchange revoked integration_id=%s err=%s",
@@ -2628,7 +2651,7 @@ def oauth_salesforce_callback_endpoint(
     # JSON-file fallback: same shape, separate connection per call.
     try:
         cfg = get_oauth_config(provider)
-        tokens = exchange_code_for_tokens(cfg, code)
+        tokens = exchange_code_for_tokens(cfg, code, code_verifier=code_verifier_plain)
     except RefreshTokenRevoked as exc:
         log.warning(
             "[oauth.callback] exchange revoked integration_id=%s err=%s",

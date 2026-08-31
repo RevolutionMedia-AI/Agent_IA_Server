@@ -144,6 +144,37 @@ def _safe_int(v) -> int | None:
 async def lifespan(app: FastAPI):
     db_tenants.backfill_from_json()
 
+    # ponyy: log OAuth provider status at boot so the operator
+    # can see in the Railway deploy log whether Salesforce (or
+    # any future OAuth provider) is configured WITHOUT having to
+    # click Connect + read the 503. Validates each provider's
+    # required env vars and logs a per-provider OK / missing
+    # line. A consolidated "[oauth.boot] X/Y providers configured"
+    # line gives the operator the upshot at a glance.
+    try:
+        from STT_server.services import oauth_providers as _oauth_boot_diag
+        configured = 0
+        for pid in _oauth_boot_diag.known_oauth_providers():
+            ok, missing = _oauth_boot_diag.validate_oauth_env(pid)
+            if ok:
+                log.info("[oauth.boot] %s: configured (all env vars present)", pid)
+                configured += 1
+            else:
+                log.warning(
+                    "[oauth.boot] %s: missing env vars %s — "
+                    "operators can configure Salesforce via Setup -> App Manager "
+                    "and set SALESFORCE_CLIENT_ID / SALESFORCE_CLIENT_SECRET / "
+                    "SALESFORCE_REDIRECT_URI on the Railway service, then restart.",
+                    pid, list(missing),
+                )
+        total = len(_oauth_boot_diag.known_oauth_providers())
+        log.info("[oauth.boot] %d/%d OAuth providers configured", configured, total)
+    except Exception as exc:
+        # Diagnostic is best-effort; a bad env config must not
+        # prevent the BE from starting. The /oauth/start call
+        # surfaces a clearer error to the operator anyway.
+        log.warning("[oauth.boot] diagnostic failed: %s", exc)
+
     # ponytail: 2026-08-14 — pre-generate the static greeting WAVs at
     # boot so the first call after deploy doesn't pay the TTS TTFB
     # (the operator reported "el saludo llega después de 28 Segundos
