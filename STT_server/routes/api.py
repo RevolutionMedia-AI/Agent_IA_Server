@@ -2715,51 +2715,119 @@ def disconnect_integration_endpoint(integration_id: str, auth: dict = Depends(re
     After disconnect: connection_status='disconnected' (NOT
     'pending' — pending means "OAuth dance hasn't happened yet",
     disconnected means "was connected, operator chose to unlink").
+
+    ponyy: the body is wrapped in a top-level try/except. The
+    inner best-effort revoke already catches its own failures,
+    but anything else (DB error, unexpected exception in the
+    route layer, etc.) used to propagate as an unhandled 500 with
+    no CORS headers — the browser then reported a generic "CORS
+    error" that masked the real cause. With this guard, the
+    operator always gets a structured 200 with `connection_status`
+    and a `reason` field, so the FE can surface a snackbar with
+    the actual error.
     """
-    from STT_server.db_integrations import (
-        get_integration as db_get_integration,
-        count_dependent_tools,
-        disconnect_integration as db_disconnect,
-    )
-    from STT_server.services.oauth_providers import (
-        get_oauth_config, revoke_token,
-    )
-    from STT_server.security.credentials import decrypt_credentials
-    integ = db_get_integration(integration_id, auth["user_id"])
-    if not integ:
-        raise HTTPException(status_code=404, detail="Integration not found")
-    deps = count_dependent_tools(integration_id, auth["user_id"])
-    if deps > 0:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": f"{deps} tools depend on this integration", "tool_count": deps},
+    try:
+        from STT_server.db_integrations import (
+            get_integration as db_get_integration,
+            count_dependent_tools,
+            disconnect_integration as db_disconnect,
         )
-    # Best-effort revoke at the provider. We do this BEFORE wiping
-    # local credentials so the revoke call still has the access
-    # token. Failures are logged but don't block the local wipe —
-    # the operator wants out, we get them out.
-    if integ.get("credentials_encrypted"):
-        try:
-            cfg = get_oauth_config(integ["provider"])
-            creds_plain = decrypt_credentials(integ["credentials_encrypted"])
-            access_token = creds_plain.get("access_token")
-            if access_token:
-                revoke_token(cfg, access_token)
-        except Exception as exc:
-            log.warning(
-                "[oauth.disconnect] remote revoke failed integration_id=%s err=%s",
-                integration_id, exc,
+        from STT_server.services.oauth_providers import (
+            get_oauth_config, revoke_token,
+        )
+        from STT_server.security.credentials import decrypt_credentials
+        integ = db_get_integration(integration_id, auth["user_id"])
+        if not integ:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "connection_status": "unknown",
+                    "reason": "integration_not_found",
+                    "message": "Integration not found",
+                },
             )
-    ok, err = db_disconnect(integration_id, auth["user_id"])
-    if err:
-        raise HTTPException(status_code=409, detail={"message": err})
-    if not ok:
-        raise HTTPException(status_code=404, detail="Integration not found")
-    log.info(
-        "[oauth.disconnect] disconnected integration_id=%s user_id=%s",
-        integration_id, auth["user_id"],
-    )
-    return {"success": True, "connection_status": "disconnected"}
+        deps = count_dependent_tools(integration_id, auth["user_id"])
+        if deps > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "connection_status": integ.get("connection_status"),
+                    "reason": "dependent_tools",
+                    "message": f"{deps} tool{'s' if deps != 1 else ''} depend on this integration. Remove or reassign them first.",
+                    "tool_count": deps,
+                },
+            )
+        # Best-effort revoke at the provider. We do this BEFORE wiping
+        # local credentials so the revoke call still has the access
+        # token. Failures are logged but don't block the local wipe —
+        # the operator wants out, we get them out.
+        if integ.get("credentials_encrypted"):
+            try:
+                cfg = get_oauth_config(integ["provider"])
+                creds_plain = decrypt_credentials(integ["credentials_encrypted"])
+                access_token = creds_plain.get("access_token")
+                if access_token:
+                    revoke_token(cfg, access_token)
+            except Exception as exc:
+                # ponyy: this includes the case where SALESFORCE_*
+                # env vars are missing (the operator has a stale
+                # connection row from before the env was set). We
+                # skip the revoke, wipe local creds, and surface a
+                # warning — the operator's local state is what
+                # matters for "disconnect".
+                log.warning(
+                    "[oauth.disconnect] remote revoke failed integration_id=%s err=%s",
+                    integration_id, exc,
+                )
+        ok, err = db_disconnect(integration_id, auth["user_id"])
+        if err:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "connection_status": integ.get("connection_status"),
+                    "reason": "dependent_tools",
+                    "message": err,
+                },
+            )
+        if not ok:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "connection_status": "unknown",
+                    "reason": "integration_not_found",
+                    "message": "Integration not found",
+                },
+            )
+        log.info(
+            "[oauth.disconnect] disconnected integration_id=%s user_id=%s",
+            integration_id, auth["user_id"],
+        )
+        return {"success": True, "connection_status": "disconnected"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # ponyy: never let an unhandled 5xx out without CORS
+        # headers. The browser reports those as a generic "CORS
+        # error" and the operator can't tell what actually broke.
+        # Return 200 with a structured body so the FE surfaces a
+        # useful snackbar and we keep an audit trail in the logs.
+        log.exception(
+            "[oauth.disconnect] unhandled error integration_id=%s err=%s",
+            integration_id, exc,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "connection_status": "unknown",
+                "reason": "internal_error",
+                "message": f"Disconnect failed: {exc}",
+            },
+        )
 
 
 # ── /internal/integrations/{id}/credentials (service-token only) ────────────

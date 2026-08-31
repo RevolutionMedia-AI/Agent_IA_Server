@@ -235,6 +235,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+# ponyy: global exception handler. FastAPI's default exception
+# handler returns a JSONResponse with the right status code, but
+# in some middleware chains the response phase can race and the
+# CORS headers don't get added — the browser then reports a
+# generic "CORS error" that hides the actual cause. This handler
+# catches any unhandled Exception (NOT HTTPException, which has
+# its own path) and returns a 500 with explicit CORS headers so
+# the FE can show a useful error to the operator. The
+# CORSMiddleware would normally do this for us, but having an
+# explicit fallback is cheap insurance for the disconnect /
+# callback / oauth-start paths where a bug would otherwise show
+# up as a misleading CORS error.
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc):
+    log.exception(
+        "[unhandled] %s %s raised %s",
+        request.method, request.url.path, type(exc).__name__,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "message": f"{type(exc).__name__}: {str(exc)[:300]}",
+        },
+        headers={
+            "Access-Control-Allow-Origin": ", ".join(ALLOWED_ORIGINS) if ALLOWED_ORIGINS else "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        },
+    )
+
 # CORS allowlist — comma-separated env var. Defaults include both
 # the local dev origins AND the production Railway frontend
 # (agentiafrontend-production.up.railway.app) so the deploy works
