@@ -54,7 +54,8 @@ _INTEGRATIONS_FILE = _DATA_DIR / "integrations.json"
 _INTEGRATIONS_COLS_BASE = (
     "id, user_id, agent_id, provider, name, configuration, "
     "credentials_encrypted, credentials_cipher, connection_status, "
-    "last_tested_at, last_test_message, created_at, updated_at"
+    "last_tested_at, last_test_message, oauth_scope, "
+    "oauth_state_hash, oauth_state_expires_at, created_at, updated_at"
 )
 # credentials_encrypted lands as BYTEA; we kept `cipher` as a separate
 # TEXT column so future migrations (rotating Fernet keys, switching to
@@ -90,7 +91,7 @@ def _ensure_integrations_table() -> None:
                     )
                     # ponytail: use fetchone in a loop with both
                     # dict + tuple row handling so this works under
-                    # RealDictCursor (psycopg2 with cursor_factory=
+# RealDictCursor (psycopg2 with cursor_factory=
                     # RealDictCursor — what Railway's prod uses) and
                     # the plain tuple cursors used in tests. The
                     # earlier `cur.fetchall()` + `row[0]` shape threw
@@ -130,6 +131,9 @@ def _ensure_integrations_table() -> None:
                             "  connection_status     TEXT        NOT NULL DEFAULT 'unknown',"
                             "  last_tested_at        TIMESTAMPTZ,"
                             "  last_test_message     TEXT,"
+                            "  oauth_scope            TEXT,"
+                            "  oauth_state_hash       TEXT,"
+                            "  oauth_state_expires_at TIMESTAMPTZ,"
                             "  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
                             "  updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()"
                             ")"
@@ -141,6 +145,11 @@ def _ensure_integrations_table() -> None:
                         cur.execute(
                             "CREATE INDEX IF NOT EXISTS idx_integrations_provider "
                             "ON integrations (user_id, provider)"
+                        )
+                        cur.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_integrations_oauth_state_hash "
+                            "ON integrations (oauth_state_hash) "
+                            "WHERE oauth_state_hash IS NOT NULL"
                         )
             else:
                 # Table exists; confirm every column we expect. If a
@@ -156,6 +165,9 @@ def _ensure_integrations_table() -> None:
                     "connection_status": "TEXT NOT NULL DEFAULT 'unknown'",
                     "last_tested_at": "TIMESTAMPTZ",
                     "last_test_message": "TEXT",
+                    "oauth_scope": "TEXT",
+                    "oauth_state_hash": "TEXT",
+                    "oauth_state_expires_at": "TIMESTAMPTZ",
                     "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                     "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                 }
@@ -194,6 +206,12 @@ def _row_to_integration(row: dict | None) -> dict | None:
     bytes (callers in /internal/integrations/{id}/credentials pass
     them through to decrypt_credentials). The /integrations endpoints
     in routes/api.py strip both fields before returning to the FE.
+
+    OAuth fields (oauth_state_hash, oauth_state_expires_at) are
+    internal-only — never returned by any /integrations endpoint.
+    They're consumed by the OAuth helpers (start_oauth_flow,
+    complete_oauth_flow, get_integration_by_oauth_state). _strip
+    below trims them before any wire response.
     """
     if row is None:
         return None
@@ -205,9 +223,25 @@ def _row_to_integration(row: dict | None) -> dict | None:
             out["configuration"] = {}
     if not isinstance(out.get("configuration"), dict):
         out["configuration"] = {}
-    for k in ("last_tested_at", "created_at", "updated_at"):
+    for k in ("last_tested_at", "oauth_state_expires_at", "created_at", "updated_at"):
         if hasattr(out.get(k), "isoformat"):
             out[k] = out[k].isoformat() + "Z"
+    return out
+
+
+def _strip_integration_for_wire_with_oauth(row: dict | None) -> dict | None:
+    """Wire shape for /integrations + /integrations/{id}. Strips
+    credentials AND oauth state fields. Use this from the route
+    handlers instead of the local _strip_integration_for_wire helper
+    in routes/api.py so OAuth internals never leak.
+    """
+    if row is None:
+        return None
+    out = dict(row)
+    out.pop("credentials_encrypted", None)
+    out.pop("credentials_cipher", None)
+    out.pop("oauth_state_hash", None)
+    out.pop("oauth_state_expires_at", None)
     return out
 
 
@@ -578,3 +612,298 @@ def _write_integrations_file(rows: list[dict]) -> None:
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# ─ ─ ─ OAuth state + refresh helpers ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+# ponytail: the OAuth helpers below are intentionally separate from the
+# generic CRUD above. The OAuth flow has its own concerns (state hash
+# storage, single-use semantics, refresh-on-read under advisory lock,
+# revoke + status reset) and inlining them into the CRUD layer would
+# make both harder to read. Future providers (Dynamics, Google,
+# HubSpot) reuse these helpers unchanged.
+
+
+def start_oauth_flow(
+    integration_id: str,
+    user_id: str,
+    state_hash: str,
+    ttl_seconds: int = 600,
+) -> dict | None:
+    """Persist the OAuth state hash + expiry on the integration row.
+
+    Sets connection_status='pending' (the operator hasn't completed
+    the dance yet). Returns the refreshed row so the caller can
+    surface the new status without an extra round-trip.
+
+    `ttl_seconds` defaults to 10 minutes — long enough for the
+    operator to log in to Salesforce and approve, short enough that
+    a stolen state can't be replayed for long.
+    """
+    from datetime import datetime, timezone, timedelta
+    if not is_postgres():
+        rows = _read_integrations_file()
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["oauth_state_hash"] = state_hash
+                r["oauth_state_expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+                r["connection_status"] = "pending"
+                r["updated_at"] = _now_iso()
+                _write_integrations_file(rows)
+                return r
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+            cur.execute(
+                f"UPDATE integrations SET oauth_state_hash = %s, "
+                "oauth_state_expires_at = %s, connection_status = 'pending', "
+                "updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s "
+                f"RETURNING {_integrations_cols()}",
+                (state_hash, expires, integration_id, user_id),
+            )
+            row = cur.fetchone()
+    return _row_to_integration(row) if row else None
+
+
+def get_integration_by_oauth_state(state_hash: str) -> dict | None:
+    """Find an integration by its OAuth state hash (no user_id filter — the
+    callback doesn't know which user clicked Connect, the hash IS the
+    binding). Single-use semantics: caller must clear oauth_state_hash
+    inside the same transaction that persists the tokens, so a replay
+    never matches.
+
+    Returns the row including oauth_state_expires_at so the caller can
+    reject an expired state before doing the token exchange.
+    """
+    if not is_postgres():
+        for rows_owner in _walk_all_integrations_json():
+            for r in rows_owner:
+                if isinstance(r, dict) and r.get("oauth_state_hash") == state_hash:
+                    return r
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_integrations_cols()} FROM integrations "
+                "WHERE oauth_state_hash = %s",
+                (state_hash,),
+            )
+            row = cur.fetchone()
+            return _row_to_integration(row) if row else None
+
+
+def complete_oauth_flow(
+    integration_id: str,
+    user_id: str,
+    *,
+    credentials_encrypted: bytes,
+    configuration: dict,
+    scope: str | None,
+    connection_status: str = "connected",
+) -> dict | None:
+    """Persist the OAuth tokens + clear the state hash in one shot.
+
+    Called from the /oauth/callback handler after a successful token
+    exchange. The state hash clear is in the same UPDATE so a duplicate
+    callback delivery can't re-exchange the same code.
+    """
+    if not is_postgres():
+        rows = _read_integrations_file()
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["credentials_encrypted"] = credentials_encrypted
+                r["configuration"] = configuration
+                r["oauth_scope"] = scope
+                r["oauth_state_hash"] = None
+                r["oauth_state_expires_at"] = None
+                r["connection_status"] = connection_status
+                r["updated_at"] = _now_iso()
+                _write_integrations_file(rows)
+                return r
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE integrations SET credentials_encrypted = %s, "
+                "configuration = %s::jsonb, oauth_scope = %s, "
+                "oauth_state_hash = NULL, oauth_state_expires_at = NULL, "
+                "connection_status = %s, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s "
+                f"RETURNING {_integrations_cols()}",
+                (credentials_encrypted, json.dumps(configuration),
+                 scope, connection_status, integration_id, user_id),
+            )
+            row = cur.fetchone()
+    return _row_to_integration(row) if row else None
+
+
+def clear_oauth_state(integration_id: str, user_id: str) -> None:
+    """Drop the state hash + expiry without touching credentials.
+
+    Used when the callback fails (e.g. provider returned ?error=access_denied
+    or our token exchange 5xx'd). The next /oauth/start for the same
+    integration can then write a fresh state hash without the unique-
+    index collision.
+    """
+    if not is_postgres():
+        rows = _read_integrations_file()
+        changed = False
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["oauth_state_hash"] = None
+                r["oauth_state_expires_at"] = None
+                r["updated_at"] = _now_iso()
+                changed = True
+                break
+        if changed:
+            _write_integrations_file(rows)
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE integrations SET oauth_state_hash = NULL, "
+                "oauth_state_expires_at = NULL, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s",
+                (integration_id, user_id),
+            )
+
+
+def disconnect_integration(
+    integration_id: str,
+    user_id: str,
+) -> tuple[bool, str | None]:
+    """Wipe credentials + flip status to 'disconnected'.
+
+    Caller (the route handler) is expected to have already best-effort
+    revoked at the provider. We don't gate on dependent tools here —
+    that's done in the route layer via count_dependent_tools so the
+    409 message carries the count. Returns (success, error_message)
+    matching the pattern used by delete_integration.
+    """
+    if not is_postgres():
+        rows = _read_integrations_file()
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["credentials_encrypted"] = None
+                r["connection_status"] = "disconnected"
+                r["last_tested_at"] = None
+                r["last_test_message"] = None
+                r["updated_at"] = _now_iso()
+                _write_integrations_file(rows)
+                return True, None
+        return False, None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE integrations SET credentials_encrypted = NULL, "
+                "connection_status = 'disconnected', "
+                "last_tested_at = NULL, last_test_message = NULL, "
+                "updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s "
+                f"RETURNING {_integrations_cols()}",
+                (integration_id, user_id),
+            )
+            row = cur.fetchone()
+            return (row is not None, None)
+
+
+def update_integration_credentials(
+    integration_id: str,
+    user_id: str,
+    credentials_encrypted: bytes,
+) -> None:
+    """Persist refreshed tokens back to the row. Called from the
+    /internal/.../credentials handler after a successful refresh.
+
+    Caller holds the advisory lock on the integration row (see the
+    route handler) so concurrent refreshes serialize here. We do NOT
+    clear connection_status — if the row was 'failed' for some
+    reason, refresh succeeded means we should mark it 'connected'.
+    Caller passes the right status via mark_integration_status().
+    """
+    if not is_postgres():
+        rows = _read_integrations_file()
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["credentials_encrypted"] = credentials_encrypted
+                r["updated_at"] = _now_iso()
+                _write_integrations_file(rows)
+                return
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE integrations SET credentials_encrypted = %s, "
+                "updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s",
+                (credentials_encrypted, integration_id, user_id),
+            )
+
+
+def mark_integration_status(
+    integration_id: str,
+    user_id: str,
+    status: str,
+    *,
+    last_tested_at=None,
+    last_test_message: str | None = None,
+) -> None:
+    """Flip connection_status (and optionally last_tested_*). Used by
+    the /test endpoint and by the refresh-failure handler."""
+    if status not in {"unknown", "pending", "connected", "failed", "disconnected"}:
+        raise ValueError(f"invalid connection_status: {status!r}")
+    if not is_postgres():
+        rows = _read_integrations_file()
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["connection_status"] = status
+                if last_tested_at is not None:
+                    r["last_tested_at"] = last_tested_at
+                if last_test_message is not None:
+                    r["last_test_message"] = last_test_message
+                r["updated_at"] = _now_iso()
+                _write_integrations_file(rows)
+                return
+        return
+    if last_tested_at is not None:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE integrations SET connection_status = %s, "
+                    "last_tested_at = %s, last_test_message = %s, "
+                    "updated_at = NOW() "
+                    "WHERE id = %s AND user_id = %s",
+                    (status, last_tested_at, last_test_message,
+                     integration_id, user_id),
+                )
+    else:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE integrations SET connection_status = %s, "
+                    "last_test_message = %s, updated_at = NOW() "
+                    "WHERE id = %s AND user_id = %s",
+                    (status, last_test_message, integration_id, user_id),
+                )
+
+
+def acquire_advisory_xact_lock(cur, lock_key: str) -> None:
+    """Take a transaction-scoped advisory lock on `lock_key`.
+
+    Released automatically when the surrounding transaction commits
+    or rolls back. Concurrent requests with the same key serialize on
+    this lock. Used by the refresh-on-read path so 5 parallel n8n
+    requests on the same integration don't all try to refresh the
+    Salesforce token in parallel — first one does the work, the rest
+    read the freshly-persisted row.
+
+    ponytail: we use pg_advisory_xact_lock (transaction-scoped) over
+    pg_advisory_lock (session-scoped) so a forgotten RELEASE call
+    can never leak a lock. Postgres's hashtext() hashes the key
+    into a 32-bit signed range — same input always maps to the same
+    lock id, no collisions within a single deployment.
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('integration:' || %s))",
+        (lock_key,),
+    )

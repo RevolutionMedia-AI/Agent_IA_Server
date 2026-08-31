@@ -88,6 +88,21 @@ if _parsed.path and _parsed.path not in ("", "/"):
         _parsed.path,
     )
 
+# ponytail: OAuth providers (Salesforce) need their client_id +
+# client_secret + redirect_uri in env before the OAuth flow can
+# complete. Validate at boot so a misconfigured deploy fails fast
+# instead of 500-ing on the first Connect click. The validator
+# runs as part of module import — slow on cold start but it's a
+# one-shot cost and the operator benefits from the loud failure.
+try:
+    from STT_server.services import oauth_providers as _oauth_providers
+    _oauth_providers.validate_oauth_env()
+except RuntimeError as exc:
+    # ponytail: log the full message but exit with the short form
+    # so Railway's restart loop doesn't spam identical logs.
+    log.error("[oauth.boot] %s", exc)
+    raise
+
 # ponytail: removed the OPENAI_API_KEY / DEEPGRAM_API_KEY /
 # ELEVENLABS_API_KEY boot-time logs entirely. The platform is
 # a multi-tenant provider: every user configures their own keys

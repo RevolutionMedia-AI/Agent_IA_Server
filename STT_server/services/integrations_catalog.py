@@ -85,6 +85,21 @@ class IntegrationProviderSpec:
     # returns {valid: false, message: "Test not yet implemented for ..."}.
     test_fn: Optional[str] = None
     description: str = ""
+    # ponytail: auth_type drives the FE form + BE create flow.
+    #   "static"  → operator types credentials (api_token, etc.) into
+    #               a regular form. preflight + encrypt + save.
+    #   "oauth"   → Authorization Code flow. The BE handles the OAuth
+    #               dance via /integrations/{id}/oauth/start +
+    #               /integrations/{provider}/oauth/callback. The FE
+    #               form is just Name + a [Connect with <provider>]
+    #               button. preflight is skipped (no test_fn for
+    #               OAuth — the OAuth dance IS the test).
+    auth_type: str = "static"
+    # OAuth-only fields (ignored when auth_type="static"). authorise
+    # / token URLs come from oauth_providers.py; we only need the
+    # button label + default scopes here for the FE.
+    oauth_label: str = ""          # "Connect Salesforce"
+    oauth_default_scopes: tuple[str, ...] = ()
 
 
 # ── Validation helpers (mirror credentials_resolver but for integrations) ─
@@ -246,26 +261,25 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         id="salesforce",
         name="Salesforce",
         category="crm",
-        description="Salesforce REST API — leads, contacts, opportunities, cases.",
-        fields=(
-            IntegrationFieldSpec(
-                name="instance_url", label="Instance URL", type="url",
-                required=True,
-                pattern=r"^https://[a-zA-Z0-9-]+\.my\.salesforce\.com/?$",
-                placeholder="https://acme.my.salesforce.com",
-            ),
-            IntegrationFieldSpec(
-                name="access_token", label="Access Token", type="password",
-                required=True, min_length=20,
-                help="OAuth 2.0 access token (Bearer). Refresh on expiry.",
-            ),
-        ),
+        description="Salesforce REST API — leads, contacts, opportunities, cases. Connects via OAuth 2.0 Authorization Code.",
+        fields=(),  # ponytail: OAuth — no operator-typed fields. The
+                    # token exchange writes configuration.instance_url
+                    # + credentials.{access,refresh}_token. The FE
+                    # only asks for Integration Name + clicks [Connect].
         actions=(
             _a("find_contact", "Find Contact"),
             _a("create_lead", "Create Lead"),
             _a("update_opportunity", "Update Opportunity"),
         ),
-        test_fn=None,  # stub — "Test not yet implemented"
+        test_fn=None,  # OAuth: preflight is skipped (no test_fn). The
+                       # refresh-on-read in /internal/.../credentials
+                       # keeps the token fresh; the test button on the
+                       # detail view is a soft "verify the row is
+                       # still here" check (re-checks row + decrypt
+                       # round-trip), not a network probe.
+        auth_type="oauth",
+        oauth_label="Connect Salesforce",
+        oauth_default_scopes=("api", "refresh_token"),
     ),
     IntegrationProviderSpec(
         id="dynamics365",

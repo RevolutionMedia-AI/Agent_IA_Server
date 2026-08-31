@@ -13,12 +13,13 @@ import hashlib
 import logging
 import threading
 import time
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 # ponytail: log was referenced in 8 places (lines 223, 228, 610, 615, 793,
@@ -1936,14 +1937,23 @@ class IntegrationUpdate(BaseModel):
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _strip_integration_for_wire(row: dict) -> dict:
-    """Drop credential fields before returning to the FE. Same shape the
-    FE will see regardless of which endpoint called this — there is no
-    masked variant. Replace only."""
+    """Drop credential + OAuth-internal fields before returning to the FE.
+
+    Credentials: never returned (no masked variant — Replace only).
+    oauth_state_hash / oauth_state_expires_at: internal-only — only
+    the OAuth callback handler reads them via
+    get_integration_by_oauth_state. Leaking them to the FE would
+    expose the lookup key for an active flow (a DB row leak doesn't
+    expose the real state, but the FE running with a leaked FE
+    session could replay it).
+    """
     if not row:
         return row
     out = dict(row)
     out.pop("credentials_encrypted", None)
     out.pop("credentials_cipher", None)
+    out.pop("oauth_state_hash", None)
+    out.pop("oauth_state_expires_at", None)
     return out
 
 
@@ -2061,8 +2071,9 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "id": a.id,
             "name": a.name,
             "description": a.description,
-            "parameters_schema": a.parameters_schema,
+"parameters_schema": a.parameters_schema,
         }
+
     def spec_to_wire(s: IntegrationProviderSpec) -> dict:
         return {
             "id": s.id,
@@ -2070,6 +2081,12 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "category": s.category,
             "description": s.description,
             "has_test": bool(s.test_fn),
+            # ponytail: auth_type drives the FE form. "oauth" providers
+            # render a single Connect button + Name field; "static"
+            # renders the existing fields-based form.
+            "auth_type": getattr(s, "auth_type", "static"),
+            "oauth_label": getattr(s, "oauth_label", ""),
+            "oauth_default_scopes": list(getattr(s, "oauth_default_scopes", ())),
             "fields": [field_to_wire(f) for f in s.fields],
             "actions": [action_to_wire(a) for a in s.actions],
         }
@@ -2112,9 +2129,15 @@ def list_integrations_endpoint(
 @api_router.post("/integrations")
 def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(require_auth)):
     """Create a new integration. Preflight runs automatically; if it
-    fails, returns 422 with the test message. Admin-only _skip_preflight
-    field bypasses the preflight (use only for tests / migrations)."""
-# Pull skip_preflight out before any validation so a non-admin
+    fails, returns 422 with the test message. Admin-only skip_preflight
+    field bypasses the preflight (use only for tests / migrations).
+
+    OAuth providers (Salesforce) skip preflight entirely — the OAuth
+    dance IS the test. We persist the row with `connection_status='pending'`
+    and the FE follows up with a redirect to /oauth/start. Static
+    providers keep the existing preflight + encrypt-and-store flow.
+    """
+    # Pull skip_preflight out before any validation so a non-admin
     # sending the field can't even cause a log line about admin checks.
     skip_preflight = body.skip_preflight
     if skip_preflight:
@@ -2127,25 +2150,37 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
     spec = get_integration_provider_spec(body.provider)
     if spec is None:
         raise HTTPException(status_code=422, detail=f"Unknown provider '{body.provider}'")
-    cleaned_config, cleaned_creds, errors = validate_integration_fields(
-        body.provider, body.configuration, body.credentials,
-    )
-    if errors:
-        raise HTTPException(status_code=422, detail={"errors": errors})
-    # preflight unless admin-skipped
-    if not skip_preflight:
-        valid, message = _run_preflight(body.provider, body.configuration, body.credentials)
-        if not valid:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "preflight": {"valid": False, "message": message},
-                    "errors": [{"field": "_preflight", "message": message}],
-                },
-            )
+    auth_type = getattr(spec, "auth_type", "static")
+    if auth_type == "oauth":
+        # OAuth create: just persist the row with name + provider +
+        # agent_id + an empty configuration. The OAuth callback
+        # writes the actual config (instance_url) + encrypted
+        # credentials + flips connection_status to 'connected'.
+        # No preflight (the OAuth redirect IS the verification).
+        cleaned_config = {}
+    else:
+        cleaned_config, cleaned_creds, errors = validate_integration_fields(
+            body.provider, body.configuration, body.credentials,
+        )
+        if errors:
+            raise HTTPException(status_code=422, detail={"errors": errors})
+        # preflight unless admin-skipped
+        if not skip_preflight:
+            valid, message = _run_preflight(body.provider, body.configuration, body.credentials)
+            if not valid:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "preflight": {"valid": False, "message": message},
+                        "errors": [{"field": "_preflight", "message": message}],
+                    },
+                )
     from STT_server.db_integrations import create_integration as db_create_integration
     from STT_server.security.credentials import encrypt_credentials
-    encrypted = encrypt_credentials(cleaned_creds) if cleaned_creds else None
+    if auth_type == "oauth":
+        encrypted = None
+    else:
+        encrypted = encrypt_credentials(cleaned_creds) if cleaned_creds else None
     payload = {
         "provider": body.provider,
         "name": body.name,
@@ -2158,8 +2193,18 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
         credentials_encrypted=encrypted,
         cipher="fernet-v1",
     )
-    # set connection_status from preflight (we ran it, so we know)
-    if not skip_preflight:
+    if auth_type == "oauth":
+        # Mark pending immediately so the FE detail view + provider
+        # card reflect that the OAuth dance is in progress.
+        from STT_server.db_integrations import mark_integration_status as db_mark
+        db_mark(row["id"], auth["user_id"], "pending")
+        row = db_create_integration(
+            auth["user_id"],
+            payload,
+            credentials_encrypted=encrypted,
+            cipher="fernet-v1",
+        ) or row
+    elif not skip_preflight:
         from STT_server.db_integrations import update_integration as db_update_integration
         row = db_update_integration(
             row["id"], auth["user_id"], {},
@@ -2300,6 +2345,289 @@ def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_
     }
 
 
+# ── /integrations/{id}/oauth/start + /oauth/callback + disconnect ────────────
+
+@api_router.get("/integrations/{integration_id}/oauth/start")
+def oauth_start_endpoint(
+    integration_id: str,
+    token: Optional[str] = None,
+    auth: Optional[dict] = Depends(require_auth),
+):
+    """Generate a fresh OAuth state, persist its hash, redirect the
+    operator to the provider's authorize URL.
+
+    The state hash is stored on the integration row (TTL 10 min). The
+    callback hashes the incoming state and looks the row up by hash.
+    No DB write happens to the secret state — a leaked DB row can't
+    be used to ride an active flow.
+
+    The provider redirects back to
+    `${SALESFORCE_REDIRECT_URI}` (which we control) — that's where
+    the code is exchanged.
+
+    Auth: require_auth (Bearer header) when called from the FE's
+    `request()` helper. The FE's OAuth start uses `window.location`
+    to follow the redirect (no fetch — see integrationsApi.oauthStart
+    in the FE), which can't send an Authorization header. For that
+    path the FE passes the JWT in `?token=` as a fallback. The
+    fallback is only honoured here, only when the Bearer header is
+    absent, and the token is consumed in this single request — no
+    server-side logging of the value.
+    """
+    from STT_server.db_integrations import (
+        get_integration as db_get_integration,
+        start_oauth_flow,
+    )
+    from STT_server.services.oauth_providers import (
+        generate_state, build_authorize_url, get_oauth_config,
+    )
+    # ponytail: query-param token fallback so the FE's full-page
+    # redirect (window.location) can auth without losing the
+    # operator's session. Bearer header wins when present so a
+    # direct API call doesn't need to think about it.
+    if auth is None and token:
+        from STT_server.routes.api import resolve_bearer
+        try:
+            auth = resolve_bearer(f"Bearer {token}", raise_on_missing=False)
+        except Exception:
+            auth = None
+    if auth is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated (Bearer header or ?token= required)",
+        )
+    integ = db_get_integration(integration_id, auth["user_id"])
+    if not integ:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    if integ["provider"] not in ("salesforce",):  # future OAuth providers added here
+        raise HTTPException(
+            status_code=422,
+            detail=f"Provider '{integ['provider']}' is not an OAuth integration",
+        )
+    state, state_hash = generate_state()
+    updated = start_oauth_flow(integration_id, auth["user_id"], state_hash)
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to start OAuth flow")
+    cfg = get_oauth_config(integ["provider"])
+    authorize_url = build_authorize_url(cfg, state)
+    return RedirectResponse(url=authorize_url, status_code=302)
+
+
+@api_router.get("/integrations/salesforce/oauth/callback")
+def oauth_salesforce_callback_endpoint(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    """Salesforce OAuth callback. No auth required — the state hash
+    is the binding; the BE resolves the integration row without
+    needing the operator to be logged in to the FE.
+
+    On success: exchange code → tokens + instance_url → encrypt +
+    persist + clear state → redirect to FE with ?connected=<id>.
+    On provider error (?error=access_denied, etc.): redirect to
+    FE with ?error=oauth_<code>.
+    On our validation failure: redirect to FE with a generic
+    ?error=oauth_invalid.
+    """
+    frontend_origin = os.environ.get("FRONTEND_ORIGIN", "").strip().rstrip("/")
+    if not frontend_origin:
+        # Best-effort fallback for local dev (FE on :5173).
+        frontend_origin = "http://localhost:5173"
+    if error:
+        log.warning("[oauth.callback] provider error=%s desc=%s", error, error_description)
+        sep = "&" if "?" in frontend_origin else "?"
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_{error}{sep}error_description={urllib.parse.quote(error_description or '')}",
+            status_code=302,
+        )
+    if not code or not state:
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_invalid",
+            status_code=302,
+        )
+    from STT_server.db_integrations import (
+        get_integration_by_oauth_state,
+        complete_oauth_flow,
+        clear_oauth_state,
+    )
+    from STT_server.security.credentials import encrypt_credentials
+    from STT_server.services.oauth_providers import (
+        constant_time_eq, hash_state, get_oauth_config,
+        exchange_code_for_tokens, OAuthError, RefreshTokenRevoked, now_plus_seconds,
+    )
+    state_hash = hash_state(state)
+    integ = get_integration_by_oauth_state(state_hash)
+    if not integ:
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
+            status_code=302,
+        )
+    # Constant-time compare to defeat timing oracles. SHA-256 already
+    # runs in constant time, but the helper makes intent explicit.
+    if not constant_time_eq(state_hash, integ.get("oauth_state_hash") or ""):
+        log.warning(
+            "[oauth.callback] state hash mismatch integration_id=%s",
+            integ["id"],
+        )
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
+            status_code=302,
+        )
+    # TTL check. expires_at is ISO-8601 string (datetime isoformat).
+    from datetime import datetime, timezone
+    expires_iso = integ.get("oauth_state_expires_at")
+    if not expires_iso:
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
+            status_code=302,
+        )
+    try:
+        # Stored value can be 'Z' suffix or +00:00; both should parse.
+        s = expires_iso.rstrip("Z")
+        exp_dt = datetime.fromisoformat(s)
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if exp_dt < datetime.now(timezone.utc):
+            return RedirectResponse(
+                url=f"{frontend_origin}/integrations?error=oauth_state_expired",
+                status_code=302,
+            )
+    except Exception:
+        log.exception("[oauth.callback] state expires_at unparseable integration_id=%s", integ["id"])
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
+            status_code=302,
+        )
+    # Exchange the code for tokens. Network call to Salesforce.
+    try:
+        cfg = get_oauth_config(integ["provider"])
+        tokens = exchange_code_for_tokens(cfg, code)
+    except RefreshTokenRevoked as exc:
+        log.warning(
+            "[oauth.callback] exchange revoked integration_id=%s err=%s",
+            integ["id"], exc,
+        )
+        clear_oauth_state(integ["id"], integ["user_id"])
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_code_rejected",
+            status_code=302,
+        )
+    except OAuthError as exc:
+        log.exception(
+            "[oauth.callback] exchange error integration_id=%s err=%s",
+            integ["id"], exc,
+        )
+        clear_oauth_state(integ["id"], integ["user_id"])
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_exchange_failed",
+            status_code=302,
+        )
+    # Build the credentials blob. Stored encrypted; the runtime reads
+    # it via /internal/integrations/{id}/credentials and the refresh
+    # path uses expires_at to know when to swap.
+    creds = {
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,  # may be None — only Salesforce knows
+    }
+    if tokens.expires_in is not None:
+        creds["expires_at"] = now_plus_seconds(tokens.expires_in)
+    if tokens.scope:
+        creds["scope"] = tokens.scope
+    encrypted = encrypt_credentials(creds)
+    # Configuration carries the instance_url Salesforce hands back —
+    # the FE shows it read-only on the detail view.
+    configuration = dict(integ.get("configuration") or {})
+    if tokens.instance_url:
+        configuration["instance_url"] = tokens.instance_url
+    # Persist + clear state in one UPDATE so a replay can't re-exchange.
+    saved = complete_oauth_flow(
+        integ["id"],
+        integ["user_id"],
+        credentials_encrypted=encrypted,
+        configuration=configuration,
+        scope=tokens.scope,
+        connection_status="connected",
+    )
+    if not saved:
+        log.error(
+            "[oauth.callback] complete_oauth_flow returned None integration_id=%s",
+            integ["id"],
+        )
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?error=oauth_internal",
+            status_code=302,
+        )
+    log.info(
+        "[oauth.callback] connected integration_id=%s provider=%s user_id=%s",
+        saved["id"], saved["provider"], integ["user_id"],
+    )
+    return RedirectResponse(
+        url=f"{frontend_origin}/integrations?connected={saved['id']}",
+        status_code=302,
+    )
+
+
+@api_router.post("/integrations/{integration_id}/disconnect")
+def disconnect_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
+    """Disconnect an OAuth integration: best-effort revoke at the
+    provider, then clear credentials locally.
+
+    Refuses with 409 if any tools still depend on the integration —
+    the operator must remove or reassign those tools first (same
+    pattern as DELETE /integrations/{id}).
+
+    After disconnect: connection_status='disconnected' (NOT
+    'pending' — pending means "OAuth dance hasn't happened yet",
+    disconnected means "was connected, operator chose to unlink").
+    """
+    from STT_server.db_integrations import (
+        get_integration as db_get_integration,
+        count_dependent_tools,
+        disconnect_integration as db_disconnect,
+    )
+    from STT_server.services.oauth_providers import (
+        get_oauth_config, revoke_token,
+    )
+    from STT_server.security.credentials import decrypt_credentials
+    integ = db_get_integration(integration_id, auth["user_id"])
+    if not integ:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    deps = count_dependent_tools(integration_id, auth["user_id"])
+    if deps > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"{deps} tools depend on this integration", "tool_count": deps},
+        )
+    # Best-effort revoke at the provider. We do this BEFORE wiping
+    # local credentials so the revoke call still has the access
+    # token. Failures are logged but don't block the local wipe —
+    # the operator wants out, we get them out.
+    if integ.get("credentials_encrypted"):
+        try:
+            cfg = get_oauth_config(integ["provider"])
+            creds_plain = decrypt_credentials(integ["credentials_encrypted"])
+            access_token = creds_plain.get("access_token")
+            if access_token:
+                revoke_token(cfg, access_token)
+        except Exception as exc:
+            log.warning(
+                "[oauth.disconnect] remote revoke failed integration_id=%s err=%s",
+                integration_id, exc,
+            )
+    ok, err = db_disconnect(integration_id, auth["user_id"])
+    if err:
+        raise HTTPException(status_code=409, detail={"message": err})
+    if not ok:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    log.info(
+        "[oauth.disconnect] disconnected integration_id=%s user_id=%s",
+        integration_id, auth["user_id"],
+    )
+    return {"success": True, "connection_status": "disconnected"}
+
+
 # ── /internal/integrations/{id}/credentials (service-token only) ────────────
 
 @api_router.post("/internal/integrations/{integration_id}/credentials")
@@ -2320,12 +2648,34 @@ def internal_get_integration_credentials(
     even the integration's owner can't fetch the plaintext creds
     back; they can only Replace them via PUT /integrations/{id}.
 
-Audit: every hit is logged with provider + integration_id + ip.
+    Audit: every hit is logged with provider + integration_id + ip.
     The credentials themselves are NEVER logged (this is the line
     the operator would be paged on if it ever showed up in a log).
+
+    Refresh-on-read: if the provider is OAuth and the access token
+    is within 60s of expiry (or missing expires_at), we hold a
+    pg_advisory_xact_lock keyed on the integration id and call
+    refresh_access_token. Concurrent requests for the same
+    integration serialize on the lock — the first one refreshes,
+    the rest pick up the freshly-persisted row. If refresh fails
+    (revoked/expired), we mark status='failed' and return
+    `{credentials: null, reason: "refresh_failed"}` so n8n gets a
+    deterministic 401 and the operator sees "Reconnect" in the UI.
     """
-    from STT_server.db_integrations import get_integration_by_id
-    from STT_server.security.credentials import decrypt_credentials
+    from STT_server.db_integrations import (
+        get_integration_by_id,
+        acquire_advisory_xact_lock,
+        update_integration_credentials,
+        mark_integration_status,
+    )
+    from STT_server.security.credentials import (
+        decrypt_credentials, encrypt_credentials,
+    )
+    from STT_server.services.oauth_providers import (
+        get_oauth_config, refresh_access_token, is_token_expiring, now_plus_seconds,
+        RefreshTokenRevoked, OAuthError,
+    )
+    from STT_server.db import get_conn
     # ponytail: internal endpoint uses the unscoped lookup so n8n
     # (which carries only the service token, not a user token) can
     # resolve any integration by id. Cross-user access is intentional
@@ -2337,12 +2687,23 @@ Audit: every hit is logged with provider + integration_id + ip.
             integration_id, request.client.host if request.client else "?",
         )
         raise HTTPException(status_code=404, detail="Integration not found")
-    try:
-        creds_plain = (
-            decrypt_credentials(row["credentials_encrypted"])
-            if row.get("credentials_encrypted")
-            else {}
+    provider = row.get("provider")
+    cipher = row.get("credentials_cipher") or "fernet-v1"
+    encrypted = row.get("credentials_encrypted")
+    if not encrypted:
+        log.warning(
+            "[internal.creds] no credentials stored integration_id=%s ip=%s",
+            integration_id, request.client.host if request.client else "?",
         )
+        return {
+            "integration_id": row["id"],
+            "provider": provider,
+            "configuration": row.get("configuration") or {},
+            "credentials": None,
+            "reason": "no_credentials",
+        }
+    try:
+        creds_plain = decrypt_credentials(encrypted) if cipher == "fernet-v1" else {}
     except Exception as exc:
         log.warning(
             "[internal.creds] decrypt failed integration_id=%s err=%s",
@@ -2352,13 +2713,126 @@ Audit: every hit is logged with provider + integration_id + ip.
             status_code=503,
             detail="Credentials unavailable — decryption failed",
         )
+    # Refresh-on-read only applies to OAuth providers. Static providers
+    # never expire (until the operator Replaces them).
+    from STT_server.services.integrations_catalog import get_integration_provider_spec
+    spec = get_integration_provider_spec(provider)
+    is_oauth = bool(spec and getattr(spec, "auth_type", "static") == "oauth")
+    # ponytail: refresh-on-read needs a Postgres advisory lock to
+    # serialize concurrent calls. The JSON-file fallback (local
+    # dev) doesn't have advisory locks and isn't a concurrency
+    # scenario anyway — the row is read+write with the OS-level
+    # write lock. Skip the refresh path there and return the stored
+    # creds; n8n will surface a 401 from Salesforce if the token
+    # is actually expired, which is acceptable for a dev env.
+    from STT_server.db import is_postgres
+    if is_oauth and is_token_expiring(creds_plain.get("expires_at")) and is_postgres():
+        # Advisory lock keyed on integration id. Released at txn end.
+        # Concurrent calls serialize here. The first one in reads,
+        # sees expiring token, refreshes, persists; subsequent calls
+        # read the fresh row and skip the refresh.
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    acquire_advisory_xact_lock(cur, integration_id)
+                    # Re-read inside the lock so we observe the
+                    # latest committed row (the previous lock holder
+                    # may have just persisted refreshed tokens).
+                    from STT_server.db_integrations import get_integration_by_id as _reload
+                    fresh = _reload(integration_id)
+                    if fresh and fresh.get("credentials_encrypted"):
+                        try:
+                            creds_plain = (
+                                decrypt_credentials(fresh["credentials_encrypted"])
+                                if (fresh.get("credentials_cipher") or "fernet-v1") == "fernet-v1"
+                                else creds_plain
+                            )
+                        except Exception:
+                            pass
+                    if is_token_expiring(creds_plain.get("expires_at")):
+                        # Still expiring — actually do the refresh.
+                        refresh_token = creds_plain.get("refresh_token")
+                        if not refresh_token:
+                            # No refresh token — can't recover. Mark
+                            # failed and surface to caller.
+                            mark_integration_status(
+                                integration_id, fresh["user_id"], "failed",
+                                last_test_message="no refresh token",
+                            )
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "message": "Refresh token missing — reconnect required",
+                                    "reason": "refresh_failed",
+                                },
+                            )
+                        try:
+                            cfg = get_oauth_config(provider)
+                            new_tokens = refresh_access_token(cfg, refresh_token)
+                        except RefreshTokenRevoked as exc:
+                            mark_integration_status(
+                                integration_id, fresh["user_id"], "failed",
+                                last_test_message=str(exc),
+                            )
+                            log.warning(
+                                "[internal.creds] refresh revoked integration_id=%s err=%s",
+                                integration_id, exc,
+                            )
+                            return {
+                                "integration_id": row["id"],
+                                "provider": provider,
+                                "configuration": fresh.get("configuration") or {},
+                                "credentials": None,
+                                "reason": "refresh_failed",
+                            }
+                        except OAuthError as exc:
+                            log.warning(
+                                "[internal.creds] refresh transient error integration_id=%s err=%s",
+                                integration_id, exc,
+                            )
+                            # Transient — return the current creds and
+                            # let n8n surface the 401 if it actually
+                            # expired at the provider. Better than
+                            # failing the whole call.
+                            creds_plain = creds_plain
+                        else:
+                            merged = dict(creds_plain)
+                            merged["access_token"] = new_tokens.access_token
+                            if new_tokens.refresh_token:
+                                merged["refresh_token"] = new_tokens.refresh_token
+                            if new_tokens.expires_in is not None:
+                                merged["expires_at"] = now_plus_seconds(new_tokens.expires_in)
+                            if new_tokens.scope:
+                                merged["scope"] = new_tokens.scope
+                            update_integration_credentials(
+                                integration_id, fresh["user_id"],
+                                encrypt_credentials(merged),
+                            )
+                            mark_integration_status(
+                                integration_id, fresh["user_id"], "connected",
+                                last_test_message="token refreshed",
+                            )
+                            creds_plain = merged
+                            log.info(
+                                "[internal.creds] refreshed token integration_id=%s provider=%s",
+                                integration_id, provider,
+                            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[internal.creds] refresh path failed integration_id=%s err=%s",
+                integration_id, exc,
+            )
+            # Continue with the creds we already have — n8n will
+            # surface a 401 if it's actually expired.
     log.info(
         "[internal.creds] ok integration_id=%s provider=%s ip=%s",
         integration_id, row.get("provider"), request.client.host if request.client else "?",
     )
     return {
         "integration_id": row["id"],
-        "provider": row["provider"],
+        "provider": provider,
         "configuration": row.get("configuration") or {},
         "credentials": creds_plain,
     }
