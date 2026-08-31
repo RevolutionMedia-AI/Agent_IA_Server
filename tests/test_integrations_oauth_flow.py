@@ -254,6 +254,29 @@ def test_consume_oauth_state_is_atomic():
     assert diag is None
 
 
+def test_scalar_handles_both_cursor_shapes():
+    """The disconnect crash on production ('invalid literal for
+    int() with base 10: count') came from a tuple cursor path
+    that didn't tolerate RealDictCursor. _scalar() normalizes
+    BOTH shapes to a plain int so count_dependent_tools() and
+    delete_integration() can't blow up on cursor-style changes."""
+    from STT_server.db_integrations import _scalar
+    # RealDictCursor shape: dict keyed by column name.
+    assert _scalar({"n": 5}) == 5
+    assert _scalar({"count": 3}) == 3
+    # Plain tuple cursor shape: 1-tuple.
+    assert _scalar((7,)) == 7
+    # Defensive: None / empty dict returns 0.
+    assert _scalar(None) == 0
+    assert _scalar({}) == 0
+    assert _scalar(()) == 0
+    # Defensive: a non-numeric value returns 0 instead of crashing.
+    # (Shouldn't happen for COUNT(*), but we don't trust the
+    # upstream to never give us a bad row.)
+    assert _scalar({"n": "count"}) == 0
+    assert _scalar(("oops",)) == 0
+
+
 async def test_oauth_callback_happy_path(client, auth_token, _oauth_env):
     """Full flow: create → start → callback with the state from the
     start redirect. Mocks Salesforce's token endpoint to return a

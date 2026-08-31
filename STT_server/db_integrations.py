@@ -531,10 +531,19 @@ def delete_integration(integration_id: str, user_id: str) -> tuple[bool, str | N
             # shared lock implicitly through the FOR UPDATE on the
             # integration row below.
             cur.execute(
-                "SELECT COUNT(*) FROM agent_tools WHERE integration_id = %s",
+                "SELECT COUNT(*) AS n FROM agent_tools WHERE integration_id = %s",
                 (integration_id,),
             )
-            (dep_count,) = cur.fetchone()
+            # ponytail: cursor-shape-agnostic scalar read (see
+            # _scalar() docstring). Same defensive fix as
+            # count_dependent_tools — the previous (dep_count,) =
+            # cur.fetchone() shape fails when the cursor returns a
+            # dict (RealDictCursor) because you can't unpack a dict
+            # by position. The actual production error surfaced as
+            # "invalid literal for int() with base 10: 'count'" when
+            # the dict's column name was stringified into the
+            # unpack target.
+            dep_count = _scalar(cur.fetchone())
             if dep_count > 0:
                 return False, f"{dep_count} tools depend on this integration"
             cur.execute(
@@ -567,17 +576,53 @@ def count_dependent_tools(integration_id: str, user_id: str | None = None) -> in
         with conn.cursor() as cur:
             if user_id is None:
                 cur.execute(
-                    "SELECT COUNT(*) FROM agent_tools WHERE integration_id = %s",
+                    "SELECT COUNT(*) AS n FROM agent_tools WHERE integration_id = %s",
                     (integration_id,),
                 )
             else:
                 cur.execute(
-                    "SELECT COUNT(*) FROM agent_tools "
+                    "SELECT COUNT(*) AS n FROM agent_tools "
                     "WHERE integration_id = %s AND user_id = %s",
                     (integration_id, user_id),
                 )
-            (n,) = cur.fetchone()
-            return int(n or 0)
+            # ponytail: handle BOTH cursor shapes. RealDictCursor
+            # (psycopg2.cursor_factory=RealDictCursor — what Railway
+            # uses) returns the row as a dict `{'n': 0}`. A plain
+            # tuple cursor returns a tuple `(0,)`. The previous
+            # `(n,) = cur.fetchone()` shape assumes tuple shape and
+            # throws on dicts; the dict shape `[k] = cur.fetchone()`
+            # assumes dict shape. Casting both via _scalar() is the
+            # only shape-agnostic way.
+            row = cur.fetchone()
+            return _scalar(row) or 0
+
+
+def _scalar(row) -> int:
+    """Extract the first value of a fetchone() result regardless of
+    cursor shape. RealDictCursor → dict; tuple cursor → tuple.
+
+    The function name and return type are deliberately narrow —
+    only used for COUNT-style single-value reads. If row is a dict
+    that contains a non-numeric value (which shouldn't happen for
+    `SELECT COUNT(*)` but could for a malformed query), we fall
+    back to 0 rather than crash — disconnect is best-effort and
+    a bad count shouldn't 500 the whole request.
+    """
+    if row is None:
+        return 0
+    if isinstance(row, dict):
+        # RealDictCursor: the row is a dict keyed by column name.
+        # COUNT(*) is aliased to "n" in our queries, so row['n'] is
+        # the integer. Fall back to 'count' for un-aliased queries.
+        v = row.get("n", row.get("count", 0))
+    else:
+        # Plain tuple cursor: the row is a 1-tuple.
+        v = row[0] if row else 0
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        log.warning("[db_integrations] non-numeric scalar from query: %r", v)
+        return 0
 
 
 # ── JSON-file fallback (local dev / tests) ──────────────────────────────────
