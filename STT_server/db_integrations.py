@@ -478,7 +478,7 @@ def update_integration(
     if "last_test_message" in payload:
         set_clauses.append("last_test_message = %s")
         values.append(payload["last_test_message"])
-      if credentials_encrypted is not None:
+    if credentials_encrypted is not None:
         # ponytail: BYTEA column needs Binary wrapper for dicts
         if isinstance(credentials_encrypted, dict):
             from psycopg2 import Binary
@@ -488,10 +488,10 @@ def update_integration(
             credentials_encrypted = Binary(credentials_encrypted.encode("utf-8"))
         set_clauses.append("credentials_encrypted = %s")
         values.append(credentials_encrypted)
-      if not set_clauses:
-          return get_integration(integration_id, user_id)
-      set_clauses.append("updated_at = NOW()")
-      values.extend([integration_id, user_id])
+    if not set_clauses:
+        return get_integration(integration_id, user_id)
+    set_clauses.append("updated_at = NOW()")
+    values.extend([integration_id, user_id])
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
