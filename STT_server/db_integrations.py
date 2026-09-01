@@ -378,6 +378,14 @@ def create_integration(
         rows.append(new_row)
         _write_integrations_file(rows)
         return new_row
+    # ponytail: BYTEA column needs Binary wrapper for dicts
+    _creds_for_db = credentials_encrypted
+    if isinstance(_creds_for_db, dict):
+        from psycopg2 import Binary
+        _creds_for_db = Binary(json.dumps(_creds_for_db).encode("utf-8"))
+    elif isinstance(_creds_for_db, str):
+        from psycopg2 import Binary
+        _creds_for_db = Binary(_creds_for_db.encode("utf-8"))
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -394,7 +402,7 @@ def create_integration(
                     payload["provider"],
                     payload["name"],
                     json.dumps(configuration),
-                    credentials_encrypted,
+                    _creds_for_db,
                     cipher,
                     payload.get("connection_status") or "unknown",
                     payload.get("last_tested_at"),
@@ -470,13 +478,20 @@ def update_integration(
     if "last_test_message" in payload:
         set_clauses.append("last_test_message = %s")
         values.append(payload["last_test_message"])
-    if credentials_encrypted is not None:
+      if credentials_encrypted is not None:
+        # ponytail: BYTEA column needs Binary wrapper for dicts
+        if isinstance(credentials_encrypted, dict):
+            from psycopg2 import Binary
+            credentials_encrypted = Binary(json.dumps(credentials_encrypted).encode("utf-8"))
+        elif isinstance(credentials_encrypted, str):
+            from psycopg2 import Binary
+            credentials_encrypted = Binary(credentials_encrypted.encode("utf-8"))
         set_clauses.append("credentials_encrypted = %s")
         values.append(credentials_encrypted)
-    if not set_clauses:
-        return get_integration(integration_id, user_id)
-    set_clauses.append("updated_at = NOW()")
-    values.extend([integration_id, user_id])
+      if not set_clauses:
+          return get_integration(integration_id, user_id)
+      set_clauses.append("updated_at = NOW()")
+      values.extend([integration_id, user_id])
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1022,6 +1037,13 @@ def update_integration_credentials(
     between the SELECT and the UPDATE means no chance of another
     process racing in between.
     """
+    # ponytail: BYTEA column needs Binary wrapper for dicts
+    if isinstance(credentials_encrypted, dict):
+        from psycopg2 import Binary
+        credentials_encrypted = Binary(json.dumps(credentials_encrypted).encode("utf-8"))
+    elif isinstance(credentials_encrypted, str):
+        from psycopg2 import Binary
+        credentials_encrypted = Binary(credentials_encrypted.encode("utf-8"))
     if cur is not None:
         cur.execute(
             "UPDATE integrations SET credentials_encrypted = %s, "
