@@ -105,28 +105,24 @@ def _test_salesforce(configuration: dict, credentials: dict) -> tuple[bool, str]
     instance_url = (configuration.get("instance_url") or "").strip().rstrip("/")
     access_token = (credentials.get("access_token") or "").strip()
     if not instance_url or not access_token:
-        return False, "missing instance_url or access_token (reconnect Salesforce)"
-    # Salesforce's userinfo endpoint is the cheapest auth check — it validates the
-    # Bearer token and returns the user/org, no data mutation. Fallback to the
-    # limits endpoint if userinfo 404s on an old API version.
+        return False, "Falta reconectar Salesforce para poder probar la conexión"
     for path in ("/services/oauth2/userinfo", "/services/data/v59.0/limits"):
         url = f"{instance_url}{path}"
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 ok = 200 <= resp.status < 300
-                return ok, f"HTTP {resp.status} · {path}"
+                # Mensaje natural para usuario final — sin tecnicismos HTTP
+                return (True, "Conectado correctamente a Salesforce") if ok else (False, "No se pudo conectar a Salesforce")
         except urllib.error.HTTPError as exc:
-            # 401/403 → token invalid/expired, don't try fallback — surface immediately
             if exc.code in (401, 403):
-                return False, f"HTTP {exc.code} — token invalid or expired (reconnect Salesforce)"
-            # 404 on userinfo (very old org) → try limits
+                return False, "Sesión expirada con Salesforce — reconecta la integración"
             if exc.code == 404 and path == "/services/oauth2/userinfo":
                 continue
-            return False, f"HTTP {exc.code}"
+            return False, "No se pudo conectar a Salesforce — inténtalo de nuevo"
         except Exception as exc:
             return False, _sanitize_error(str(exc))
-    return False, "Salesforce test failed"
+    return False, "No se pudo verificar la conexión con Salesforce"
 
 
 # ponytail: every official provider gets an explicit stub so adding a
