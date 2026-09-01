@@ -54,14 +54,46 @@ def get_settings(user_id: str) -> dict | None:
             return None
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT user_id, name, company, timezone, notifications, "
-                "test_data_model, updated_at "
-                "FROM settings WHERE user_id = %s",
-                (user_id,),
-            )
-            row = cur.fetchone()
-            return _row_to_settings(row) if row else None
+            try:
+                cur.execute(
+                    "SELECT user_id, name, company, timezone, notifications, "
+                    "test_data_model, updated_at "
+                    "FROM settings WHERE user_id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                return _row_to_settings(row) if row else None
+            except Exception as exc:
+                # ponytail: self-heal for missing column (migration not yet applied or failed).
+                # The transaction is aborted after the failed SELECT, so we must rollback
+                # before issuing the ALTER. This mirrors the pattern in db_integrations.py.
+                if "test_data_model" in str(exc) and "does not exist" in str(exc):
+                    conn.rollback()
+                    try:
+                        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS test_data_model TEXT DEFAULT 'gpt-4o-mini'")
+                        conn.commit()
+                        cur.execute(
+                            "SELECT user_id, name, company, timezone, notifications, "
+                            "test_data_model, updated_at "
+                            "FROM settings WHERE user_id = %s",
+                            (user_id,),
+                        )
+                        row = cur.fetchone()
+                        return _row_to_settings(row) if row else None
+                    except Exception:
+                        conn.rollback()
+                        cur.execute(
+                            "SELECT user_id, name, company, timezone, notifications, updated_at "
+                            "FROM settings WHERE user_id = %s",
+                            (user_id,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            row = dict(row)
+                            row["test_data_model"] = "gpt-4o-mini"
+                            return _row_to_settings(row)
+                        return None
+                raise
 
 
 def upsert_settings(user_id: str, payload: dict) -> dict:
@@ -99,17 +131,42 @@ def upsert_settings(user_id: str, payload: dict) -> dict:
     notif_json = json.dumps(notifications)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO settings (user_id, name, company, timezone, "
-                "notifications, test_data_model, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s::jsonb, %s, NOW()) "
-                "ON CONFLICT (user_id) DO UPDATE SET "
-                "name = COALESCE(EXCLUDED.name, settings.name), "
-                "company = COALESCE(EXCLUDED.company, settings.company), "
-                "timezone = EXCLUDED.timezone, "
-                "notifications = EXCLUDED.notifications, "
-                "test_data_model = EXCLUDED.test_data_model, "
-                "updated_at = NOW()",
-                (user_id, name, company, timezone, notif_json, test_data_model),
-            )
+            try:
+                cur.execute(
+                    "INSERT INTO settings (user_id, name, company, timezone, "
+                    "notifications, test_data_model, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb, %s, NOW()) "
+                    "ON CONFLICT (user_id) DO UPDATE SET "
+                    "name = COALESCE(EXCLUDED.name, settings.name), "
+                    "company = COALESCE(EXCLUDED.company, settings.company), "
+                    "timezone = EXCLUDED.timezone, "
+                    "notifications = EXCLUDED.notifications, "
+                    "test_data_model = EXCLUDED.test_data_model, "
+                    "updated_at = NOW()",
+                    (user_id, name, company, timezone, notif_json, test_data_model),
+                )
+            except Exception as exc:
+                if "test_data_model" in str(exc) and "does not exist" in str(exc):
+                    conn.rollback()
+                    # Self-heal and retry without the column
+                    try:
+                        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS test_data_model TEXT DEFAULT 'gpt-4o-mini'")
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                    # Retry without test_data_model (will use default)
+                    cur.execute(
+                        "INSERT INTO settings (user_id, name, company, timezone, "
+                        "notifications, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb, NOW()) "
+                        "ON CONFLICT (user_id) DO UPDATE SET "
+                        "name = COALESCE(EXCLUDED.name, settings.name), "
+                        "company = COALESCE(EXCLUDED.company, settings.company), "
+                        "timezone = EXCLUDED.timezone, "
+                        "notifications = EXCLUDED.notifications, "
+                        "updated_at = NOW()",
+                        (user_id, name, company, timezone, notif_json),
+                    )
+                else:
+                    raise
     return get_settings(user_id)
