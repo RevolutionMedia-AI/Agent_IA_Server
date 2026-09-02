@@ -3126,9 +3126,23 @@ def internal_get_integration_credentials(
         "[internal.creds] ok integration_id=%s provider=%s ip=%s",
         integration_id, row.get("provider"), request.client.host if request.client else "?",
     )
+    # ponytail: n8n should never see refresh_token. The BE keeps the
+    # full token set (access + refresh + scope) encrypted at rest and
+    # uses refresh_token internally when the access token expires.
+    # The n8n workflow only needs the bearer for Salesforce API calls.
+    # Filter here, at the edge, so even if the internal shape changes,
+    # the wire shape stays minimal. Easy to extend for future providers
+    # (add an `elif provider == "dynamics":` branch).
+    def _credentials_for_n8n(provider: str, credentials: dict) -> dict:
+        if provider == "salesforce":
+            return {"access_token": credentials.get("access_token")}
+        # Unknown provider: return nothing (fail closed). The n8n
+        # workflow will error on missing access_token and the operator
+        # will see it in the execution log.
+        return {}
     return {
         "integration_id": row["id"],
         "provider": provider,
         "configuration": row.get("configuration") or {},
-        "credentials": creds_plain,
+        "credentials": _credentials_for_n8n(provider, creds_plain),
     }
