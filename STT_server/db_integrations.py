@@ -660,10 +660,10 @@ def add_integration_assignment(integration_id: str, user_id: str, agent_id: str)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE integrations SET assignments = assignments || %s::jsonb, updated_at = NOW() "
-                "WHERE id = %s AND user_id = %s AND NOT (assignments ?| array[%s]) "
+                "UPDATE integrations SET assignments = COALESCE(assignments, '[]'::jsonb) || %s::jsonb, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s AND NOT (COALESCE(assignments, '[]'::jsonb) ?| array[%s]) "
                 f"RETURNING {_integrations_cols()}",
-                (json.dumps([agent_id]), integration_id, user_id, [agent_id]),
+                (json.dumps([agent_id]), integration_id, user_id, agent_id),
             )
             row = cur.fetchone()
             if row:
@@ -692,10 +692,10 @@ def remove_integration_assignment(integration_id: str, user_id: str, agent_id: s
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE integrations SET assignments = assignments - %s, updated_at = NOW() "
-                "WHERE id = %s AND user_id = %s AND assignments ?| array[%s] "
+                "UPDATE integrations SET assignments = COALESCE(assignments, '[]'::jsonb) - %s, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s AND COALESCE(assignments, '[]'::jsonb) ?| array[%s] "
                 f"RETURNING {_integrations_cols()}",
-                (agent_id, integration_id, user_id, [agent_id]),
+                (agent_id, integration_id, user_id, agent_id),
             )
             row = cur.fetchone()
             if row:
