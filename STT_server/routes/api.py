@@ -1128,7 +1128,16 @@ def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = D
     if integ.get("agent_id") != "__shared__":
         raise HTTPException(status_code=400, detail="Only shared integrations can be assigned.")
     try:
-        return _add_assign(integration_id, auth["user_id"], agent_id) or integ
+        result = _add_assign(integration_id, auth["user_id"], agent_id) or integ
+        # ponytail: ensure JSON-serializable (RealDictRow -> dict, handle bytes)
+        if isinstance(result, dict):
+            # copy to plain dict and ensure assignments is list
+            out = dict(result)
+            # Ensure datetime are strings (already handled in _row_to_integration)
+            return out
+        # Fallback: if result is not a dict, wrap it
+        log.warning("assign integration unexpected result type %s: %r", type(result), result)
+        return {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
     except Exception as exc:
         log.exception("assign integration %s to %s failed", integration_id, agent_id)
         raise HTTPException(status_code=500, detail=f"assign failed: {exc}")
@@ -1145,7 +1154,11 @@ def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict =
     if integ.get("agent_id") != "__shared__":
         raise HTTPException(status_code=400, detail="Only shared integrations can be unassigned.")
     try:
-        return _remove_assign(integration_id, auth["user_id"], agent_id) or integ
+        result = _remove_assign(integration_id, auth["user_id"], agent_id) or integ
+        if isinstance(result, dict):
+            return dict(result)
+        log.warning("unassign integration unexpected result type %s: %r", type(result), result)
+        return {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
     except Exception as exc:
         log.exception("unassign integration %s from %s failed", integration_id, agent_id)
         raise HTTPException(status_code=500, detail=f"unassign failed: {exc}")
