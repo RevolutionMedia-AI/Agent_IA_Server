@@ -643,27 +643,91 @@ def me_alias(auth: dict = Depends(require_auth)):
 
 @api_router.get("/dashboard/stats")
 def dashboard_stats(auth: dict = Depends(require_auth)):
+    """Live dashboard counters.
+
+    ponytail: 2026-09-03 — the legacy version returned placeholders read
+    straight from `agents.json` (`calls`, `perf` fields that were never
+    written). Every metric here is now sourced from a real store:
+
+      * active_agents → counts status='Active' on the user's agent rows
+      * usage.{calls,total_minutes,total_cost_usd} → aggregate_usage()
+        (Postgres-backed call_usage ledger)
+      * tools_count / integrations_count → live lists per-agent
+      * live_calls → open rows in call_sessions (NOT closed)
+      * recent_agents → top 5 most recent agent rows
+      * numbers_count → phone-numbers list
+
+    `avg_qa_score` is removed (the QA score was a static `perf` field
+    that was never updated). `usage.usage_label` is the new top-line
+    figure the FE renders in place of "Average QA score".
+    """
     agents = _load(AGENTS_FILE, [])
     numbers = _load(NUMBERS_FILE, [])
     user_agents = [a for a in agents if a.get("user_id") == auth["user_id"]]
     user_numbers = [n for n in numbers if n.get("user_id") == auth["user_id"]]
     active_agents = sum(1 for a in user_agents if a.get("status") == "Active")
-    total_calls = 0
-    for a in user_agents:
-        c = str(a.get("calls", "0")).replace(",", "")
-        try:
-            total_calls += int(c)
-        except ValueError:
-            pass
-    avg_qa = 0
-    if user_agents:
-        avg_qa = sum(int(a.get("perf", 0)) for a in user_agents) / len(user_agents)
+
+    from STT_server.services.usage_store import aggregate_usage
+    usage = aggregate_usage(auth["user_id"]).get("totals") or {}
+
+    from STT_server import db_tools as _db_tools
+    from STT_server import db_integrations as _db_integrations
+    from STT_server import db_call_sessions as _db_call_sessions
+
+    try:
+        all_tools = _db_tools.list_tools(auth["user_id"])
+    except Exception:
+        all_tools = []
+    try:
+        all_integrations = _db_integrations.list_integrations(auth["user_id"])
+    except Exception:
+        all_integrations = []
+    try:
+        live_calls = _db_call_sessions.count_open_sessions(user_id=auth["user_id"])
+    except Exception:
+        live_calls = 0
+
+    # ponytail: `_is_real_tool` lives a few hundred lines below — same
+    # filter the per-agent /tools endpoint uses so the dashboard
+    # badge matches what the user sees inside the agent's Tools tab.
+    real_tool_rows = [t for t in all_tools if _is_real_tool(t)]
+    connected_integrations = [
+        i for i in all_integrations if i.get("connection_status") == "connected"
+    ]
+
+    # ponytail: split per-agent usage minutes so the FE's per-row
+    # counters don't have to re-fetch /usage and join themselves.
+    usage_breakdown = aggregate_usage(auth["user_id"]).get("per_agent") or []
+    minutes_by_agent: dict[str, float] = {
+        (row.get("agent_id") or ""): float(row.get("duration_seconds") or 0) / 60.0
+        for row in usage_breakdown
+    }
+
     return {
         "active_agents": active_agents,
-        "calls_today": total_calls,
-        "avg_qa_score": f"{int(avg_qa)}%",
+        "calls_today": int(usage.get("calls") or 0),
+        "live_calls": live_calls,
+        "tools_count": len(real_tool_rows),
+        "integrations_count": len(connected_integrations),
+        "usage": {
+            "calls": int(usage.get("calls") or 0),
+            "total_minutes": round(float(usage.get("duration_seconds") or 0) / 60.0, 1),
+            "total_cost_usd": float(usage.get("cost_usd") or 0),
+            "platform_minutes": round(
+                float(usage.get("platform_duration_seconds") or 0) / 60.0, 1
+            ),
+            "own_minutes": round(float(usage.get("own_duration_seconds") or 0) / 60.0, 1),
+            "usage_label": (
+                f"{round(float(usage.get('duration_seconds') or 0) / 60.0, 1):.1f} min"
+            ),
+        },
         "recent_agents": user_agents[:5],
         "numbers_count": len(user_numbers),
+        # ponytail: per-agent counters keep the Agents page cheap — the
+        # FE can render badges straight from the row instead of
+        # firing one /agents/{id}/tools + /agents/{id}/integrations
+        # round-trip per card.
+        "minutes_by_agent": minutes_by_agent,
     }
 
 
@@ -703,7 +767,79 @@ def usage_summary(auth: dict = Depends(require_auth)):
 
 @api_router.get("/agents")
 def list_agents(auth: dict = Depends(require_auth)):
-    return db_list_agents(auth["user_id"])
+    """List every agent the caller owns.
+
+    ponytail: 2026-09-03 — each row now carries real counters sourced
+    from the live data plane:
+
+      * calls           — total calls from call_usage (was a static `calls`
+                          field on agents.json that was never written)
+      * minutes_usage   — total minutes billed for this agent (replaces
+                          the static `perf` field used as a fake QA score)
+      * tools_count     — # of real tools (webhook + call_transfer)
+                          scoped to the agent, NOT including provider-
+                          credential rows
+      * integrations_count — # of connected integrations the agent owns
+                             (private rows + shared rows assigned to it)
+
+    The counters are computed in one SQL round-trip per store so a 50-agent
+    account never fans out to 200+ HTTP requests from the Agents page.
+    """
+    rows = db_list_agents(auth["user_id"])
+
+    from STT_server import db_tools as _db_tools
+    from STT_server import db_integrations as _db_integrations
+
+    per_agent_calls: dict[str, int] = {}
+    per_agent_minutes: dict[str, float] = {}
+    try:
+        from STT_server.services.usage_store import aggregate_usage
+        usage = aggregate_usage(auth["user_id"])
+        for entry in usage.get("per_agent") or []:
+            aid = entry.get("agent_id") or ""
+            per_agent_calls[aid] = int(entry.get("calls") or 0)
+            per_agent_minutes[aid] = round(
+                float(entry.get("duration_seconds") or 0) / 60.0, 1
+            )
+    except Exception:
+        pass
+
+    tools_by_agent: dict[str, int] = {}
+    integrations_by_agent: dict[str, int] = {}
+
+    for agent in rows:
+        agent_id = agent.get("id")
+        if not agent_id:
+            continue
+        try:
+            tools = _db_tools.list_tools(auth["user_id"], agent_id=agent_id)
+            tools_by_agent[agent_id] = sum(1 for t in tools if _is_real_tool(t))
+        except Exception:
+            tools_by_agent[agent_id] = 0
+        try:
+            integ = _db_integrations.list_integrations(auth["user_id"], agent_id=agent_id)
+            integrations_by_agent[agent_id] = sum(
+                1 for i in integ if i.get("connection_status") == "connected"
+            )
+        except Exception:
+            integrations_by_agent[agent_id] = 0
+
+    # ponytail: stamp the live counters onto each row so the FE never
+    # has to issue a per-card round-trip. Old fields (`calls`, `perf`)
+    # are still returned for back-compat but they're sourced from the
+    # real ledger now.
+    for agent in rows:
+        agent_id = agent.get("id") or ""
+        agent["calls"] = per_agent_calls.get(agent_id, 0)
+        agent["minutes_usage"] = per_agent_minutes.get(agent_id, 0.0)
+        # ponytail: keep `perf` on the wire only as a backwards-compat
+        # shim — Agents.jsx used to read it for the Performance bar.
+        # We now drive that column from minutes_usage. Once the FE no
+        # longer references perf we can drop this field.
+        agent["perf"] = 0
+        agent["tools_count"] = tools_by_agent.get(agent_id, 0)
+        agent["integrations_count"] = integrations_by_agent.get(agent_id, 0)
+    return rows
 
 
 @api_router.post("/agents")

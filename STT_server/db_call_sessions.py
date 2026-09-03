@@ -180,6 +180,38 @@ def list_open_sessions() -> list:
             return [_row_to_session(r) for r in cur.fetchall()]
 
 
+def count_open_sessions(*, user_id: Optional[str] = None) -> int:
+    """Live counter for the dashboard. READ-ONLY.
+
+    `list_open_sessions()` flips every open row to closed=True, which is
+    correct at server startup (recover dropped calls) but destructive on
+    a polling dashboard. Use this helper instead — it never mutates.
+    Optional `user_id` narrows the count to a single owner's calls so
+    multi-tenant dashboards don't leak peer counts.
+    """
+    if not is_postgres():
+        return sum(
+            1
+            for s in _read_json()
+            if not s.get("closed")
+            and (user_id is None or s.get("user_id") == user_id)
+        )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if user_id is None:
+                cur.execute(
+                    "SELECT COUNT(*) FROM call_sessions WHERE closed = FALSE"
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) FROM call_sessions "
+                    "WHERE closed = FALSE AND user_id = %s",
+                    (user_id,),
+                )
+            row = cur.fetchone() or {}
+    return int(row.get("count") or 0)
+
+
 def close_session(session_key: str, ended_at: Optional[float] = None) -> bool:
     """Mark a session closed. Returns False if the row was already closed
     or doesn't exist (idempotent — calling twice is fine)."""
