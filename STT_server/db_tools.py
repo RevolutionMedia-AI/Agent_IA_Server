@@ -243,7 +243,25 @@ def _row_to_tool(row: dict) -> dict:
     """
     if row is None:
         return None
-    out = dict(row)
+    if isinstance(row, dict):
+        out = dict(row)
+    elif isinstance(row, (list, tuple)) and len(row) == 1 and isinstance(row[0], dict):
+        out = dict(row[0])
+    elif isinstance(row, (list, tuple)):
+        try:
+            # Fallback for tuple cursor (should not happen with RealDictCursor)
+            from STT_server.db_tools import _tool_cols
+            cols = [c.strip() for c in _tool_cols().split(",")]
+            out = dict(zip(cols, row))
+        except Exception:
+            log.warning("[db_tools] unexpected row shape for _row_to_tool: %r", row)
+            return None
+    else:
+        try:
+            out = dict(row)
+        except Exception as exc:
+            log.warning("[db_tools] dict(row) failed for %r: %s", row, exc)
+            return None
     for k in ("parameters", "assignments", "credentials"):
         v = out.get(k)
         if isinstance(v, str):

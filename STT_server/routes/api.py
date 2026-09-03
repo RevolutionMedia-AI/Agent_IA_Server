@@ -1085,7 +1085,11 @@ def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require
             status_code=400,
             detail="Provider credentials are not assignable tools. Configure the provider in Settings → API instead.",
         )
-    return db_add_assignment(tool_id, auth["user_id"], agent_id) or tool
+    try:
+        return db_add_assignment(tool_id, auth["user_id"], agent_id) or tool
+    except Exception as exc:
+        log.exception("assign tool %s to %s failed", tool_id, agent_id)
+        raise HTTPException(status_code=500, detail=f"assign failed: {exc}")
 
 
 @api_router.delete("/agents/{agent_id}/tools/{tool_id}/assign")
@@ -1099,7 +1103,11 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
             status_code=400,
             detail="Only shared tools can be unassigned. Delete per-agent tools instead.",
         )
-    return db_remove_assignment(tool_id, auth["user_id"], agent_id) or tool
+    try:
+        return db_remove_assignment(tool_id, auth["user_id"], agent_id) or tool
+    except Exception as exc:
+        log.exception("unassign tool %s from %s failed", tool_id, agent_id)
+        raise HTTPException(status_code=500, detail=f"unassign failed: {exc}")
 
 
 # ponytail: integrations assignment - mirrors tools assignment but for integrations.
@@ -1119,7 +1127,11 @@ def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = D
         raise HTTPException(status_code=404, detail="Integration not found")
     if integ.get("agent_id") != "__shared__":
         raise HTTPException(status_code=400, detail="Only shared integrations can be assigned.")
-    return _add_assign(integration_id, auth["user_id"], agent_id) or integ
+    try:
+        return _add_assign(integration_id, auth["user_id"], agent_id) or integ
+    except Exception as exc:
+        log.exception("assign integration %s to %s failed", integration_id, agent_id)
+        raise HTTPException(status_code=500, detail=f"assign failed: {exc}")
 
 
 @api_router.delete("/agents/{agent_id}/integrations/{integration_id}/assign")
@@ -1132,7 +1144,11 @@ def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict =
         raise HTTPException(status_code=404, detail="Integration not found")
     if integ.get("agent_id") != "__shared__":
         raise HTTPException(status_code=400, detail="Only shared integrations can be unassigned.")
-    return _remove_assign(integration_id, auth["user_id"], agent_id) or integ
+    try:
+        return _remove_assign(integration_id, auth["user_id"], agent_id) or integ
+    except Exception as exc:
+        log.exception("unassign integration %s from %s failed", integration_id, agent_id)
+        raise HTTPException(status_code=500, detail=f"unassign failed: {exc}")
 
 
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/test")

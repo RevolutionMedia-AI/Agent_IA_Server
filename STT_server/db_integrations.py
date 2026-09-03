@@ -226,7 +226,24 @@ def _row_to_integration(row: dict | None) -> dict | None:
     """
     if row is None:
         return None
-    out = dict(row)
+    # ponytail: RealDictCursor returns dict, but handle tuple/string for safety (500 fix)
+    if isinstance(row, dict):
+        out = dict(row)
+    elif isinstance(row, (list, tuple)) and len(row) == 1 and isinstance(row[0], dict):
+        out = dict(row[0])
+    elif isinstance(row, (list, tuple)):
+        try:
+            cols = [c.strip() for c in _INTEGRATIONS_COLS_BASE.split(",")]
+            out = dict(zip(cols, row))
+        except Exception:
+            log.warning("[db_integrations] unexpected row shape for _row_to_integration: %r", row)
+            return None
+    else:
+        try:
+            out = dict(row)
+        except Exception as exc:
+            log.warning("[db_integrations] dict(row) failed for %r: %s", row, exc)
+            return None
     if isinstance(out.get("configuration"), str):
         try:
             out["configuration"] = json.loads(out["configuration"])
