@@ -206,6 +206,9 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         log.debug(f"[VAD] Frame: offset={offset}, rms={rms}, is_voice={is_voice}")
         session.pre_speech_frames.append(frame)
 
+        if is_voice and not session.assistant_speaking:
+            session.last_activity_at = time.monotonic()
+
         assistant_recently_started = (
             session.assistant_speaking
             and session.assistant_started_at is not None
@@ -274,7 +277,6 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                         generation=session.active_generation,
                     )
                     session._stage_timer.mark(Stages.STT_FIRST_RESULT)
-                    session.last_activity_at = time.monotonic()
                     session.speech_frames.extend(session.pre_speech_frames)
                     session.speech_frame_count = session.voice_streak
                     session.silence_frames = 0

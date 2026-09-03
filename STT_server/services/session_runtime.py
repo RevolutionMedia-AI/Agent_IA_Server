@@ -288,9 +288,9 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
       …repeat until attempts==max_attempts…
       deadline expires once more   wait disconnect_timeout; close WS
 
-    Any user or assistant activity that bumps ``last_activity_at`` resets
-    attempts to 0 and the deadline to ``idle_first_timeout_sec`` — the
-    caller came back, start the silence clock from scratch.
+    User voice activity that bumps ``last_activity_at`` resets attempts to
+    0. Assistant playback pauses the silence clock; the next interval starts
+    only after playback finishes.
     """
     # ponytail: per-agent flow only runs when the agent row opted in AND
     # every required field is positive. Negative / None values mean the
@@ -348,6 +348,8 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
     attempts_played = 0
     deadline = first_timeout
     last_seen_activity = session.last_activity_at
+    silence_started_at = last_seen_activity
+    assistant_was_speaking = session.assistant_speaking
 
     # ponytail: lazily imported here so the module doesn't take the
     # circular-import cost when this monitor is never reached (e.g. the
@@ -360,6 +362,7 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
             #    blocks user input here, so we don't fire an extra
             #    prompt on top of the TTS we just queued).
             if session.assistant_speaking:
+                assistant_was_speaking = True
                 await asyncio.sleep(IDLE_MONITOR_POLL_SEC)
                 continue
 
@@ -369,9 +372,15 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                 last_seen_activity = session.last_activity_at
                 attempts_played = 0
                 deadline = first_timeout
+                silence_started_at = last_seen_activity
+
+            # Twilio, not the TTS request, decides when playback ended.
+            if assistant_was_speaking:
+                assistant_was_speaking = False
+                silence_started_at = time.monotonic()
 
             # 3) Has the current deadline elapsed?
-            remaining = deadline - (time.monotonic() - last_seen_activity)
+            remaining = deadline - (time.monotonic() - silence_started_at)
             if remaining > 0:
                 await asyncio.sleep(min(remaining, IDLE_MONITOR_POLL_SEC))
                 continue
@@ -418,6 +427,7 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
             session.assistant_started_at = time.perf_counter()
             session.last_activity_at = time.monotonic()
             last_seen_activity = session.last_activity_at
+            assistant_was_speaking = True
             try:
                 await run_tts_with_retries(
                     session, text, session.active_generation,
@@ -427,15 +437,12 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                     "Idle prompt TTS failed in %s — falling back to close",
                     session.session_key,
                 )
-            finally:
                 session.assistant_speaking = False
                 session.assistant_started_at = None
 
-            # After TTS, reset the silence clock so the user has the
-            # full next interval to respond. If they spoke while we were
-            # playing (impossible — VAD blocks them — but defensive),
-            # last_activity_at would have moved and the next tick resets.
-            last_seen_activity = session.last_activity_at
+            # run_tts_with_retries only queues audio. The Twilio mark ack
+            # clears assistant_speaking; the transition above then starts
+            # the full next interval.
             deadline = sub_timeout
             await asyncio.sleep(IDLE_MONITOR_POLL_SEC)
     except asyncio.CancelledError:
@@ -541,6 +548,9 @@ async def _demo() -> None:
     async def fake_tts(_sess, text, _gen):
         spoken.append(text)
         await asyncio.sleep(0.001)  # simulate a fast TTS round-trip
+        # Simulate Twilio acknowledging the playback mark.
+        _sess.assistant_speaking = False
+        _sess.assistant_started_at = None
     import STT_server.services.turn_manager as _tm
     _orig_tts = _tm.run_tts_with_retries
     _tm.run_tts_with_retries = fake_tts
