@@ -2084,6 +2084,7 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "min_length": f.min_length,
             "max_length": f.max_length,
             "help": f.help,
+            "options": list(getattr(f, "options", ()) or ()),
         }
     def action_to_wire(a: ActionSpec) -> dict:
         return {

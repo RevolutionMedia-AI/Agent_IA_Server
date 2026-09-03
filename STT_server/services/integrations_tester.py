@@ -64,11 +64,12 @@ def _test_zendesk(configuration: dict, credentials: dict) -> tuple[bool, str]:
 
 
 def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[bool, str]:
-    """HEAD/GET/POST the generic_webhook URL. Times out at 10s.
+    """Test the generic_webhook URL. Times out at 10s.
 
-    ponytail: n8n/Make webhooks are POST-only and return 404 on HEAD/GET.
-    Try HEAD -> GET -> POST; any HTTP response (including 404/405) proves
-    DNS/TLS works. Only network errors/timeouts are failures.
+    ponytail: n8n/Make webhooks are often POST-only and return 404 on HEAD/GET.
+    Respects configuration.webhook_method (GET/POST/PUT/PATCH/DELETE); defaults
+    to POST. Any HTTP response (including 404/405) proves DNS/TLS works.
+    Only network errors/timeouts are failures.
     """
     url = (configuration.get("webhook_url") or "").strip()
     if not url:
@@ -76,11 +77,19 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return False, f"scheme '{parsed.scheme}' not allowed"
-    # Try HEAD, then GET, then POST - POST-only webhooks (n8n) need the last.
-    for method in ("HEAD", "GET", "POST"):
+    # Respect configured method; fallback to POST for legacy rows.
+    configured = (configuration.get("webhook_method") or "POST").strip().upper()
+    if configured not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+        configured = "POST"
+    # Probe order: configured method first, then fallbacks for POST-only webhooks.
+    probe_order = [configured]
+    for m in ("HEAD", "GET", "POST"):
+        if m not in probe_order:
+            probe_order.append(m)
+    for method in probe_order:
         try:
             kwargs = {"method": method}
-            if method == "POST":
+            if method in ("POST", "PUT", "PATCH"):
                 kwargs["data"] = b"{}"
                 kwargs["headers"] = {"Content-Type": "application/json"}
             req = urllib.request.Request(url, **kwargs)
@@ -88,10 +97,9 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
                 ok = 200 <= resp.status < 400
                 return (True, f"{method} {resp.status}") if ok else (True, f"{method} {resp.status} — webhook reachable")
         except urllib.error.HTTPError as exc:
-            # Any 4xx proves the host responded - for webhooks 404/405 is expected on HEAD/GET
+            # Any 4xx proves the host responded - for webhooks 404/405 is expected on wrong method
             if 400 <= exc.code < 500:
-                return True, f"HTTP {exc.code} — webhook reachable (POST expected)"
-            # 5xx is a real server error - try next method
+                return True, f"HTTP {exc.code} — webhook reachable ({configured} expected)"
             continue
         except Exception as exc:
             return False, _sanitize_error(str(exc))

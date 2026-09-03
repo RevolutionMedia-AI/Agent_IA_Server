@@ -46,13 +46,14 @@ class IntegrationFieldSpec:
     """
     name: str
     label: str
-    type: str = "text"            # "text" | "password" | "url" | "email"
+    type: str = "text"            # "text" | "password" | "url" | "email" | "select"
     placeholder: str = ""
     required: bool = False
     pattern: str | None = None    # regex (re.search)
     min_length: int = 0
     max_length: int = 0
     help: str = ""
+    options: tuple[str, ...] = ()  # for type="select" - allowed values
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,12 @@ def validate_integration_fields(
             errors.append({
                 "field": f"credential.{f.name}" if is_secret else f"config.{f.name}",
                 "message": f"{f.label} doesn't match the expected format. {f.help}".strip(),
+            })
+            continue
+        if f.options and value not in f.options:
+            errors.append({
+                "field": f"credential.{f.name}" if is_secret else f"config.{f.name}",
+                "message": f"{f.label} must be one of: {', '.join(f.options)}",
             })
             continue
         if is_secret:
@@ -364,14 +371,21 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         id="generic_webhook",
         name="Generic Webhook",
         category="custom",
-        description="POST JSON to any HTTPS endpoint. The operator defines a free-form action per tool.",
+        description="Send JSON to any HTTPS endpoint. Choose the HTTP method your webhook expects.",
         fields=(
             IntegrationFieldSpec(
                 name="webhook_url", label="Webhook URL", type="url",
                 required=True,
                 pattern=r"^https?://\S+$",
                 placeholder="https://example.com/webhook",
-                help="The endpoint we will POST to when this tool is invoked.",
+                help="The endpoint we will call when this tool is invoked.",
+            ),
+            IntegrationFieldSpec(
+                name="webhook_method", label="HTTP Method", type="select",
+                required=False,
+                placeholder="POST",
+                help="Method used to call the webhook. Most n8n webhooks use POST; use GET for fetch-only endpoints. Supported: GET, POST, PUT, PATCH, DELETE.",
+                options=("GET", "POST", "PUT", "PATCH", "DELETE"),
             ),
         ),
         actions=(),  # empty: the operator picks the action free-form per tool

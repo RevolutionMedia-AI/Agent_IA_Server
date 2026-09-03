@@ -52,6 +52,16 @@ def _resolve_integration_webhook(integration: dict) -> str:
     return ""
 
 
+def _resolve_integration_method(integration: dict | None) -> str:
+    """Resolve HTTP method for generic_webhook. Defaults to POST for legacy rows."""
+    if not integration or integration.get("provider") != "generic_webhook":
+        return "POST"
+    method = ((integration.get("configuration") or {}).get("webhook_method") or "POST").strip().upper()
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+        return "POST"
+    return method
+
+
 def _redact_url(url: str) -> str:
     """Ponytail: SEC — never leak a generic_webhook URL into a client
     error. Keeps the host (and port, if any), redacts path/query so
@@ -254,6 +264,7 @@ class ToolExecutor:
         webhook_url: str,
         arguments: dict,
         tool_name: str,
+        method: str = "POST",
     ) -> dict:
         """Execute a tool by calling its n8n webhook.
 
@@ -261,6 +272,7 @@ class ToolExecutor:
             webhook_url: The n8n webhook URL to call.
             arguments: The arguments collected by the LLM to send to the tool.
             tool_name: Name of the tool being executed (for logging).
+            method: HTTP method (GET, POST, PUT, PATCH, DELETE). Defaults to POST.
 
         Returns:
             The JSON response from n8n as a dict.
@@ -293,9 +305,13 @@ class ToolExecutor:
             )
             raise
 
+        method = (method or "POST").strip().upper()
+        if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+            method = "POST"
+
         log.info(
-            "[ToolExecutor] Executing tool '%s' host=%s args_keys=%s",
-            tool_name,
+            "[ToolExecutor] Executing tool '%s' method=%s host=%s args_keys=%s",
+            tool_name, method,
             urlparse(webhook_url).hostname or "<unknown>",
             list(sanitized_args.keys()) if isinstance(sanitized_args, dict) else type(sanitized_args).__name__,
         )
@@ -309,11 +325,18 @@ class ToolExecutor:
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=False,
             ) as client:
-                response = await client.post(
-                    webhook_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
+                if method == "GET":
+                    response = await client.request(
+                        method, webhook_url, params=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                elif method == "HEAD":
+                    response = await client.request(method, webhook_url, headers={"Content-Type": "application/json"})
+                else:
+                    response = await client.request(
+                        method, webhook_url, json=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
 
                 if response.status_code >= 400:
                     raise ToolExecutionError(
@@ -359,10 +382,11 @@ async def execute_tool(
     webhook_url: str,
     arguments: dict,
     tool_name: str,
+    method: str = "POST",
 ) -> dict:
     """Convenience function to execute a tool using the singleton executor."""
     executor = get_tool_executor()
-    return await executor.execute(webhook_url, arguments, tool_name)
+    return await executor.execute(webhook_url, arguments, tool_name, method=method)
 
 
 # ponytail: 016 — single entry point used by turn_manager after
@@ -425,10 +449,11 @@ async def execute_tool_call(
         # binding. Still useful — the n8n Switch can dispatch on it.
         body["action"] = tool["action"]
     executor = get_tool_executor()
+    method = _resolve_integration_method(integration)
     # We pass the resolved URL directly to .execute(), which strips
     # a second time (defense in depth) and posts the body.
     try:
-        return await executor.execute(url, body, body["tool_name"])
+        return await executor.execute(url, body, body["tool_name"], method=method)
     except ToolExecutionError as exc:
         # Redact the URL in the message so the FE / logs don't leak
         # a tokenized generic_webhook path. The class allows us to
