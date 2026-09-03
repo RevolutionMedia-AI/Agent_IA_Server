@@ -208,34 +208,40 @@ def _build_session_update_payload(session: CallSession) -> str:
         # unknown_parameter in the WS error event with a clear
         # `param` field — the dispatcher log below captures it.
         "type": "realtime",
+        # ponytail: this session is a STT-only pipe. The LLM lives
+        # in `process_transcripts` / `_stream_llm_with_tools` so we
+        # MUST NOT let Realtime emit text or tool calls — otherwise
+        # the agent speaks twice and tool args leak to TTS. We also
+        # disable tools entirely: every tool path now runs through
+        # the central pipeline against the user's LLM credentials,
+        # which is the single source of truth for the agent's
+        # system prompt + Salesforce integration.
         "output_modalities": ["text"],
         "instructions": _build_instructions(session),
         "audio": {
             "input": {
-                # ponytail: OpenAI Realtime GA expects MIME
-                # types for audio format. Supported values:
-                # 'audio/pcm' (16-bit linear), 'audio/pcmu'
-                # (mu-law), 'audio/pcma' (A-law). Twilio Media
-                # Streams sends mu-law so we want 'audio/pcmu'.
-                #
-                # sample_rate is NOT accepted at format.* in
-                # GA — it would be unknown_parameter. The
-                # server infers the rate from the type (audio/pcmu
-                # → 8000 Hz). Don't try to send it explicitly.
                 "format": {"type": "audio/pcmu"},
                 "transcription": {"model": "whisper-1"},
                 "turn_detection": {
+                    # ponytail: 1500 ms holds the channel open while
+                    # the user pauses to think. The previous 500 ms
+                    # closed the turn after every short breath and
+                    # made the agent speak over the user. 0.5 was
+                    # tuned for keyboard dictation; phones need more
+                    # headroom.
                     "type": "server_vad",
                     "threshold": 0.5,
                     "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
+                    "silence_duration_ms": 1500,
                 },
             },
         },
     }
-    if tools is not None:
-        session_dict["tools"] = tools
-        session_dict["tool_choice"] = "auto"
+    # ponytail: tools intentionally omitted. The Realtime API would
+    # emit function_call events for these, which the central pipeline
+    # already handles when the same transcripts hit
+    # `process_transcripts`. Re-emitting them here produces duplicate
+    # tool invocations and inconsistent responses.
     return json.dumps({"type": "session.update", "session": session_dict})
 
 
@@ -685,19 +691,12 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 response_started_at = time.perf_counter()
                 current_response_text = ""
                 pending = ""
-                # ponytail: P4 — every new response starts with an empty
-                # tool-call slate. The previous response's calls were
-                # either executed (and removed) or stayed pending
-                # because the WS closed mid-flight. Resetting here
-                # guarantees we never confuse two consecutive
-                # responses' tool calls.
                 pending_tool_calls = {}
                 text_queue: asyncio.Queue[str | None] = asyncio.Queue(
                     maxsize=TEXT_SEGMENT_QUEUE_MAXSIZE,
                 )
                 session.realtime_text_queue = text_queue
                 session.active_generation += 1
-                # Mark that a server-side response is now active (used to gate cancels)
                 session.response_active = True
                 generation = session.active_generation
                 playback_task = asyncio.create_task(
@@ -705,6 +704,19 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 )
                 session.tasks.add(playback_task)
                 playback_task.add_done_callback(session.tasks.discard)
+                # ponytail: this response just started; if OpenAI chose
+                # to emit only tool calls, no text delta will follow
+                # for this generation. Guard the streaming branches
+                # below on `expect_text=False` until we either see an
+                # output_text.delta (then it's True) or response.done
+                # confirms it's a tool-only response.
+                expect_text = False
+                # ponytail: 2026-09-03 — advance the mute-buffer cursor
+                # so audio the agent produced DURING this turn never
+                # re-enters the STT pipeline. The buffer keeps adding
+                # chunks while `assistant_speaking` is True; we drop
+                # the tail on the next non-speaking chunk.
+                session.stt_mute_buffer_cursor = len(session.stt_mute_buffer)
                 continue
 
             # ponytail: P4 — accumulate the function name + args as
@@ -744,6 +756,7 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 tq = session.realtime_text_queue
                 if not delta or tq is None:
                     continue
+                expect_text = True
                 current_response_text += delta
                 if REALTIME_TTS_STREAMING:
                     pending += delta
@@ -781,6 +794,7 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 tq = session.realtime_text_queue
                 if not delta or tq is None:
                     continue
+                expect_text = True
                 current_response_text += delta
                 if REALTIME_TTS_STREAMING:
                     pending += delta
@@ -801,15 +815,22 @@ async def _event_receiver(ws, session: CallSession) -> None:
                 continue
 
             if etype == "response.done":
-                # ponytail: P4 — tool-call branch. If this response was
-                # the model's tool call (no text, just function calls),
-                # execute them now, ship the results back as
-                # `conversation.item` entries, then trigger a fresh
-                # `response.create` so the model can compose the final
-                # reply using the tool output. We deliberately skip
-                # the TTS-playback + history-append + "Turno" log
-                # because there's nothing to speak yet — the real
-                # reply comes from the next response.cycle.
+                # ponytail: discard any tool-only response's stray text
+                # fragments before they reach TTS. A response whose
+                # entire content is function calls should produce zero
+                # audio. The previous code shipped whatever text had
+                # been buffered (often the function arguments JSON) to
+                # the caller. We toggle `expect_text` on the first
+                # text delta and treat a `response.done` without any
+                # delta as a tool-only turn.
+                if not expect_text and current_response_text.strip():
+                    log.info(
+                        "[OPENAI_REALTIME] dropping tool-only payload from TTS session=%s len=%d",
+                        session.session_key, len(current_response_text.strip()),
+                    )
+                    current_response_text = ""
+                    pending = ""
+                expect_text = False
                 if pending_tool_calls:
                     log.info(
                             "[OPENAI_REALTIME] response.done with %d tool calls session=%s",

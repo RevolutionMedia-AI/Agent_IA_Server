@@ -151,6 +151,15 @@ class CallSession:
     playback_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=PLAYBACK_QUEUE_MAXSIZE))
     stt_audio_queue: asyncio.Queue[bytes | None] = field(default_factory=lambda: asyncio.Queue(maxsize=STT_AUDIO_QUEUE_MAXSIZE))
     stt_mute_buffer: deque[bytes] = field(default_factory=lambda: deque(maxlen=STT_MUTE_BUFFER_CHUNKS))
+    # ponytail: 2026-09-03 — cursor into stt_mute_buffer marking the
+    # offset at which the most recent assistant turn started. Anything
+    # captured BEFORE the cursor was either genuine user audio or audio
+    # of the previous (now-finished) assistant turn; both are safe to
+    # re-inject as fresh STT input. Anything captured AFTER the cursor
+    # belongs to the live assistant turn and must NOT be replayed into
+    # STT (it would echo the agent's own voice back into the
+    # transcription pipeline).
+    stt_mute_buffer_cursor: int = 0
     transcript_queue: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=TRANSCRIPT_QUEUE_MAXSIZE))
     tasks: set[asyncio.Task] = field(default_factory=set)
     # ponytail: name → monotonic-ts when mark was sent, so the consumer in

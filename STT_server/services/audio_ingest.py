@@ -162,9 +162,18 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                         _m.incr("mute_buffer_reinjected_chunks", len(session.stt_mute_buffer))
                     except Exception:
                         pass
-                for buffered_chunk in session.stt_mute_buffer:
+                # ponytail: 2026-09-03 — only re-inject chunks that
+                # landed AFTER the last TTS playback started.
+                # Otherwise we feed the agent's own voice back into
+                # STT and produce phantom transcripts. The buffer keeps
+                # a cursor (`stt_mute_buffer_cursor`) that we advance
+                # at the start of every assistant turn.
+                cursor = getattr(session, "stt_mute_buffer_cursor", 0)
+                _buf = session.stt_mute_buffer
+                for buffered_chunk in list(_buf)[cursor:]:
                     await enqueue_with_drop(target_queue, buffered_chunk, queue_name)
                 session.stt_mute_buffer.clear()
+                session.stt_mute_buffer_cursor = 0
             await enqueue_with_drop(target_queue, raw, queue_name)
 
     # Conversión y chequeo de formato

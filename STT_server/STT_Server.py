@@ -1180,6 +1180,10 @@ async def media_stream(ws: WebSocket) -> None:
                     # realtime dispatch path is untouched.
                     pump_task = asyncio.create_task(_pump_realtime_transcripts_to_central_queue(session))
                     session.tasks.add(pump_task)
+                    # ponytail: do NOT launch process_transcripts here.
+                    # The pump already forwards realtime finals into the
+                    # central pipeline; adding a second consumer races on
+                    # transcript_queue and double-fires TTS turns.
                 elif session.stt_provider == 'inworld':
                     track_task(
                         session,
