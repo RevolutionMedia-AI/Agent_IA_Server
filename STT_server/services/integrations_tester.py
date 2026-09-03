@@ -64,11 +64,11 @@ def _test_zendesk(configuration: dict, credentials: dict) -> tuple[bool, str]:
 
 
 def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[bool, str]:
-    """HEAD/GET the generic_webhook URL. Times out at 10s.
+    """HEAD/GET/POST the generic_webhook URL. Times out at 10s.
 
-    ponytail: we use GET with a HEAD fallback because some webhook
-    providers (Slack, certain n8n setups) reject HEAD with 405. Any
-    2xx/3xx response counts as reachable; 4xx/5xx does not.
+    ponytail: n8n/Make webhooks are POST-only and return 404 on HEAD/GET.
+    Try HEAD -> GET -> POST; any HTTP response (including 404/405) proves
+    DNS/TLS works. Only network errors/timeouts are failures.
     """
     url = (configuration.get("webhook_url") or "").strip()
     if not url:
@@ -76,26 +76,26 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return False, f"scheme '{parsed.scheme}' not allowed"
-    # Try HEAD first; fall back to GET on 405 (some endpoints reject HEAD).
-    try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            ok = 200 <= resp.status < 400
-            return ok, f"HEAD {resp.status}"
-    except urllib.error.HTTPError as exc:
-        if exc.code == 405:
-            try:
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    ok = 200 <= resp.status < 400
-                    return ok, f"GET {resp.status}"
-            except urllib.error.HTTPError as exc2:
-                return False, f"HTTP {exc2.code}"
-            except Exception as exc2:
-                return False, _sanitize_error(str(exc2))
-        return False, f"HTTP {exc.code}"
-    except Exception as exc:
-        return False, _sanitize_error(str(exc))
+    # Try HEAD, then GET, then POST - POST-only webhooks (n8n) need the last.
+    for method in ("HEAD", "GET", "POST"):
+        try:
+            kwargs = {"method": method}
+            if method == "POST":
+                kwargs["data"] = b"{}"
+                kwargs["headers"] = {"Content-Type": "application/json"}
+            req = urllib.request.Request(url, **kwargs)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                ok = 200 <= resp.status < 400
+                return (True, f"{method} {resp.status}") if ok else (True, f"{method} {resp.status} — webhook reachable")
+        except urllib.error.HTTPError as exc:
+            # Any 4xx proves the host responded - for webhooks 404/405 is expected on HEAD/GET
+            if 400 <= exc.code < 500:
+                return True, f"HTTP {exc.code} — webhook reachable (POST expected)"
+            # 5xx is a real server error - try next method
+            continue
+        except Exception as exc:
+            return False, _sanitize_error(str(exc))
+    return False, "unreachable"
 
 
 # ponytail: Salesforce OAuth test. Hits the instance's REST API with the
