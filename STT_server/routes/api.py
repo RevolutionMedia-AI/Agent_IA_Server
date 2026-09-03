@@ -1129,11 +1129,20 @@ def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = D
         raise HTTPException(status_code=400, detail="Only shared integrations can be assigned.")
     try:
         result = _add_assign(integration_id, auth["user_id"], agent_id) or integ
+        log.info("assign integration raw result type=%s value=%r", type(result).__name__, str(result)[:500])
         # ponytail: ensure JSON-serializable (RealDictRow -> dict, handle bytes)
         if isinstance(result, dict):
             # copy to plain dict and ensure assignments is list
             out = dict(result)
+            # Strip non-serializable bytes
+            out.pop("credentials_encrypted", None)
+            out.pop("credentials_cipher", None)
+            out.pop("oauth_code_verifier_encrypted", None)
             # Ensure datetime are strings (already handled in _row_to_integration)
+            # Force assignments to be list
+            if not isinstance(out.get("assignments"), list):
+                out["assignments"] = []
+            log.info("assign integration returning dict keys=%s", list(out.keys()))
             return out
         # Fallback: if result is not a dict, wrap it
         log.warning("assign integration unexpected result type %s: %r", type(result), result)
@@ -1155,8 +1164,16 @@ def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict =
         raise HTTPException(status_code=400, detail="Only shared integrations can be unassigned.")
     try:
         result = _remove_assign(integration_id, auth["user_id"], agent_id) or integ
+        log.info("unassign integration raw result type=%s value=%r", type(result).__name__, str(result)[:500])
         if isinstance(result, dict):
-            return dict(result)
+            out = dict(result)
+            out.pop("credentials_encrypted", None)
+            out.pop("credentials_cipher", None)
+            out.pop("oauth_code_verifier_encrypted", None)
+            if not isinstance(out.get("assignments"), list):
+                out["assignments"] = []
+            log.info("unassign integration returning dict keys=%s", list(out.keys()))
+            return out
         log.warning("unassign integration unexpected result type %s: %r", type(result), result)
         return {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
     except Exception as exc:
