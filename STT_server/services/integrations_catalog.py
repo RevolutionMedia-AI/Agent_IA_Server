@@ -101,6 +101,9 @@ class IntegrationProviderSpec:
     # button label + default scopes here for the FE.
     oauth_label: str = ""          # "Connect Salesforce"
     oauth_default_scopes: tuple[str, ...] = ()
+    # ponytail: prompt_snippet auto-injected into agent's system prompt when this
+    # integration's tool is assigned. Empty = no injection.
+    prompt_snippet: str = ""
 
 
 # ── Validation helpers (mirror credentials_resolver but for integrations) ─
@@ -390,6 +393,42 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         ),
         actions=(),  # empty: the operator picks the action free-form per tool
         test_fn="STT_server.services.integrations_tester._test_webhook_reachable",
+    ),
+    # ponytail: native Google Calendar via n8n - zero-config for the operator.
+    # Webhook URL is server-managed (INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__GOOGLE_CALENDAR or hardcoded fallback),
+    # so the operator just clicks Add and the tool + prompt injection work automatically.
+    IntegrationProviderSpec(
+        id="google_calendar",
+        name="Google Calendar",
+        category="custom",
+        description="Agenda citas en Google Calendar y envía correos vía n8n. URL fija: https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica",
+        fields=(),
+        actions=(
+            _a(
+                "agendar_cita_dinamica",
+                "Agendar Cita Dinámica",
+                "Agenda una cita en Google Calendar y envía correo de confirmación.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Nombre completo del asistente"},
+                        "email": {"type": "string", "description": "Email del asistente"},
+                        "datetime": {"type": "string", "description": "Fecha y hora de la cita en ISO 8601, ej: 2026-09-04T15:00:00-06:00"},
+                        "duration_minutes": {"type": "integer", "description": "Duración en minutos, por defecto 30"},
+                        "host_email": {"type": "string", "description": "Email del calendario destino (opcional)"},
+                    },
+                    "required": ["name", "email", "datetime"],
+                },
+            ),
+        ),
+        test_fn="STT_server.services.integrations_tester._test_google_calendar",
+        prompt_snippet=(
+            "[Google Calendar] Cuando el usuario quiera agendar, reservar o programar una cita, "
+            "debes recopilar: name (nombre completo), email (correo), datetime (fecha y hora en formato ISO 8601, ej: 2026-09-04T15:00:00-06:00), "
+            "duration_minutes (opcional, por defecto 30), host_email (opcional, por defecto kevin.escalante@revolutionmedia.ai). "
+            "Convierte cualquier expresión como 'mañana a las 3pm' a ISO 8601. No inventes datetime: si falta, pregunta. "
+            "Luego llama a la herramienta agendar_cita_dinamica con esos campos."
+        ),
     ),
 )
 

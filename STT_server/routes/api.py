@@ -2109,6 +2109,7 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "oauth_default_scopes": list(getattr(s, "oauth_default_scopes", ())),
             "fields": [field_to_wire(f) for f in s.fields],
             "actions": [action_to_wire(a) for a in s.actions],
+            "prompt_snippet": getattr(s, "prompt_snippet", ""),
         }
     return {
         "providers": [spec_to_wire(s) for s in INTEGRATION_PROVIDERS],
@@ -2244,6 +2245,45 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
         row = db_update_integration(
             row["id"], auth["user_id"], {},
         ) or row
+
+    # ponytail: auto-create Google Calendar tool for zero-config provider - one click creates integration + tool
+    if body.provider == "google_calendar":
+        try:
+            from STT_server.db_tools import list_tools as db_list_tools, create_tool as db_create_tool
+            from STT_server.domain.tool import AgentTool
+            # Check if tool already exists for this integration to keep idempotency guard
+            try:
+                existing_tools = db_list_tools(auth["user_id"], agent_id=row["agent_id"] if row["agent_id"] != "__shared__" else "__shared__")
+            except Exception:
+                existing_tools = []
+            already = any(
+                isinstance(t, dict) and t.get("integration_id") == row["id"] and t.get("action") == "agendar_cita_dinamica"
+                for t in (existing_tools or [])
+            )
+            if not already:
+                tool = AgentTool(
+                    agent_id=row["agent_id"],
+                    name="Agendar Cita",
+                    description="Agenda una cita en Google Calendar y envía correo de confirmación",
+                    integration_id=row["id"],
+                    action="agendar_cita_dinamica",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Nombre completo del asistente"},
+                            "email": {"type": "string", "description": "Email del asistente"},
+                            "datetime": {"type": "string", "description": "Fecha y hora ISO 8601, ej: 2026-09-04T15:00:00-06:00"},
+                            "duration_minutes": {"type": "integer", "description": "Duración en minutos, por defecto 30"},
+                            "host_email": {"type": "string", "description": "Email calendario destino (opcional)"},
+                        },
+                        "required": ["name", "email", "datetime"],
+                    },
+                )
+                db_create_tool(auth["user_id"], tool.to_dict())
+                log.info("[integrations] auto-created google_calendar tool for integration %s", row["id"])
+        except Exception as exc:
+            log.warning("[integrations] auto-create google_calendar tool failed: %s", exc)
+
     return _strip_integration_for_wire(row)
 
 

@@ -106,6 +106,15 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
     return False, "unreachable"
 
 
+def _test_google_calendar(configuration: dict, credentials: dict) -> tuple[bool, str]:
+    """Test the fixed Google Calendar n8n webhook."""
+    # ponytail: delegate to webhook tester with the server-managed URL; no operator config needed
+    return _test_webhook_reachable(
+        {"webhook_url": "https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica", "webhook_method": "POST"},
+        {},
+    )
+
+
 # ponytail: Salesforce OAuth test. Hits the instance's REST API with the
 # stored access_token. Lightweight, no side-effects, and the endpoint
 # exists on every Salesforce org (including sandboxes).

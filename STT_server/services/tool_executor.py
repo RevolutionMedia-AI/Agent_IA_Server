@@ -49,6 +49,9 @@ def _resolve_integration_webhook(integration: dict) -> str:
     # Fallback: only generic_webhook is allowed to surface its own URL.
     if integration.get("provider") == "generic_webhook":
         return (integration.get("configuration") or {}).get("webhook_url", "") or ""
+    if integration.get("provider") == "google_calendar":
+        # ponytail: zero-config Google Calendar - URL is server-managed, not operator-configured
+        return "https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica"
     return ""
 
 
