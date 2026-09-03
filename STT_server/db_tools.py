@@ -323,7 +323,7 @@ def list_tools(user_id: str, agent_id: str | None = None) -> list[dict]:
                     f"SELECT {_tool_cols()} FROM agent_tools "
                     "WHERE user_id = %s AND ("
                     "  agent_id = %s OR "
-                    "  (agent_id = '__shared__' AND COALESCE(assignments, '[]'::jsonb) ?| array[%s])"
+                    "  (agent_id = '__shared__' AND COALESCE(assignments, '[]'::jsonb) ? %s)"
                     ") ORDER BY created_at DESC",
                     (user_id, agent_id, agent_id),
                 )
@@ -615,7 +615,7 @@ def add_assignment(tool_id: str, user_id: str, agent_id: str) -> dict | None:
                 "UPDATE agent_tools SET assignments = COALESCE(assignments, '[]'::jsonb) || %s::jsonb, "
                 "updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s "
-                "AND NOT (COALESCE(assignments, '[]'::jsonb) ?| array[%s]) "
+                "AND NOT (COALESCE(assignments, '[]'::jsonb) ? %s) "
                 f"RETURNING {_tool_cols()}",
                 (json.dumps([agent_id]), tool_id, user_id, agent_id),
             )
@@ -669,7 +669,7 @@ def remove_assignment(tool_id: str, user_id: str, agent_id: str) -> dict | None:
                 "UPDATE agent_tools SET assignments = COALESCE(assignments, '[]'::jsonb) - %s::jsonb, "
                 "updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s "
-                "AND (COALESCE(assignments, '[]'::jsonb) ?| array[%s]) "
+                "AND (COALESCE(assignments, '[]'::jsonb) ? %s) "
                 f"RETURNING {_tool_cols()}",
                 (json.dumps([agent_id]), tool_id, user_id, agent_id),
             )
