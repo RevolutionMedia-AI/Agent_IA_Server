@@ -1102,6 +1102,39 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
     return db_remove_assignment(tool_id, auth["user_id"], agent_id) or tool
 
 
+# ponytail: integrations assignment - mirrors tools assignment but for integrations.
+# Shared integrations (agent_id=="__shared__") are assigned to specific agents via
+# integrations.assignments JSONB array. Private integrations (agent_id==agent_id) are
+# implicitly available and not assignable.
+@api_router.post("/agents/{agent_id}/integrations/{integration_id}/assign")
+def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = Depends(require_auth)):
+    """Assign a shared integration to an agent. Idempotent."""
+    from STT_server.db_agents import get_agent as _get_agent
+    if not _get_agent(agent_id, auth["user_id"]):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    from STT_server.db_integrations import get_integration as _get_integ
+    from STT_server.db_integrations import add_integration_assignment as _add_assign
+    integ = _get_integ(integration_id, auth["user_id"])
+    if not integ:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    if integ.get("agent_id") != "__shared__":
+        raise HTTPException(status_code=400, detail="Only shared integrations can be assigned.")
+    return _add_assign(integration_id, auth["user_id"], agent_id) or integ
+
+
+@api_router.delete("/agents/{agent_id}/integrations/{integration_id}/assign")
+def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict = Depends(require_auth)):
+    """Remove a shared integration assignment from an agent. Idempotent."""
+    from STT_server.db_integrations import get_integration as _get_integ
+    from STT_server.db_integrations import remove_integration_assignment as _remove_assign
+    integ = _get_integ(integration_id, auth["user_id"])
+    if not integ:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    if integ.get("agent_id") != "__shared__":
+        raise HTTPException(status_code=400, detail="Only shared integrations can be unassigned.")
+    return _remove_assign(integration_id, auth["user_id"], agent_id) or integ
+
+
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/test")
 async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
     """Test a tool by executing its webhook with sample data."""

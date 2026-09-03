@@ -55,7 +55,7 @@ _INTEGRATIONS_COLS_BASE = (
     "id, user_id, agent_id, provider, name, configuration, "
     "credentials_encrypted, credentials_cipher, connection_status, "
     "last_tested_at, last_test_message, oauth_scope, "
-    "oauth_state_hash, oauth_state_expires_at, created_at, updated_at"
+    "oauth_state_hash, oauth_state_expires_at, assignments, created_at, updated_at"
 )
 # credentials_encrypted lands as BYTEA; we kept `cipher` as a separate
 # TEXT column so future migrations (rotating Fernet keys, switching to
@@ -178,6 +178,7 @@ def _ensure_integrations_table() -> None:
                     # with "column oauth_code_verifier_encrypted
                     # does not exist" forever.
                     "oauth_code_verifier_encrypted": "BYTEA",
+                    "assignments": "JSONB NOT NULL DEFAULT '[]'::jsonb",
                     "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                     "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                 }
@@ -236,6 +237,21 @@ def _row_to_integration(row: dict | None) -> dict | None:
     for k in ("last_tested_at", "oauth_state_expires_at", "created_at", "updated_at"):
         if hasattr(out.get(k), "isoformat"):
             out[k] = out[k].isoformat() + "Z"
+    # ponytail: normalize assignments to list for FE assignment UI
+    if not isinstance(out.get("assignments"), list):
+        if isinstance(out.get("assignments"), str):
+            try:
+                out["assignments"] = json.loads(out["assignments"])
+            except Exception:
+                out["assignments"] = []
+        elif out.get("assignments") is None:
+            out["assignments"] = []
+        else:
+            # Handle psycopg2 returning JSONB as already-parsed list or other
+            try:
+                out["assignments"] = list(out["assignments"])
+            except Exception:
+                out["assignments"] = []
     return out
 
 
@@ -620,6 +636,71 @@ def count_dependent_tools(integration_id: str, user_id: str | None = None) -> in
             # only shape-agnostic way.
             row = cur.fetchone()
             return _scalar(row) or 0
+
+
+def add_integration_assignment(integration_id: str, user_id: str, agent_id: str) -> dict | None:
+    """Add `agent_id` to the integration's `assignments` JSONB array. Idempotent."""
+    if not is_postgres():
+        rows = _read_integrations_file()
+        out = None
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                assigns = r.get("assignments") or []
+                if agent_id in assigns:
+                    return r
+                assigns.append(agent_id)
+                r["assignments"] = assigns
+                r["updated_at"] = _now_iso()
+                out = r
+                break
+        if out is None:
+            return None
+        _write_integrations_file(rows)
+        return out
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE integrations SET assignments = assignments || %s::jsonb, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s AND NOT (assignments ?| array[%s]) "
+                f"RETURNING {_integrations_cols()}",
+                (json.dumps([agent_id]), integration_id, user_id, [agent_id]),
+            )
+            row = cur.fetchone()
+            if row:
+                return _row_to_integration(row)
+            return get_integration(integration_id, user_id)
+
+
+def remove_integration_assignment(integration_id: str, user_id: str, agent_id: str) -> dict | None:
+    """Drop `agent_id` from the integration's `assignments` JSONB array. Idempotent."""
+    if not is_postgres():
+        rows = _read_integrations_file()
+        out = None
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                assigns = r.get("assignments") or []
+                if agent_id not in assigns:
+                    return r
+                r["assignments"] = [a for a in assigns if a != agent_id]
+                r["updated_at"] = _now_iso()
+                out = r
+                break
+        if out is None:
+            return None
+        _write_integrations_file(rows)
+        return out
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE integrations SET assignments = assignments - %s, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s AND assignments ?| array[%s] "
+                f"RETURNING {_integrations_cols()}",
+                (agent_id, integration_id, user_id, [agent_id]),
+            )
+            row = cur.fetchone()
+            if row:
+                return _row_to_integration(row)
+            return get_integration(integration_id, user_id)
 
 
 def _scalar(row) -> int:
