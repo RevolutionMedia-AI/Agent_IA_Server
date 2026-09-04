@@ -4114,17 +4114,28 @@ def internal_get_integration_credentials(
     # ponytail: n8n should never see refresh_token. The BE keeps the
     # full token set (access + refresh + scope) encrypted at rest and
     # uses refresh_token internally when the access token expires.
-    # The n8n workflow only needs the bearer for Salesforce API calls.
-    # Filter here, at the edge, so even if the internal shape changes,
-    # the wire shape stays minimal. Easy to extend for future providers
-    # (add an `elif provider == "dynamics":` branch).
+    # The n8n workflow only needs the bearer for the upstream API
+    # calls (Salesforce REST API, Google Calendar API). Filter here, at
+    # the edge, so even if the internal shape changes the wire shape
+    # stays minimal. Easy to extend for future providers (add another
+    # `elif provider == "dynamics":` branch).
     def _credentials_for_n8n(provider: str, credentials: dict) -> dict:
-        if provider == "salesforce":
+        # ponytail: provider whitelist. Each entry declares the
+        # narrowest shape n8n needs to call the upstream API — usually
+        # only the bearer. Static providers (zendesk, twilio, etc.) go
+        # through the explicit ``return credentials`` branch below so
+        # legacy integrations still receive the full dict they always
+        # have. New providers MUST land in this whitelist BEFORE the
+        # route ships to production — otherwise n8n gets ``{}`` and
+        # the workflow errors out (the same bug that affected Google
+        # Calendar before 2026-09-04).
+        oauth_bearer_providers = {"salesforce", "google_calendar"}
+        if provider in oauth_bearer_providers:
             return {"access_token": credentials.get("access_token")}
-        # Unknown provider: return nothing (fail closed). The n8n
-        # workflow will error on missing access_token and the operator
-        # will see it in the execution log.
-        return {}
+        # Static / unrestricted providers — keep the full dict so the
+        # n8n workflow can read whatever the BE stored. This is the
+        # previous behaviour for non-OAuth integrations.
+        return dict(credentials)
     return {
         "integration_id": row["id"],
         "provider": provider,
