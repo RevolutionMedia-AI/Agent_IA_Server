@@ -167,9 +167,16 @@ async def test_execute_create_appointment_happy_path(
     assert body["data"]["id"] == "evt-new-1"
     assert body["data"]["meet_link"] == "https://meet.google.com/abc-defg-hij"
     # ponytail: two HTTP calls (freebusy + events.insert) in order.
+    # The events.insert URL carries BOTH ``conferenceDataVersion=1`` and
+    # ``sendUpdates=all`` so the Meet is actually created and the
+    # attendee gets a calendar invite. Order in the query string is
+    # implementation-defined; we just check both flags are present.
     assert len(call_log) == 2
     assert call_log[0][0] == "POST" and call_log[0][1].endswith("/freeBusy")
-    assert call_log[1][0] == "POST" and "/calendars/" in call_log[1][1] and call_log[1][1].endswith("?sendUpdates=all")
+    insert_url = call_log[1][1]
+    assert call_log[1][0] == "POST" and "/calendars/" in insert_url
+    assert "conferenceDataVersion=1" in insert_url
+    assert "sendUpdates=all" in insert_url
 
 
 async def test_execute_create_appointment_rejects_slot_taken(

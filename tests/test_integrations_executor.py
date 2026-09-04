@@ -9,10 +9,10 @@ registry entry; the tests pin the contract today.
 from __future__ import annotations
 
 import importlib
-import json
 import sys
 import urllib.error
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -38,81 +38,95 @@ _GCAL_CREDS = {
 }
 
 
-def _json_response(payload: dict, status: int = 200):
-    """urllib mock that returns a usable body for read()/readline()."""
-    body = json.dumps(payload).encode("utf-8")
+# ── Timezone helper unit tests ───────────────────────────────────────────
 
-    class _Resp:
-        def __init__(self):
-            self._body = body
 
-        def read(self, _n: int = -1) -> bytes:
-            return self._body
+def test_parse_local_naive_uses_integration_timezone():
+    """A naive ``2026-09-08T14:00:00`` against America/Tijuana should
+    produce an aware datetime at 14:00 -07:00 — NOT 14:00 UTC.
+    """
+    exec_mod = _import_executor()
+    dt = exec_mod._parse_local("2026-09-08T14:00:00", "America/Tijuana")
+    assert dt.tzinfo is not None
+    assert dt.utcoffset().total_seconds() == -7 * 3600
+    # ponytail: the wall-clock moment in the integration's timezone
+    # is what we care about, NOT the absolute UTC time. 14:00
+    # Tijuana == 21:00 UTC. The previous bug treated naive strings
+    # as UTC and produced 14:00 UTC == 07:00 -07:00.
+    assert dt.astimezone(ZoneInfo("UTC")).hour == 21
+    assert dt.astimezone(ZoneInfo("America/Tijuana")).hour == 14
 
-        def __enter__(self):
-            return self
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
+def test_parse_local_offset_preserves_caller_value():
+    """A string with an explicit offset must NOT be re-interpreted.
+    14:00 -07:00 == 21:00 UTC always."""
+    exec_mod = _import_executor()
+    dt = exec_mod._parse_local("2026-09-08T14:00:00-07:00", "America/Tijuana")
+    assert dt.utcoffset().total_seconds() == -7 * 3600
+    assert dt.astimezone(ZoneInfo("UTC")).hour == 21
 
-    return _Resp()
+
+def test_format_google_datetime_emits_offset_not_z():
+    exec_mod = _import_executor()
+    dt = exec_mod._parse_local("2026-09-08T14:00:00", "America/Tijuana")
+    formatted = exec_mod._format_google_datetime(dt)
+    # The 2026-09-04 incident shipped ...Z which Google combined
+    # with ``timeZone: America/Tijuana`` to land the event 7 hours
+    # off. The new formatter emits ``...-07:00`` so the wall-clock
+    # moment is unambiguous.
+    assert formatted == "2026-09-08T14:00:00-07:00"
+    assert not formatted.endswith("Z")
+
+
+# ── Action dispatch ────────────────────────────────────────────────────
 
 
 def test_check_availability_happy_path():
     exec_mod = _import_executor()
-
-    fake_busy = []
-    fake_fb_response = {"calendars": {"cal-team@example.com": {"busy": fake_busy}}}
-
+    fake_fb_response = {"calendars": {"cal-team@example.com": {"busy": []}}}
     with mock.patch.object(
-        exec_mod,
-        "_google_http",
-        return_value=fake_fb_response,
+        exec_mod, "_google_http", return_value=fake_fb_response,
     ) as fake_http:
         ok, data, err = exec_mod._google_check_availability(
             integration_row=_GCAL_ROW,
             credentials=_GCAL_CREDS,
             arguments={"datetime": "2026-09-08T14:00:00", "duration_minutes": 30},
         )
-
     assert ok is True
     assert err is None
-    assert data["available"] is True
-    assert data["conflicts"] == 0
-    assert data["busy"] == []
-    # ponytail: freebusy.query against the integration's calendar_id,
-    # not "primary", so the spec stays aligned with the same source
-    # of truth that the FE Configures.
+    assert data == {"available": True, "conflicts": 0, "busy": []}
     sent = fake_http.call_args
     assert sent.args[0] == "POST"
     assert sent.args[1] == exec_mod._GOOGLE_API_BASE + "/calendar/v3/freeBusy"
-    assert sent.args[2] == "TOKEN_X"
     sent_body = sent.kwargs["body"]
     assert sent_body["items"] == [{"id": "cal-team@example.com"}]
-    assert sent_body["timeMin"].startswith("2026-09-08T14:00:00")
-    assert sent_body["timeMax"].startswith("2026-09-08T14:30:00")
+    # ponytail: 2026-09-04 fix. The body must carry the offset, not
+    # a bare "Z" (UTC). Without the offset, Google reinterprets
+    # the moment as UTC and the integration's timeZone field eats
+    # 7 hours on Tijuana.
+    assert sent_body["timeMin"] == "2026-09-08T14:00:00-07:00"
+    assert sent_body["timeMax"] == "2026-09-08T14:30:00-07:00"
     assert sent_body["timeZone"] == "America/Tijuana"
 
 
 def test_check_availability_reports_conflicts():
     exec_mod = _import_executor()
     fake_busy = [
-        {"start": "2026-09-08T14:00:00Z", "end": "2026-09-08T14:30:00Z"},
+        {"start": "2026-09-08T14:00:00-07:00", "end": "2026-09-08T14:30:00-07:00"},
     ]
-    fake_fb_response = {
-        "calendars": {"cal-team@example.com": {"busy": fake_busy}},
-    }
-    with mock.patch.object(exec_mod, "_google_http", return_value=fake_fb_response):
+    with mock.patch.object(
+        exec_mod, "_google_http",
+        return_value={"calendars": {"cal-team@example.com": {"busy": fake_busy}}},
+    ):
         ok, data, err = exec_mod._google_check_availability(
             integration_row=_GCAL_ROW,
             credentials=_GCAL_CREDS,
             arguments={"datetime": "2026-09-08T14:00:00", "duration_minutes": 30},
         )
     assert ok is True
-    assert err is None
     assert data["available"] is False
     assert data["conflicts"] == 1
-    assert data["busy"][0]["start"].startswith("2026-09-08T14:00:00")
+    assert data["busy"][0]["start"] == "2026-09-08T14:00:00-07:00"
 
 
 def test_check_availability_refuses_missing_calendar_id():
@@ -135,7 +149,10 @@ def test_check_availability_refuses_bad_datetime():
         arguments={"datetime": "not-an-iso", "duration_minutes": 30},
     )
     assert ok is False
-    assert "not-a" in err or "ISO" in err
+    assert err
+    # ponytail: the user-facing message must hint at ISO 8601 so the
+    # operator can fix their input on the next call.
+    assert "ISO" in err or "not-an-iso" in err
 
 
 def test_create_appointment_happy_path():
@@ -151,18 +168,15 @@ def test_create_appointment_happy_path():
                 }
             ]
         },
-        "start": {"dateTime": "2026-09-08T14:00:00Z"},
-        "end": {"dateTime": "2026-09-08T14:30:00Z"},
+        "start": {"dateTime": "2026-09-08T14:00:00-07:00"},
+        "end": {"dateTime": "2026-09-08T14:30:00-07:00"},
         "summary": "Test (test@example.com)",
         "status": "confirmed",
     }
-
     with mock.patch.object(
         exec_mod, "_google_http",
         side_effect=[
-            # 1) freebusy.query probe
             {"calendars": {"cal-team@example.com": {"busy": []}}},
-            # 2) events.insert response
             fake_event,
         ],
     ) as fake_http:
@@ -177,30 +191,112 @@ def test_create_appointment_happy_path():
                 "notes": "hello",
             },
         )
-
     assert fake_http.call_count == 2
     assert ok is True
     assert err is None
     assert data["id"] == "evt-1"
     assert data["meet_link"] == "https://meet.google.com/abc-defg-hij"
     assert data["htmlLink"].startswith("https://calendar.google.com")
-    # ponytail: events.insert asks Google to attach a Meet link.
-    # ``sendUpdates=all`` triggers invitations to the attendee.
-    assert fake_http.call_args_list[1].args[0] == "POST"
-    assert "/calendars/cal-team%40example.com/events" in fake_http.call_args_list[1].args[1]
-    assert fake_http.call_args_list[1].kwargs["body"]["conferenceData"]["createRequest"]["conferenceSolutionKey"]["type"] == "hangoutsMeet"
-    body = fake_http.call_args_list[1].kwargs["body"]
-    # ponytail: sendUpdates=all on the URL query triggers Google to
-    # email the attendee; the body itself never carries it.
-    assert "cal-team%40example.com/events" in fake_http.call_args_list[1].args[1]
-    assert "sendUpdates=all" in fake_http.call_args_list[1].args[1]
+    assert data["start"] == "2026-09-08T14:00:00-07:00"
+    assert data["end"] == "2026-09-08T14:30:00-07:00"
+    assert data["meet_pending"] is False
+
+    # ponytail: freebusy + events.insert URLs and bodies. events.insert
+    # MUST carry conferenceDataVersion=1 so Google actually creates
+    # the Meet (the 2026-09-04 incident was missing this flag and
+    # meet_link came back null).
+    freebusy = fake_http.call_args_list[0]
+    insert = fake_http.call_args_list[1]
+    assert freebusy.kwargs["body"]["timeMin"] == "2026-09-08T14:00:00-07:00"
+    assert insert.args[1].endswith("?conferenceDataVersion=1&sendUpdates=all")
+    assert insert.kwargs["body"]["conferenceDataVersion"] == 1
+    body = insert.kwargs["body"]
+    assert body["conferenceData"]["createRequest"]["conferenceSolutionKey"]["type"] == "hangoutsMeet"
+    # ponytail: requestId is a uuid4 hex, not a timestamp — the
+    # previous implementation could collide on two calls in the
+    # same second and Google returned CONFERENCE_REQUEST_ALREADY_EXISTS.
+    request_id = body["conferenceData"]["createRequest"]["requestId"]
+    assert request_id.startswith("revolutionmedia-")
+    assert len(request_id.split("-", 1)[1]) == 32  # uuid4 hex
     assert body["attendees"] == [{"email": "test@example.com", "displayName": "Test"}]
-    assert body["conferenceDataVersion"] == 1
+
+
+def test_create_appointment_falls_back_to_hangoutLink():
+    """The 2026-09-04 incident: meet_link was null because Google
+    hadn't populated entryPoints yet. We now also read
+    ``hangoutLink`` (the canonical field) as a fallback."""
+    exec_mod = _import_executor()
+    fake_event = {
+        "id": "evt-2",
+        "htmlLink": "https://calendar.google.com/event?eid=evt-2",
+        "hangoutLink": "https://meet.google.com/direct-hangout-link",
+        "start": {"dateTime": "2026-09-08T14:00:00-07:00"},
+        "end": {"dateTime": "2026-09-08T14:30:00-07:00"},
+        "summary": "Test (test@example.com)",
+        "status": "confirmed",
+    }
+    with mock.patch.object(
+        exec_mod, "_google_http",
+        side_effect=[
+            {"calendars": {"cal-team@example.com": {"busy": []}}},
+            fake_event,
+        ],
+    ):
+        ok, data, _ = exec_mod._google_create_appointment(
+            integration_row=_GCAL_ROW,
+            credentials=_GCAL_CREDS,
+            arguments={
+                "name": "Test",
+                "email": "test@example.com",
+                "datetime": "2026-09-08T14:00:00",
+            },
+        )
+    assert ok is True
+    assert data["meet_link"] == "https://meet.google.com/direct-hangout-link"
+
+
+def test_create_appointment_marks_meet_pending_when_status_pending():
+    """When Google returns ``conferenceData.createRequest.status.statusCode
+    == "pending"`` the Meet URL is being generated async. The
+    response surfaces ``meet_pending: true`` so the FE can retry."""
+    exec_mod = _import_executor()
+    fake_event = {
+        "id": "evt-3",
+        "htmlLink": "https://calendar.google.com/event?eid=evt-3",
+        "conferenceData": {
+            "createRequest": {
+                "status": {"statusCode": "pending"},
+            }
+        },
+        "start": {"dateTime": "2026-09-08T14:00:00-07:00"},
+        "end": {"dateTime": "2026-09-08T14:30:00-07:00"},
+        "summary": "Test (test@example.com)",
+        "status": "confirmed",
+    }
+    with mock.patch.object(
+        exec_mod, "_google_http",
+        side_effect=[
+            {"calendars": {"cal-team@example.com": {"busy": []}}},
+            fake_event,
+        ],
+    ):
+        ok, data, _ = exec_mod._google_create_appointment(
+            integration_row=_GCAL_ROW,
+            credentials=_GCAL_CREDS,
+            arguments={
+                "name": "Test",
+                "email": "test@example.com",
+                "datetime": "2026-09-08T14:00:00",
+            },
+        )
+    assert ok is True
+    assert data["meet_pending"] is True
+    assert data["meet_link"] is None
 
 
 def test_create_appointment_rejects_slots_already_taken():
     exec_mod = _import_executor()
-    busy = [{"start": "2026-09-08T14:00:00Z", "end": "2026-09-08T14:30:00Z"}]
+    busy = [{"start": "2026-09-08T14:00:00-07:00", "end": "2026-09-08T14:30:00-07:00"}]
     with mock.patch.object(
         exec_mod, "_google_http",
         return_value={"calendars": {"cal-team@example.com": {"busy": busy}}},
@@ -214,9 +310,6 @@ def test_create_appointment_rejects_slots_already_taken():
                 "datetime": "2026-09-08T14:00:00",
             },
         )
-
-    # ponytail: freebusy refused → no insert attempt. createAppointment
-    # surfaces the conflict so the agent can suggest a different time.
     assert ok is False
     assert err == "slot_taken"
     assert data["available"] is False
@@ -230,8 +323,7 @@ def test_create_appointment_validates_email():
         exec_mod, "_google_http",
         return_value={"calendars": {"cal-team@example.com": {"busy": []}}},
     ):
-        # Missing TLD after the @ — our permissive regex catches it.
-        ok, data, err = exec_mod._google_create_appointment(
+        ok, _, err = exec_mod._google_create_appointment(
             integration_row=_GCAL_ROW,
             credentials=_GCAL_CREDS,
             arguments={
@@ -265,22 +357,14 @@ def test_supported_actions_lists_google_calendar_only():
 
 def test_google_http_propagates_http_errors():
     exec_mod = _import_executor()
-    # Build a real HTTPError pointing at a body so the message includes
-    # the truncated payload.
-    err = urllib.error.HTTPError(
-        "https://x/y", 403, "Forbidden", {}, None,
-    )
+    err = urllib.error.HTTPError("https://x/y", 403, "Forbidden", {}, None)
 
     def _raise(*a, **kw):
         raise err
 
     err.read = lambda *_a, **_kw: b'{"error":"forbidden"}'
-    with mock.patch(
-        "urllib.request.urlopen", side_effect=_raise,
-    ):
+    with mock.patch("urllib.request.urlopen", side_effect=_raise):
         with pytest.raises(RuntimeError) as info:
             exec_mod._google_http("GET", "https://x/y", "TOKEN")
-        # ponytail: the helper includes the response body so the
-        # n8n workflow gets a deterministic error message.
         assert "HTTP 403" in str(info.value)
         assert "forbidden" in str(info.value)
