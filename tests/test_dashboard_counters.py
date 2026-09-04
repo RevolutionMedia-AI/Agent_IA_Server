@@ -36,8 +36,19 @@ def test_dashboard_stats_drops_avg_qa_and_adds_usage(monkeypatch):
             "cost_usd": 1.23,
         },
         "per_agent": [
-            {"agent_id": "agent-a", "calls": 4, "duration_seconds": 600.0},
+            {
+                "agent_id": "agent-a",
+                "calls": 4,
+                "duration_seconds": 252.0,  # 4.2 min
+                "cost_usd": 0.3478,  # 4.2 * 0.0828 (own rate)
+                "rate_per_min": 0.0828,
+            },
         ],
+        "rates": {
+            "own_per_min": 0.0828,
+            "platform_per_min": 0.14,
+            "currency": "USD",
+        },
     }
 
     class FakeAggregate:
@@ -75,11 +86,12 @@ def test_dashboard_stats_drops_avg_qa_and_adds_usage(monkeypatch):
                 {"session_key": "s2", "call_sid": "CA2", "agent_id": "agent-b", "started_at": "2026-09-03T22:00:01Z"},
             ]
 
-    monkeypatch.setattr(api._load, "__defaults__", (), raising=False)
+    monkeypatch.setattr("STT_server.db.is_postgres", lambda: True)
+    monkeypatch.setattr(api, "db_list_agents", lambda user_id: [
+        {"id": "agent-a", "user_id": user_id, "status": "Active", "name": "Eduardo"},
+    ])
     monkeypatch.setattr(api, "_load", lambda path, default: (
-        [{"id": "agent-a", "user_id": "user-1", "status": "Active", "name": "Eduardo"}]
-        if "agents" in path
-        else [{"id": "num-1", "user_id": "user-1"}]
+        [{"id": "num-1", "user_id": "user-1"}]
     ))
     monkeypatch.setattr("STT_server.services.usage_store.aggregate_usage", FakeAggregate())
     monkeypatch.setattr("STT_server.db_tools.list_tools", FakeTools.list_tools)
@@ -99,12 +111,55 @@ def test_dashboard_stats_drops_avg_qa_and_adds_usage(monkeypatch):
     usage = out["usage"]
     assert usage["calls"] == 12
     assert usage["total_minutes"] == 31.0  # 1860 / 60
-    assert usage["total_cost_usd"] == 1.23
+    # rate-aware: own 21.0 * 0.0828 + platform 10.0 * 0.14 ≈ 3.1388
+    assert usage["total_cost_usd"] == round(21.0 * 0.0828 + 10.0 * 0.14, 4)
     assert usage["platform_minutes"] == 10.0
     assert usage["own_minutes"] == 21.0
+    assert usage["own_per_min"] == 0.0828
+    assert usage["platform_per_min"] == 0.14
     assert usage["usage_label"] == "31.0 min"
+    assert out["rates"] == {"own_per_min": 0.0828, "platform_per_min": 0.14, "currency": "USD"}
     assert out["numbers_count"] == 1
-    assert out["minutes_by_agent"]["agent-a"] == 10.0  # 600 / 60
+    assert out["minutes_by_agent"]["agent-a"] == 4.2  # 252 / 60
+    assert out["pricing"]["agent-a"]["rate_per_min"] == 0.0828
+    assert out["pricing"]["agent-a"]["cost_usd"] == 0.3478
+
+
+def test_dashboard_active_agents_case_insensitive(monkeypatch):
+    """Legacy rows with lowercase `active` should also count."""
+    api = _import_api()
+
+    class FakeAggregate:
+        def __call__(self, user_id):
+            return {
+                "totals": {
+                    "calls": 0, "duration_seconds": 0.0,
+                    "platform_duration_seconds": 0.0, "own_duration_seconds": 0.0,
+                    "cost_usd": 0.0,
+                },
+                "per_agent": [],
+                "rates": {
+                    "own_per_min": 0.0828, "platform_per_min": 0.14, "currency": "USD"
+                },
+            }
+
+    monkeypatch.setattr("STT_server.db.is_postgres", lambda: False)
+    agents_seed = [
+        {"id": "agent-a", "user_id": "user-1", "status": "active", "name": "Eduardo"},
+        {"id": "agent-b", "user_id": "user-1", "status": "Paused", "name": "Mateo"},
+    ]
+    monkeypatch.setattr(api, "_load", lambda path, default: (
+        agents_seed if path.endswith("agents.json")
+        else ([] if path.endswith("numbers.json") else default)
+    ))
+    monkeypatch.setattr("STT_server.services.usage_store.aggregate_usage", FakeAggregate())
+    monkeypatch.setattr("STT_server.db_tools.list_tools", lambda user_id: [])
+    monkeypatch.setattr("STT_server.db_integrations.list_integrations", lambda user_id: [])
+    monkeypatch.setattr("STT_server.db_call_sessions.count_open_sessions", lambda *, user_id=None: 0)
+    monkeypatch.setattr("STT_server.db_call_sessions.list_active_for_user", lambda *, user_id=None, limit=20: [])
+
+    out = api.dashboard_stats(auth={"user_id": "user-1"})
+    assert out["active_agents"] == 1
 
 
 def test_list_agents_stamps_counters(monkeypatch):

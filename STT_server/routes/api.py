@@ -557,11 +557,12 @@ class PhoneNumberCreate(BaseModel):
     # campaign config. Optional, defaults to no campaign on the BE.
     campaign: Optional[str] = None
     agent: Optional[str] = None
-    # ponytail: credenciales de Twilio opcionales. Si el provider es
-    # 'twilio' o 'sip' y se pasan, se validan y guardan en el record
-    # del phone number (asi cada number puede usar credenciales distintas
-    # si el user lo necesita). Si no se pasan, el record queda sin
-    # credenciales y el runtime tendra que caer al global.
+    # ponytail: per-number Twilio FK. After migration 019 the FE picks
+    # a credential from /twilio-credentials instead of pasting SID+token
+    # here. The inline twilio_account_sid/twilio_auth_token fields below
+    # are kept for backward compat (legacy callers + the JSON file
+    # path) but new rows are expected to set twilio_credential_id.
+    twilio_credential_id: Optional[str] = None
     twilio_account_sid: Optional[str] = None
     twilio_auth_token: Optional[str] = None
     # SIP trunk fields
@@ -581,15 +582,10 @@ class PhoneNumberUpdate(BaseModel):
     status: Optional[str] = None
     label: Optional[str] = None
     campaign: Optional[str] = None
-    # ponytail: bug history. This schema only declared the routing
-    # fields (agent/status/label/campaign) so Pydantic silently
-    # dropped every credential the FE sent on edit. Operators kept
-    # seeing "old creds still in use" because the original CREATE
-    # path stored the values (PhoneNumberCreate has these fields)
-    # but every subsequent PUT stripped them. Mirror the CREATE
-    # schema's credential fields here so PUT can actually update
-    # them. The DB-layer allowed set in db_phone_numbers.update_number
-    # also has to include these — both layers have to agree.
+    # ponytail: FK flip on edit. Same constraint as the CREATE schema:
+    # the FE picks a credential from the global pool instead of pasting
+    # SID+token. Inline twilio_* kept for legacy callers.
+    twilio_credential_id: Optional[str] = None
     twilio_account_sid: Optional[str] = None
     twilio_auth_token: Optional[str] = None
     sip_host: Optional[str] = None
@@ -661,11 +657,27 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
     that was never updated). `usage.usage_label` is the new top-line
     figure the FE renders in place of "Average QA score".
     """
-    agents = _load(AGENTS_FILE, [])
+    # ponytail: 2026-09-03 — when Postgres is active, agents live in
+    # db_agents, not in data/agents.json. Reading from JSON first
+    # produced `active_agents=0` for any tenant whose JSON file was
+    # empty (the default after a backfill). Read the matching store
+    # so the KPI matches what /agents returns.
+    from STT_server.db import is_postgres
+    if is_postgres():
+        user_agents = db_list_agents(auth["user_id"])
+    else:
+        agents = _load(AGENTS_FILE, [])
+        user_agents = [a for a in agents if a.get("user_id") == auth["user_id"]]
     numbers = _load(NUMBERS_FILE, [])
-    user_agents = [a for a in agents if a.get("user_id") == auth["user_id"]]
     user_numbers = [n for n in numbers if n.get("user_id") == auth["user_id"]]
-    active_agents = sum(1 for a in user_agents if a.get("status") == "Active")
+    # ponytail: status check is case-insensitive. Legacy JSON rows
+    # may have `status="active"` (lowercase) while Postgres stores the
+    # canonical `Active`. Without the normalize the KPI silently
+    # undercounts on older agents.
+    active_agents = sum(
+        1 for a in user_agents
+        if str(a.get("status") or "").strip().lower() == "active"
+    )
 
     from STT_server.services.usage_store import aggregate_usage
     usage = aggregate_usage(auth["user_id"]).get("totals") or {}
@@ -723,11 +735,33 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
 
     # ponytail: split per-agent usage minutes so the FE's per-row
     # counters don't have to re-fetch /usage and join themselves.
-    usage_breakdown = aggregate_usage(auth["user_id"]).get("per_agent") or []
+    # Compute the rate-aware cost the same way the per-agent rows do,
+    # then expose it on the response as `pricing`. Aggregating twice
+    # here (totals.cost_usd + manual re-sum) keeps the dashboard card
+    # consistent with the per-minute figure the Usage page shows
+    # for the same rows.
+    usage_full = aggregate_usage(auth["user_id"])
+    usage_breakdown = usage_full.get("per_agent") or []
     minutes_by_agent: dict[str, float] = {
         (row.get("agent_id") or ""): float(row.get("duration_seconds") or 0) / 60.0
         for row in usage_breakdown
     }
+    pricing_by_agent: dict[str, dict] = {
+        (row.get("agent_id") or ""): {
+            "rate_per_min": float(row.get("rate_per_min") or 0),
+            "cost_usd": float(row.get("cost_usd") or 0),
+            "minutes": float(row.get("duration_seconds") or 0) / 60.0,
+        }
+        for row in usage_breakdown
+    }
+    rates = usage_full.get("rates") or {}
+    own_rate = float(rates.get("own_per_min") or 0.0)
+    platform_rate = float(rates.get("platform_per_min") or 0.0)
+    own_minutes = float((usage.get("own_duration_seconds") or 0)) / 60.0
+    platform_minutes = float((usage.get("platform_duration_seconds") or 0)) / 60.0
+    rate_aware_cost = round(
+        own_minutes * own_rate + platform_minutes * platform_rate, 4
+    )
 
     return {
         "active_agents": active_agents,
@@ -739,14 +773,27 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
         "usage": {
             "calls": int(usage.get("calls") or 0),
             "total_minutes": round(float(usage.get("duration_seconds") or 0) / 60.0, 1),
-            "total_cost_usd": float(usage.get("cost_usd") or 0),
+            # ponytail: 2026-09-03 — `total_cost_usd` is now recomputed
+            # from the rates so the dashboard card matches the same
+            # figure the per-agent table uses. The stored `cost_usd`
+            # column can lag behind when billing rules change; the
+            # rate_aware_sum never does.
+            "total_cost_usd": rate_aware_cost,
             "platform_minutes": round(
                 float(usage.get("platform_duration_seconds") or 0) / 60.0, 1
             ),
             "own_minutes": round(float(usage.get("own_duration_seconds") or 0) / 60.0, 1),
+            "own_per_min": own_rate,
+            "platform_per_min": platform_rate,
             "usage_label": (
                 f"{round(float(usage.get('duration_seconds') or 0) / 60.0, 1):.1f} min"
             ),
+        },
+        "pricing": pricing_by_agent,
+        "rates": {
+            "own_per_min": own_rate,
+            "platform_per_min": platform_rate,
+            "currency": "USD",
         },
         "recent_agents": user_agents[:5],
         "numbers_count": len(user_numbers),
@@ -1620,6 +1667,197 @@ def create_number_alias(data: PhoneNumberCreate, auth: dict = Depends(require_au
     return create_phone_number(data, auth)
 
 
+# ---------- /twilio-credentials CRUD ----------
+#
+# ponytail: per-user multi-credential Twilio store. Replaces the single-row
+# `agent_tools` entry Settings → API used to maintain, so a single tenant
+# can register N independent Twilio sub-accounts. Each row holds an
+# encrypted SID + Token; phone numbers later reference the row via
+# `phone_numbers.twilio_credential_id` (set in PhoneNumberCreate). The
+# Settings modal CRUDs this list; ModalConnectNumber reads it as a dropdown.
+#
+# ponytail: validation lives here, not in PROVIDER_CATALOG. The catalog
+# still defines the FIELD shapes for /settings/api-keys, but Twilio no
+# longer participates in that flow — the per-row name + (sid, token) is
+# the only contract this surface needs. Sid format mirrors the catalog's
+# pre-019 regex (`^AC[0-9a-fA-F]{32}$`) so legacy rows survive the move.
+
+import re as _re
+_TWILIO_SID_RE = _re.compile(r"^AC[0-9a-fA-F]{32}$")
+
+
+class TwilioCredentialCreate(BaseModel):
+    name: str
+    account_sid: str
+    auth_token: str
+
+
+class TwilioCredentialUpdate(BaseModel):
+    name: Optional[str] = None
+    account_sid: Optional[str] = None
+    auth_token: Optional[str] = None
+
+
+def _validate_twilio_credential_payload(
+    *, name: str, account_sid: str, auth_token: str
+) -> Optional[str]:
+    """Return an error message when the SID+Token+name triple is invalid.
+    None means OK. Mirrors the catalog's pre-019 regex so a previously
+    saved credential still passes after the move."""
+    if not name or not name.strip():
+        return "Name is required"
+    if len(name.strip()) > 80:
+        return "Name is too long (max 80 chars)"
+    sid = (account_sid or "").strip()
+    if not _TWILIO_SID_RE.match(sid):
+        return "Twilio Account SID must start with 'AC' followed by 32 hex characters"
+    tok = (auth_token or "").strip()
+    if len(tok) < 32 or len(tok) > 64:
+        return "Twilio Auth Token must be 32-64 characters"
+    return None
+
+
+@api_router.get("/twilio-credentials")
+def list_twilio_credentials(auth: dict = Depends(require_auth)):
+    """Return the user's Twilio credentials (no plaintext secrets).
+
+    ponytail: never returns the auth_token — only the SID's last 4 chars.
+    Use GET /twilio-credentials/{id}/value for the reveal flow."""
+    from STT_server import db_twilio_credentials as db_twcreds
+    return {"credentials": db_twcreds.list_credentials(auth["user_id"])}
+
+
+@api_router.post("/twilio-credentials")
+async def create_twilio_credential(
+    data: TwilioCredentialCreate, auth: dict = Depends(require_auth)
+):
+    err = _validate_twilio_credential_payload(
+        name=data.name, account_sid=data.account_sid, auth_token=data.auth_token
+    )
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    from STT_server import db_twilio_credentials as db_twcreds
+    # ponytail: live-validate against Twilio before persisting. The FE
+    # ALSO has a "Test connection" button that calls /test, but gating
+    # the create on a successful auth prevents a typo'd SID+token pair
+    # from getting saved (and the operator hitting "Connection failed"
+    # every time they try to use it).
+    from STT_server.adapters.twilio_api import validate_twilio_credentials
+    res = await validate_twilio_credentials(data.account_sid.strip(), data.auth_token.strip())
+    if not res.get("valid"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Twilio rejected the credentials: {res.get('error') or res.get('message') or 'unknown error'}",
+        )
+    saved = db_twcreds.create_credential(
+        auth["user_id"],
+        name=data.name,
+        account_sid=data.account_sid.strip(),
+        auth_token=data.auth_token.strip(),
+        status="connected",
+        last_test_message=res.get("message") or f"account status: {res.get('account_status') or 'ok'}",
+    )
+    return saved
+
+
+@api_router.put("/twilio-credentials/{credential_id}")
+async def update_twilio_credential(
+    credential_id: str,
+    data: TwilioCredentialUpdate,
+    auth: dict = Depends(require_auth),
+):
+    from STT_server import db_twilio_credentials as db_twcreds
+    existing = db_twcreds.get_credential(credential_id, auth["user_id"])
+    if not existing:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    if data.name is not None or data.account_sid is not None or data.auth_token is not None:
+        next_name = data.name if data.name is not None else existing["name"]
+        # Reveal secrets to validate. We only hit the DB once via
+        # get_credential(include_secrets=True) and then drop the
+        # plaintext — never log or return it.
+        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+        next_sid = (
+            data.account_sid.strip()
+            if data.account_sid is not None
+            else full.get("account_sid") or ""
+        )
+        next_token = (
+            data.auth_token.strip()
+            if data.auth_token is not None
+            else full.get("auth_token") or ""
+        )
+        err = _validate_twilio_credential_payload(
+            name=next_name, account_sid=next_sid, auth_token=next_token
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+    kwargs: dict = {}
+    if data.name is not None:
+        kwargs["name"] = data.name
+    status_update = None
+    test_message_update = None
+    if data.account_sid is not None or data.auth_token is not None:
+        from STT_server.adapters.twilio_api import validate_twilio_credentials
+        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+        next_sid = (
+            data.account_sid.strip()
+            if data.account_sid is not None
+            else full.get("account_sid") or ""
+        )
+        next_token = (
+            data.auth_token.strip()
+            if data.auth_token is not None
+            else full.get("auth_token") or ""
+        )
+        res = await validate_twilio_credentials(next_sid, next_token)
+        status_update = "connected" if res.get("valid") else "invalid"
+        test_message_update = res.get("message") or res.get("error") or ""
+        kwargs["status"] = status_update
+        kwargs["last_test_message"] = test_message_update
+        kwargs["account_sid"] = next_sid
+        kwargs["auth_token"] = next_token
+    if not kwargs:
+        return existing
+    return db_twcreds.update_credential(credential_id, auth["user_id"], **kwargs)
+
+
+@api_router.delete("/twilio-credentials/{credential_id}")
+def delete_twilio_credential(credential_id: str, auth: dict = Depends(require_auth)):
+    from STT_server import db_twilio_credentials as db_twcreds
+    if not db_twcreds.delete_credential(credential_id, auth["user_id"]):
+        raise HTTPException(status_code=404, detail="Credential not found")
+    return {"success": True}
+
+
+@api_router.post("/twilio-credentials/{credential_id}/test")
+async def test_twilio_credential(
+    credential_id: str, auth: dict = Depends(require_auth)
+):
+    """Live-validate the stored credential against Twilio and update its
+    status. The endpoint always persists the test outcome so the Settings
+    card reflects the latest known state without the operator having to
+    re-save."""
+    from STT_server import db_twilio_credentials as db_twcreds
+    full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+    if not full:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    sid = full.get("account_sid") or ""
+    token = full.get("auth_token") or ""
+    if not sid or not token:
+        raise HTTPException(status_code=400, detail="Credential is missing the SID or Auth Token")
+    from STT_server.adapters.twilio_api import validate_twilio_credentials
+    res = await validate_twilio_credentials(sid, token)
+    status = "connected" if res.get("valid") else "invalid"
+    message = res.get("message") or res.get("error") or ""
+    updated = db_twcreds.update_credential(
+        credential_id,
+        auth["user_id"],
+        status=status,
+        last_test_message=message,
+    )
+    return {"valid": res.get("valid"), "message": message, "status": status, "credential": updated}
+
+
 # ---------- /settings ----------
 
 def _settings_path(user_id: str) -> str:
@@ -1854,10 +2092,18 @@ def list_api_keys(auth: dict = Depends(require_auth)):
     override `item["connected"] = spec.id in configured_ids` used to
     shadow the resolver's view with a stale JSON snapshot — which was
     right after a save and wrong after every redeploy on Railway.
+
+    ponytail: Twilio is no longer rendered here. The Settings page
+    surfaces Twilio through a dedicated /twilio-credentials panel
+    (multi-sub-account CRUD); keeping the empty-fields spec here would
+    only produce a misleading "Connect Twilio" card that asks the
+    operator for nothing.
     """
     user_id = auth["user_id"]
     services = []
     for spec in PROVIDER_CATALOG:
+        if spec.id == "twilio":
+            continue
         services.append(_serialize_provider(spec, user_id))
     return {"services": services}
 

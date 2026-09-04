@@ -129,6 +129,11 @@ def aggregate_usage(user_id, *, agent_name_lookup=None, limit_recent=50):
     Single SQL round-trip for the totals, a second for the per-agent
     breakdown, a third for the recent feed. Avoids the legacy
     in-memory aggregation that read the whole ledger in Python.
+
+    ponytail: 2026-09-03 — per-agent rows now carry the rate the call
+    was billed at. Previously the FE had to assume `$0.0828/min` and
+    read the durations only. With `rates_per_min` the Usage page can
+    show `0.0828 × 4.2 = $0.3478` per agent without guesswork.
     """
     if not agent_name_lookup:
         agent_name_lookup = {}
@@ -154,7 +159,8 @@ def aggregate_usage(user_id, *, agent_name_lookup=None, limit_recent=50):
                 "  COALESCE(SUM(duration_seconds), 0) AS total_duration, "
                 "  COALESCE(SUM(duration_seconds) FILTER (WHERE used_platform_keys), 0) AS platform_duration, "
                 "  COALESCE(SUM(duration_seconds) FILTER (WHERE NOT used_platform_keys), 0) AS own_duration, "
-                "  COALESCE(SUM(cost_usd), 0) AS total_cost "
+                "  COALESCE(SUM(cost_usd), 0) AS total_cost, "
+                "  BOOL_OR(used_platform_keys) AS used_platform_keys "
                 "FROM call_usage WHERE user_id = %s "
                 "GROUP BY COALESCE(agent_id, '_unassigned') "
                 "ORDER BY total_duration DESC",
@@ -179,11 +185,20 @@ def aggregate_usage(user_id, *, agent_name_lookup=None, limit_recent=50):
         "platform_duration_seconds": round(_safe_float(t, "platform_duration"), 1),
         "own_duration_seconds": round(_safe_float(t, "own_duration"), 1),
         "cost_usd": round(_safe_float(t, "total_cost"), 2),
+        "platform_per_min": PRICE_PLATFORM_KEY_PER_MIN,
+        "own_per_min": PRICE_OWN_KEY_PER_MIN,
     }
 
     per_agent = []
     for r in agent_rows:
         bucket = r["bucket"]
+        # ponytail: 2026-09-03 — rate a per-agent at the dominant rate
+        # observed for that bucket. If at least one call of the row
+        # used the platform key the user is paying the platform rate;
+        # otherwise the own-key rate applies. Mirrors what the billing
+        # ledger already does per row.
+        used_platform = bool(r.get("used_platform_keys"))
+        rate = PRICE_PLATFORM_KEY_PER_MIN if used_platform else PRICE_OWN_KEY_PER_MIN
         per_agent.append({
             "agent_id": bucket,
             "agent_name": agent_name_lookup.get(bucket) or bucket,
@@ -191,7 +206,8 @@ def aggregate_usage(user_id, *, agent_name_lookup=None, limit_recent=50):
             "duration_seconds": round(_safe_float(r, "total_duration"), 1),
             "platform_duration_seconds": round(_safe_float(r, "platform_duration"), 1),
             "own_duration_seconds": round(_safe_float(r, "own_duration"), 1),
-            "cost_usd": round(_safe_float(r, "total_cost"), 2),
+            "cost_usd": round(_safe_float(r, "total_cost"), 4),
+            "rate_per_min": rate,
         })
 
     return {
