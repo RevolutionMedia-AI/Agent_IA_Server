@@ -2667,6 +2667,15 @@ def _strip_integration_for_wire(row: dict) -> dict:
     expose the lookup key for an active flow (a DB row leak doesn't
     expose the real state, but the FE running with a leaked FE
     session could replay it).
+
+    ponytail: 2026-09-03 — also stamps `assigned_agents` (the agent
+    ids this integration is reachable from) and
+    `_assigned_owner_agent` (the original owner when the row is a
+    private integration). The previous version only returned
+    `assignments` (the shared-row JSONB array), so a private
+    integration looked "unassigned" to the FE even though the agent
+    it was created for could call it. The FE's "Agent assignments"
+    list rendered empty in that case.
     """
     if not row:
         return row
@@ -2675,6 +2684,18 @@ def _strip_integration_for_wire(row: dict) -> dict:
     out.pop("credentials_cipher", None)
     out.pop("oauth_state_hash", None)
     out.pop("oauth_state_expires_at", None)
+    # ponytail: `assigned_agents` mirrors `list_agents_for_integration`
+    # so the FE reads ONE field for both kinds of integration. Private
+    # rows expose their owner; shared rows expose the JSONB array.
+    if "assigned_agents" not in out:
+        agent_id = out.get("agent_id")
+        assigns = out.get("assignments") or []
+        if agent_id and agent_id != "__shared__":
+            out["assigned_agents"] = [agent_id]
+        elif agent_id == "__shared__":
+            out["assigned_agents"] = [a for a in assigns if isinstance(a, str)]
+        else:
+            out["assigned_agents"] = []
     return out
 
 
