@@ -135,6 +135,15 @@ async def register_session(session: CallSession) -> None:
             tts_provider=session.tts_provider,
             custom_prompt=session.custom_prompt,
             started_at=session.started_at,
+            # ponytail: 2026-09-03 — the dashboard `Live calls` KPI
+            # only works when the row knows who owns the call and
+            # which agent picked up. Without these the counter is
+            # always zero. user_id can be None for legacy callers
+            # (the auth bootstrap runs before /start sets it), and
+            # the UPDATE path in register_session backfills it on
+            # the very next register call.
+            user_id=getattr(session, "user_id", None),
+            agent_id=getattr(session, "agent_id", None),
         )
     except Exception as exc:  # noqa: BLE001 — DB write must never block a call
         log.warning("[runtime] DB register_session failed for %s: %s",

@@ -687,6 +687,32 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
     except Exception:
         live_calls = 0
 
+    # ponytail: 2026-09-03 — `live_calls` card needs the roster too so
+    # the FE can show "Eduardo on call — 00:42" without firing a
+    # second request. We cap at 20 active rows; the FE only renders
+    # `live_calls` anyway. agent_name resolves inline so the FE
+    # doesn't have to look the agent up.
+    live_calls_payload: list[dict] = []
+    try:
+        active_rows = _db_call_sessions.list_active_for_user(
+            user_id=auth["user_id"], limit=20
+        )
+        name_lookup = {
+            a.get("id"): a.get("name") or a.get("id")
+            for a in user_agents
+            if isinstance(a, dict) and a.get("id")
+        }
+        for row in active_rows:
+            live_calls_payload.append({
+                "session_key": row.get("session_key"),
+                "call_sid": row.get("call_sid"),
+                "agent_id": row.get("agent_id"),
+                "agent_name": name_lookup.get(row.get("agent_id")),
+                "started_at": row.get("started_at"),
+            })
+    except Exception:
+        live_calls_payload = []
+
     # ponytail: `_is_real_tool` lives a few hundred lines below — same
     # filter the per-agent /tools endpoint uses so the dashboard
     # badge matches what the user sees inside the agent's Tools tab.
@@ -707,6 +733,7 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
         "active_agents": active_agents,
         "calls_today": int(usage.get("calls") or 0),
         "live_calls": live_calls,
+        "live_calls_detail": live_calls_payload,
         "tools_count": len(real_tool_rows),
         "integrations_count": len(connected_integrations),
         "usage": {
@@ -806,6 +833,7 @@ def list_agents(auth: dict = Depends(require_auth)):
 
     tools_by_agent: dict[str, int] = {}
     integrations_by_agent: dict[str, int] = {}
+    active_calls_by_agent: dict[str, int] = {}
 
     for agent in rows:
         agent_id = agent.get("id")
@@ -824,6 +852,22 @@ def list_agents(auth: dict = Depends(require_auth)):
         except Exception:
             integrations_by_agent[agent_id] = 0
 
+    # ponytail: 2026-09-03 — count active call sessions per agent so
+    # the FE can show a "On a call" pulse next to each agent without
+    # hitting the dashboard endpoint. Read once for ALL agents of the
+    # owner in a single round-trip (not per agent).
+    try:
+        from STT_server import db_call_sessions as _db_call_sessions
+        for row in _db_call_sessions.list_active_for_user(
+            user_id=auth["user_id"], limit=200
+        ):
+            aid = row.get("agent_id")
+            if not aid:
+                continue
+            active_calls_by_agent[aid] = active_calls_by_agent.get(aid, 0) + 1
+    except Exception:
+        active_calls_by_agent = {}
+
     # ponytail: stamp the live counters onto each row so the FE never
     # has to issue a per-card round-trip. Old fields (`calls`, `perf`)
     # are still returned for back-compat but they're sourced from the
@@ -839,6 +883,7 @@ def list_agents(auth: dict = Depends(require_auth)):
         agent["perf"] = 0
         agent["tools_count"] = tools_by_agent.get(agent_id, 0)
         agent["integrations_count"] = integrations_by_agent.get(agent_id, 0)
+        agent["active_calls"] = active_calls_by_agent.get(agent_id, 0)
     return rows
 
 

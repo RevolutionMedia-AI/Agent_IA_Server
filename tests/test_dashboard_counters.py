@@ -68,6 +68,13 @@ def test_dashboard_stats_drops_avg_qa_and_adds_usage(monkeypatch):
         def count_open_sessions(*, user_id=None):
             return 3
 
+        @staticmethod
+        def list_active_for_user(*, user_id=None, limit=50):
+            return [
+                {"session_key": "s1", "call_sid": "CA1", "agent_id": "agent-a", "started_at": "2026-09-03T22:00:00Z"},
+                {"session_key": "s2", "call_sid": "CA2", "agent_id": "agent-b", "started_at": "2026-09-03T22:00:01Z"},
+            ]
+
     monkeypatch.setattr(api._load, "__defaults__", (), raising=False)
     monkeypatch.setattr(api, "_load", lambda path, default: (
         [{"id": "agent-a", "user_id": "user-1", "status": "Active", "name": "Eduardo"}]
@@ -78,12 +85,14 @@ def test_dashboard_stats_drops_avg_qa_and_adds_usage(monkeypatch):
     monkeypatch.setattr("STT_server.db_tools.list_tools", FakeTools.list_tools)
     monkeypatch.setattr("STT_server.db_integrations.list_integrations", FakeIntegrations.list_integrations)
     monkeypatch.setattr("STT_server.db_call_sessions.count_open_sessions", FakeCallSessions.count_open_sessions)
+    monkeypatch.setattr("STT_server.db_call_sessions.list_active_for_user", FakeCallSessions.list_active_for_user)
 
     out = api.dashboard_stats(auth={"user_id": "user-1"})
 
     assert out["active_agents"] == 1
     assert out["calls_today"] == 12
     assert out["live_calls"] == 3
+    assert out["live_calls_detail"][0]["agent_id"] == "agent-a"
     assert out["tools_count"] == 2  # provider-credential row filtered out
     assert out["integrations_count"] == 2  # only 'connected'
     assert "avg_qa_score" not in out
@@ -126,6 +135,15 @@ def test_list_agents_stamps_counters(monkeypatch):
                 return [{"id": "i1", "connection_status": "connected"}]
             return []
 
+    class FakeCallSessions:
+        @staticmethod
+        def list_active_for_user(*, user_id=None, limit=200):
+            return [
+                {"session_key": "s1", "call_sid": "CA1", "agent_id": "agent-a", "started_at": "2026-09-03T22:00:00Z"},
+                {"session_key": "s2", "call_sid": "CA2", "agent_id": "agent-a", "started_at": "2026-09-03T22:00:01Z"},
+                {"session_key": "s3", "call_sid": "CA3", "agent_id": "agent-b", "started_at": "2026-09-03T22:00:02Z"},
+            ]
+
     usage = {
         "totals": {"calls": 7, "duration_seconds": 0, "cost_usd": 0},
         "per_agent": [
@@ -138,6 +156,7 @@ def test_list_agents_stamps_counters(monkeypatch):
     monkeypatch.setattr("STT_server.services.usage_store.aggregate_usage", lambda user_id: usage)
     monkeypatch.setattr("STT_server.db_tools.list_tools", FakeTools.list_tools)
     monkeypatch.setattr("STT_server.db_integrations.list_integrations", FakeIntegrations.list_integrations)
+    monkeypatch.setattr("STT_server.db_call_sessions.list_active_for_user", FakeCallSessions.list_active_for_user)
 
     rows = api.list_agents(auth={"user_id": "user-1"})
 
@@ -145,10 +164,12 @@ def test_list_agents_stamps_counters(monkeypatch):
     assert rows[0]["minutes_usage"] == 10.0
     assert rows[0]["tools_count"] == 2
     assert rows[0]["integrations_count"] == 0
+    assert rows[0]["active_calls"] == 2
     assert rows[1]["calls"] == 2
     assert rows[1]["minutes_usage"] == 1.0
     assert rows[1]["tools_count"] == 0
     assert rows[1]["integrations_count"] == 1
+    assert rows[1]["active_calls"] == 1
 
 
 def test_count_open_sessions_does_not_mutate(monkeypatch):
@@ -175,11 +196,13 @@ def test_count_open_sessions_does_not_mutate(monkeypatch):
     total = db.count_open_sessions()
     own = db.count_open_sessions(user_id="u1")
     other = db.count_open_sessions(user_id="u2")
+    detail = db.list_active_for_user(user_id="u1")
 
     assert total == 2
     assert own == 1
     assert other == 1
-    assert writes == [], "count_open_sessions must never mutate the ledger"
+    assert writes == [], "count + list must never mutate the ledger"
+    assert [r.get("session_key") for r in detail] == ["a"]
 
 
 def test_agents_api_no_longer_round_trips_tool_counts_per_card():

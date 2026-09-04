@@ -47,6 +47,13 @@ _SESSION_COLS = (
     "started_at, ended_at"
 )
 
+# ponytail: 2026-09-03 — dashboard live-calls needs per-tenant counts.
+# The runtime never stored user_id or agent_id on the session row, so
+# `live_calls` always read as 0 even with active calls. We read them
+# defensively off the GET response: callers that send `agent_id` +
+# `user_id` get them back, the rest keep working.
+_EXTRA_COLS = "user_id, agent_id"
+
 
 def _row_to_session(row):
     if row is None:
@@ -94,16 +101,32 @@ def register_session(
     tts_provider: Optional[str] = None,
     custom_prompt: Optional[str] = None,
     started_at: Optional[float] = None,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> dict:
     """Persist a new call session. Idempotent on session_key — a second
     call with the same key returns the existing row instead of erroring.
 
     Mirrors session_runtime.register_session: one row per call, used
-    for /dashboard history and post-mortem on dropped WebSockets."""
+    for /dashboard history and post-mortem on dropped WebSockets.
+
+    ponytail: 2026-09-03 — `user_id` + `agent_id` are optional kwargs.
+    Existing callers that don't pass them keep working; the dashboard
+    only counts live rows that the BE actually registered with these
+    fields. Without them we can't tell whose call is active, so the
+    'Live calls' KPI always read 0.
+    """
     if not is_postgres():
         rows = _read_json()
         for s in rows:
             if s.get("session_key") == session_key:
+                # ponytail: refresh ownership on the JSON backend too so
+                # a re-registration (e.g. WS reconnect) carries the agent
+                # forward into the row that already exists.
+                if user_id is not None:
+                    s["user_id"] = user_id
+                if agent_id is not None:
+                    s["agent_id"] = agent_id
                 return s
         record = {
             "session_key": session_key,
@@ -116,6 +139,8 @@ def register_session(
             "closed": False,
             "started_at": _float_to_iso(started_at) if started_at is not None else None,
             "ended_at": None,
+            "user_id": user_id,
+            "agent_id": agent_id,
         }
         rows.append(record)
         _write_json(rows)
@@ -125,17 +150,26 @@ def register_session(
             cur.execute(
                 "INSERT INTO call_sessions "
                 "(session_key, tenant_id, call_sid, preferred_language, "
-                " tts_provider, custom_prompt, started_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, COALESCE(to_timestamp(%s), NOW())) "
+                " tts_provider, custom_prompt, started_at, user_id, agent_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, "
+                "        COALESCE(to_timestamp(%s), NOW()), %s, %s) "
                 "ON CONFLICT (session_key) DO NOTHING "
                 f"RETURNING {_SESSION_COLS}",
                 (session_key, tenant_id, call_sid, preferred_language,
-                 tts_provider, custom_prompt, started_at),
+                 tts_provider, custom_prompt, started_at, user_id, agent_id),
             )
             row = cur.fetchone()
             if row:
-                return _row_to_session(row)
-    return get_session(session_key) or {}
+                out = _row_to_session(row)
+                out["user_id"] = user_id
+                out["agent_id"] = agent_id
+                return out
+    existing = get_session(session_key) or {}
+    if user_id is not None:
+        existing["user_id"] = user_id
+    if agent_id is not None:
+        existing["agent_id"] = agent_id
+    return existing
 
 
 def get_session(session_key: str) -> Optional[dict]:
@@ -210,6 +244,45 @@ def count_open_sessions(*, user_id: Optional[str] = None) -> int:
                 )
             row = cur.fetchone() or {}
     return int(row.get("count") or 0)
+
+
+def list_active_for_user(
+    *, user_id: Optional[str] = None, limit: int = 50
+) -> list[dict]:
+    """Active rows for the dashboard, READ-ONLY.
+
+    Returns the latest open rows (one per call) so the FE can render a
+    roster. Rows without `user_id` (legacy callers that pre-date the
+    field) are excluded from the per-user view so we don't leak
+    anonymous calls into a tenant's dashboard.
+    """
+    if not is_postgres():
+        rows = [
+            s
+            for s in _read_json()
+            if not s.get("closed")
+            and (user_id is None or s.get("user_id") == user_id)
+        ]
+        rows.sort(key=lambda s: s.get("started_at") or "", reverse=True)
+        return rows[: max(0, limit)]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if user_id is None:
+                cur.execute(
+                    f"SELECT {_SESSION_COLS} FROM call_sessions "
+                    "WHERE closed = FALSE "
+                    "ORDER BY started_at DESC LIMIT %s",
+                    (max(0, limit),),
+                )
+            else:
+                cur.execute(
+                    f"SELECT {_SESSION_COLS} FROM call_sessions "
+                    "WHERE closed = FALSE AND user_id = %s "
+                    "ORDER BY started_at DESC LIMIT %s",
+                    (user_id, max(0, limit)),
+                )
+            return [_row_to_session(r) for r in cur.fetchall()]
 
 
 def close_session(session_key: str, ended_at: Optional[float] = None) -> bool:
