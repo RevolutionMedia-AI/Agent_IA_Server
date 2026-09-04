@@ -2,7 +2,14 @@
 # To upgrade: bump version explicitly and verify tests pass in CI.
 # Exact pins preferred; >=,<,* ranges only for fast-moving SDKs (twilio, openai).
 
-cryptography==49.0.0  # Fernet encryption for per-user provider credentials at rest
+# ponytail: 2026-09-04 security upgrade — bump cryptography to the
+# 50.x line (CVE-2024-12797 et al. affected 41.x / 42.x; the 49.x pin we
+# shipped was a half-step before the upstream advisory landed). The
+# Fernet API the BE uses (`cryptography.fernet.Fernet`) is unchanged
+# between 49 and 51+, so ciphertexts on disk remain readable. Operators
+# do NOT need to rotate CREDENTIAL_ENCRYPTION_KEY. Existing
+# `credentials_encrypted` rows persist across restarts.
+cryptography>=50.0.0  # Fernet encryption for per-user provider credentials at rest
 # ponytail: tzdata ships the IANA timezone database (tzdb) for
 # Python's stdlib `zoneinfo`. The python:3.11-slim base image
 # doesn't include /usr/share/zoneinfo, so ZoneInfo("America/Tijuana")
