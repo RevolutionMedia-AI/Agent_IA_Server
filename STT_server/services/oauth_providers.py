@@ -5,14 +5,14 @@ Credentials live behind a different entry point that doesn't apply to the
 Integrations feature — operators consent via their own provider account,
 the BE never holds a username/password.
 
-Salesforce is the only OAuth provider in V1. The registry is shaped so
-the next provider (Dynamics 365, Google, HubSpot) drops in by adding an
-entry to `_OAUTH_PROVIDERS` and reading its own env vars; the route
-layer + the catalog entry stay untouched.
+The registry is shaped so the next provider (Dynamics 365, HubSpot,
+etc.) drops in by adding an entry to `_ensure_provider_built` and
+reading its own env vars; the route layer + the catalog entry stay
+untouched.
 
 Boot contract (LAZY):
   Providers are NOT validated at boot. A deployment that doesn't use
-  Salesforce shouldn't have to set SALESFORCE_* env vars just to
+  a given OAuth provider shouldn't have to set its env vars just to
   start. Instead:
     * /integrations/providers lists every provider as available
       (the catalog is static — what you build with is what ships).
@@ -23,8 +23,8 @@ Boot contract (LAZY):
       credential blob).
   Trade-off: a misconfigured deploy doesn't crash, but the operator
   discovers the misconfiguration the first time they click Connect
-  on Salesforce instead of at deploy time. The error message names
-  the missing variable, so the fix is one env var set + restart.
+  instead of at deploy time. The error message names the missing
+  variable, so the fix is one env var set + restart.
 """
 from __future__ import annotations
 
@@ -123,6 +123,52 @@ def _build_salesforce_config() -> OAuthConfig:
     )
 
 
+def _build_google_calendar_config() -> OAuthConfig:
+    """Reads GOOGLE_* env vars. Same redirect_uri fallback as Salesforce.
+
+    ponytail: scopes. Google Calendar needs a delegated credential
+    that can actually create events on the user's calendar.
+    `https://www.googleapis.com/auth/calendar.events` covers
+    create/update/delete single events; `calendar` (read-only) would
+    be too restrictive; `calendar.events.owned` would block free-busy
+    inserts. We ship the create+update+delete scope by default;
+    operators can tighten via GOOGLE_SCOPES env var.
+    """
+    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
+    if not redirect_uri:
+        public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+        if public_url:
+            redirect_uri = f"{public_url}/integrations/google_calendar/oauth/callback"
+    if not redirect_uri:
+        raise RuntimeError(
+            "GOOGLE_REDIRECT_URI is not set and PUBLIC_URL is not "
+            "configured; cannot build the redirect target. Set "
+            "GOOGLE_REDIRECT_URI=https://<backend>/integrations/google_calendar/oauth/callback"
+        )
+    scopes_env = os.environ.get("GOOGLE_SCOPES", "").strip()
+    scopes = (
+        tuple(s.strip() for s in scopes_env.split() if s.strip())
+        if scopes_env
+        else ("openid", "email", "profile", "https://www.googleapis.com/auth/calendar.events")
+    )
+    return OAuthConfig(
+        provider_id="google_calendar",
+        authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
+        # Google supports both the JSON + form-encoded paths on the
+        # token endpoint. Form-encoded is the older, more permissive
+        # path — matches the _http_post_form helper without changes.
+        token_url="https://oauth2.googleapis.com/token",
+        # Google's revoke endpoint accepts the access_token (not the
+        # refresh_token) and returns 200 OK on success. We surface this
+        # in the future disconnect flow; not used today.
+        revoke_url="https://oauth2.googleapis.com/revoke",
+        default_scopes=scopes,
+        client_id=os.environ["GOOGLE_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+        redirect_uri=redirect_uri,
+    )
+
+
 # ponyy: registry is empty at boot. Providers are built lazily on
 # first call to get_oauth_config — that means a deployment that
 # doesn't use Salesforce can start without setting SALESFORCE_*
@@ -143,6 +189,8 @@ def _ensure_provider_built(provider_id: str) -> None:
         return
     if provider_id == "salesforce":
         _OAUTH_PROVIDERS["salesforce"] = _build_salesforce_config()
+    elif provider_id == "google_calendar":
+        _OAUTH_PROVIDERS["google_calendar"] = _build_google_calendar_config()
     else:
         raise KeyError(f"Provider '{provider_id}' is not registered as OAuth")
 
@@ -153,7 +201,7 @@ def get_oauth_config(provider_id: str) -> OAuthConfig:
 
 
 def known_oauth_providers() -> list[str]:
-    return ["salesforce"]
+    return ["salesforce", "google_calendar"]
 
 
 def _required_env_vars(provider_id: str) -> tuple[str, ...]:
@@ -163,6 +211,12 @@ def _required_env_vars(provider_id: str) -> tuple[str, ...]:
     helper — no FE or route changes."""
     if provider_id == "salesforce":
         return ("SALESFORCE_CLIENT_ID", "SALESFORCE_CLIENT_SECRET", "SALESFORCE_REDIRECT_URI")
+    if provider_id == "google_calendar":
+        return (
+            "GOOGLE_CLIENT_ID",
+            "GOOGLE_CLIENT_SECRET",
+            "GOOGLE_REDIRECT_URI",
+        )
     return ()
 
 

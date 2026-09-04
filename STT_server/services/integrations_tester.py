@@ -107,11 +107,53 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
 
 
 def _test_google_calendar(configuration: dict, credentials: dict) -> tuple[bool, str]:
-    """Test the fixed Google Calendar n8n webhook."""
-    # ponytail: delegate to webhook tester with the server-managed URL; no operator config needed
-    return _test_webhook_reachable(
-        {"webhook_url": "https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica", "webhook_method": "POST"},
-        {},
+    """Live test against Google's APIs using the OAuth credentials the
+    operator stored on the integration row.
+
+    Three signals we want to see:
+      1. The access_token authenticates against Google's userinfo
+         endpoint. Without a valid token the operator's credentials
+         are stale or the OAuth scope is wrong.
+      2. configuration.calendar_id is set. The n8n workflow picks
+         the host calendar from this field — empty value means every
+         event creation will fail.
+      3. configuration.timezone is set (IANA tz, e.g. America/Tijuana).
+         Google API requires timezone-aware datetimes; without it
+         every event is created in UTC and the operator's calendar
+         shows the wrong wall-clock time.
+
+    Returns (False, ...) if any check fails so the FE surfaces a
+    clear "Reconnect" or "Set calendar_id + timezone" CTA.
+    """
+    access_token = (credentials.get("access_token") or "").strip()
+    if not access_token:
+        return False, "Falta conectar Google Calendar para poder probar la conexión"
+    calendar_id = (configuration.get("calendar_id") or "").strip()
+    if not calendar_id:
+        return False, "Falta configurar el calendar_id del calendario destino"
+    timezone = (configuration.get("timezone") or "").strip()
+    if not timezone:
+        return False, "Falta configurar el timezone (por ejemplo America/Tijuana)"
+    # Hit Google's userinfo endpoint with the stored access token.
+    # 200 + email payload proves the token authenticates AND that the
+    # user can read its own profile. We don't surface the email to the
+    # operator; we just need the round-trip to succeed.
+    try:
+        req = urllib.request.Request(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if not (200 <= resp.status < 300):
+                return False, "No se pudo conectar a Google — inténtalo de nuevo"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, "Sesión expirada con Google — reconecta la integración"
+        return False, f"No se pudo conectar a Google (HTTP {exc.code})"
+    except Exception as exc:
+        return False, _sanitize_error(str(exc))
+    return True, (
+        f"Conectado correctamente a Google Calendar ({calendar_id}, {timezone})"
     )
 
 

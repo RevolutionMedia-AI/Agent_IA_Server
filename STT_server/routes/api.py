@@ -2948,35 +2948,37 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
             row["id"], auth["user_id"], {},
         ) or row
 
-    # ponytail: auto-create Google Calendar tool for zero-config provider - one click creates integration + tool
+    # ponytail: auto-create Google Calendar tool for OAuth providers - one
+    # click creates the integration + a default tool that points at the
+    # catalog's `calendar_event` action. The operator then connects via
+    # /oauth/start, picks calendar_id + timezone, and assigns the
+    # integration to agents.
     if body.provider == "google_calendar":
         try:
             from STT_server.db_tools import list_tools as db_list_tools, create_tool as db_create_tool
             from STT_server.domain.tool import AgentTool
-            # Check if tool already exists for this integration to keep idempotency guard
             try:
                 existing_tools = db_list_tools(auth["user_id"], agent_id=row["agent_id"] if row["agent_id"] != "__shared__" else "__shared__")
             except Exception:
                 existing_tools = []
             already = any(
-                isinstance(t, dict) and t.get("integration_id") == row["id"] and t.get("action") == "agendar_cita_dinamica"
+                isinstance(t, dict) and t.get("integration_id") == row["id"] and t.get("action") == "calendar_event"
                 for t in (existing_tools or [])
             )
             if not already:
                 tool = AgentTool(
                     agent_id=row["agent_id"],
-                    name="Agendar Cita",
-                    description="Agenda una cita en Google Calendar y envía correo de confirmación",
+                    name="Create Calendar Event",
+                    description="Create an event on the host calendar.",
                     integration_id=row["id"],
-                    action="agendar_cita_dinamica",
+                    action="calendar_event",
                     parameters={
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string", "description": "Nombre completo del asistente"},
-                            "email": {"type": "string", "description": "Email del asistente"},
-                            "datetime": {"type": "string", "description": "Fecha y hora ISO 8601, ej: 2026-09-04T15:00:00-06:00"},
-                            "duration_minutes": {"type": "integer", "description": "Duración en minutos, por defecto 30"},
-                            "host_email": {"type": "string", "description": "Email calendario destino (opcional)"},
+                            "name": {"type": "string", "description": "Customer full name"},
+                            "email": {"type": "string", "description": "Customer email"},
+                            "datetime": {"type": "string", "description": "Appointment date and time in ISO 8601 format, e.g. 2026-09-04T15:00:00-06:00"},
+                            "duration_minutes": {"type": "integer", "description": "Duration in minutes, default 30"},
                         },
                         "required": ["name", "email", "datetime"],
                     },
@@ -3279,7 +3281,7 @@ def oauth_start_endpoint(
     integ = db_get_integration(integration_id, auth["user_id"])
     if not integ:
         raise HTTPException(status_code=404, detail="Integration not found")
-    if integ["provider"] not in ("salesforce",):  # future OAuth providers added here
+    if integ["provider"] not in ("salesforce", "google_calendar"):
         raise HTTPException(
             status_code=422,
             detail=f"Provider '{integ['provider']}' is not an OAuth integration",
@@ -3339,16 +3341,49 @@ def oauth_salesforce_callback_endpoint(
     error: Optional[str] = None,
     error_description: Optional[str] = None,
 ):
-    """Salesforce OAuth callback. No auth required — the state hash
-    is the binding; the BE resolves the integration row without
-    needing the operator to be logged in to the FE.
+    """Salesforce OAuth callback — thin wrapper around the shared
+    `_oauth_callback` helper. Salesforce needs no post-connect hook
+    (its `instance_url` already lands on the integration row via the
+    token response), so `post_connect_hook=None` skips the extra
+    configuration hydration."""
+    return _oauth_callback(
+        provider="salesforce",
+        code=code, state=state, error=error, error_description=error_description,
+        post_connect_hook=None,
+    )
 
-    On success: exchange code → tokens + instance_url → encrypt +
-    persist + clear state → redirect to FE with ?connected=<id>.
-    On provider error (?error=access_denied, etc.): redirect to
-    FE with ?error=oauth_<code>.
-    On our validation failure: redirect to FE with a generic
-    ?error=oauth_invalid.
+
+# ponytail: shared OAuth callback implementation. The provider-
+# specific route handlers above are thin wrappers that pass a
+# `post_connect_hook` (=None for Salesforce, =Google userinfo
+# prefill for Google Calendar). This is the ONE place that handles:
+#   * state hash consumption (atomic via Postgres row lock)
+#   * PKCE verifier decryption
+#   * code → token exchange
+#   * credential encryption + persist via complete_oauth_flow
+#   * post-connect hook (optional) for configuration hydration
+#   * redirect-to-FE on every outcome
+#
+# Adding a new OAuth provider means: a /oauth/start wrapper that
+# calls build_authorize_url, a /oauth/callback wrapper that calls
+# _oauth_callback with a provider-specific hook, and (optionally) a
+# _required_env_vars branch in oauth_providers.py. No copy-paste of
+# the consume/exchange/persist dance.
+def _oauth_callback(
+    *,
+    provider: str,
+    code: Optional[str],
+    state: Optional[str],
+    error: Optional[str],
+    error_description: Optional[str],
+    post_connect_hook: Optional[callable] = None,
+):
+    """The previous version of this code inlined the consume +
+    exchange + persist dance for Salesforce. With Google Calendar
+    now also OAuth, that copy-paste was going to grow to ~200
+    duplicated lines. This helper is the single point of truth —
+    provider-specific differences (instance_url vs. userinfo prefill)
+    flow through `post_connect_hook` and `_provider_post_connect_query`.
     """
     frontend_origin = os.environ.get("FRONTEND_ORIGIN", "").strip().rstrip("/")
     if not frontend_origin:
@@ -3360,35 +3395,37 @@ def oauth_salesforce_callback_endpoint(
     if not frontend_origin:
         env_label = os.environ.get("ENVIRONMENT", "production").strip().lower()
         frontend_origin = "http://localhost:5173" if env_label in ("development", "dev", "local", "test") else "https://agentiafrontend-production.up.railway.app"
-    if error:
-        log.warning("[oauth.callback] provider error=%s desc=%s", error, error_description)
+
+    def _redirect_with_error(code: str) -> RedirectResponse:
         sep = "&" if "?" in frontend_origin else "?"
         return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_{error}{sep}error_description={urllib.parse.quote(error_description or '')}",
+            url=f"{frontend_origin}/integrations?error={code}{sep}error_description={urllib.parse.quote(error_description or '')}",
             status_code=302,
         )
+
+    if error:
+        log.warning("[oauth.callback] provider error=%s desc=%s", error, error_description)
+        return _redirect_with_error(f"oauth_{error}")
     if not code or not state:
         return RedirectResponse(
             url=f"{frontend_origin}/integrations?error=oauth_invalid",
             status_code=302,
         )
+
     from STT_server.db_integrations import (
         consume_oauth_state,
         complete_oauth_flow,
-        get_integration_by_id,
     )
-    from STT_server.security.credentials import encrypt_credentials, decrypt_credentials
+    from STT_server.security.credentials import (
+        encrypt_credentials, decrypt_credentials,
+    )
     from STT_server.services.oauth_providers import (
         hash_state, get_oauth_config,
         exchange_code_for_tokens, OAuthError, RefreshTokenRevoked, now_plus_seconds,
     )
     from STT_server.db import get_conn, is_postgres
+
     state_hash = hash_state(state)
-    # ponyy: ATOMIC consume BEFORE exchange. We use the WHERE-filter
-    # UPDATE ... RETURNING so a concurrent / replayed callback can't
-    # double-exchange the same code. If 0 rows come back, the state
-    # was tampered with, expired, or already used — redirect with
-    # the same code (no leak about which).
     if is_postgres():
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -3396,133 +3433,109 @@ def oauth_salesforce_callback_endpoint(
     else:
         integ = consume_oauth_state(state_hash)
     if not integ:
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_invalid_state",
-            status_code=302,
-        )
-    # At this point the state has been consumed. The remaining work
-    # (token exchange + persist) uses the SAME cursor (Postgres)
-    # so a single transaction wraps the whole callback.
+        return _redirect_with_error("oauth_invalid_state")
+
     integration_id = integ["id"]
     user_id = integ["user_id"]
-    provider = integ["provider"]
-    # ponyy: PKCE. The verifier was returned from consume_oauth_state
-    # as a key on the row (`_oauth_code_verifier_encrypted`).
-    # Decrypt it now so we can send the original to Salesforce in
-    # the token-exchange POST. Missing verifier (legacy row from
-    # before migration 018) → exchange without PKCE — falls back
-    # to the no-PKCE path, which works on non-PKCE Connected Apps.
+    integ_provider = integ.get("provider") or provider
     code_verifier_plain = None
     verifier_encrypted = integ.pop("_oauth_code_verifier_encrypted", None)
     if verifier_encrypted:
         try:
-              code_verifier_plain = decrypt_value(verifier_encrypted)
+            code_verifier_plain = decrypt_value(verifier_encrypted)
         except Exception as exc:
-            log.warning("[oauth.callback] verifier decrypt failed integration_id=%s err=%s",
-                        integration_id, exc)
+            log.warning(
+                "[oauth.callback] verifier decrypt failed integration_id=%s err=%s",
+                integration_id, exc,
+            )
+
+    def _mark_failed_and_redirect(exc_message: str, code: str) -> RedirectResponse:
+        from STT_server.db_integrations import clear_oauth_state
+        clear_oauth_state(integration_id, user_id)
+        log.warning(
+            "[oauth.callback] %s integration_id=%s err=%s", code, integration_id, exc_message,
+        )
+        from STT_server.db_integrations import mark_integration_status as _mark_status
+        _mark_status(integration_id, user_id, "failed", last_test_message=exc_message[:500])
+        return _redirect_with_error(code)
+
+    def _finalize_postgres(cur) -> RedirectResponse:
+        try:
+            cfg = get_oauth_config(integ_provider)
+            tokens = exchange_code_for_tokens(cfg, code, code_verifier=code_verifier_plain)
+        except RefreshTokenRevoked as exc:
+            conn.rollback()
+            return _mark_failed_and_redirect(str(exc), "oauth_code_rejected")
+        except OAuthError as exc:
+            log.exception(
+                "[oauth.callback] exchange error integration_id=%s err=%s",
+                integration_id, exc,
+            )
+            conn.rollback()
+            return _mark_failed_and_redirect(str(exc), "oauth_exchange_failed")
+        creds = {
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+        }
+        if tokens.expires_in is not None:
+            creds["expires_at"] = now_plus_seconds(tokens.expires_in)
+        if tokens.scope:
+            creds["scope"] = tokens.scope
+        encrypted = encrypt_credentials(creds)
+        configuration = dict(integ.get("configuration") or {})
+        if tokens.instance_url:
+            configuration["instance_url"] = tokens.instance_url
+        if post_connect_hook:
+            try:
+                extra = post_connect_hook(integration_id, user_id, creds) or {}
+                if extra:
+                    configuration.update(extra)
+            except Exception as exc:
+                log.warning(
+                    "[oauth.callback] post_connect_hook failed integration_id=%s err=%s",
+                    integration_id, exc,
+                )
+        saved = complete_oauth_flow(
+            integration_id, user_id,
+            credentials_encrypted=encrypted,
+            configuration=configuration,
+            scope=tokens.scope,
+            connection_status="connected",
+            cur=cur,
+        )
+        if not saved:
+            conn.rollback()
+            log.error(
+                "[oauth.callback] complete_oauth_flow returned None integration_id=%s",
+                integration_id,
+            )
+            return _redirect_with_error("oauth_internal")
+        log.info(
+            "[oauth.callback] connected integration_id=%s provider=%s user_id=%s",
+            saved["id"], saved["provider"], user_id,
+        )
+        return RedirectResponse(
+            url=f"{frontend_origin}/integrations?connected={saved['id']}"
+            + _provider_post_connect_query(saved["provider"]),
+            status_code=302,
+        )
+
     if is_postgres():
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Exchange the code for tokens. Network call to
-                # Salesforce — done inside the transaction so the
-                # callback is one round trip from "code received"
-                # to "tokens persisted".
-                try:
-                    cfg = get_oauth_config(provider)
-                    tokens = exchange_code_for_tokens(cfg, code, code_verifier=code_verifier_plain)
-                except RefreshTokenRevoked as exc:
-                    log.warning(
-                        "[oauth.callback] exchange revoked integration_id=%s err=%s",
-                        integration_id, exc,
-                    )
-                    mark_integration_status_failed(
-                        cur, integration_id, user_id, str(exc),
-                    )
-                    conn.commit()
-                    return RedirectResponse(
-                        url=f"{frontend_origin}/integrations?error=oauth_code_rejected",
-                        status_code=302,
-                    )
-                except OAuthError as exc:
-                    log.exception(
-                        "[oauth.callback] exchange error integration_id=%s err=%s",
-                        integration_id, exc,
-                    )
-                    # State was already consumed. Mark failed so the
-                    # operator sees the row is broken in the UI; they
-                    # can re-trigger OAuth from /oauth/start.
-                    mark_integration_status_failed(
-                        cur, integration_id, user_id, str(exc),
-                    )
-                    conn.commit()
-                    return RedirectResponse(
-                        url=f"{frontend_origin}/integrations?error=oauth_exchange_failed",
-                        status_code=302,
-                    )
-                creds = {
-                    "access_token": tokens.access_token,
-                    "refresh_token": tokens.refresh_token,
-                }
-                if tokens.expires_in is not None:
-                    creds["expires_at"] = now_plus_seconds(tokens.expires_in)
-                if tokens.scope:
-                    creds["scope"] = tokens.scope
-                encrypted = encrypt_credentials(creds)
-                configuration = dict(integ.get("configuration") or {})
-                if tokens.instance_url:
-                    configuration["instance_url"] = tokens.instance_url
-                saved = complete_oauth_flow(
-                    integration_id, user_id,
-                    credentials_encrypted=encrypted,
-                    configuration=configuration,
-                    scope=tokens.scope,
-                    connection_status="connected",
-                    cur=cur,
-                )
-                if not saved:
-                    conn.rollback()
-                    log.error(
-                        "[oauth.callback] complete_oauth_flow returned None integration_id=%s",
-                        integration_id,
-                    )
-                    return RedirectResponse(
-                        url=f"{frontend_origin}/integrations?error=oauth_internal",
-                        status_code=302,
-                    )
-                log.info(
-                    "[oauth.callback] connected integration_id=%s provider=%s user_id=%s",
-                    saved["id"], saved["provider"], user_id,
-                )
-                return RedirectResponse(
-                    url=f"{frontend_origin}/integrations?connected={saved['id']}",
-                    status_code=302,
-                )
-    # JSON-file fallback: same shape, separate connection per call.
+                return _finalize_postgres(cur)
+    # JSON-file fallback path
     try:
-        cfg = get_oauth_config(provider)
+        cfg = get_oauth_config(integ_provider)
         tokens = exchange_code_for_tokens(cfg, code, code_verifier=code_verifier_plain)
     except RefreshTokenRevoked as exc:
-        log.warning(
-            "[oauth.callback] exchange revoked integration_id=%s err=%s",
-            integration_id, exc,
-        )
-        from STT_server.db_integrations import clear_oauth_state
-        clear_oauth_state(integration_id, user_id)
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_code_rejected",
-            status_code=302,
-        )
+        return _mark_failed_and_redirect(str(exc), "oauth_code_rejected")
     except OAuthError as exc:
         log.exception(
             "[oauth.callback] exchange error integration_id=%s err=%s",
             integration_id, exc,
         )
-        from STT_server.db_integrations import clear_oauth_state
-        clear_oauth_state(integration_id, user_id)
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_exchange_failed",
-            status_code=302,
-        )
+        return _mark_failed_and_redirect(str(exc), "oauth_exchange_failed")
     creds = {
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
@@ -3535,6 +3548,16 @@ def oauth_salesforce_callback_endpoint(
     configuration = dict(integ.get("configuration") or {})
     if tokens.instance_url:
         configuration["instance_url"] = tokens.instance_url
+    if post_connect_hook:
+        try:
+            extra = post_connect_hook(integration_id, user_id, creds) or {}
+            if extra:
+                configuration.update(extra)
+        except Exception as exc:
+            log.warning(
+                "[oauth.callback] post_connect_hook failed integration_id=%s err=%s",
+                integration_id, exc,
+            )
     saved = complete_oauth_flow(
         integration_id, user_id,
         credentials_encrypted=encrypted,
@@ -3547,18 +3570,89 @@ def oauth_salesforce_callback_endpoint(
             "[oauth.callback] complete_oauth_flow returned None integration_id=%s",
             integration_id,
         )
-        return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error=oauth_internal",
-            status_code=302,
-        )
+        return _redirect_with_error("oauth_internal")
     log.info(
         "[oauth.callback] connected integration_id=%s provider=%s user_id=%s",
         saved["id"], saved["provider"], user_id,
     )
     return RedirectResponse(
-        url=f"{frontend_origin}/integrations?connected={saved['id']}",
+        url=f"{frontend_origin}/integrations?connected={saved['id']}"
+        + _provider_post_connect_query(saved["provider"]),
         status_code=302,
     )
+@api_router.get("/integrations/google_calendar/oauth/callback")
+def oauth_google_calendar_callback_endpoint(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    """Google Calendar OAuth callback.
+
+    ponytail: the OAuth flow itself is the same wire shape as
+    Salesforce — same consume_oauth_state / exchange / encrypt /
+    complete_oauth_flow sequence, same error taxonomy. The only
+    difference post-exchange is that Google returns NO equivalent
+    of Salesforce's `instance_url`; we pull the user's primary
+    calendar email + timezone from the userinfo endpoint instead
+    so the operator's first view of the connected integration
+    shows a sensible `calendar_id` default (their own email).
+    Empty `calendar_id` is fine — the operator picks one in the
+    next UI step (or the LLM-driven runtime can swap it)."""
+    return _oauth_callback(
+        provider="google_calendar",
+        code=code, state=state, error=error, error_description=error_description,
+        # ponytail: provider-specific configuration hydration. After
+        # tokens land, fetch userinfo and prefill calendar_id with
+        # the user's primary email so the operator sees a sensible
+        # default in the connection-status panel.
+        post_connect_hook=_google_calendar_post_connect,
+    )
+
+
+def _google_calendar_post_connect(integration_id: str, user_id: str, decrypted_credentials: dict) -> dict:
+    """After the OAuth handshake lands tokens, fetch the user's
+    primary email + timezone from Google and prefill
+    configuration.calendar_id / configuration.timezone so the
+    operator's connection-status panel opens with a sensible
+    default. Empty results are fine — the operator picks later.
+
+    Returns the configuration dict to merge into the integration
+    row (caller is responsible for persisting it)."""
+    access_token = (decrypted_credentials.get("access_token") or "").strip()
+    if not access_token:
+        return {}
+    try:
+        req = urllib.request.Request(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if 200 <= resp.status < 300:
+                payload = _json.loads(resp.read())
+            else:
+                payload = {}
+    except Exception as exc:
+        log.info(
+            "[oauth.callback] google_calendar userinfo fetch failed integration_id=%s err=%s",
+            integration_id, exc,
+        )
+        return {}
+    config = {}
+    email = (payload.get("email") or "").strip() if isinstance(payload, dict) else ""
+    if email:
+        config["calendar_id"] = email
+    return config
+
+
+def _provider_post_connect_query(provider: str) -> str:
+    """Some integrations need an extra ?configure=1 flag so the FE
+    routes to a configuration step. Google Calendar needs the
+    operator to pick calendar_id + timezone before they assign
+    tools; Salesforce is ready to use immediately after connect."""
+    if provider == "google_calendar":
+        return "&configure=1"
+    return ""
 
 
 def mark_integration_status_failed(cur, integration_id, user_id, message: str) -> None:

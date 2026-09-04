@@ -320,7 +320,7 @@ def test_reconcile_propagates_integration_changes():
             "name": "Google Calendar",
         }),
         get_integration_provider_spec_fn=_fake_spec([
-            _action("agendar_cita_dinamica", "Agendar Cita",
+            _action("calendar_event", "Create Calendar Event",
                     when_en="Use when the caller wants to schedule.",
                     when_es="Usa cuando el cliente quiera agendar.",
                     required=["datetime"],
@@ -332,5 +332,5 @@ def test_reconcile_propagates_integration_changes():
         ]),
     )
     assert "## Integration: Google Calendar" in after
-    assert "### Action: Agendar Cita" in after
+    assert "### Action: Create Calendar Event" in after
     assert any("INTEGRATION:int_1" in line for line in log)

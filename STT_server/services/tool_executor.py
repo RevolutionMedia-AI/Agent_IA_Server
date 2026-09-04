@@ -447,6 +447,33 @@ async def execute_tool_call(
         body["provider"] = integration["provider"]
         if tool.get("action"):
             body["action"] = tool["action"]
+        # ponytail: Google Calendar OAuth credentials + per-integration
+        # configuration flow downstream in the n8n workflow. The LLM
+        # never sees these — they're server-injected from the encrypted
+        # row + configuration.calendar_id / configuration.timezone that
+        # the operator picked in /integrations after the OAuth
+        # handshake completed. `access_token` and `refresh_token` let
+        # the n8n workflow call Google API directly without bouncing
+        # back to us for each event.
+        if integration.get("provider") == "google_calendar":
+            configuration = integration.get("configuration") or {}
+            calendar_id = (configuration.get("calendar_id") or "").strip()
+            timezone = (configuration.get("timezone") or "").strip()
+            if calendar_id:
+                body["calendar_id"] = calendar_id
+            if timezone:
+                body["timezone"] = timezone
+            # ponytail: We cannot decrypt credentials here without
+            # circular-importing the security module into the tool
+            # executor. Instead we forward the integration_id + a
+            # server-internal flag telling n8n to call our
+            # /internal/integrations/{id}/credentials endpoint (which
+            # decrypts + refreshes-on-read) for the access/refresh
+            # tokens. The tokens never leave the BE in plaintext
+            # logs — only the internal endpoint serves them to n8n.
+            body["credentials_endpoint"] = (
+                f"/internal/integrations/{integration['id']}/credentials"
+            )
     elif tool.get("action"):
         # Degraded: tool carries an action but no integration
         # binding. Still useful — the n8n Switch can dispatch on it.

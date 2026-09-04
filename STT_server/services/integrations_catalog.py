@@ -420,26 +420,46 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         actions=(),  # empty: the operator picks the action free-form per tool
         test_fn="STT_server.services.integrations_tester._test_webhook_reachable",
     ),
-    # ponytail: native Google Calendar via n8n - zero-config for the operator.
-    # Webhook URL is server-managed (INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__GOOGLE_CALENDAR or hardcoded fallback),
-    # so the operator just clicks Add and the tool + prompt injection work automatically.
+    # ponytail: Google Calendar via OAuth. Each operator connects
+    # THEIR Google account in /integrations → Connect with Google.
+    # The OAuth handshake writes the user's access_token + refresh_token
+    # to the integration row (encrypted) plus whatever scope metadata
+    # Google returns. The flow reuses the OAuth plumbing that
+    # Salesforce already established — same registry, same callback
+    # shape, same refresh-on-read logic in
+    # /internal/integrations/{id}/credentials. n8n then receives
+    # the access_token (and refresh_token) inside its body alongside
+    # `calendar_id` + `timezone` from the integration's configuration.
     #
-    # The bilingual when_to_use_en/es land in the agent's System Prompt
-    # via agent_prompt_tools.build_integration_section the moment the
-    # operator assigns this integration to an agent. They are kept at
-    # the action level (NOT inside parameters_schema) so they never
-    # leak into the OpenAI tools[] payload.
+    # ponytail: action parameters are the LLM's contract — they go
+    # verbatim into the function-call body and into the `## Tool:`
+    # section that the LLM reads. We deliberately exclude
+    # `host_email` from the JSON Schema because the host calendar is
+    # always resolved server-side from configuration.calendar_id —
+    # the LLM cannot pick a calendar, so the field shouldn't appear
+    # in the function definition.
     IntegrationProviderSpec(
         id="google_calendar",
         name="Google Calendar",
         category="custom",
-        description="Agenda citas en Google Calendar y envía correos vía n8n. URL fija: https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica",
-        fields=(),
+        # ponytail: configuration keys. The operator sets these
+        # AFTER the OAuth handshake (the connection-status page
+        # surfaces an extra "calendar_id" / "timezone" picker once
+        # the integration is `connected`). The LLM never sees
+        # these — the n8n workflow picks them up off the body the
+        # tool_executor sends.
+        description=(
+            "OAuth — connect a Google account to create + delete calendar "
+            "events through n8n. The host calendar (configuration.calendar_id) "
+            "and timezone (configuration.timezone) live on the integration row, "
+            "not in the LLM's arguments."
+        ),
+        fields=(),  # OAuth — no operator-typed fields at create time.
         actions=(
             _a(
-                "agendar_cita_dinamica",
-                "Agendar Cita Dinámica",
-                "Agenda una cita en Google Calendar y envía correo de confirmación.",
+                "calendar_event",
+                "Create Calendar Event",
+                "Create an event on the host calendar.",
                 {
                     "type": "object",
                     "properties": {
@@ -447,7 +467,6 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
                         "email": {"type": "string", "description": "Customer email"},
                         "datetime": {"type": "string", "description": "Appointment date and time in ISO 8601 format, e.g. 2026-09-04T15:00:00-06:00"},
                         "duration_minutes": {"type": "integer", "description": "Duration in minutes, default 30"},
-                        "host_email": {"type": "string", "description": "Host calendar email (optional, defaults to kevin.escalante@revolutionmedia.ai)"},
                     },
                     "required": ["name", "email", "datetime"],
                 },
@@ -462,6 +481,19 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
             ),
         ),
         test_fn="STT_server.services.integrations_tester._test_google_calendar",
+        auth_type="oauth",
+        oauth_label="Connect Google Calendar",
+        # Default scope list intentionally left empty here — the
+        # registry in oauth_providers._build_google_calendar_config
+        # supplies the canonical set (openid + email + profile +
+        # calendar.events). This tuple is only used as a fallback
+        # when the OAuthConfig.default_scopes field is missing.
+        oauth_default_scopes=(
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/calendar.events",
+        ),
     ),
 )
 
