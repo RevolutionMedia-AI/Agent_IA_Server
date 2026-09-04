@@ -4142,3 +4142,206 @@ def internal_get_integration_credentials(
         "configuration": row.get("configuration") or {},
         "credentials": _credentials_for_n8n(provider, creds_plain),
     }
+
+
+# ── /internal/integrations/{id}/execute (service-token only) ─────────────
+
+class _IntegrationExecuteRequest(BaseModel):
+    """POST body the n8n webhook sends for `action` calls.
+
+    `action` is the verb the BE dispatcher matches against the
+    (provider, action) registry in services/integrations_executor.py.
+    `arguments` is whatever the FE / LLM collected during the call —
+    we forward it untouched to the executor.
+    """
+    action: str = Field(..., min_length=1, max_length=64)
+    arguments: dict = Field(default_factory=dict)
+
+
+@api_router.post("/internal/integrations/{integration_id}/execute")
+def internal_execute_integration_action(
+    integration_id: str,
+    body: _IntegrationExecuteRequest,
+    request: Request,
+    _service: dict = Depends(require_service_token),
+):
+    """Server-to-server action executor (called by n8n today; same
+    shape works for any future Workflow provider).
+
+    ponytail: this shares the entire happy-path with
+    ``/internal/integrations/{id}/credentials`` — same
+    ``require_service_token`` gate, same JSON-backed credential
+    resolution, same refresh-on-read advisory lock. Refactor was
+    considered (extract ``_resolve_google_calendar_creds``); the win
+    was small and the cost was a third function to keep aligned with
+    the BE's internal endpoint contract. The duplication lives
+    behind a comment so the next person sees it.
+    """
+    import dataclasses
+    from STT_server.db_integrations import (
+        get_integration_by_id as _db_get_integration_by_id,
+        acquire_advisory_xact_lock as _acquire_advisory_lock,
+        update_integration_credentials as _update_creds,
+        mark_integration_status as _mark_failed,
+    )
+    from STT_server.security.credentials import (
+        decrypt_credentials as _decrypt_creds,
+        encrypt_credentials as _encrypt_creds,
+    )
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec as _get_spec,
+    )
+    from STT_server.services.integrations_executor import execute_action
+    from STT_server.services.oauth_providers import (
+        get_oauth_config as _get_oauth_config,
+        refresh_access_token as _refresh_oauth,
+        is_token_expiring as _expiring,
+        now_plus_seconds as _now_plus,
+        RefreshTokenRevoked as _Revoked,
+        OAuthError as _OauthError,
+    )
+    from STT_server.db import get_conn as _get_conn
+
+    row = _db_get_integration_by_id(integration_id)
+    if not row:
+        log.warning(
+            "[internal.exec] 404 integration_id=%s ip=%s",
+            integration_id, request.client.host if request.client else "?",
+        )
+        raise HTTPException(status_code=404, detail="Integration not found")
+    provider = row.get("provider") or ""
+    config = row.get("configuration") or {}
+    cipher = row.get("credentials_cipher") or "fernet-v1"
+    encrypted = row.get("credentials_encrypted")
+    if not encrypted:
+        return {
+            "success": False,
+            "action": body.action,
+            "data": None,
+            "error": "no_credentials",
+        }
+
+    try:
+        creds_plain = _decrypt_creds(encrypted) if cipher == "fernet-v1" else {}
+    except Exception as exc:
+        log.warning(
+            "[internal.exec] decrypt failed integration_id=%s err=%s",
+            integration_id, exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Credentials unavailable: {exc}",
+        )
+
+    spec = _get_spec(provider)
+    is_oauth = bool(spec and getattr(spec, "auth_type", "static") == "oauth")
+
+    # Refresh-on-read: identical pattern to /credentials above. Two
+    # concurrent calls for the same integration serialize on the
+    # advisory lock; the second one sees the freshly-persisted row.
+    from STT_server.db import is_postgres as _is_pg
+    if (
+        is_oauth
+        and _expiring(creds_plain.get("expires_at"))
+        and _is_pg()
+    ):
+        try:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    _acquire_advisory_lock(cur, integration_id)
+                    fresh = _db_get_integration_by_id(integration_id)
+                    if fresh and fresh.get("credentials_encrypted"):
+                        try:
+                            creds_plain = _decrypt_creds(fresh["credentials_encrypted"])
+                        except Exception:
+                            pass
+                    if not _expiring(creds_plain.get("expires_at")):
+                        pass
+                    else:
+                        rt = creds_plain.get("refresh_token")
+                        if not rt:
+                            _mark_failed(
+                                integration_id, fresh["user_id"], "failed",
+                                last_test_message="no refresh token", cur=cur,
+                            )
+                            conn.commit()
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error": "oauth_refresh_failed",
+                                    "message": "Refresh token missing",
+                                    "provider": provider,
+                                },
+                            )
+                        try:
+                            cfg = _get_oauth_config(provider)
+                            new_tokens = _refresh_oauth(cfg, rt)
+                        except _Revoked as exc:
+                            _mark_failed(
+                                integration_id, fresh["user_id"], "failed",
+                                last_test_message=str(exc), cur=cur,
+                            )
+                            conn.commit()
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error": "oauth_refresh_failed",
+                                    "message": str(exc),
+                                    "provider": provider,
+                                },
+                            )
+                        except _OauthError as exc:
+                            _mark_failed(
+                                integration_id, fresh["user_id"], "failed",
+                                last_test_message=str(exc), cur=cur,
+                            )
+                            conn.commit()
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error": "oauth_refresh_failed",
+                                    "message": str(exc),
+                                    "provider": provider,
+                                },
+                            )
+                        merged = dict(creds_plain)
+                        merged["access_token"] = new_tokens.access_token
+                        if new_tokens.refresh_token:
+                            merged["refresh_token"] = new_tokens.refresh_token
+                        if new_tokens.expires_in is not None:
+                            merged["expires_at"] = _now_plus(new_tokens.expires_in)
+                        _update_creds(
+                            integration_id, fresh["user_id"],
+                            _encrypt_creds(merged), cur=cur,
+                        )
+                        creds_plain = merged
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[internal.exec] refresh path failed integration_id=%s err=%s",
+                integration_id, exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "oauth_refresh_failed", "message": str(exc)},
+            )
+
+    log.info(
+        "[internal.exec] integration_id=%s provider=%s action=%s ip=%s",
+        integration_id, provider, body.action, request.client.host if request.client else "?",
+    )
+
+    success, data, error_message = execute_action(
+        provider=provider,
+        action=body.action,
+        integration_row=row,
+        credentials=creds_plain,
+        arguments=body.arguments,
+    )
+    return {
+        "success": bool(success),
+        "action": body.action,
+        "data": data,
+        "error": error_message,
+    }
