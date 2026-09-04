@@ -227,6 +227,38 @@ def test_list_agents_stamps_counters(monkeypatch):
     assert rows[1]["active_calls"] == 1
 
 
+def test_has_user_stored_key_reads_credentials_column(monkeypatch):
+    """Regression: per-user provider credentials live in the
+    ``credentials`` JSONB column on the agent_tools row, not as a
+    ``connected`` boolean. The previous version queried
+    ``t.get("connected")`` which never matched → every call was
+    classified ``used_platform_keys=True`` and the operator paid the
+    platform rate even after uploading their own OpenAI key.
+    """
+    from STT_server.services.usage_store import has_user_stored_key
+
+    fake_rows = {
+        ("openai", "user-1"): {"id": "openai", "credentials": {"api_key": "sk-..."}},
+        ("elevenlabs", "user-1"): {"id": "elevenlabs", "credentials": {}},
+        ("inworld", "user-1"): {"id": "inworld", "credentials": "{}"},  # JSON string 'null'
+    }
+
+    def fake_get_tool(tool_id, user_id):
+        return fake_rows.get((tool_id, user_id))
+
+    import STT_server.db_tools as db_tools_mod
+    # ponytail: the helper lazy-imports ``db_get_tool`` from db_tools,
+    # so monkeypatch the source attribute (not the consumer module).
+    monkeypatch.setattr(db_tools_mod, "db_get_tool", fake_get_tool)
+
+    assert has_user_stored_key("user-1", "openai") is True
+    assert has_user_stored_key("user-1", "elevenlabs") is False
+    assert has_user_stored_key("user-1", "inworld") is False
+    assert has_user_stored_key("user-1", "missing") is False
+    assert has_user_stored_key("user-1", "") is False
+    assert has_user_stored_key("", "openai") is False
+
+
 def test_count_open_sessions_does_not_mutate(monkeypatch):
     """list_open_sessions flips rows to closed; count_open_sessions is
     read-only so polling dashboards don't accidentally tear down the

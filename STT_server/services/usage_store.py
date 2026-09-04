@@ -66,12 +66,38 @@ def aggregate_usage(
 
 
 def has_user_stored_key(user_id: str, provider: str | None) -> bool:
-    """True if the user has a connected api-key record for this
-    provider. Reads from tools_integrations (Postgres) via db_tools."""
+    """True if the user has a stored credential for this provider.
+
+    ponytail: 2026-09-03 — per-user provider credentials live in the
+    `agent_tools` table with `agent_id='__shared__'`, `id=service_id`
+    and the encrypted dict under the `credentials` JSONB column. The
+    resolver derives `connected` server-side from `credentials is None`,
+    but that flag is NOT persisted on disk. The previous version looked
+    for `t.get("connected")` which never matched → every call was
+    classified `used_platform_keys=True` and the operator paid the
+    platform rate even after uploading their own OpenAI key. Look at
+    `credentials` directly (a non-null / non-empty dict) so the JSON
+    backend and Postgres backend agree.
+    """
     if not provider or not user_id:
         return False
-    from STT_server.db_tools import list_tools
-    return any(
-        t.get("id") == provider and t.get("connected")
-        for t in list_tools(user_id)
-    )
+    # ponytail: lazy import so importing this module doesn't drag in
+    # the whole db_tools stack (psycopg2 + JSON fallback) on a code
+    # path that never touches it (the live-calls dashboard endpoint
+    # imports usage_store transitively for record_call only).
+    from STT_server.db_tools import db_get_tool
+
+    row = db_get_tool(provider, user_id)
+    if not row:
+        return False
+    creds = row.get("credentials")
+    if creds is None:
+        return False
+    if isinstance(creds, str):
+        creds = creds.strip()
+        if not creds or creds in ("{}", "null"):
+            return False
+        return True
+    if isinstance(creds, dict):
+        return bool(creds)
+    return bool(creds)

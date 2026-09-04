@@ -354,6 +354,13 @@ def get_tool(tool_id: str, user_id: str) -> dict | None:
             return _row_to_tool(row) if row else None
 
 
+# ponytail: 2026-09-03 — keep an aliased name available for callers
+# that imported `db_get_tool` before the route layer consolidated on
+# `get_tool`. The session_runtime + usage_store consume this alias
+# to keep their import surface stable.
+db_get_tool = get_tool
+
+
 def create_tool(
     user_id: str,
     payload: dict,
