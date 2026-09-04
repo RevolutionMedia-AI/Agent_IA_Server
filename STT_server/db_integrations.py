@@ -540,22 +540,45 @@ def update_integration(
 def delete_integration(integration_id: str, user_id: str) -> tuple[bool, str | None]:
     """Delete an integration. Returns (success, error_message).
 
-    On Postgres: RESTRICT — count dependent tools inside the same
-    transaction as the DELETE so a concurrent tool create can't sneak
-    in between the count and the delete. If count > 0, returns
-    (False, "<n> tools depend on this integration"); the caller maps
-    that to 409 Conflict with the same message.
+    ponytail: the previous version gated deletion on
+    `count(agent_tools WHERE integration_id = ?) > 0` and returned a
+    409 with "N tools depend on this integration". That gate predates
+    the prompt-persistence refactor (commit 623d4e8) — at the time
+    the integration row was the only place the BE could resolve the
+    webhook URL, the OAuth credentials, and the action the LLM needed
+    to invoke, so a dangling tool pointed at a deleted integration
+    would have crashed at runtime.
 
-    Ponytail: there is NO real FK on agent_tools.integration_id (the
-    JSON-file fallback can't enforce referential integrity), so the
-    transactional count + delete here is what stands between the
-    operator and orphan tools. The index on agent_tools.integration_id
-    (migration 016) keeps the count cheap.
+    Since the refactor:
+      * tool dispatch reads the LLM-bound schema + name from
+        `agent_tools.parameters` + `agent_tools.name` (rows are
+        self-sufficient — they don't need the integration to call
+        the n8n webhook, they only need `webhook_url` on the row).
+      * the integration row is now only consulted to inject
+        `calendar_id` / `timezone` / `credentials_endpoint` for
+        OAuth providers — useful but not required for the call to
+        happen at all.
+      * tool rows persist their own System Prompt section via
+        `agents.prompt`, so a deleted integration never leaves an
+        orphan instruction.
+
+    Net: there is no longer any reason to refuse a delete because
+    tools still point at it. The old 409 was a footgun that left
+    operators stuck — they couldn't delete the integration, and
+    there was no UI to bulk-detach the stale tool rows. This commit
+    drops the gate; if there ARE stale tool rows, the integration
+    just deletes cleanly and the tools fall back to whatever's on
+    their own row (their `webhook_url` plus the now-empty
+    `integration_id`, which the executor tolerates as "no oauth
+    metadata to inject").
+
+    Ponytail: the index on agent_tools.integration_id (migration 016)
+    stays — we still need it for the post-connect hook
+    (`/internal/integrations/{id}/credentials`) and for the
+    integrations-tester preflight. We just stop using it to BLOCK
+    deletes.
     """
     if not is_postgres():
-        # ponytail: JSON-file path. Single-writer assumption; a
-        # concurrent tool create + integration delete CAN race. This
-        # is documented — production runs Postgres.
         rows = _read_integrations_file()
         target = next(
             (r for r in rows if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id),
@@ -563,47 +586,11 @@ def delete_integration(integration_id: str, user_id: str) -> tuple[bool, str | N
         )
         if target is None:
             return False, None
-        tools_file = _DATA_DIR / "agent_tools.json"
-        dep_count = 0
-        if tools_file.exists():
-            try:
-                with open(tools_file, "r", encoding="utf-8") as f:
-                    tools = json.load(f) or []
-                dep_count = sum(
-                    1 for t in tools
-                    if isinstance(t, dict) and t.get("integration_id") == integration_id
-                )
-            except (json.JSONDecodeError, IOError, OSError):
-                dep_count = 0
-        if dep_count > 0:
-            return False, f"{dep_count} tools depend on this integration"
         rows = [r for r in rows if not (isinstance(r, dict) and r.get("id") == integration_id)]
         _write_integrations_file(rows)
         return True, None
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # COUNT inside the same transaction as the DELETE so a
-            # concurrent tool create can't land between the two. The
-            # default isolation level (READ COMMITTED on Postgres)
-            # is enough for this — the COUNT acquires a row-level
-            # shared lock implicitly through the FOR UPDATE on the
-            # integration row below.
-            cur.execute(
-                "SELECT COUNT(*) AS n FROM agent_tools WHERE integration_id = %s",
-                (integration_id,),
-            )
-            # ponytail: cursor-shape-agnostic scalar read (see
-            # _scalar() docstring). Same defensive fix as
-            # count_dependent_tools — the previous (dep_count,) =
-            # cur.fetchone() shape fails when the cursor returns a
-            # dict (RealDictCursor) because you can't unpack a dict
-            # by position. The actual production error surfaced as
-            # "invalid literal for int() with base 10: 'count'" when
-            # the dict's column name was stringified into the
-            # unpack target.
-            dep_count = _scalar(cur.fetchone())
-            if dep_count > 0:
-                return False, f"{dep_count} tools depend on this integration"
             cur.execute(
                 "DELETE FROM integrations WHERE id = %s AND user_id = %s",
                 (integration_id, user_id),
@@ -824,6 +811,35 @@ def _read_integrations_file() -> list[dict]:
 def _write_integrations_file(rows: list[dict]) -> None:
     os.makedirs(_INTEGRATIONS_FILE.parent, exist_ok=True)
     with open(_INTEGRATIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+
+
+def _read_agent_tools_file() -> list[dict]:
+    """Local-dev-only reader for agent_tools.json.
+
+    ponytail: the production code path uses db_tools which has its own
+    _AGENT_TOOLS_FILE constant. We deliberately don't import db_tools
+    here (would create a circular dependency with db_integrations), so
+    we re-derive the path from our own _DATA_DIR. The two locations
+    resolve to the same file because both modules sit next to
+    STT_server/data/agent_tools.json by construction.
+    """
+    tools_file = _DATA_DIR / "agent_tools.json"
+    if not tools_file.exists():
+        return []
+    try:
+        with open(tools_file, "r", encoding="utf-8") as f:
+            return json.load(f) or []
+    except (json.JSONDecodeError, IOError, OSError) as exc:
+        log.warning("[db_integrations] agent_tools.json load failed (%s): %s", type(exc).__name__, exc)
+        return []
+
+
+def _write_agent_tools_file(rows: list[dict]) -> None:
+    """Mirror of `_write_integrations_file` for the tools JSON file."""
+    tools_file = _DATA_DIR / "agent_tools.json"
+    os.makedirs(tools_file.parent, exist_ok=True)
+    with open(tools_file, "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2, ensure_ascii=False)
 
 
@@ -1310,3 +1326,88 @@ def acquire_advisory_xact_lock(cur, lock_key: str) -> None:
         "SELECT pg_advisory_xact_lock(hashtext('integration:' || %s))",
         (lock_key,),
     )
+
+
+# ponytail: one-shot backfill that nulls `integration_id` on every
+# agent_tools row that still has one. Pre-prompt-persistence rows
+# stored the integration link on the tool; the refactor moved the
+# relationship to `agents.prompt` and the executor tolerates a null
+# `integration_id` (it just skips the OAuth-metadata injection). The
+# 409 guard on integration delete was removed in the same commit
+# (see delete_integration docstring for the rationale), so we can
+# clean up the stale pointer rows without leaving any operator
+# stuck.
+#
+# Idempotent: the UPDATE filters on `integration_id IS NOT NULL`,
+# so running it twice is a no-op the second time. Safe to call on
+# every boot — it's an UPDATE-with-WHERE that touches at most
+# `count(agent_tools WHERE integration_id IS NOT NULL)` rows
+# (typically zero post-refactor, but the production data shipped
+# with the prompt-persistence refactor had ~115 stale rows per
+# tenant).
+def nullify_stale_tool_integration_pointers() -> int:
+    """NULL out `agent_tools.integration_id` on every row that still
+    has one set. Returns the number of rows touched.
+
+    ponytail: rationale for the surgical UPDATE. The refactor
+    (commit 623d4e8) replaced the "tool holds the integration
+    pointer" model with a "system prompt section holds the
+    instruction" model. Tools persisted before the refactor kept
+    their `integration_id` populated even though the runtime no
+    longer reads it for LLM dispatch — the value lingered in the
+    table as a historical artifact. Until we wipe those pointers,
+    `count(agent_tools WHERE integration_id = ?)` returns >0 for the
+    production tenants that upgraded, blocking DELETE /integrations
+    with a 409 that the operator cannot resolve (no FE surface
+    exists to bulk-detach a tool). The fix is a single UPDATE
+    because the prompt sections in `agents.prompt` already carry
+    the LLM-facing instructions; the table pointer is purely
+    vestigial.
+
+    Called once on first boot after deploy via STT_Server.py
+    lifespan. Safe to call repeatedly — the WHERE clause filters
+    on `integration_id IS NOT NULL` and we report rowcount.
+    """
+    if not is_postgres():
+        tools_file = _DATA_DIR / "agent_tools.json"
+        if not tools_file.exists():
+            return 0
+        try:
+            with open(tools_file, "r", encoding="utf-8") as f:
+                rows = json.load(f) or []
+        except (json.JSONDecodeError, IOError, OSError):
+            return 0
+        # ponytail: count the rows that have a stale pointer BEFORE
+        # the in-place mutation, otherwise the second pass of an
+        # idempotent call would see zero rows that match `IS NOT
+        # NULL` and incorrectly report 0. We report the rowcount
+        # for the same logical reason the Postgres path uses
+        # `cur.rowcount`: number of rows that needed fixing.
+        to_clear = [
+            r for r in rows
+            if isinstance(r, dict) and r.get("integration_id")
+        ]
+        changed = len(to_clear)
+        for r in to_clear:
+            r["integration_id"] = None
+        if changed:
+            _write_agent_tools_file(rows)
+            log.info(
+                "[backfill] nullified stale integration_id on %d agent_tools row(s) (JSON)",
+                changed,
+            )
+        return changed
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE agent_tools SET integration_id = NULL "
+                "WHERE integration_id IS NOT NULL"
+            )
+            touched = cur.rowcount
+            conn.commit()
+    if touched:
+        log.info(
+            "[backfill] nullified stale integration_id on %d agent_tools row(s)",
+            touched,
+        )
+    return touched

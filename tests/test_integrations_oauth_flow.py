@@ -507,9 +507,12 @@ async def test_oauth_callback_provider_error_redirects(client, auth_token, _oaut
 
 # ── Disconnect ──────────────────────────────────────────────────────────────
 
-async def test_disconnect_blocks_when_tools_depend(client, auth_token, _oauth_env):
-    """Per the matrix: 409 if any tool still points at the
-    integration. Same gate as DELETE."""
+async def test_disconnect_succeeds_even_when_tools_still_depend(client, auth_token, _oauth_env):
+    """Regression: the post-refactor contract drops the
+    dependent_tools gate from /integrations/{id}/disconnect (and the
+    matching DELETE). Tools don't need the integration row to
+    dispatch a call after the prompt-persistence refactor —
+    disconnect always succeeds."""
     create = await client.post(
         "/integrations",
         headers={"Authorization": f"Bearer {auth_token}"},
@@ -531,19 +534,16 @@ async def test_disconnect_blocks_when_tools_depend(client, auth_token, _oauth_en
         },
     )
     assert tool.status_code == 200, tool.text
-    resp = await client.post(
-        f"/integrations/{iid}/disconnect",
-        headers={"Authorization": f"Bearer {auth_token}"},
-    )
-    # New shape: the disconnect wraps the body in a top-level
-    # try/except so the FE always gets a structured response.
-    # 409 with success=False and reason='dependent_tools'.
-    assert resp.status_code == 409
+    # Mock revoke so the test doesn't reach Salesforce.
+    from STT_server.services import oauth_providers as oa
+    with patch.object(oa, "revoke_token", return_value=None):
+        resp = await client.post(
+            f"/integrations/{iid}/disconnect",
+            headers={"Authorization": f"Bearer {auth_token}"},
+        )
+    assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["success"] is False
-    assert body["reason"] == "dependent_tools"
-    assert body["tool_count"] == 1
-    assert "depend on this integration" in body["message"]
+    assert body["connection_status"] == "disconnected"
 
 
 async def test_disconnect_succeeds_when_no_tools(client, auth_token, _oauth_env):

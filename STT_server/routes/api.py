@@ -3101,21 +3101,24 @@ def update_integration_endpoint(
 
 @api_router.delete("/integrations/{integration_id}")
 def delete_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
-    """Delete an integration. Returns 409 if any tools still depend
-    on it (the count is computed transactionally so a concurrent
-    tool create can't sneak in between the count and the delete)."""
+    """Delete an integration.
+
+    ponytail: the previous version gated deletion on the count of
+    agent_tools pointing at the integration (409 if any). That gate
+    predated the prompt-persistence refactor — see the long docstring
+    on `STT_server.db_integrations.delete_integration` for why. The
+    gate is gone: tools don't need the integration row to be callable
+    after the refactor (they carry their own webhook_url + name +
+    parameters; the integration only injected OAuth-only metadata).
+    """
     from STT_server.db_integrations import delete_integration as db_delete_integration
     ok, err = db_delete_integration(integration_id, auth["user_id"])
     if err:
-        # The error message is the human-readable count: "5 tools depend..."
-        # Surface as 409 Conflict with a structured body so the FE can
-        # render the count + a "View tools" link.
-        from STT_server.db_integrations import count_dependent_tools
-        n = count_dependent_tools(integration_id, auth["user_id"])
-        raise HTTPException(
-            status_code=409,
-            detail={"message": err, "tool_count": n},
-        )
+        # ponytail: 404 for "not found" still comes through this path;
+        # we keep the same shape so the FE's 404 handler doesn't need
+        # a new branch. A real "blocked by dependent tools" never
+        # reaches here post-refactor.
+        raise HTTPException(status_code=404, detail="Integration not found")
     if not ok:
         raise HTTPException(status_code=404, detail="Integration not found")
     # ponytail: before deleting the integration, sweep the orphan
@@ -3695,7 +3698,6 @@ def disconnect_integration_endpoint(integration_id: str, auth: dict = Depends(re
     try:
         from STT_server.db_integrations import (
             get_integration as db_get_integration,
-            count_dependent_tools,
             disconnect_integration as db_disconnect,
         )
         from STT_server.services.oauth_providers import (
@@ -3713,18 +3715,13 @@ def disconnect_integration_endpoint(integration_id: str, auth: dict = Depends(re
                     "message": "Integration not found",
                 },
             )
-        deps = count_dependent_tools(integration_id, auth["user_id"])
-        if deps > 0:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "success": False,
-                    "connection_status": integ.get("connection_status"),
-                    "reason": "dependent_tools",
-                    "message": f"{deps} tool{'s' if deps != 1 else ''} depend on this integration. Remove or reassign them first.",
-                    "tool_count": deps,
-                },
-            )
+        # ponytail: the previous version gated disconnect on
+        # `count_dependent_tools > 0` and returned 409. That gate was
+        # dropped alongside the matching DELETE gate — see
+        # delete_integration's docstring for the full rationale.
+        # Tools don't need the integration to dispatch a call after
+        # the prompt-persistence refactor; the disconnect flow just
+        # nulls credentials + flips status.
         # Best-effort revoke at the provider. We do this BEFORE wiping
         # local credentials so the revoke call still has the access
         # token. Failures are logged but don't block the local wipe —

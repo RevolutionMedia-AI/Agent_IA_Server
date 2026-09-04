@@ -143,6 +143,32 @@ def _safe_int(v) -> int | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db_tenants.backfill_from_json()
+    # ponytail: nullify stale agent_tools.integration_id on every boot.
+    # The prompt-persistence refactor (commit 623d4e8) made the
+    # `integration_id` column vestigial — tools dispatch from their own
+    # webhook_url + name + parameters, and the prompt sections in
+    # agents.prompt carry the LLM-facing instructions. Pre-refactor
+    # rows still have a non-null `integration_id`; the dependent-tools
+    # delete gate was removed in the same commit as this backfill,
+    # so leaving the stale pointer would have only one effect: it
+    # counts toward `count(agent_tools WHERE integration_id = ?)` for
+    # reporting purposes (the dashboard counter, future
+    # `is_integration_used` health checks, etc.). Wiping the column
+    # on every boot keeps the data shape consistent. Idempotent —
+    # the WHERE clause filters on `integration_id IS NOT NULL`, so
+    # the second boot after a clean migration is a no-op.
+    try:
+        from STT_server.db_integrations import (
+            nullify_stale_tool_integration_pointers as _backfill_tools,
+        )
+        cleared = _backfill_tools()
+        if cleared:
+            log.info(
+                "[lifespan] nullified stale integration_id on %d agent_tools row(s)",
+                cleared,
+            )
+    except Exception as exc:
+        log.warning("[lifespan] stale-integration_id backfill failed: %s", exc)
 
     # ponyy: log OAuth provider status at boot so the operator
     # can see in the Railway deploy log whether Salesforce (or

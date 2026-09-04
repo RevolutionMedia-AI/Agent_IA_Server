@@ -234,11 +234,24 @@ async def test_unassign_integration_returns_envelope_with_agent_and_change_log(
     assert isinstance(body["change_log"], list)
 
 
-async def test_delete_integration_409_when_tool_depends_on_it(client, auth_token, mock_test_fn):
+async def test_delete_integration_succeeds_even_when_tools_still_point_at_it(
+    client, auth_token, mock_test_fn,
+):
+    """Regression for the post-refactor delete-flow contract.
+
+    Pre-refactor: `count(agent_tools WHERE integration_id = ?)` gated
+    DELETE /integrations/{id} with a 409 + "N tools depend" message
+    that the FE had no UI to bulk-resolve. Operators were stuck.
+
+    Post-refactor: tools carry their own webhook_url + name +
+    parameters and dispatch without the integration row, so the
+    dependent-tool gate is gone. Delete always succeeds (200);
+    the backfill in db_integrations.nullify_stale_tool_integration_pointers
+    clears the dangling `integration_id` columns when the operator
+    next saves the agent's prompt (or on the next BE boot)."""
     headers = {"Authorization": f"Bearer {auth_token}"}
     create_resp = await _create_zendesk(client, headers, mock_test_fn)
     iid = create_resp.json()["id"]
-    # Create a tool that references this integration.
     tool_resp = await client.post(
         f"/tools",
         headers=headers,
@@ -252,9 +265,49 @@ async def test_delete_integration_409_when_tool_depends_on_it(client, auth_token
         },
     )
     assert tool_resp.status_code == 200, tool_resp.text
-    # Now delete should 409.
     resp = await client.delete(f"/integrations/{iid}", headers=headers)
-    assert resp.status_code == 409
-    detail = resp.json()["detail"]
-    assert "tools depend" in detail["message"]
-    assert detail["tool_count"] == 1
+    assert resp.status_code == 200, resp.text
+
+
+def test_nullify_stale_tool_integration_pointers_is_idempotent(tmp_path, monkeypatch):
+    """Two backfill runs in a row leave the same final state. JSON path
+    covers the local-dev + production-fallback backend."""
+    import STT_server.db_integrations as _db_int
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    tools_file = data_dir / "agent_tools.json"
+    # ponytail: db_integrations derives the tools file path from its
+    # own _DATA_DIR (kept separate from db_tools so the backfill is
+    # self-contained). We patch _DATA_DIR; the read happens via
+    # _DATA_DIR / "agent_tools.json".
+    monkeypatch.setattr(_db_int, "_DATA_DIR", data_dir)
+
+    seed = [
+        {"id": "t_1", "agent_id": "agent_1", "name": "a", "description": "",
+         "webhook_url": "https://x", "kind": "webhook", "destination": None,
+         "parameters": {}, "integration_id": "int_1",
+         "assignments": [], "function_name": "a",
+         "created_at": "2026-09-04T00:00:00Z", "updated_at": "2026-09-04T00:00:00Z",
+         "last_tested_at": None, "last_test_result": None,
+         "last_invoked_at": None, "last_invocation_status": None,
+         "invocation_count": 0},
+        {"id": "t_2", "agent_id": "agent_1", "name": "b", "description": "",
+         "webhook_url": "https://y", "kind": "webhook", "destination": None,
+         "parameters": {}, "integration_id": None,
+         "assignments": [], "function_name": "b",
+         "created_at": "2026-09-04T00:00:00Z", "updated_at": "2026-09-04T00:00:00Z",
+         "last_tested_at": None, "last_test_result": None,
+         "last_invoked_at": None, "last_invocation_status": None,
+         "invocation_count": 0},
+    ]
+    import json
+    tools_file.write_text(json.dumps(seed), encoding="utf-8")
+
+    first = _db_int.nullify_stale_tool_integration_pointers()
+    second = _db_int.nullify_stale_tool_integration_pointers()
+    assert first == 1, "exactly one stale row should be cleared on first run"
+    assert second == 0, "second run must be a no-op"
+    after = json.loads(tools_file.read_text(encoding="utf-8"))
+    assert after[0]["integration_id"] is None
+    assert after[1]["integration_id"] is None
