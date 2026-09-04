@@ -957,6 +957,22 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
                 detail=f"Unknown provider '{v}'",
             )
     payload = data.dict(exclude_none=True)
+    # ponytail: prompt reconciliation. When the operator saves an agent,
+    # we run the reconciler so every assigned tool/integration has a
+    # section in `agents.prompt`. If the operator deleted a section by
+    # mistake, it gets regenerated. If a stale section exists from an
+    # old unassign, it gets cleaned up. We only reconcile when the
+    # caller actually sent `prompt` — saving other fields (status,
+    # voice, etc.) shouldn't touch the prompt.
+    reconcile_log: list[str] = []
+    if "prompt" in payload:
+        from STT_server.services.agent_prompt_tools import reconcile_agent_prompt
+        new_prompt, reconcile_log = reconcile_agent_prompt(
+            agent_id,
+            auth["user_id"],
+            payload.get("prompt") or "",
+        )
+        payload["prompt"] = new_prompt
     if not is_postgres():
         # JSON path still needs the lock for RMW atomicity.
         with _data_lock():
@@ -966,12 +982,18 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
                     for k, v in payload.items():
                         a[k] = v
                     _save(AGENTS_FILE, agents)
-                    return a
+                    return {
+                        "agent": a,
+                        "change_log": reconcile_log,
+                    }
         raise HTTPException(status_code=404, detail="Agent not found")
     updated = db_update_agent(agent_id, auth["user_id"], payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Agent not found")
-    return updated
+    return {
+        "agent": updated,
+        "change_log": reconcile_log,
+    }
 
 
 @api_router.delete("/agents/{agent_id}")
@@ -1251,6 +1273,14 @@ def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict 
     sneak past without the matching required field being present
     because we re-run AgentTool.from_dict + .validate() before
     persisting the patch.
+
+    ponytail: when the operator changes a tool's name, description,
+    or parameters, we also regenerate the tool's prompt section so
+    the LLM sees the up-to-date schema on the next call. This only
+    runs for per-agent tools (the agent_id in the URL must match
+    the tool's own agent_id) or for shared tools that are already
+    assigned to the agent — a never-assigned shared tool has no
+    prompt section to update.
     """
     payload = _build_tool_payload(agent_id, data, user_id=auth["user_id"])
     # ponytail: db_update_tool patches with the payload keys it
@@ -1260,7 +1290,42 @@ def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict 
     updated = db_update_tool(tool_id, auth["user_id"], payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Tool not found")
-    return updated
+    # Prompt regeneration — only when the tool is actually callable
+    # by this agent (per-agent rows always; shared rows only when
+    # assigned). call_transfer has no LLM-controlled parameters and
+    # is skipped.
+    change_log: list[str] = []
+    if updated.get("kind") != "call_transfer":
+        from STT_server.db_agents import get_agent as _get_agent
+        from STT_server.services.agent_prompt_tools import (
+            add_or_update_section, KIND_AGENT_TOOL, build_agent_tool_section,
+        )
+        is_per_agent = updated.get("agent_id") == agent_id
+        is_shared_assigned = (
+            updated.get("agent_id") == SHARED_TOOL_AGENT_ID
+            and isinstance(updated.get("assignments"), list)
+            and agent_id in updated["assignments"]
+        )
+        if is_per_agent or is_shared_assigned:
+            agent = _get_agent(agent_id, auth["user_id"])
+            if agent:
+                body = build_agent_tool_section(
+                    tool_id=tool_id,
+                    name=updated.get("name") or tool_id,
+                    description=updated.get("description") or "",
+                    parameters_schema=updated.get("parameters") or {},
+                )
+                new_prompt = add_or_update_section(
+                    agent.get("prompt") or "",
+                    KIND_AGENT_TOOL, tool_id, body,
+                )
+                if new_prompt != (agent.get("prompt") or ""):
+                    db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+                    change_log.append(f"AGENT_TOOL:{tool_id} section updated")
+    return {
+        "tool": updated,
+        "change_log": change_log,
+    }
 
 
 @api_router.delete("/agents/{agent_id}/tools/{tool_id}")
@@ -1280,13 +1345,20 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
 # can't be unassigned (delete the tool instead).
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/assign")
 def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
-    """Assign a shared tool to an agent. Idempotent."""
+    """Assign a shared tool to an agent. Idempotent.
+
+    ponytail: in addition to flipping the assignment row, we patch
+    the agent's System Prompt with a section for this tool so the
+    LLM learns its schema and when to call it. The change_log in the
+    response tells the FE which sections were added/updated/removed.
+    """
     # ponytail: confirm the agent belongs to this user. The agent
     # row is the source of truth for ownership; without this check a
     # operator could fish another user's agent id and widen a shared
     # tool's blast radius.
     from STT_server.db_agents import get_agent as _get_agent
-    if not _get_agent(agent_id, auth["user_id"]):
+    agent = _get_agent(agent_id, auth["user_id"])
+    if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     # ponytail: load the tool first so we can short-circuit when
     # the operator tries to assign a per-agent tool (only shared
@@ -1314,15 +1386,57 @@ def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require
             detail="Provider credentials are not assignable tools. Configure the provider in Settings → API instead.",
         )
     try:
-        return db_add_assignment(tool_id, auth["user_id"], agent_id) or tool
+        updated_tool = db_add_assignment(tool_id, auth["user_id"], agent_id) or tool
     except Exception as exc:
         log.exception("assign tool %s to %s failed", tool_id, agent_id)
         raise HTTPException(status_code=500, detail=f"assign failed: {exc}")
+    # ponytail: persist the tool's section into agents.prompt. Skip
+    # call_transfer (no LLM-controlled parameters) and the
+    # tool-already-on-this-agent case (the section is already
+    # present, but add_or_update_section is idempotent so we let it
+    # re-write rather than duplicate the logic).
+    change_log: list[str] = []
+    if tool.get("kind") != "call_transfer":
+        from STT_server.services.agent_prompt_tools import (
+            add_or_update_section,
+            KIND_AGENT_TOOL,
+        )
+        from STT_server.services.agent_prompt_tools import (
+            build_agent_tool_section,
+        )
+        body = build_agent_tool_section(
+            tool_id=tool_id,
+            name=tool.get("name") or tool_id,
+            description=tool.get("description") or "",
+            parameters_schema=tool.get("parameters") or {},
+        )
+        new_prompt = add_or_update_section(
+            agent.get("prompt") or "",
+            KIND_AGENT_TOOL, tool_id, body,
+        )
+        if new_prompt != (agent.get("prompt") or ""):
+            db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+            change_log.append(f"AGENT_TOOL:{tool_id} section added")
+    return {
+        "tool": updated_tool,
+        "agent": db_get_agent(agent_id, auth["user_id"]),
+        "change_log": change_log,
+    }
 
 
 @api_router.delete("/agents/{agent_id}/tools/{tool_id}/assign")
 def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
-    """Remove a shared tool assignment from an agent. Idempotent."""
+    """Remove a shared tool assignment from an agent. Idempotent.
+
+    ponytail: mirror of assign_shared_tool — we strip the tool's
+    prompt section so the LLM no longer sees it. The reconciler is
+    NOT called here (single-section patch is cheaper + we don't
+    want a full sweep on every unassign).
+    """
+    from STT_server.db_agents import get_agent as _get_agent
+    agent = _get_agent(agent_id, auth["user_id"])
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
     tool = db_get_tool(tool_id, auth["user_id"])
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
@@ -1332,10 +1446,23 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
             detail="Only shared tools can be unassigned. Delete per-agent tools instead.",
         )
     try:
-        return db_remove_assignment(tool_id, auth["user_id"], agent_id) or tool
+        result = db_remove_assignment(tool_id, auth["user_id"], agent_id) or tool
     except Exception as exc:
         log.exception("unassign tool %s from %s failed", tool_id, agent_id)
         raise HTTPException(status_code=500, detail=f"unassign failed: {exc}")
+    change_log: list[str] = []
+    from STT_server.services.agent_prompt_tools import (
+        remove_section, KIND_AGENT_TOOL,
+    )
+    new_prompt = remove_section(agent.get("prompt") or "", KIND_AGENT_TOOL, tool_id)
+    if new_prompt != (agent.get("prompt") or ""):
+        db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+        change_log.append(f"AGENT_TOOL:{tool_id} section removed")
+    return {
+        "tool": result,
+        "agent": db_get_agent(agent_id, auth["user_id"]),
+        "change_log": change_log,
+    }
 
 
 # ponytail: integrations assignment - mirrors tools assignment but for integrations.
@@ -1344,9 +1471,16 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
 # implicitly available and not assignable.
 @api_router.post("/agents/{agent_id}/integrations/{integration_id}/assign")
 def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = Depends(require_auth)):
-    """Assign a shared integration to an agent. Idempotent."""
+    """Assign a shared integration to an agent. Idempotent.
+
+    ponytail: same shape as assign_shared_tool — we patch the
+    agent's System Prompt with a section per integration (one block
+    per integration, containing one `### Action:` sub-block per
+    catalog action). The FE reads `change_log` to surface a toast.
+    """
     from STT_server.db_agents import get_agent as _get_agent
-    if not _get_agent(agent_id, auth["user_id"]):
+    agent = _get_agent(agent_id, auth["user_id"])
+    if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     from STT_server.db_integrations import get_integration as _get_integ
     from STT_server.db_integrations import add_integration_assignment as _add_assign
@@ -1371,18 +1505,66 @@ def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = D
             if not isinstance(out.get("assignments"), list):
                 out["assignments"] = []
             log.info("assign integration returning dict keys=%s", list(out.keys()))
-            return out
-        # Fallback: if result is not a dict, wrap it
-        log.warning("assign integration unexpected result type %s: %r", type(result), result)
-        return {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
+        else:
+            out = {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
+            log.warning("assign integration unexpected result type %s: %r", type(result), result)
     except Exception as exc:
         log.exception("assign integration %s to %s failed", integration_id, agent_id)
         raise HTTPException(status_code=500, detail=f"assign failed: {exc}")
+    # ponytail: persist the integration's prompt section. We rebuild
+    # the entire block from the catalog (multiple actions -> multiple
+    # `### Action:` sub-blocks) so an edit to the catalog action
+    # description shows up on the next assign without needing a
+    # separate "regenerate" action.
+    change_log: list[str] = []
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec,
+    )
+    spec = get_integration_provider_spec(integ.get("provider"))
+    if spec is not None:
+        from STT_server.services.agent_prompt_tools import (
+            add_or_update_section,
+            KIND_INTEGRATION,
+            build_integration_section,
+        )
+        actions = [
+            {
+                "id": a.id,
+                "name": a.name,
+                "description": a.description,
+                "when_to_use_en": getattr(a, "when_to_use_en", "") or "",
+                "when_to_use_es": getattr(a, "when_to_use_es", "") or "",
+                "parameters_schema": a.parameters_schema,
+            }
+            for a in spec.actions
+        ]
+        body = build_integration_section(integration_id, integ.get("name") or integration_id, actions)
+        new_prompt = add_or_update_section(
+            agent.get("prompt") or "",
+            KIND_INTEGRATION, integration_id, body,
+        )
+        if new_prompt != (agent.get("prompt") or ""):
+            db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+            change_log.append(f"INTEGRATION:{integration_id} section added")
+    return {
+        "integration": out,
+        "agent": db_get_agent(agent_id, auth["user_id"]),
+        "change_log": change_log,
+    }
 
 
 @api_router.delete("/agents/{agent_id}/integrations/{integration_id}/assign")
 def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict = Depends(require_auth)):
-    """Remove a shared integration assignment from an agent. Idempotent."""
+    """Remove a shared integration assignment from an agent. Idempotent.
+
+    ponytail: mirror of unassign_shared_tool — we strip the
+    integration's prompt section. change_log returned for the FE
+    toast.
+    """
+    from STT_server.db_agents import get_agent as _get_agent
+    agent = _get_agent(agent_id, auth["user_id"])
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
     from STT_server.db_integrations import get_integration as _get_integ
     from STT_server.db_integrations import remove_integration_assignment as _remove_assign
     integ = _get_integ(integration_id, auth["user_id"])
@@ -1400,13 +1582,25 @@ def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict =
             out.pop("oauth_code_verifier_encrypted", None)
             if not isinstance(out.get("assignments"), list):
                 out["assignments"] = []
-            log.info("unassign integration returning dict keys=%s", list(out.keys()))
-            return out
-        log.warning("unassign integration unexpected result type %s: %r", type(result), result)
-        return {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
+        else:
+            out = {"status": "ok", "integration_id": integration_id, "agent_id": agent_id}
+            log.warning("unassign integration unexpected result type %s: %r", type(result), result)
     except Exception as exc:
         log.exception("unassign integration %s from %s failed", integration_id, agent_id)
         raise HTTPException(status_code=500, detail=f"unassign failed: {exc}")
+    change_log: list[str] = []
+    from STT_server.services.agent_prompt_tools import (
+        remove_section, KIND_INTEGRATION,
+    )
+    new_prompt = remove_section(agent.get("prompt") or "", KIND_INTEGRATION, integration_id)
+    if new_prompt != (agent.get("prompt") or ""):
+        db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+        change_log.append(f"INTEGRATION:{integration_id} section removed")
+    return {
+        "integration": out,
+        "agent": db_get_agent(agent_id, auth["user_id"]),
+        "change_log": change_log,
+    }
 
 
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/test")
@@ -2849,7 +3043,56 @@ def update_integration_endpoint(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Integration not found")
-    return _strip_integration_for_wire(updated)
+    # ponytail: prompt propagation. When the integration's name or
+    # configuration changes, regenerate every agent's prompt section
+    # for this integration. The reconciliation runs synchronously
+    # per affected agent (the brief explicitly accepted sync — we want
+    # the operator to see the updated prompts on the next edit_agent
+    # round-trip without waiting for a background job).
+    change_log: list[str] = []
+    if body.name is not None or body.configuration is not None:
+        from STT_server.db_integrations import list_agents_for_integration
+        from STT_server.services.integrations_catalog import get_integration_provider_spec
+        from STT_server.services.agent_prompt_tools import (
+            add_or_update_section,
+            KIND_INTEGRATION,
+            build_integration_section,
+        )
+        spec = get_integration_provider_spec(updated.get("provider"))
+        if spec is not None:
+            actions = [
+                {
+                    "id": a.id,
+                    "name": a.name,
+                    "description": a.description,
+                    "when_to_use_en": getattr(a, "when_to_use_en", "") or "",
+                    "when_to_use_es": getattr(a, "when_to_use_es", "") or "",
+                    "parameters_schema": a.parameters_schema,
+                }
+                for a in spec.actions
+            ]
+            body_text = build_integration_section(
+                integration_id, updated.get("name") or integration_id, actions,
+            )
+            affected = list_agents_for_integration(integration_id, auth["user_id"])
+            for agent_id in affected:
+                from STT_server.db_agents import get_agent as _get_ag, update_agent as _upd_ag
+                ag = _get_ag(agent_id, auth["user_id"])
+                if not ag:
+                    continue
+                new_prompt = add_or_update_section(
+                    ag.get("prompt") or "",
+                    KIND_INTEGRATION, integration_id, body_text,
+                )
+                if new_prompt != (ag.get("prompt") or ""):
+                    _upd_ag(agent_id, auth["user_id"], {"prompt": new_prompt})
+                    change_log.append(
+                        f"INTEGRATION:{integration_id} section updated in agent {agent_id}"
+                    )
+    return {
+        "integration": _strip_integration_for_wire(updated),
+        "change_log": change_log,
+    }
 
 
 @api_router.delete("/integrations/{integration_id}")
@@ -2871,7 +3114,30 @@ def delete_integration_endpoint(integration_id: str, auth: dict = Depends(requir
         )
     if not ok:
         raise HTTPException(status_code=404, detail="Integration not found")
-    return {"success": True}
+    # ponytail: before deleting the integration, sweep the orphan
+    # prompt section from every agent that referenced it. Same sync
+    # propagation we run on update — synchronous, deterministic,
+    # no async job to monitor.
+    change_log: list[str] = []
+    from STT_server.db_integrations import list_agents_for_integration
+    from STT_server.services.agent_prompt_tools import (
+        remove_section, KIND_INTEGRATION,
+    )
+    for agent_id in list_agents_for_integration(integration_id, auth["user_id"]):
+        from STT_server.db_agents import get_agent as _get_ag, update_agent as _upd_ag
+        ag = _get_ag(agent_id, auth["user_id"])
+        if not ag:
+            continue
+        new_prompt = remove_section(
+            ag.get("prompt") or "",
+            KIND_INTEGRATION, integration_id,
+        )
+        if new_prompt != (ag.get("prompt") or ""):
+            _upd_ag(agent_id, auth["user_id"], {"prompt": new_prompt})
+            change_log.append(
+                f"INTEGRATION:{integration_id} section removed from agent {agent_id}"
+            )
+    return {"success": True, "change_log": change_log}
 
 
 @api_router.post("/integrations/{integration_id}/test")

@@ -1091,60 +1091,12 @@ async def media_stream(ws: WebSocket) -> None:
                     session.agent_tools = _load_agent_tools(session.agent_id, session.user_id)
                     if session.agent_tools:
                         log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
-                    # ponytail: auto-inject prompt snippets for native integrations (e.g. Google Calendar)
-                    # When the operator assigns a Google Calendar tool to an agent, the agent's
-                    # system prompt is augmented at call time so the LLM knows to collect
-                    # name/email/datetime without the operator editing the prompt manually.
-                    try:
-                        if getattr(session, 'custom_prompt', None):
-                            from STT_server.services.integrations_catalog import get_integration_provider_spec
-                            from STT_server.db_integrations import get_integration as _get_integ
-                            snippets = []
-                            seen = set()
-                            for _tool in (session.agent_tools or []):
-                                _iid = _tool.get('integration_id')
-                                if not _iid:
-                                    continue
-                                try:
-                                    _integ = _get_integ(_iid, session.user_id) if session.user_id else None
-                                    if not _integ:
-                                        from STT_server.db_integrations import get_integration_by_id as _get_by_id
-                                        _integ = _get_by_id(_iid)
-                                    if not _integ:
-                                        continue
-                                    _spec = get_integration_provider_spec(_integ.get('provider'))
-                                    _snippet = getattr(_spec, 'prompt_snippet', '') if _spec else ''
-                                    if _snippet and _snippet not in seen:
-                                        snippets.append(_snippet)
-                                        seen.add(_snippet)
-                                except Exception:
-                                    continue
-                            # Also check directly assigned integrations (without tool) - e.g. Google Calendar assigned but tool not yet assigned
-                            try:
-                                from STT_server.db_integrations import list_integrations as _list_integ
-                                if session.user_id and session.agent_id:
-                                    for _integ in (_list_integ(session.user_id) or []):
-                                        _is_assigned = False
-                                        if _integ.get('agent_id') == session.agent_id:
-                                            _is_assigned = True
-                                        elif _integ.get('agent_id') == '__shared__':
-                                            _assigns = _integ.get('assignments') or []
-                                            if session.agent_id in _assigns:
-                                                _is_assigned = True
-                                        if not _is_assigned:
-                                            continue
-                                        _spec = get_integration_provider_spec(_integ.get('provider'))
-                                        _snippet = getattr(_spec, 'prompt_snippet', '') if _spec else ''
-                                        if _snippet and _snippet not in seen:
-                                            snippets.append(_snippet)
-                                            seen.add(_snippet)
-                            except Exception:
-                                pass
-                            if snippets:
-                                session.custom_prompt = (session.custom_prompt or '') + "\n\n" + "\n\n".join(snippets)
-                                log.info("[AGENT] Injected %d prompt snippet(s) for agent %s", len(snippets), session.agent_id)
-                    except Exception as _exc:
-                        log.warning("[AGENT] prompt snippet injection failed for %s: %s", session.session_key, _exc)
+                    # ponytail: tool/integration prompt instructions now
+                    # live inside agents.prompt (see agent_prompt_tools.py).
+                    # The runtime no longer concatenates anything at call
+                    # start — the LLM reads the persisted sections as part
+                    # of the system message. This block intentionally
+                    # does nothing for prompt augmentation.
                 # ponytail: helper that closes over `session` so the
                 # caller can `await _enqueue_transcript(item)` instead
                 # of `await lambda item: enqueue_transcript_event(session, item)`.

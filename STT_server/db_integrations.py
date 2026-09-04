@@ -655,6 +655,56 @@ def count_dependent_tools(integration_id: str, user_id: str | None = None) -> in
             return _scalar(row) or 0
 
 
+def list_agents_for_integration(integration_id: str, user_id: str) -> list[str]:
+    """Return every agent id that has this integration assigned.
+
+    An integration is "assigned" to an agent when either:
+      - it is private (agent_id == agent) -> implicitly assigned to that
+        single agent, OR
+      - it is shared (agent_id == "__shared__") and the agent id is in
+        its `assignments` JSONB array.
+
+    ponytail: callers (mainly agent_prompt_tools.reconcile_agent_prompt
+    + the integration-update propagation in routes/api.py) only need
+    the agent ids -- the rest of the agent row is loaded separately by
+    db_agents.get_agent. Returning a flat list keeps the contract
+    tight and avoids accidental coupling between this module and the
+    prompt-reconciliation logic.
+    """
+    if not integration_id or not user_id:
+        return []
+    out: list[str] = []
+    if not is_postgres():
+        rows = _list_integrations_json(user_id, agent_id=None)
+        integ = next((r for r in rows if r.get("id") == integration_id), None)
+        if not integ:
+            return []
+        agent_id = integ.get("agent_id")
+        assignments = integ.get("assignments") or []
+        if agent_id and agent_id != "__shared__":
+            out.append(agent_id)
+        if agent_id == "__shared__":
+            out.extend(a for a in assignments if isinstance(a, str))
+        return sorted(set(out))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT agent_id, assignments FROM integrations "
+                "WHERE id = %s AND user_id = %s",
+                (integration_id, user_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return []
+    agent_id = row.get("agent_id")
+    assignments = row.get("assignments") or []
+    if agent_id and agent_id != "__shared__":
+        out.append(agent_id)
+    if agent_id == "__shared__":
+        out.extend(a for a in assignments if isinstance(a, str))
+    return sorted(set(out))
+
+
 def add_integration_assignment(integration_id: str, user_id: str, agent_id: str) -> dict | None:
     """Add `agent_id` to the integration's `assignments` JSONB array. Idempotent."""
     if not is_postgres():

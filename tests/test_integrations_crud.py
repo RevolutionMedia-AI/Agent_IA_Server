@@ -177,7 +177,13 @@ async def test_delete_integration_succeeds_when_no_dependents(client, auth_token
     iid = create_resp.json()["id"]
     resp = await client.delete(f"/integrations/{iid}", headers=headers)
     assert resp.status_code == 200
-    assert resp.json() == {"success": True}
+    body = resp.json()
+    # ponytail: 019 prompt-persistence refactor added a `change_log`
+    # to the delete response so the FE can show a toast about which
+    # agents lost their prompt sections. Empty list when no agents
+    # were referencing the integration (the common case).
+    assert body["success"] is True
+    assert body.get("change_log") == []
 
 
 async def test_delete_integration_409_when_tool_depends_on_it(client, auth_token, mock_test_fn):
