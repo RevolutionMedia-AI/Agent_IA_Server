@@ -46,6 +46,7 @@ from STT_server.db import is_postgres
 from STT_server.db_agents import (
     list_agents as db_list_agents,
     create_agent as db_create_agent,
+    get_agent as db_get_agent,
     update_agent as db_update_agent,
     delete_agent as db_delete_agent,
 )
@@ -1592,13 +1593,14 @@ def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict =
     from STT_server.services.agent_prompt_tools import (
         remove_section, KIND_INTEGRATION,
     )
+    from STT_server.db_agents import update_agent as _upd_agent
     new_prompt = remove_section(agent.get("prompt") or "", KIND_INTEGRATION, integration_id)
     if new_prompt != (agent.get("prompt") or ""):
-        db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+        _upd_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
         change_log.append(f"INTEGRATION:{integration_id} section removed")
     return {
         "integration": out,
-        "agent": db_get_agent(agent_id, auth["user_id"]),
+        "agent": _get_agent(agent_id, auth["user_id"]),
         "change_log": change_log,
     }
 

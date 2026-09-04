@@ -186,6 +186,54 @@ async def test_delete_integration_succeeds_when_no_dependents(client, auth_token
     assert body.get("change_log") == []
 
 
+async def test_unassign_integration_returns_envelope_with_agent_and_change_log(
+    client, auth_token, mock_test_fn,
+):
+    """Regression: the 019 refactor used `db_get_agent` in the
+    unassign endpoint without importing it. Production 500'd with
+    `NameError: name 'db_get_agent' is not defined`. The endpoint now
+    imports + uses the alias `_get_agent` and returns
+    `{integration, agent, change_log}` so the FE can sync the
+    System Prompt textarea + surface a toast."""
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    # Seed an agent via the HTTP layer so the route + db module agree
+    # on where the row lives (JSON file vs Postgres).
+    created = await client.post(
+        "/agents",
+        headers=headers,
+        json={"name": "Regression Agent"},
+    )
+    assert created.status_code == 200, created.text
+    agent_id = created.json()["id"]
+    integ = await _create_zendesk(client, headers, mock_test_fn)
+    iid = integ.json()["id"]
+    # Promote the integration to shared so the assign endpoint accepts it.
+    await client.put(
+        f"/integrations/{iid}",
+        headers=headers,
+        json={"agent_id": "__shared__"},
+    )
+    # Assign + unassign round-trip. The unassign path used to crash
+    # with NameError; now it returns the envelope.
+    r1 = await client.post(
+        f"/agents/{agent_id}/integrations/{iid}/assign",
+        headers=headers,
+    )
+    assert r1.status_code == 200, r1.text
+    assign_body = r1.json()
+    assert assign_body["agent"]["id"] == agent_id
+    assert isinstance(assign_body["change_log"], list)
+    r2 = await client.delete(
+        f"/agents/{agent_id}/integrations/{iid}/assign",
+        headers=headers,
+    )
+    assert r2.status_code == 200, r2.text
+    body = r2.json()
+    assert body["integration"]["id"] == iid
+    assert body["agent"]["id"] == agent_id
+    assert isinstance(body["change_log"], list)
+
+
 async def test_delete_integration_409_when_tool_depends_on_it(client, auth_token, mock_test_fn):
     headers = {"Authorization": f"Bearer {auth_token}"}
     create_resp = await _create_zendesk(client, headers, mock_test_fn)
