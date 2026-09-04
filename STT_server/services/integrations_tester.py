@@ -127,13 +127,13 @@ def _test_google_calendar(configuration: dict, credentials: dict) -> tuple[bool,
     """
     access_token = (credentials.get("access_token") or "").strip()
     if not access_token:
-        return False, "Falta conectar Google Calendar para poder probar la conexión"
+        return False, "Connect Google Calendar first to test the connection"
     calendar_id = (configuration.get("calendar_id") or "").strip()
     if not calendar_id:
-        return False, "Falta configurar el calendar_id del calendario destino"
+        return False, "Set the target calendar_id before running this test"
     timezone = (configuration.get("timezone") or "").strip()
     if not timezone:
-        return False, "Falta configurar el timezone (por ejemplo America/Tijuana)"
+        return False, "Set the timezone (e.g. America/Tijuana) before running this test"
     # Hit Google's userinfo endpoint with the stored access token.
     # 200 + email payload proves the token authenticates AND that the
     # user can read its own profile. We don't surface the email to the

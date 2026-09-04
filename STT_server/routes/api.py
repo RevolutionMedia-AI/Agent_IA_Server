@@ -3170,22 +3170,65 @@ def delete_integration_endpoint(integration_id: str, auth: dict = Depends(requir
 
 @api_router.post("/integrations/{integration_id}/test")
 def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
-    """Run the provider's test_fn against the stored credentials and
-    persist the result (connection_status + last_test_message)."""
+    """Run the integration's LLM-driven preview + provider preflight.
+
+    ponytail: 2026-09-04 — same shape as the tool Test button. Ask
+    the per-user ``test_data_model`` (set in Settings → API) for a
+    realistic configuration payload covering every catalog-declared
+    field. The LLM result goes back to the FE so the operator can
+    confirm what the agent will send before clicking Connect, plus
+    we still ping the provider's preflight so ``connection_status``
+    reflects reality. The same response shape is used for both flows.
+    """
     from STT_server.db_integrations import (
         get_integration as db_get_integration,
         update_integration as db_update_integration,
     )
     from STT_server.services.integrations_catalog import get_integration_provider_spec
     from STT_server.security.credentials import decrypt_credentials
+    from STT_server.services.test_data_generator import (
+        TestDataUnavailable,
+        generate_integration_test_payload,
+    )
+
     row = db_get_integration(integration_id, auth["user_id"])
     if not row:
         raise HTTPException(status_code=404, detail="Integration not found")
     spec = get_integration_provider_spec(row["provider"])
     if spec is None:
         raise HTTPException(status_code=422, detail=f"Unknown provider '{row['provider']}'")
+
+    # ponytail: pick the operator's configured LLM for tests. Same
+    # config the tools Test button uses, so the operator gets
+    # consistent preview behaviour no matter where they click. Falls
+    # back to gpt-4o-mini via the generator's own default.
+    test_model = None
+    try:
+        from STT_server.db_settings import get_settings as _db_get_settings
+        settings = _db_get_settings(auth["user_id"]) or {}
+        candidate = (settings.get("test_data_model") or "").strip()
+        if candidate:
+            test_model = candidate
+    except Exception:
+        test_model = None
+
+    llm_payload: dict[str, Any] = {}
+    try:
+        llm_payload = generate_integration_test_payload(
+            row, auth["user_id"], model=test_model,
+        )
+    except TestDataUnavailable as exc:
+        # ponytail: keep the endpoint useful even when the operator
+        # hasn't uploaded an OpenAI key yet. We surface the error in
+        # the response so the FE shows the toast, but the preflight
+        # still runs so the operator gets actionable feedback on the
+        # stored credentials.
+        log.warning(
+            "[integrations.test] LLM preview unavailable integration_id=%s: %s",
+            integration_id, exc,
+        )
+
     if not spec.test_fn:
-        # same shape as a real failure so the FE handles it uniformly
         valid, message = False, f"Test not yet implemented for {row['provider']}"
     else:
         try:
@@ -3200,10 +3243,20 @@ def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_
                 integration_id, exc,
             )
             creds_plain = {}
+        # ponytail: merge the LLM-generated configuration into the
+        # shape the provider's preflight expects, but never overwrite
+        # what the operator already typed. The LLM fills blanks so
+        # the operator can preview an end-to-end call without
+        # retyping every field.
+        merged_cfg = dict(row.get("configuration") or {})
+        for k, v in (llm_payload or {}).items():
+            if k not in merged_cfg or merged_cfg.get(k) in (None, ""):
+                merged_cfg[k] = v
         from STT_server.services.integrations_tester import run_integration_test
         valid, message = run_integration_test(
-            spec.test_fn, row.get("configuration") or {}, creds_plain,
+            spec.test_fn, merged_cfg, creds_plain,
         )
+
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     db_update_integration(
         integration_id, auth["user_id"], {
@@ -3217,6 +3270,11 @@ def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_
         "message": message,
         "connection_status": "connected" if valid else "failed",
         "last_tested_at": now_iso,
+        # ponytail: surface the LLM-generated payload so the FE can
+        # show "Here's what we'd send" alongside the connection
+        # status. Empty dict when the LLM is unavailable.
+        "preview_payload": llm_payload or {},
+        "preview_model": test_model or "gpt-4o-mini",
     }
 
 
