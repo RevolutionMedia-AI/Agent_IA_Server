@@ -413,7 +413,11 @@ PLATFORM_ENV_KEYS: dict[str, dict[str, str]] = {
     "anthropic":  {"api_key": "ANTHROPIC_API_KEY",    "base_url": "ANTHROPIC_BASE_URL"},
     "gemini":     {"api_key": "GEMINI_API_KEY",       "base_url": "GEMINI_BASE_URL"},
     "minimax":    {"api_key": "MINIMAX_API_KEY",      "base_url": "MINIMAX_BASE_URL"},
-    "twilio":     {"account_sid": "TWILIO_ACCOUNT_SID", "auth_token": "TWILIO_AUTH_TOKEN", "phone_number": "TWILIO_PHONE_NUMBER"},
+    # ponytail: Twilio removed from PLATFORM_ENV_KEYS. Twilio credentials
+    # are managed per-sub-account from /twilio-credentials now; there is
+    # no Railway-level fallback. A user with no configured credentials
+    # gets a hard "Twilio not configured" error — that's the intended
+    # behaviour, not a silent failure.
     "elevenlabs": {"api_key": "ELEVENLABS_API_KEY",   "voice_id": "ELEVENLABS_VOICE_ID", "model_id": "ELEVENLABS_MODEL_ID"},
     "rime":       {"api_key": "RIME_API_KEY",         "model_id": "RIME_MODEL_ID"},
     "deepgram":   {"api_key": "DEEPGRAM_API_KEY",     "model": "DEEPGRAM_MODEL"},
