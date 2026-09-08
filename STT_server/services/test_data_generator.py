@@ -117,6 +117,8 @@ def generate_integration_test_payload(
     integration: dict,
     user_id: str,
     model: str | None = None,
+    *,
+    action: str | None = None,
 ) -> dict[str, Any]:
     """Same idea as ``generate_test_payload`` but for integrations.
 
@@ -135,6 +137,14 @@ def generate_integration_test_payload(
     they click it. The integration row's `connection_status` is
     still driven by the provider's preflight after generation —
     the LLM only fills the payload, it doesn't ping n8n.
+
+    ponytail: 2026-09-04 (v2) — when the caller passes ``action`` we
+    also seed the LLM with the action's ``parameters_schema`` so the
+    preview reflects the shape the LLM will eventually hand to
+    n8n. Google Calendar's ``create_appointment`` action is the
+    motivating case: the LLM has to invent ``name``, ``email``,
+    ``datetime``, ``duration_minutes``, ``title`` and
+    ``description`` from nothing, so we ask for the same shape.
     """
     provider = (integration.get("provider") or "").strip() or "integration"
     name = (integration.get("name") or "").strip() or provider
@@ -146,7 +156,9 @@ def generate_integration_test_payload(
 
     catalog = _load_catalog()
     spec = catalog.get(provider)
-    fields: list[dict] = []
+
+    # ── configuration fields (always) ──
+    cfg_fields: list[dict] = []
     if spec is not None and getattr(spec, "configuration_fields", None):
         for f in spec.configuration_fields:
             entry = {
@@ -157,34 +169,89 @@ def generate_integration_test_payload(
             }
             if f.name in existing_cfg:
                 entry["example"] = existing_cfg[f.name]
-            fields.append(entry)
+            cfg_fields.append(entry)
+
+    # ── action-level parameters (optional) ──
+    action_props: list[dict] = []
+    if action and spec is not None:
+        for a in spec.actions:
+            if a.id != action:
+                continue
+            for pname, pdef in (a.parameters_schema or {}).get("properties", {}).items():
+                prop = {
+                    "name": pname,
+                    "type": pdef.get("type", "string"),
+                    "required": pname in (a.parameters_schema or {}).get("required", []),
+                    "description": pdef.get("description", ""),
+                }
+                if pdef.get("minimum") is not None:
+                    prop["minimum"] = pdef["minimum"]
+                if pdef.get("maximum") is not None:
+                    prop["maximum"] = pdef["maximum"]
+                action_props.append(prop)
+            break
+
+    # Build the response schema. The LLM returns one flat object; the
+    # caller splits it by field group downstream.
+    properties: dict[str, dict] = {}
+    required: list[str] = []
+    for f in cfg_fields:
+        properties[f["name"]] = f
+        if f.get("required"):
+            required.append(f["name"])
+    for p in action_props:
+        properties[p["name"]] = p
+        if p.get("required"):
+            required.append(p["name"])
+    if not properties:
+        properties = {"value": {"type": "string"}}
+        required = ["value"]
 
     schema = {
         "type": "object",
-        "properties": {f["name"]: f for f in fields} if fields else {"value": {"type": "string"}},
-        "required": [f["name"] for f in fields if f.get("required")] or ["value"],
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
     }
 
-    examples_blob = json.dumps(existing_cfg, indent=2) if existing_cfg else "(none yet)"
-    fields_blob = json.dumps(fields, indent=2) if fields else "(no catalog fields declared)"
-    user_msg = (
-        f"Generate realistic configuration values for the \"{name}\" "
-        f"{provider} integration so the operator can preview them in the "
-        "Test Connection flow. Return a JSON object — one key per declared "
-        "configuration field — with plausible, real-world values for the "
-        "specific provider. If the operator already provided values, "
-        "reuse them unless they are empty.\n\n"
-        f"Provider: {provider}\n"
-        f"Integration name: {name}\n"
-        f"Declared configuration fields:\n{fields_blob}\n\n"
-        f"Operator-supplied values so far:\n{examples_blob}"
+    cfg_blob = (
+        json.dumps(existing_cfg, indent=2) if existing_cfg else "(none yet)"
     )
+    cfg_fields_blob = (
+        json.dumps(cfg_fields, indent=2) if cfg_fields else "(none)"
+    )
+    if action_props:
+        action_blob = (
+            f"Action the operator is testing: ``{action}``\n"
+            f"Action argument schema:\n{json.dumps(action_props, indent=2)}\n\n"
+        )
+    else:
+        action_blob = ""
 
+    user_msg = (
+        f"Generate realistic test data for the \"{name}\" {provider} "
+        "integration so the operator can preview what the agent will "
+        "send during a real call.\n\n"
+        f"Provider: {provider}\n"
+        f"Integration name: {name}\n\n"
+        f"Configuration fields the operator must fill in:\n{cfg_fields_blob}\n"
+        f"Operator-supplied configuration so far:\n{cfg_blob}\n\n"
+        f"{action_blob}"
+        "Return a single JSON object with one key per declared field "
+        "(configuration + action arguments). Reuse operator-supplied "
+        "values when they exist; only invent blanks. Field descriptions "
+        "are the operator's own hints — honour them. For Google "
+        "Calendar's ``create_appointment`` action, fill the calendar "
+        "event's ``summary`` and ``description`` based purely on what "
+        "the operator would have said on a call. Do NOT invent dates or "
+        "times — the LLM only fills these on a real call when the "
+        "caller has agreed on a specific moment."
+    )
     resolved_model = _resolve_model(model)
     client = _resolve_openai_client(user_id)
     return _call_structured(
         client, resolved_model, user_msg, schema,
-        kind_label="configuration values for an integration",
+        kind_label="integration test data",
     )
 
 

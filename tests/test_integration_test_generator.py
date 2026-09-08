@@ -22,6 +22,7 @@ import importlib
 import json
 import sys
 import types
+from types import SimpleNamespace
 
 
 def _import_test_data_generator(monkeypatch):
@@ -135,7 +136,7 @@ def test_route_uses_settings_test_data_model(monkeypatch):
 
     captured: dict = {}
 
-    def fake_generator(integration, user_id, model=None):
+    def fake_generator(integration, user_id, model=None, **kwargs):
         captured["model"] = model
         return {"calendar_id": "ops@revolutionmedia.ai"}
 
@@ -178,7 +179,7 @@ def test_route_uses_settings_test_data_model(monkeypatch):
         lambda user_id: {"test_data_model": "gpt-4o-2024-08-06"},
     )
 
-    out = api.test_integration_endpoint("integ-1", auth={"user_id": "user-1"})
+    out = api.test_integration_endpoint("integ-1", request=SimpleNamespace(query_params={}), auth={"user_id": "user-1"})
     assert captured["model"] == "gpt-4o-2024-08-06", (
         "the operator-configured model must reach the generator"
     )
@@ -196,7 +197,7 @@ def test_route_swallows_llm_failure_and_still_runs_preflight(monkeypatch):
     api = importlib.import_module("STT_server.routes.api")
     importlib.reload(api)
 
-    def boom(integration, user_id, model=None):
+    def boom(integration, user_id, model=None, **kwargs):
         raise TestDataUnavailable("no OpenAI key configured")
 
     monkeypatch.setattr(
@@ -232,7 +233,7 @@ def test_route_swallows_llm_failure_and_still_runs_preflight(monkeypatch):
         lambda user_id: {},
     )
 
-    out = api.test_integration_endpoint("integ-1", auth={"user_id": "user-1"})
+    out = api.test_integration_endpoint("integ-1", request=SimpleNamespace(query_params={}), auth={"user_id": "user-1"})
     assert out["valid"] is True
     assert out["message"] == "credentials ok"
     assert out["preview_payload"] == {}, (

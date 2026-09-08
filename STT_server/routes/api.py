@@ -3169,7 +3169,11 @@ def delete_integration_endpoint(integration_id: str, auth: dict = Depends(requir
 
 
 @api_router.post("/integrations/{integration_id}/test")
-def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
+def test_integration_endpoint(
+    integration_id: str,
+    request: Request,
+    auth: dict = Depends(require_auth),
+):
     """Run the integration's LLM-driven preview + provider preflight.
 
     ponytail: 2026-09-04 — same shape as the tool Test button. Ask
@@ -3212,10 +3216,19 @@ def test_integration_endpoint(integration_id: str, auth: dict = Depends(require_
     except Exception:
         test_model = None
 
+    # ponytail: 2026-09-04 v2 — the operator can pick which action the
+    # LLM is previewing (e.g. Google Calendar's ``create_appointment``).
+    # We forward the catalog's full action schema so the preview
+    # matches what the LLM will eventually send to n8n. The FE passes
+    # ``?action=...`` from the integrations page when the user picks
+    # a specific verb; without it we fall back to the configuration
+    # fields only (legacy behaviour).
+    test_action = request.query_params.get("action") or None
     llm_payload: dict[str, Any] = {}
     try:
         llm_payload = generate_integration_test_payload(
             row, auth["user_id"], model=test_model,
+            action=test_action,
         )
     except TestDataUnavailable as exc:
         # ponytail: keep the endpoint useful even when the operator
