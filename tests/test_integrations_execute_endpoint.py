@@ -152,11 +152,13 @@ async def test_execute_create_appointment_happy_path(
         json={
             "action": "create_appointment",
             "arguments": {
-                "name": "Test",
-                "email": "test@example.com",
-                "datetime": "2026-09-08T14:00:00",
+                "name": "Ulises Escalante",
+                "email": "kueh560@gmail.com",
+                "datetime": "2026-09-08T15:00:00",
                 "duration_minutes": 30,
-                "notes": "first call",
+                "title": "Consulta sobre renovación de servicio",
+                "description": "El cliente desea revisar las opciones disponibles para renovar su servicio.",
+                "notes": "El cliente prefiere revisar opciones durante una reunión de 30 minutos.",
             },
         },
     )
@@ -170,7 +172,7 @@ async def test_execute_create_appointment_happy_path(
     # The events.insert URL carries BOTH ``conferenceDataVersion=1`` and
     # ``sendUpdates=all`` so the Meet is actually created and the
     # attendee gets a calendar invite. Order in the query string is
-    # implementation-defined; we just check both flags are present.
+    # implementation defined; we just check both flags are present.
     assert len(call_log) == 2
     assert call_log[0][0] == "POST" and call_log[0][1].endswith("/freeBusy")
     insert_url = call_log[1][1]
@@ -208,6 +210,9 @@ async def test_execute_create_appointment_rejects_slot_taken(
                 "name": "Test",
                 "email": "test@example.com",
                 "datetime": "2026-09-08T14:00:00",
+                "duration_minutes": 30,
+                "title": "X",
+                "description": "Y",
             },
         },
     )

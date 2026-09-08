@@ -457,18 +457,88 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         fields=(),  # OAuth — no operator-typed fields at create time.
         actions=(
             _a(
-                "calendar_event",
-                "Create Calendar Event",
-                "Create an event on the host calendar.",
+                "create_appointment",
+                "Create Calendar Appointment",
+                "Book a new event on the host calendar with a Google Meet link.",
+                # ponytail: 2026-09-04 schema expansion. The LLM now
+                # produces a short, descriptive ``title`` and a
+                # ``description`` based on the call context, so anyone
+                # opening the calendar event later sees the purpose
+                # without replaying the call. ``datetime`` carries the
+                # wall-clock moment in the integration's timezone (no
+                # offset needed in the LLM prompt; the BE attaches
+                # the offset at request time). ``additionalProperties: false``
+                # stops the model from inventing extra fields the
+                # executor doesn't read.
                 {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Customer full name"},
-                        "email": {"type": "string", "description": "Customer email"},
-                        "datetime": {"type": "string", "description": "Appointment date and time in ISO 8601 format, e.g. 2026-09-04T15:00:00-06:00"},
-                        "duration_minutes": {"type": "integer", "description": "Duration in minutes, default 30"},
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Nombre completo de la persona que solicita la cita."
+                            ),
+                        },
+                        "email": {
+                            "type": "string",
+                            "description": (
+                                "Correo electrónico de la persona que asistirá a la reunión."
+                            ),
+                        },
+                        "datetime": {
+                            "type": "string",
+                            "description": (
+                                "Fecha y hora de inicio de la reunión en formato "
+                                "ISO 8601 local, por ejemplo: 2026-09-08T15:00:00. "
+                                "No inventar la fecha ni la hora; debe haber sido "
+                                "acordada con el cliente."
+                            ),
+                        },
+                        "duration_minutes": {
+                            "type": "integer",
+                            "description": "Duración de la reunión en minutos.",
+                            "minimum": 5,
+                            "maximum": 240,
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "Título breve y descriptivo de la reunión. Debe "
+                                "indicar claramente el propósito de la cita, por "
+                                "ejemplo: 'Consulta sobre renovación de servicio' o "
+                                "'Seguimiento de problema de facturación'. No usar "
+                                "únicamente el nombre del cliente."
+                            ),
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": (
+                                "Resumen claro del motivo de la reunión basado "
+                                "exclusivamente en lo hablado durante la llamada. "
+                                "Debe explicar qué necesita el cliente, qué quiere "
+                                "revisar o resolver y cualquier contexto relevante "
+                                "para la persona que atenderá la cita."
+                            ),
+                        },
+                        "notes": {
+                            "type": "string",
+                            "description": (
+                                "Notas adicionales útiles para la reunión que no "
+                                "formen parte del motivo principal, por ejemplo "
+                                "preferencias, condiciones especiales o información "
+                                "adicional mencionada por el cliente."
+                            ),
+                        },
                     },
-                    "required": ["name", "email", "datetime"],
+                    "required": [
+                        "name",
+                        "email",
+                        "datetime",
+                        "duration_minutes",
+                        "title",
+                        "description",
+                    ],
+                    "additionalProperties": False,
                 },
                 when_to_use_en=(
                     "Use this action when the caller wants to schedule, book, or "

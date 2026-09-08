@@ -232,12 +232,13 @@ def _google_create_appointment(
     """Implements Google Calendar ``events.insert``.
 
     The FE/agent passes ``{name, email, datetime, duration_minutes,
-    notes}``. We always re-run the freebusy probe inside this
-    executor so a double-booking returns ``{success: false,
-    reason: "slot_taken"}`` instead of an event with overlapping
-    attendees. Google Meet (conferenceData) is requested when the
-    operator's account supports it — Google Workspace responds with
-    a hangout link; consumer accounts no-op (the field stays null).
+    title, description, notes}``. We always re-run the freebusy probe
+    inside this executor so a double-booking returns
+    ``{success: false, reason: "slot_taken"}`` instead of an event with
+    overlapping attendees. Google Meet (conferenceData) is requested
+    when the operator's account supports it — Google Workspace
+    responds with a hangout link; consumer accounts no-op (the field
+    stays null).
     """
     cfg = integration_row.get("configuration") or {}
     calendar_id = cfg.get("calendar_id")
@@ -248,11 +249,39 @@ def _google_create_appointment(
     name = (arguments.get("name") or "").strip()
     email = (arguments.get("email") or "").strip()
     raw_dt = arguments.get("datetime")
-    duration = int(arguments.get("duration_minutes") or 30)
+    duration_raw = arguments.get("duration_minutes")
+    title = (arguments.get("title") or "").strip()
+    description = (arguments.get("description") or "").strip()
     notes = (arguments.get("notes") or "").strip()
 
-    if not name or not email or not raw_dt:
-        return False, None, "name, email and datetime are required"
+    # ponytail: required-fields gate. ``title`` + ``description`` are
+    # NEW requirements on the LLM side; the operator's voice agent
+    # already has the call context to produce a useful summary. We
+    # fail loud with a structured error so the n8n workflow can
+    # surface a clear "agent didn't provide title/description" toast
+    # instead of letting Google store a half-empty event.
+    missing = [
+        field for field, value in (
+            ("name", name),
+            ("email", email),
+            ("datetime", raw_dt),
+            ("title", title),
+            ("description", description),
+        )
+        if not value
+    ]
+    if missing:
+        return False, None, f"missing required argument(s): {', '.join(missing)}"
+    if duration_raw is None:
+        return False, None, "missing required argument(s): duration_minutes"
+    try:
+        duration = int(duration_raw)
+    except (TypeError, ValueError):
+        return False, None, f"duration_minutes must be an integer, got {duration_raw!r}"
+    if duration < 5 or duration > 240:
+        return False, None, (
+            f"duration_minutes must be between 5 and 240, got {duration}"
+        )
 
     # ponytail: parse the caller's datetime honoring the integration's
     # timezone (not UTC). The 2026-09-04 incident shipped
@@ -300,13 +329,24 @@ def _google_create_appointment(
     if "@" not in email or "." not in email.split("@", 1)[1]:
         return False, None, f"email '{email}' is not a valid address"
 
-    summary = f"{name} ({email})"
-    description_parts = []
-    if email:
-        description_parts.append(f"Attendee: {email}")
+    # ponytail: 2026-09-04 expansion. The LLM now produces a short
+    # ``title`` and a longer ``description`` from the call context, so
+    # anyone opening the calendar event later can see the purpose
+    # without replaying the call. We honour the operator's copy
+    # verbatim — empty string only as fallback when the LLM didn't
+    # supply one (we already gated ``missing`` above, so this is
+    # defensive).
+    summary = title or f"Cita con {name}"
+
+    description_parts: list[str] = [
+        f"Cliente: {name}",
+        f"Email: {email}",
+    ]
+    if description:
+        description_parts.append(f"Motivo:\n{description}")
     if notes:
-        description_parts.append(notes)
-    description = "\n\n".join(description_parts) if description_parts else ""
+        description_parts.append(f"Notas:\n{notes}")
+    description_body = "\n\n".join(description_parts)
 
     # ponytail: meet request. The 2026-09-04 incident had ``meet_link: null``
     # because the request was missing ``conferenceDataVersion=1`` and
@@ -315,7 +355,7 @@ def _google_create_appointment(
     # requestId (so retries don't dedupe against the prior attempt).
     event_body: Dict[str, Any] = {
         "summary": summary,
-        "description": description,
+        "description": description_body,
         "start": {
             "dateTime": _format_google_datetime(start_dt),
             "timeZone": timezone,

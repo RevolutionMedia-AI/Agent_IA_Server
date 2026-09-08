@@ -170,7 +170,7 @@ def test_create_appointment_happy_path():
         },
         "start": {"dateTime": "2026-09-08T14:00:00-07:00"},
         "end": {"dateTime": "2026-09-08T14:30:00-07:00"},
-        "summary": "Test (test@example.com)",
+        "summary": "Consulta sobre renovación de servicio",
         "status": "confirmed",
     }
     with mock.patch.object(
@@ -184,11 +184,13 @@ def test_create_appointment_happy_path():
             integration_row=_GCAL_ROW,
             credentials=_GCAL_CREDS,
             arguments={
-                "name": "Test",
-                "email": "test@example.com",
-                "datetime": "2026-09-08T14:00:00",
+                "name": "Ulises Escalante",
+                "email": "kueh560@gmail.com",
+                "datetime": "2026-09-08T15:00:00",
                 "duration_minutes": 30,
-                "notes": "hello",
+                "title": "Consulta sobre renovación de servicio",
+                "description": "El cliente desea revisar las opciones disponibles para renovar su servicio.",
+                "notes": "El cliente prefiere revisar opciones durante una reunión de 30 minutos.",
             },
         )
     assert fake_http.call_count == 2
@@ -207,18 +209,31 @@ def test_create_appointment_happy_path():
     # meet_link came back null).
     freebusy = fake_http.call_args_list[0]
     insert = fake_http.call_args_list[1]
-    assert freebusy.kwargs["body"]["timeMin"] == "2026-09-08T14:00:00-07:00"
+    assert freebusy.kwargs["body"]["timeMin"] == "2026-09-08T15:00:00-07:00"
+    assert freebusy.kwargs["body"]["timeMax"] == "2026-09-08T15:30:00-07:00"
     assert insert.args[1].endswith("?conferenceDataVersion=1&sendUpdates=all")
     assert insert.kwargs["body"]["conferenceDataVersion"] == 1
     body = insert.kwargs["body"]
+    # ponytail: 2026-09-04 expansion. ``title`` is the calendar
+    # event's summary; ``description`` is split into Cliente / Email /
+    # Motivo / Notas blocks so anyone opening the event understands
+    # the meeting without replaying the call. The executor joins
+    # the four parts with ``\n\n`` so each block reads cleanly in
+    # the Google Calendar UI.
+    assert body["summary"] == "Consulta sobre renovación de servicio"
+    assert body["description"] == (
+        "Cliente: Ulises Escalante\n\n"
+        "Email: kueh560@gmail.com\n\n"
+        "Motivo:\n"
+        "El cliente desea revisar las opciones disponibles para renovar su servicio."
+        "\n\nNotas:\n"
+        "El cliente prefiere revisar opciones durante una reunión de 30 minutos."
+    )
     assert body["conferenceData"]["createRequest"]["conferenceSolutionKey"]["type"] == "hangoutsMeet"
-    # ponytail: requestId is a uuid4 hex, not a timestamp — the
-    # previous implementation could collide on two calls in the
-    # same second and Google returned CONFERENCE_REQUEST_ALREADY_EXISTS.
     request_id = body["conferenceData"]["createRequest"]["requestId"]
     assert request_id.startswith("revolutionmedia-")
-    assert len(request_id.split("-", 1)[1]) == 32  # uuid4 hex
-    assert body["attendees"] == [{"email": "test@example.com", "displayName": "Test"}]
+    assert len(request_id.split("-", 1)[1]) == 32
+    assert body["attendees"] == [{"email": "kueh560@gmail.com", "displayName": "Ulises Escalante"}]
 
 
 def test_create_appointment_falls_back_to_hangoutLink():
@@ -249,6 +264,9 @@ def test_create_appointment_falls_back_to_hangoutLink():
                 "name": "Test",
                 "email": "test@example.com",
                 "datetime": "2026-09-08T14:00:00",
+                "duration_minutes": 30,
+                "title": "X",
+                "description": "Y",
             },
         )
     assert ok is True
@@ -287,6 +305,9 @@ def test_create_appointment_marks_meet_pending_when_status_pending():
                 "name": "Test",
                 "email": "test@example.com",
                 "datetime": "2026-09-08T14:00:00",
+                "duration_minutes": 30,
+                "title": "X",
+                "description": "Y",
             },
         )
     assert ok is True
@@ -308,6 +329,9 @@ def test_create_appointment_rejects_slots_already_taken():
                 "name": "Test",
                 "email": "test@example.com",
                 "datetime": "2026-09-08T14:00:00",
+                "duration_minutes": 30,
+                "title": "X",
+                "description": "Y",
             },
         )
     assert ok is False
@@ -330,10 +354,96 @@ def test_create_appointment_validates_email():
                 "name": "Test",
                 "email": "kevin@revolutionmedia",
                 "datetime": "2026-09-08T14:00:00",
+                "duration_minutes": 30,
+                "title": "X",
+                "description": "Y",
             },
         )
     assert ok is False
     assert "not a valid" in err
+
+
+def test_create_appointment_requires_title_and_description():
+    exec_mod = _import_executor()
+    # Missing title + description. The error must name BOTH so the FE
+    # can show the operator which field the agent skipped.
+    ok, _, err = exec_mod._google_create_appointment(
+        integration_row=_GCAL_ROW,
+        credentials=_GCAL_CREDS,
+        arguments={
+            "name": "Test",
+            "email": "test@example.com",
+            "datetime": "2026-09-08T14:00:00",
+            "duration_minutes": 30,
+        },
+    )
+    assert ok is False
+    assert "title" in err and "description" in err
+
+
+def test_create_appointment_validates_duration_minutes_range():
+    exec_mod = _import_executor()
+    ok, _, err = exec_mod._google_create_appointment(
+        integration_row=_GCAL_ROW,
+        credentials=_GCAL_CREDS,
+        arguments={
+            "name": "Test",
+            "email": "test@example.com",
+            "datetime": "2026-09-08T14:00:00",
+            "duration_minutes": 1,  # below the catalog's minimum=5
+            "title": "X",
+            "description": "Y",
+        },
+    )
+    assert ok is False
+    assert "between 5 and 240" in err
+
+
+def test_create_appointment_falls_back_to_fake_summary_when_title_missing():
+    """Defensive: even though title is now required at the schema
+    layer, the executor still produces a useful fallback so a stale
+    tool row from a previous schema doesn't drop the booking on the
+    floor. The LLM-facing gate is the 422; the runtime safety net is
+    the title-or-Cita-con-X default."""
+    exec_mod = _import_executor()
+    fake_event = {
+        "id": "evt-x",
+        "htmlLink": "https://calendar.google.com/event?eid=evt-x",
+        "conferenceData": {
+            "entryPoints": [
+                {"entryPointType": "video", "uri": "https://meet.google.com/x"}
+            ]
+        },
+        "start": {"dateTime": "2026-09-08T14:00:00-07:00"},
+        "end": {"dateTime": "2026-09-08T14:30:00-07:00"},
+        "summary": "Cita con Test",
+        "status": "confirmed",
+    }
+    with mock.patch.object(
+        exec_mod, "_google_http",
+        side_effect=[
+            {"calendars": {"cal-team@example.com": {"busy": []}}},
+            fake_event,
+        ],
+    ):
+        ok, data, err = exec_mod._google_create_appointment(
+            integration_row=_GCAL_ROW,
+            credentials=_GCAL_CREDS,
+            arguments={
+                "name": "Test",
+                "email": "test@example.com",
+                "datetime": "2026-09-08T14:00:00",
+                "duration_minutes": 30,
+                "title": "",
+                "description": "Y",
+            },
+        )
+    # ponytail: title is now in the missing-required list, so this
+    # short-circuits with a 4xx — we expect ``ok is False`` and the
+    # executor NEVER reaches the events.insert call.
+    assert ok is False
+    assert "title" in err
+    assert err != "Cita con Test", "the fallback never fires — title is required"
 
 
 def test_dispatcher_rejects_unsupported_action():

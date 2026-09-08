@@ -78,9 +78,18 @@ def test_google_calendar_validate_env_reports_missing(monkeypatch):
 
 
 def test_catalog_spec_advertises_google_calendar_oauth_without_host_email():
-    """The catalog entry must use auth_type=oauth and the calendar_event
-    action must NOT carry host_email (the LLM must not pick the host
-    calendar — it's a configuration field)."""
+    """The catalog entry must use auth_type=oauth and the
+    create_appointment action must NOT carry host_email (the LLM must
+    not pick the host calendar — it's a configuration field).
+
+    ponytail: 2026-09-04 — the action was renamed from
+    ``calendar_event`` to ``create_appointment`` to match the
+    dispatcher in services/integrations_executor.py. The schema
+    gained ``title`` + ``description`` so the LLM can summarise the
+    call before invoking the action. ``additionalProperties: false``
+    stops the model from inventing extra fields the executor doesn't
+    read.
+    """
     from STT_server.services.integrations_catalog import get_integration_provider_spec
 
     spec = get_integration_provider_spec("google_calendar")
@@ -89,17 +98,29 @@ def test_catalog_spec_advertises_google_calendar_oauth_without_host_email():
     assert spec.oauth_label == "Connect Google Calendar"
 
     action_ids = [a.id for a in spec.actions]
-    assert "calendar_event" in action_ids
-    # No host_email — the host calendar is always resolved server-side
-    # from configuration.calendar_id.
+    assert "create_appointment" in action_ids
     for action in spec.actions:
-        if action.id == "calendar_event":
-            assert "host_email" not in (action.parameters_schema or {}).get("properties", {})
-            # The required fields are what the n8n workflow expects.
-            required = set((action.parameters_schema or {}).get("required") or [])
-            assert "name" in required
-            assert "email" in required
-            assert "datetime" in required
+        if action.id == "create_appointment":
+            schema = action.parameters_schema or {}
+            props = schema.get("properties", {})
+            # No host_email — the host calendar is always resolved
+            # server-side from configuration.calendar_id.
+            assert "host_email" not in props
+            # The required fields are what the n8n workflow + executor
+            # consume. ``title`` and ``description`` are NEW
+            # (2026-09-04): the LLM must summarise the call before
+            # invoking the action so the operator sees a useful event.
+            required = set(schema.get("required") or [])
+            assert {"name", "email", "datetime", "duration_minutes",
+                    "title", "description"} <= required
+            # duration_minutes has explicit min/max so the LLM can't
+            # book a 0-minute meeting.
+            duration_schema = props.get("duration_minutes") or {}
+            assert duration_schema.get("minimum") == 5
+            assert duration_schema.get("maximum") == 240
+            # additionalProperties:false stops the model from
+            # inventing extra fields the executor doesn't read.
+            assert schema.get("additionalProperties") is False
 
 
 def test_test_google_calendar_rejects_missing_config():
@@ -170,23 +191,31 @@ def test_tool_executor_body_includes_calendar_id_and_timezone(monkeypatch):
     tool = {
         "id": "tool-1",
         "function_name": "create_calendar_event",
-        "name": "Create Calendar Event",
+        "name": "Create Calendar Appointment",
         "integration_id": "int-1",
-        "action": "calendar_event",
+        "action": "create_appointment",
         "parameters": {"type": "object", "properties": {}, "required": []},
     }
 
     async def _run():
         return await execute_tool_call(
             tool, "user-admin-001",
-            {"name": "Alice", "email": "a@b.com", "datetime": "2026-09-04T15:00:00-06:00"},
+            {
+                "name": "Alice",
+                "email": "a@b.com",
+                "datetime": "2026-09-04T15:00:00-06:00",
+                "duration_minutes": 30,
+                "title": "Consulta sobre renovación",
+                "description": "El cliente quiere revisar las opciones disponibles.",
+                "notes": "Solicitó una reunión de 30 minutos.",
+            },
         )
 
     out = asyncio.run(_run())
     body = captured["body"]
     assert body["integration_id"] == "int-1"
     assert body["provider"] == "google_calendar"
-    assert body["action"] == "calendar_event"
+    assert body["action"] == "create_appointment"
     assert body["calendar_id"] == "ventas@clienteB.com"
     assert body["timezone"] == "America/Tijuana"
     assert body["credentials_endpoint"] == "/internal/integrations/int-1/credentials"
@@ -195,9 +224,16 @@ def test_tool_executor_body_includes_calendar_id_and_timezone(monkeypatch):
     args = body["arguments"]
     assert "calendar_id" not in args
     assert "timezone" not in args
+    # ponytail: 2026-09-04 schema includes title + description. They
+    # pass through to n8n untouched so the Switch node can route by
+    # verb + forward to the executor.
     assert args == {
         "name": "Alice",
         "email": "a@b.com",
         "datetime": "2026-09-04T15:00:00-06:00",
+        "duration_minutes": 30,
+        "title": "Consulta sobre renovación",
+        "description": "El cliente quiere revisar las opciones disponibles.",
+        "notes": "Solicitó una reunión de 30 minutos.",
     }
     assert out == {"ok": True}
