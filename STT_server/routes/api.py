@@ -3047,12 +3047,32 @@ def update_integration_endpoint(
     if body.agent_id is not None:
         patch["agent_id"] = body.agent_id
     if body.configuration is not None:
+        # ponytail: 2026-09-04 — Google Calendar's OAuth configuration
+        # holds ``calendar_id`` + ``timezone`` (post-Connect operator
+        # fields) which are NOT in the catalog's ``fields`` tuple (that
+        # tuple is for static providers). The catalog's
+        # ``validate_integration_fields`` validator strips anything
+        # not in the whitelist — that used to silently drop
+        # ``calendar_id`` on save, breaking the next Test Connection.
+        # We preserve unknown fields by diffing the incoming dict
+        # against the validator's output and re-adding the extras.
         from STT_server.services.integrations_catalog import validate_integration_fields
         cleaned_config, _, errors = validate_integration_fields(
             existing["provider"], body.configuration, {},
         )
         if errors:
             raise HTTPException(status_code=422, detail={"errors": errors})
+        # Merge: cleaned_config (whitelisted) + anything else the
+        # validator dropped. OAuth providers' calendar_id / timezone
+        # / instance_url / etc. land here. We trust the operator's
+        # input — these fields are operator-typed, not OAuth-managed.
+        extra_keys = set(body.configuration.keys()) - set(cleaned_config.keys())
+        for k in extra_keys:
+            value = body.configuration.get(k)
+            if isinstance(value, str):
+                cleaned_config[k] = value.strip()
+            elif isinstance(value, (int, float, bool)):
+                cleaned_config[k] = value
         patch["configuration"] = cleaned_config
     new_encrypted_blob = None
     if body.credentials is not None:
