@@ -297,15 +297,270 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         id="salesforce",
         name="Salesforce",
         category="crm",
-        description="Salesforce REST API — leads, contacts, opportunities, cases. Connects via OAuth 2.0 Authorization Code.",
+        description="Salesforce REST API — leads, contacts, cases. Connects via OAuth 2.0 Authorization Code.",
         fields=(),  # ponytail: OAuth — no operator-typed fields. The
                     # token exchange writes configuration.instance_url
                     # + credentials.{access,refresh}_token. The FE
                     # only asks for Integration Name + clicks [Connect].
+        #
+        # ponytail: 6 actions per the brief (find_customer, create_lead,
+        # create_case, update_customer, get_cases, log_call). Every
+        # schema carries `additionalProperties: false` so the executor
+        # rejects fields the LLM wasn't supposed to invent (e.g. an
+        # `integration_id` or `provider` in `arguments`). The runtime
+        # also enforces a non-empty PATCH on `update_customer` — the
+        # schema alone can't express "at least one of these must be
+        # set besides customer_id", so the n8n workflow runs the
+        # minProperties check on its side before issuing the PATCH.
         actions=(
-            _a("find_contact", "Find Contact"),
-            _a("create_lead", "Create Lead"),
-            _a("update_opportunity", "Update Opportunity"),
+            _a(
+                "find_customer",
+                "Find Customer",
+                desc="Search an existing Salesforce Contact by name, email, or phone.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Nombre, correo electrónico o número telefónico del cliente que se desea buscar en Salesforce.",
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                when_to_use_en=(
+                    "Use this action to look up an existing Salesforce Contact when "
+                    "the caller identifies themselves (by name, email, or phone). "
+                    "The returned customer.id is the link to every other Salesforce "
+                    "action — never invent it."
+                ),
+                when_to_use_es=(
+                    "Usa esta acción para buscar un Contact existente cuando el "
+                    "cliente se identifica (por nombre, email o teléfono). El "
+                    "customer.id devuelto es el vínculo con el resto de las acciones "
+                    "de Salesforce — nunca lo inventes."
+                ),
+            ),
+            _a(
+                "create_lead",
+                "Create Lead",
+                desc="Create a new prospect in Salesforce.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "first_name": {
+                            "type": "string",
+                            "description": "Nombre del prospecto.",
+                        },
+                        "last_name": {
+                            "type": "string",
+                            "description": "Apellido del prospecto.",
+                        },
+                        "company": {
+                            "type": "string",
+                            "description": "Nombre de la empresa del prospecto.",
+                        },
+                        "email": {
+                            "type": "string",
+                            "description": "Correo electrónico del prospecto.",
+                        },
+                        "phone": {
+                            "type": "string",
+                            "description": "Número telefónico del prospecto.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Resumen de la necessidade, interés o contexto mencionado durante la llamada.",
+                        },
+                    },
+                    "required": ["last_name", "company"],
+                    "additionalProperties": False,
+                },
+                when_to_use_en=(
+                    "Use this action when the caller is a new prospect who is not "
+                    "yet a Contact in Salesforce — typically a cold outreach or "
+                    "a new business lead. After create_lead succeeds the operator "
+                    "can promote the lead to a Contact later through Salesforce UI."
+                ),
+                when_to_use_es=(
+                    "Usa esta acción cuando el cliente es un prospecto nuevo que aún "
+                    "no es un Contact en Salesforce — generalmente una llamada en frío "
+                    "o un lead nuevo. Después de que create_lead tenga éxito, el "
+                    "operador puede promover el lead a Contact desde la UI de Salesforce."
+                ),
+            ),
+            _a(
+                "create_case",
+                "Create Case",
+                desc="Open a new Salesforce Case for follow-up.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {
+                            "type": "string",
+                            "description": "ID del Contact de Salesforce obtenido previamente con find_customer. Nunca debe inventarse.",
+                        },
+                        "subject": {
+                            "type": "string",
+                            "description": "Título corto y específico que explique el motivo del caso.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Descripción detallada del problema, solicitud y contexto relevante explicado por el cliente.",
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["Low", "Medium", "High"],
+                            "description": "Nivel de prioridad del caso.",
+                        },
+                        "origin": {
+                            "type": "string",
+                            "enum": ["Phone"],
+                            "description": "Origen del caso. Para el agente telefónico debe utilizar Phone.",
+                        },
+                    },
+                    "required": [
+                        "customer_id",
+                        "subject",
+                        "description",
+                        "priority",
+                        "origin",
+                    ],
+                    "additionalProperties": False,
+                },
+                when_to_use_en=(
+                    "Use this action when the caller has an issue or request that "
+                    "needs human follow-up after the call. Always run get_cases "
+                    "first to check for an existing open case with the same subject "
+                    "before opening a duplicate."
+                ),
+                when_to_use_es=(
+                    "Usa esta acción cuando el cliente tiene un problema o solicitud "
+                    "que necesita seguimiento humano después de la llamada. Siempre "
+                    "ejecuta get_cases primero para verificar si ya existe un caso "
+                    "abierto con el mismo asunto antes de abrir uno duplicado."
+                ),
+            ),
+            _a(
+                "update_customer",
+                "Update Customer",
+                desc="Patch an existing Salesforce Contact with one or more changed fields.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {
+                            "type": "string",
+                            "description": "ID del Contact de Salesforce obtenido previamente con find_customer. Nunca debe inventarse.",
+                        },
+                        "first_name": {
+                            "type": "string",
+                            "description": "Nuevo nombre del cliente. Enviar únicamente si el cliente solicita actualizarlo.",
+                        },
+                        "last_name": {
+                            "type": "string",
+                            "description": "Nuevo apellido del cliente. Enviar únicamente si el cliente solicita actualizarlo.",
+                        },
+                        "email": {
+                            "type": "string",
+                            "description": "Nuevo correo electrónico del cliente. Enviar únicamente si necesita actualizarse.",
+                        },
+                        "phone": {
+                            "type": "string",
+                            "description": "Nuevo número telefónico del cliente. Enviar únicamente si necesita actualizarse.",
+                        },
+                    },
+                    "required": ["customer_id"],
+                    "additionalProperties": False,
+                },
+                when_to_use_en=(
+                    "Use this action when the caller wants to change their own "
+                    "contact details (new email, new phone, name correction, etc). "
+                    "Send ONLY the fields that actually changed — never re-send "
+                    "fields whose value is unchanged. The runtime rejects an "
+                    "empty PATCH (customer_id alone is not enough) so at least "
+                    "one of first_name, last_name, email, phone must accompany it."
+                ),
+                when_to_use_es=(
+                    "Usa esta acción cuando el cliente quiere cambiar sus propios "
+                    "datos de contacto (nuevo email, nuevo teléfono, corrección de "
+                    "nombre, etc). Envía SOLO los campos que realmente cambiaron "
+                    "— nunca reenvíes campos cuyo valor no cambió. El runtime "
+                    "rechaza un PATCH vacío (customer_id solo no es suficiente), "
+                    "así que al menos uno de first_name, last_name, email, phone "
+                    "debe acompañarlo."
+                ),
+            ),
+            _a(
+                "get_cases",
+                "Get Cases",
+                desc="List Salesforce Cases linked to a Contact.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {
+                            "type": "string",
+                            "description": "ID del Contact de Salesforce obtenido previamente mediante find_customer.",
+                        }
+                    },
+                    "required": ["customer_id"],
+                    "additionalProperties": False,
+                },
+                when_to_use_en=(
+                    "Use this action to check whether the caller already has an "
+                    "open Salesforce Case for their request. Run it BEFORE "
+                    "create_case to avoid opening duplicates."
+                ),
+                when_to_use_es=(
+                    "Usa esta acción para verificar si el cliente ya tiene un "
+                    "caso abierto en Salesforce para su solicitud. Ejecútala "
+                    "ANTES de create_case para evitar abrir duplicados."
+                ),
+            ),
+            _a(
+                "log_call",
+                "Log Call",
+                desc="Record the call summary on the customer's Salesforce record.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {
+                            "type": "string",
+                            "description": "ID del Contact de Salesforce asociado con la llamada.",
+                        },
+                        "subject": {
+                            "type": "string",
+                            "description": "Título corto que describa el propósito principal de la llamada.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Resumen profesional de la llamada, incluyendo motivo, información relevante, acciones realizadas y resultado.",
+                        },
+                        "duration_seconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Duración total de la llamada en segundos.",
+                        },
+                        "outcome": {
+                            "type": "string",
+                            "description": "Resultado final de la llamada, por ejemplo Resolved, Case created, Follow-up required, Information provided o Customer not interested.",
+                        },
+                    },
+                    "required": ["customer_id", "subject", "description"],
+                    "additionalProperties": False,
+                },
+                when_to_use_en=(
+                    "Use this action at the end of the call to persist a "
+                    "professional summary on the customer's record. duration_seconds "
+                    "and outcome are optional but recommended — they let the "
+                    "operator audit call length and outcome later from Salesforce."
+                ),
+                when_to_use_es=(
+                    "Usa esta acción al final de la llamada para guardar un "
+                    "resumen profesional en el registro del cliente. duration_seconds "
+                    "y outcome son opcionales pero recomendados — permiten al "
+                    "operador auditar la duración y el resultado después desde Salesforce."
+                ),
+            ),
         ),
         test_fn="STT_server.services.integrations_tester._test_salesforce",
         auth_type="oauth",

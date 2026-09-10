@@ -334,3 +334,201 @@ def test_reconcile_propagates_integration_changes():
     assert "## Integration: Google Calendar" in after
     assert "### Action: Create Calendar Event" in after
     assert any("INTEGRATION:int_1" in line for line in log)
+
+
+def test_salesforce_real_catalog_exposes_six_actions_with_brief_specs():
+    """Lock down the live Salesforce spec against the brief:
+
+      find_customer · create_lead · create_case · update_customer
+        · get_cases · log_call
+
+    ponytail: this test reads the real `INTEGRATION_PROVIDERS` from
+    `integrations_catalog` — no `_fake_spec`, no stub. We assert:
+
+      * exactly six action ids in the canonical order
+      * each action has a non-empty bilingual when_to_use_* (rendered
+        into the agent's System Prompt by build_integration_section)
+      * required lists match the brief:
+          - find_customer  → [query]
+          - create_lead    → [last_name, company]
+          - create_case    → [customer_id, subject, description, priority, origin]
+          - update_customer → [customer_id]
+          - get_cases      → [customer_id]
+          - log_call       → [customer_id, subject, description]
+      * every parameters_schema carries `additionalProperties: false`
+        so the executor rejects fields the LLM wasn't supposed to
+        invent (e.g. `integration_id` inside `arguments`)
+      * the create_case enums are closed: priority in
+        {Low, Medium, High}, origin in {Phone}
+      * log_call.outcome stays a free string (per the brief)
+      * Salesforce remains OAuth-scoped (the executor pulls
+        calendar_id/timezone/credentials from the integration row,
+        not from the schema)
+
+    The test fails immediately if anyone tries to swap the order,
+    rename an action, drop a field, or remove the bilingual copy.
+    """
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec,
+    )
+
+    spec = get_integration_provider_spec("salesforce")
+    assert spec is not None, "salesforce must be a registered provider"
+    assert spec.auth_type == "oauth", "salesforce stays OAuth-scoped"
+
+    actions_by_id = {a.id: a for a in spec.actions}
+    expected_ids = [
+        "find_customer",
+        "create_lead",
+        "create_case",
+        "update_customer",
+        "get_cases",
+        "log_call",
+    ]
+    assert list(actions_by_id) == expected_ids, (
+        f"salesforce must expose exactly these six actions in this order: "
+        f"{expected_ids}, got {list(actions_by_id)}"
+    )
+
+    # Bilingual when_to_use_* present on every action.
+    for action in spec.actions:
+        assert action.when_to_use_en, f"{action.id} missing English copy"
+        assert action.when_to_use_es, f"{action.id} missing Spanish copy"
+        assert action.parameters_schema.get("additionalProperties") is False, (
+            f"{action.id} parameters_schema must set additionalProperties: false"
+        )
+
+    # Required-field assertions per action.
+    def required(action_id):
+        return set(actions_by_id[action_id].parameters_schema.get("required") or [])
+
+    assert required("find_customer") == {"query"}
+    assert required("create_lead") == {"last_name", "company"}
+    assert required("create_case") == {
+        "customer_id", "subject", "description", "priority", "origin",
+    }
+    assert required("update_customer") == {"customer_id"}
+    assert required("get_cases") == {"customer_id"}
+    assert required("log_call") == {"customer_id", "subject", "description"}
+
+    # Enums where the brief asks for them.
+    priority_enum = (
+        actions_by_id["create_case"].parameters_schema["properties"]["priority"].get("enum")
+    )
+    origin_enum = (
+        actions_by_id["create_case"].parameters_schema["properties"]["origin"].get("enum")
+    )
+    assert priority_enum == ["Low", "Medium", "High"]
+    assert origin_enum == ["Phone"]
+
+    # update_customer keeps every non-customer_id field optional so
+    # the LLM only sends what changed.
+    update_required = required("update_customer")
+    assert "first_name" not in update_required
+    assert "last_name" not in update_required
+    assert "email" not in update_required
+    assert "phone" not in update_required
+
+    # log_call.outcome stays a free string (no enum) so the LLM can
+    # write custom outcomes like "Rescheduled callback".
+    outcome_spec = actions_by_id["log_call"].parameters_schema["properties"]["outcome"]
+    assert outcome_spec["type"] == "string"
+    assert "enum" not in outcome_spec
+
+
+# ponytail: end-to-end reconciliation test against the LIVE catalog.
+# This is the contract the brief asked for: an agent with the
+# Salesforce integration assigned has a System Prompt that contains
+# all six actions. We use the HTTP layer (assign_shared_integration)
+# so the path includes everything: create_agent → create_integration
+# (JSON path) → assign → reconciler → db_update_agent → read back.
+async def test_reconciling_real_salesforce_assignment_emits_six_action_sections(
+    client, auth_token,
+):
+    """After an agent assigns the real Salesforce integration, its
+    System Prompt contains exactly the six action sections the brief
+    requires — find_customer, create_lead, create_case, update_customer,
+    get_cases, log_call — with their JSON Schemas inline."""
+    from STT_server.db_integrations import create_integration as db_create_integration
+    from STT_server.db_agents import create_agent as db_create_agent
+
+    headers = {"Authorization": f"Bearer {auth_token}"}
+
+    # Seed an agent via the HTTP layer so the row matches what the
+    # FE would produce (POST /agents → agent_id).
+    agent_resp = await client.post(
+        "/agents", headers=headers,
+        json={"name": "Reconciliation test agent"},
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    agent_id = agent_resp.json()["id"]
+
+    # Seed a real Salesforce integration via the DB helper (JSON-file
+    # path; the test backend uses JSON per the conftest). We skip the
+    # HTTP create + OAuth dance — what matters is the catalog-driven
+    # section, and the catalog is the same in both paths.
+    integ = db_create_integration(
+        "user-test-001",
+        {
+            "provider": "salesforce",
+            "name": "Test Salesforce",
+            "agent_id": "__shared__",
+            "configuration": {},
+        },
+    )
+    iid = integ["id"]
+
+    # Assign → reconciler runs server-side. The reconciler reads the
+    # live catalog (NOT a stub) and patches agents.prompt with one
+    # `### Action:` per salesforce action.
+    r = await client.post(
+        f"/agents/{agent_id}/integrations/{iid}/assign",
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["agent"]["id"] == agent_id
+    # The reconciliation log includes an INTEGRATION section entry —
+    # we don't pin the exact wording, only that something landed.
+    assert any("INTEGRATION:" in line for line in body["change_log"])
+
+    # Read the agent back. The System Prompt must contain every one
+    # of the six actions in the canonical order.
+    agent = body["agent"]
+    prompt = agent["prompt"]
+    expected_actions = [
+        "Find Customer",
+        "Create Lead",
+        "Create Case",
+        "Update Customer",
+        "Get Cases",
+        "Log Call",
+    ]
+    for name in expected_actions:
+        marker = f"### Action: {name}"
+        assert marker in prompt, (
+            f"agent System Prompt is missing the `{marker}` section after "
+            f"Salesforce assign. Full prompt:\n{prompt}"
+        )
+    # Order check: the actions appear in the same order we list them
+    # in INTEGRATION_PROVIDERS. If anyone shuffles the catalog, the
+    # operator will see the new order, but the LLM still gets the
+    # right schema.
+    indices = [prompt.index(f"### Action: {n}") for n in expected_actions]
+    assert indices == sorted(indices), (
+        f"action sections out of order: {list(zip(expected_actions, indices))}"
+    )
+
+    # Verify each section carries the bilingual copy + the JSON
+    # schema inline. We don't pin the exact shape — the schema is
+    # already covered by the unit test against the real catalog —
+    # but we do confirm both ENGLISH/ESPAÑOL headers appear once per
+    # action so the LLM gets the bilingual instructions.
+    for name in expected_actions:
+        section_start = prompt.index(f"### Action: {name}")
+        section_end = prompt.index("<!-- END_INTEGRATION", section_start)
+        section = prompt[section_start:section_end]
+        assert "ENGLISH:" in section
+        assert "ESPAÑOL:" in section
+        assert "Do not rename the JSON properties." in section
+        assert "No cambies los nombres de las propiedades JSON." in section

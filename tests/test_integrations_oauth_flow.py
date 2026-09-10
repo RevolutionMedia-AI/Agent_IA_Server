@@ -525,11 +525,11 @@ async def test_disconnect_succeeds_even_when_tools_still_depend(client, auth_tok
         "/tools",
         headers={"Authorization": f"Bearer {auth_token}"},
         json={
-            "name": "Find contact",
+            "name": "Find customer",
             "description": "Lookup",
             "kind": "webhook",
             "integration_id": iid,
-            "action": "find_contact",
+            "action": "find_customer",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     )
