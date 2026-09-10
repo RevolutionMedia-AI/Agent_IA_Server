@@ -1785,10 +1785,10 @@ async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(requ
 
     # ponytail: configure the Twilio webhook so calls actually route
     # to us. Without this the number lives in our DB but Twilio has no
-    # idea where to send inbound audio. We use the per-number Twilio
-    # creds the user just submitted (with fallback to the env var
-    # TWILIO_AUTH_TOKEN). On failure we surface the Twilio error to the
-    # FE but keep the row - the user can retry via PUT.
+    # idea where to send inbound audio. Inline creds win; otherwise we
+    # resolve the Settings credential (twilio_credential_id → SID match →
+    # most recent) since Settings is the source of truth. On failure we
+    # surface the Twilio error to the FE but keep the row - retry via PUT.
     #
     # The previous version called `asyncio.run(configure_voice_webhook(...))`
     # inside an async endpoint. asyncio.run() cannot be called from a
@@ -1796,14 +1796,24 @@ async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(requ
     # number creation. The fix is to make the endpoint async and await
     # the coroutine directly - configure_voice_webhook already returns
     # one.
-    if data.provider == "twilio" and data.twilio_account_sid and data.twilio_auth_token:
+    _wh_sid = (data.twilio_account_sid or "").strip() or None
+    _wh_tok = (data.twilio_auth_token or "").strip() or None
+    if data.provider == "twilio" and not (_wh_sid and _wh_tok) and data.twilio_credential_id:
+        try:
+            from STT_server import db_twilio_credentials as _twcreds
+            _cred = _twcreds.find_for_phone_number(data.twilio_credential_id, auth["user_id"])
+            if _cred and _cred.get("account_sid") and _cred.get("auth_token"):
+                _wh_sid, _wh_tok = _cred["account_sid"], _cred["auth_token"]
+        except Exception as exc:
+            log.warning("[phone-numbers] settings credential resolve failed: %s", exc)
+    if data.provider == "twilio" and _wh_sid and _wh_tok:
         try:
             from STT_server.adapters.twilio_api import configure_voice_webhook
             from STT_server.config import PUBLIC_URL
             webhook_url = f"{PUBLIC_URL.rstrip('/')}/voice"
             result = await configure_voice_webhook(
-                data.twilio_account_sid,
-                data.twilio_auth_token,
+                _wh_sid,
+                _wh_tok,
                 data.number,
                 webhook_url,
             )

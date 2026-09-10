@@ -63,6 +63,17 @@ def _row_to_number(row: dict) -> dict:
     return out
 
 
+def _number_cols() -> str:
+    # ponytail: twilio_credential_id added by 019. Selected explicitly so
+    # Settings remains source of truth even when legacy sid/token are NULL.
+    return (
+        "id, user_id, provider, country, number, display, label, campaign, agent, "
+        "calls, status, twilio_account_sid, twilio_auth_token, twilio_credential_id, sip_host, "
+        "sip_username, sip_password, whatsapp_phone_number_id, "
+        "whatsapp_access_token, created_at, updated_at"
+    )
+
+
 def list_numbers(user_id: str) -> list[dict]:
     if not is_postgres():
         if not NUMBERS_FILE.exists():
@@ -76,10 +87,7 @@ def list_numbers(user_id: str) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, user_id, provider, country, number, display, label, campaign, agent, "
-                "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                "sip_username, sip_password, whatsapp_phone_number_id, "
-                "whatsapp_access_token, created_at, updated_at "
+                f"SELECT {_number_cols()} "
                 "FROM phone_numbers WHERE user_id = %s ORDER BY created_at DESC",
                 (user_id,),
             )
@@ -103,19 +111,13 @@ def get_number(number_id: str, user_id: str | None = None) -> dict | None:
         with conn.cursor() as cur:
             if user_id is None:
                 cur.execute(
-                    "SELECT id, user_id, provider, country, number, display, label, agent, "
-                    "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                    "sip_username, sip_password, whatsapp_phone_number_id, "
-                    "whatsapp_access_token, created_at, updated_at "
+                    f"SELECT {_number_cols()} "
                     "FROM phone_numbers WHERE id = %s",
                     (number_id,),
                 )
             else:
                 cur.execute(
-                    "SELECT id, user_id, provider, country, number, display, label, agent, "
-                    "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                    "sip_username, sip_password, whatsapp_phone_number_id, "
-                    "whatsapp_access_token, created_at, updated_at "
+                    f"SELECT {_number_cols()} "
                     "FROM phone_numbers WHERE id = %s AND user_id = %s",
                     (number_id, user_id),
                 )
@@ -144,7 +146,7 @@ def create_number(user_id: str, payload: dict) -> dict:
         "calls": "0",
         "status": "Active",
     }
-    for opt in ("twilio_account_sid", "twilio_auth_token", "sip_host",
+    for opt in ("twilio_account_sid", "twilio_auth_token", "twilio_credential_id", "sip_host",
                  "sip_username", "sip_password",
                  "whatsapp_phone_number_id", "whatsapp_access_token"):
         v = payload.get(opt)
@@ -166,7 +168,7 @@ def create_number(user_id: str, payload: dict) -> dict:
     cols = ["id", "user_id", "provider", "country", "number", "display", "label",
             "campaign",
             "agent", "calls", "status",
-            "twilio_account_sid", "twilio_auth_token", "sip_host", "sip_username",
+            "twilio_account_sid", "twilio_auth_token", "twilio_credential_id", "sip_host", "sip_username",
             "sip_password", "whatsapp_phone_number_id", "whatsapp_access_token"]
     placeholders = ", ".join(["%s"] * len(cols))
     values = [record[c] if c in record else None for c in cols]
@@ -174,10 +176,7 @@ def create_number(user_id: str, payload: dict) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 f"INSERT INTO phone_numbers ({', '.join(cols)}) VALUES ({placeholders}) "
-                "RETURNING id, user_id, provider, country, number, display, label, campaign, agent, "
-                "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                "sip_username, sip_password, whatsapp_phone_number_id, "
-                "whatsapp_access_token, created_at, updated_at",
+                f"RETURNING {_number_cols()}",
                 values,
             )
             row = cur.fetchone()
@@ -212,7 +211,7 @@ def update_number(number_id: str, user_id: str, payload: dict) -> dict | None:
     # drops anything not listed. Keep both in sync.
     allowed = {
         "agent", "status", "label", "campaign",
-        "twilio_account_sid", "twilio_auth_token",
+        "twilio_account_sid", "twilio_auth_token", "twilio_credential_id",
         "sip_host", "sip_username", "sip_password",
         "whatsapp_phone_number_id", "whatsapp_access_token",
     }
@@ -231,10 +230,7 @@ def update_number(number_id: str, user_id: str, payload: dict) -> dict | None:
             cur.execute(
                 f"UPDATE phone_numbers SET {', '.join(set_clauses)} "
                 "WHERE id = %s AND user_id = %s "
-                "RETURNING id, user_id, provider, country, number, display, label, campaign, agent, "
-                "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                "sip_username, sip_password, whatsapp_phone_number_id, "
-                "whatsapp_access_token, created_at, updated_at",
+                f"RETURNING {_number_cols()}",
                 values,
             )
             row = cur.fetchone()
@@ -298,16 +294,10 @@ def find_for_agent(user_id: str, agent_id: str) -> dict | None:
         ]
         candidates.sort(key=lambda n: n.get("created_at") or "", reverse=True)
         return candidates[0] if candidates else None
-    base_cols = (
-        "id, user_id, provider, country, number, display, label, campaign, agent, "
-        "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-        "sip_username, sip_password, whatsapp_phone_number_id, "
-        "whatsapp_access_token, created_at, updated_at"
-    )
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT {base_cols} FROM phone_numbers "
+                f"SELECT {_number_cols()} FROM phone_numbers "
                 "WHERE user_id = %s AND agent = %s "
                 "ORDER BY created_at DESC LIMIT 1",
                 (user_id, agent_id),
@@ -355,17 +345,11 @@ def find_by_number(to_number: str, user_id: str | None = None) -> dict | None:
         return None
     with get_conn() as conn:
         with conn.cursor() as cur:
-            base_cols = (
-                "id, user_id, provider, country, number, display, label, campaign, agent, "
-                "calls, status, twilio_account_sid, twilio_auth_token, sip_host, "
-                "sip_username, sip_password, whatsapp_phone_number_id, "
-                "whatsapp_access_token, created_at, updated_at"
-            )
             # Exact match (with + stripped) wins; falls back to the
             # original literal so rows stored with `+` also resolve.
             where_user = " AND " if user_id is not None else " WHERE "
             sql = (
-                f"SELECT {base_cols} FROM phone_numbers"
+                f"SELECT {_number_cols()} FROM phone_numbers"
                 f"{' WHERE user_id = %s' if user_id is not None else ''}"
                 f"{where_user}(replace(number, '+', '') = %s OR number = %s) "
                 "ORDER BY length(number) DESC LIMIT 1"

@@ -419,12 +419,12 @@ async def voice(
     has an agent linked, the agent_id is added to the stream's
     custom parameters so media_stream can pick it up at call start.
 
-    When TWILIO_AUTH_TOKEN is set in the environment, we verify the
-    X-Twilio-Signature header against the per-number Twilio auth token.
-    Reject any request whose signature doesn't match. No env fallback —
-    the user enters their Twilio subaccount credentials when they
-    connect a number (ModalConnectNumber → phone_numbers.twilio_auth_token),
-    and that's the only source of truth.
+    We verify the X-Twilio-Signature header against the Twilio auth
+    token. Reject any request whose signature doesn't match. No env
+    fallback — Settings → Twilio (twilio_credentials) is the source of
+    truth: the per-number inline token wins when present, otherwise we
+    resolve the number's twilio_credential_id / matching SID / most
+    recent credential for that user.
     """
     # ponytail: read the form once. Twilio sends it as
     # application/x-www-form-urlencoded; the signature verifier and
@@ -485,6 +485,8 @@ async def voice(
     # fallback to a global credential (removed per the spec).
     per_number_token = None
     per_number_row_id = None
+    per_number_sid = None
+    token_source = "per-number"
     from STT_server.adapters.twilio_api import validate_twilio_signature
     from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
     try:
@@ -494,27 +496,55 @@ async def voice(
             if row:
                 per_number_row_id = row.get("id")
                 per_number_token = row.get("twilio_auth_token") or None
+                per_number_sid = row.get("twilio_account_sid") or None
+                per_number_user_id = row.get("user_id")
+                per_number_cred_id = row.get("twilio_credential_id")
+                # ponytail: Settings is source of truth. When the row has
+                # no inline token, resolve from twilio_credentials:
+                # explicit FK first, then SID match / most recent.
+                if not per_number_token and per_number_user_id:
+                    try:
+                        from STT_server import db_twilio_credentials as _twcreds
+                        cred = None
+                        if per_number_cred_id:
+                            cred = _twcreds.find_for_phone_number(per_number_cred_id, per_number_user_id)
+                            if cred and cred.get("auth_token"):
+                                token_source = f"settings:{per_number_cred_id}"
+                        if not (cred and cred.get("auth_token")):
+                            cred = _twcreds.resolve_for_user(
+                                per_number_user_id,
+                                form_dict.get("AccountSid") or form_dict.get("accountsid"),
+                            )
+                            if cred and cred.get("auth_token"):
+                                token_source = f"settings:{cred.get('id')}"
+                        if cred and cred.get("auth_token"):
+                            per_number_token = cred.get("auth_token")
+                            if not per_number_sid and cred.get("account_sid"):
+                                per_number_sid = cred.get("account_sid")
+                    except Exception as exc:
+                        log.warning("[VOICE] settings credential fallback failed: %s", exc)
     except Exception as exc:
         log.warning("[VOICE] could not look up per-number auth token: %s", exc)
     token_to_check = per_number_token
-    # ponytail: env fallback gone. If the phone number row has no
-    # twilio_auth_token, we refuse the call with 503 — the operator
-    # must edit the number and save the Twilio credentials before
-    # the webhook can route. No silent global-key acceptance.
+    # ponytail: refuse only when neither the row nor Settings has a
+    # token. Settings (twilio_credentials) is the source of truth, so a
+    # number without inline creds still routes when the user validated
+    # the sub-account in Settings → Twilio.
     if not token_to_check:
         log.error(
-            "[VOICE] phone row %s has no twilio_auth_token — refusing "
-            "inbound call to To=%s. The user must save the Twilio "
-            "subaccount credentials via the Edit-number modal before "
-            "the number can route.",
+            "[VOICE] phone row %s has no twilio_auth_token and no Settings "
+            "credential — refusing inbound call to To=%s. Save the Twilio "
+            "subaccount in Settings → Twilio.",
             per_number_row_id or "(unresolved)",
             called_to or "(missing)",
         )
         return Response(
             content="Phone number has no Twilio auth token configured. "
-                   "Edit the number and save the Twilio credentials.",
+                   "Save the Twilio subaccount in Settings → Twilio.",
             status_code=503,
         )
+    if token_source != "per-number":
+        log.info("[VOICE] phone row %s using Settings credential (%s)", per_number_row_id, token_source)
     # Twilio always signs webhooks. A missing signature with a
     # configured token is suspicious (proxy stripping the header,
     # or someone bypassing the check).
@@ -1018,6 +1048,25 @@ async def media_stream(ws: WebSocket) -> None:
                             if num_row:
                                 session.twilio_account_sid = num_row.get("twilio_account_sid") or None
                                 session.twilio_auth_token = num_row.get("twilio_auth_token") or None
+                                # ponytail: Settings fallback, same as /voice.
+                                if not (session.twilio_account_sid and session.twilio_auth_token):
+                                    try:
+                                        from STT_server import db_twilio_credentials as _twcreds
+                                        _cred = None
+                                        _cid = num_row.get("twilio_credential_id")
+                                        if _cid:
+                                            _cred = _twcreds.find_for_phone_number(_cid, session.user_id)
+                                        if not (_cred and _cred.get("auth_token")):
+                                            _cred = _twcreds.resolve_for_user(session.user_id)
+                                        if _cred and _cred.get("auth_token"):
+                                            session.twilio_account_sid = session.twilio_account_sid or _cred.get("account_sid")
+                                            session.twilio_auth_token = _cred.get("auth_token")
+                                            log.info(
+                                                "[TRANSFER] Twilio auth from Settings (%s) for %s",
+                                                _cred.get("id"), session.session_key,
+                                            )
+                                    except Exception as exc:
+                                        log.warning("[TRANSFER] settings credential fallback failed: %s", exc)
                                 if session.twilio_account_sid and session.twilio_auth_token:
                                     log.info(
                                         "[TRANSFER] Twilio auth denormalized for %s (sid=%s...)",

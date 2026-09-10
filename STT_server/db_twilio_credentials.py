@@ -298,3 +298,38 @@ def find_for_phone_number(credential_id: str, user_id: Optional[str] = None) -> 
     phone-number / call path. Caller passes user_id to keep the query
     tenant-scoped (defence-in-depth)."""
     return get_credential(credential_id, user_id, include_secrets=True) if user_id else None
+
+
+def resolve_for_user(user_id: str, account_sid_hint: Optional[str] = None) -> Optional[dict]:
+    """Settings-as-source-of-truth fallback for the call path.
+
+    Returns the decrypted {account_sid, auth_token, id, name} of the
+    credential to use when the phone_numbers row carries no inline
+    token. Prefers the row whose SID matches Twilio's AccountSid form
+    field (correct sub-account when the user owns several); falls back
+    to the most recently created credential otherwise. None when the
+    user has no credentials stored.
+    """
+    if not user_id:
+        return None
+    hint = (account_sid_hint or "").strip()
+    try:
+        ids = [c.get("id") for c in list_credentials(user_id) if c.get("id")]
+    except Exception as exc:
+        log.warning("[db_twilio_credentials] resolve list failed for user %s: %s", user_id, exc)
+        return None
+    if not ids:
+        return None
+    first = None
+    for cid in ids:
+        try:
+            full = get_credential(cid, user_id, include_secrets=True)
+        except Exception:
+            continue
+        if not full or not full.get("auth_token"):
+            continue
+        if first is None:
+            first = full
+        if hint and (full.get("account_sid") or "").strip() == hint:
+            return full
+    return first
