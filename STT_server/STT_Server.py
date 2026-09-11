@@ -964,6 +964,22 @@ async def media_stream(ws: WebSocket) -> None:
                         session.welcome_message = agent_cfg['welcome_message']
                         log.info("[AGENT] Stored welcome_message for agent %s (len=%d)",
                                  agent_id_from_params, len(agent_cfg['welcome_message']))
+                    # ponytail: Bug 2026-09-04 — agent.language is the
+                    # authoritative language for the session's TTS output.
+                    # Tenant.preferred_language was the previous source,
+                    # which meant an English agent in an otherwise Spanish
+                    # tenant was overridden to Spanish and the operator
+                    # couldn't fix it without editing the tenant row.
+                    # The agent row wins; the tenant value is the
+                    # fallback for calls without an agent.
+                    if agent_cfg.get('language'):
+                        session.preferred_language = (
+                            agent_cfg['language'].strip().lower()
+                        )
+                        log.info(
+                            "[AGENT] Set preferred_language from agent %s: %s",
+                            agent_id_from_params, session.preferred_language,
+                        )
                     # ponytail: usage record needs to know which agent
                     # took this call so the per-agent totals are right.
                     session.agent_id = agent_cfg.get('id') or agent_id_from_params

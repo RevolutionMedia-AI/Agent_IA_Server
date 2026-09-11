@@ -1103,12 +1103,23 @@ async def process_transcripts(session: CallSession) -> None:
                 if not text:
                     continue
 
-                language = normalize_supported_language(item.get("language") or session.preferred_language or DEFAULT_CALL_LANGUAGE)
+                # ponytail: Bug 2026-09-04 — the STT detects the caller's
+                # language per-transcript and used to overwrite
+                # `session.preferred_language` here. That meant the
+                # TTS voice could swap from English to Spanish mid-call
+                # if the caller used a single Spanish word ("sí"), which
+                # is exactly the operator report ("de la nada empieza
+                # a hablar en español"). The agent's language (set in
+                # STT_Server.py from agent_cfg) is the AUTHORITATIVE
+                # TTS language for the call; the STT's per-utterance
+                # `language` field is only used as a hint for the LLM
+                # routing decision and the deferred-final merge — it
+                # does NOT mutate session.preferred_language anymore.
+                language = normalize_supported_language(session.preferred_language or DEFAULT_CALL_LANGUAGE)
+                stt_hint_language = normalize_supported_language(item.get("language") or language)
                 source = item.get("source") or "realtime"
                 is_final = bool(item.get("is_final"))
                 speech_final = bool(item.get("speech_final"))
-                if is_final:
-                    session.preferred_language = language
                 session.current_transcript = text
 
                 if is_final and not final_transcript_ready(session, is_final):
