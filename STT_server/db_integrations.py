@@ -972,12 +972,26 @@ def consume_oauth_state(state_hash: str, cur=None) -> dict | None:
     if cur is not None:
         return _consume_oauth_state_cursor(state_hash, cur)
     if not is_postgres():
-        # JSON-file fallback: no atomic compare-and-swap, but the
-        # operator's dev environment doesn't have concurrent
-        # callbacks in flight. Best-effort: clear the hash + read.
+        # JSON-file fallback: no atomic compare-and-swap, but still enforce
+        # the same TTL as Postgres before consuming the single-use state.
         rows = _read_integrations_file()
         for r in rows:
             if isinstance(r, dict) and r.get("oauth_state_hash") == state_hash:
+                from datetime import datetime, timezone
+                try:
+                    expires = datetime.fromisoformat(
+                        str(r.get("oauth_state_expires_at") or "").replace("Z", "+00:00")
+                    )
+                    if expires.tzinfo is None:
+                        expires = expires.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    expires = datetime.min.replace(tzinfo=timezone.utc)
+                if expires <= datetime.now(timezone.utc):
+                    r["oauth_state_hash"] = None
+                    r["oauth_state_expires_at"] = None
+                    r["oauth_code_verifier_encrypted"] = None
+                    _write_integrations_file(rows)
+                    return None
                 verifier = r.get("oauth_code_verifier_encrypted")
                 r["oauth_state_hash"] = None
                 r["oauth_state_expires_at"] = None

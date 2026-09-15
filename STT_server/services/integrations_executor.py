@@ -441,6 +441,10 @@ _REGISTRY: Dict[Tuple[str, str], ExecutorFn] = {
     ("google_calendar", "create_appointment"): _google_create_appointment,
 }
 
+from STT_server.services.dynamics365 import DYNAMICS365_EXECUTORS
+
+_REGISTRY.update({("dynamics365", action): fn for action, fn in DYNAMICS365_EXECUTORS.items()})
+
 
 def supported_actions(provider: str) -> list[str]:
     """Public helper for the FE: enumerate the action ids the
@@ -465,6 +469,13 @@ def execute_action(
     them to a 422 / structured error. Keeping this dispatcher in the
     one place means new providers ship without a route change.
     """
+    forbidden = {
+        "integration_id", "provider", "environment_url", "resource_url",
+        "access_token", "refresh_token", "client_secret", "credentials",
+    }
+    leaked = sorted(forbidden.intersection(arguments or {}))
+    if leaked:
+        return False, None, f"Arguments contain backend-managed fields: {', '.join(leaked)}"
     fn = _REGISTRY.get((provider, action))
     if fn is None:
         return False, None, f"unsupported action '{action}' for provider '{provider}'"

@@ -169,6 +169,40 @@ def _build_google_calendar_config() -> OAuthConfig:
     )
 
 
+def _build_dynamics365_config() -> OAuthConfig:
+    """Microsoft Entra ID OAuth for user-delegated Dataverse access."""
+    redirect_uri = os.environ.get("DYNAMICS365_REDIRECT_URI", "").strip()
+    if not redirect_uri:
+        public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+        if public_url:
+            redirect_uri = f"{public_url}/integrations/dynamics365/oauth/callback"
+    if not redirect_uri:
+        raise RuntimeError(
+            "DYNAMICS365_REDIRECT_URI is not set and PUBLIC_URL is not configured"
+        )
+    scopes_env = os.environ.get("DYNAMICS365_SCOPES", "").strip()
+    scopes = tuple(scopes_env.split()) if scopes_env else (
+        "openid",
+        "profile",
+        "email",
+        "offline_access",
+        "https://globaldisco.crm.dynamics.com/.default",
+    )
+    # `organizations` is Microsoft's multi-tenant authority, not a customer
+    # tenant id. Entra resolves the real tenant during sign-in and returns it
+    # in the token/discovery response stored on that integration.
+    authority = "https://login.microsoftonline.com/organizations/oauth2/v2.0"
+    return OAuthConfig(
+        provider_id="dynamics365",
+        authorize_url=f"{authority}/authorize",
+        token_url=f"{authority}/token",
+        default_scopes=scopes,
+        client_id=os.environ["DYNAMICS365_CLIENT_ID"],
+        client_secret=os.environ["DYNAMICS365_CLIENT_SECRET"],
+        redirect_uri=redirect_uri,
+    )
+
+
 # ponyy: registry is empty at boot. Providers are built lazily on
 # first call to get_oauth_config — that means a deployment that
 # doesn't use Salesforce can start without setting SALESFORCE_*
@@ -191,6 +225,8 @@ def _ensure_provider_built(provider_id: str) -> None:
         _OAUTH_PROVIDERS["salesforce"] = _build_salesforce_config()
     elif provider_id == "google_calendar":
         _OAUTH_PROVIDERS["google_calendar"] = _build_google_calendar_config()
+    elif provider_id == "dynamics365":
+        _OAUTH_PROVIDERS["dynamics365"] = _build_dynamics365_config()
     else:
         raise KeyError(f"Provider '{provider_id}' is not registered as OAuth")
 
@@ -201,7 +237,7 @@ def get_oauth_config(provider_id: str) -> OAuthConfig:
 
 
 def known_oauth_providers() -> list[str]:
-    return ["salesforce", "google_calendar"]
+    return ["salesforce", "google_calendar", "dynamics365"]
 
 
 def _required_env_vars(provider_id: str) -> tuple[str, ...]:
@@ -216,6 +252,12 @@ def _required_env_vars(provider_id: str) -> tuple[str, ...]:
             "GOOGLE_CLIENT_ID",
             "GOOGLE_CLIENT_SECRET",
             "GOOGLE_REDIRECT_URI",
+        )
+    if provider_id == "dynamics365":
+        return (
+            "DYNAMICS365_CLIENT_ID",
+            "DYNAMICS365_CLIENT_SECRET",
+            "DYNAMICS365_REDIRECT_URI",
         )
     return ()
 
@@ -427,24 +469,28 @@ def exchange_code_for_tokens(
         kind = _oauth_error_kind(payload)
         msg = payload.get("error_description") or payload.get("error")
         if kind == "refresh_revoked":
-            raise RefreshTokenRevoked(f"Salesforce rejected the code: {msg}")
+            raise RefreshTokenRevoked(f"{config.provider_id} rejected the code: {msg}")
         raise OAuthError(f"OAuth exchange failed: {payload.get('error')}: {msg}")
     return _parse_token_response(payload)
 
 
-def refresh_access_token(config: OAuthConfig, refresh_token: str) -> OAuthTokenResponse:
+def refresh_access_token(
+    config: OAuthConfig,
+    refresh_token: str,
+    scopes: Optional[tuple[str, ...]] = None,
+) -> OAuthTokenResponse:
     """POST grant_type=refresh_token. Salesforce only re-emits
     refresh_token when the operator's session policy rotates them; we
     keep the existing one in the caller."""
-    payload = _http_post_form(
-        config.token_url,
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": config.client_id,
-            "client_secret": config.client_secret,
-        },
-    )
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": config.client_id,
+        "client_secret": config.client_secret,
+    }
+    if scopes:
+        body["scope"] = " ".join(scopes)
+    payload = _http_post_form(config.token_url, body)
     if "error" in payload:
         kind = _oauth_error_kind(payload)
         msg = payload.get("error_description") or payload.get("error")

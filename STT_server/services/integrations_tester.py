@@ -190,7 +190,21 @@ def _test_salesforce(configuration: dict, credentials: dict) -> tuple[bool, str]
 
 
 def _test_dynamics365(configuration: dict, credentials: dict) -> tuple[bool, str]:
-    return _stub("dynamics365")
+    if not configuration.get("environment_url"):
+        return False, "Select a Dynamics 365 environment first"
+    if not credentials.get("access_token"):
+        return False, "Reconnect Microsoft Dynamics 365"
+    try:
+        from STT_server.services.dynamics365 import _json_request, normalize_environment_url
+        environment_url = normalize_environment_url(configuration["environment_url"])
+        payload, _ = _json_request(
+            "GET",
+            f"{environment_url}/api/data/v9.2/WhoAmI",
+            credentials["access_token"],
+        )
+        return bool(payload.get("UserId")), "Connected to Microsoft Dynamics 365"
+    except Exception as exc:
+        return False, _sanitize_error(str(exc))
 
 
 def _test_genesys_cloud(configuration: dict, credentials: dict) -> tuple[bool, str]:

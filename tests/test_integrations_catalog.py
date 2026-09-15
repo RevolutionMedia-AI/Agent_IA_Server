@@ -30,7 +30,7 @@ async def test_providers_endpoint_returns_well_formed_catalog(client, auth_token
         assert isinstance(p["has_test"], bool)
         for f in p["fields"]:
             assert {"name", "label", "type", "required"}.issubset(f.keys())
-            assert f["type"] in ("text", "password", "url", "email")
+            assert f["type"] in ("text", "password", "url", "email", "select")
 
 
 async def test_zendesk_has_real_test_and_actions(client, auth_token):
@@ -45,19 +45,17 @@ async def test_zendesk_has_real_test_and_actions(client, auth_token):
             "add_comment", "update_ticket"}.issubset(action_ids)
 
 
-async def test_non_zendesk_providers_marked_as_no_test(client, auth_token):
-    """Salesforce / Dynamics / Genesys / NICE are stubs in V1 — the
-    FE renders Configure but Test Connection returns 'not yet
-    implemented'. This test pins that contract so a future dev
-    doesn't accidentally flip has_test=True without wiring the
-    test_fn."""
+async def test_provider_test_flags_match_implemented_probes(client, auth_token):
     body = (await client.get(
         "/integrations/providers",
         headers={"Authorization": f"Bearer {auth_token}"},
     )).json()
-    for pid in ("salesforce", "dynamics365", "genesys_cloud", "nice_cxone"):
+    for pid in ("salesforce", "dynamics365"):
         spec = next(p for p in body["providers"] if p["id"] == pid)
-        assert spec["has_test"] is False, f"{pid} should be has_test=False in V1"
+        assert spec["has_test"] is True
+    for pid in ("genesys_cloud", "nice_cxone"):
+        spec = next(p for p in body["providers"] if p["id"] == pid)
+        assert spec["has_test"] is False
 
 
 async def test_generic_webhook_accepts_free_form_action():

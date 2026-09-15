@@ -16,7 +16,7 @@ import time
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -2840,6 +2840,7 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "auth_type": getattr(s, "auth_type", "static"),
             "oauth_label": getattr(s, "oauth_label", ""),
             "oauth_default_scopes": list(getattr(s, "oauth_default_scopes", ())),
+            "capabilities": list(getattr(s, "capabilities", ())),
             "fields": [field_to_wire(f) for f in s.fields],
             "actions": [action_to_wire(a) for a in s.actions],
             "prompt_snippet": getattr(s, "prompt_snippet", ""),
@@ -3052,11 +3053,22 @@ def update_integration_endpoint(
     if not existing:
         raise HTTPException(status_code=404, detail="Integration not found")
     patch: dict = {}
+    new_encrypted_blob = None
+    dynamics_environment_selected = False
     if body.name is not None:
         patch["name"] = body.name
     if body.agent_id is not None:
         patch["agent_id"] = body.agent_id
     if body.configuration is not None:
+        forbidden_config = {
+            "access_token", "refresh_token", "client_secret", "credentials",
+        }
+        leaked = sorted(forbidden_config.intersection(body.configuration))
+        if leaked:
+            raise HTTPException(
+                status_code=422,
+                detail={"errors": [{"field": k, "message": "Backend-managed field"} for k in leaked]},
+            )
         # ponytail: 2026-09-04 — Google Calendar's OAuth configuration
         # holds ``calendar_id`` + ``timezone`` (post-Connect operator
         # fields) which are NOT in the catalog's ``fields`` tuple (that
@@ -3083,9 +3095,73 @@ def update_integration_endpoint(
                 cleaned_config[k] = value.strip()
             elif isinstance(value, (int, float, bool)):
                 cleaned_config[k] = value
+        if existing["provider"] == "dynamics365":
+            from STT_server.services.dynamics365 import normalize_environment_url
+            current = dict(existing.get("configuration") or {})
+            selected_url = body.configuration.get("environment_url")
+            if selected_url:
+                try:
+                    selected_url = normalize_environment_url(selected_url)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                environments = current.get("environments") or []
+                allowed = {
+                    normalize_environment_url(item.get("environment_url") or "")
+                    for item in environments
+                    if isinstance(item, dict) and item.get("environment_url")
+                }
+                if allowed and selected_url not in allowed:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The selected environment was not returned by Microsoft for this account",
+                    )
+                selected = next(
+                    (
+                        item for item in environments
+                        if isinstance(item, dict) and item.get("environment_url") == selected_url
+                    ),
+                    {},
+                )
+                cleaned_config.update({
+                    "environment_url": selected_url,
+                    "environment_name": selected.get("name") or selected_url,
+                    "organization_id": selected.get("organization_id"),
+                    "environment_id": selected.get("environment_id"),
+                    "tenant_id": selected.get("tenant_id") or current.get("tenant_id"),
+                })
+                # ponytail: Field Service availability was probed against
+                # the previous environment. Drop the cached probe so the
+                # next Field Service action re-probes the new environment.
+                cleaned_config.pop("field_service_available", None)
+                try:
+                    from STT_server.services.dynamics365 import _replace_with_environment_token
+                    credentials = decrypt_credentials(existing.get("credentials_encrypted"))
+                    _replace_with_environment_token(
+                        credentials, selected_url, cleaned_config.get("tenant_id")
+                    )
+                    new_encrypted_blob = encrypt_credentials(credentials)
+                    dynamics_environment_selected = True
+                except Exception as exc:
+                    log.warning(
+                        "[dynamics365] environment token exchange failed integration_id=%s err=%s",
+                        integration_id, type(exc).__name__,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Microsoft could not authorize the selected Dynamics environment",
+                    ) from exc
+            for key in ("environments", "tenant_id", "capabilities", "environment_url", "environment_name", "organization_id", "environment_id"):
+                if key in current and key not in cleaned_config:
+                    cleaned_config[key] = current[key]
         patch["configuration"] = cleaned_config
-    new_encrypted_blob = None
-    if body.credentials is not None:
+    if body.credentials:
+        from STT_server.services.integrations_catalog import get_integration_provider_spec
+        integration_spec = get_integration_provider_spec(existing["provider"])
+        if integration_spec and integration_spec.auth_type == "oauth":
+            raise HTTPException(
+                status_code=422,
+                detail="OAuth credentials are managed exclusively by the backend",
+            )
         # Merge with existing — empty/missing = keep.
         new_encrypted_blob = _merge_credentials(
             existing.get("credentials_encrypted"),
@@ -3098,6 +3174,18 @@ def update_integration_endpoint(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Integration not found")
+    if dynamics_environment_selected:
+        from STT_server.db_integrations import (
+            mark_integration_status as db_mark_integration_status,
+            get_integration as db_reload_integration,
+        )
+        db_mark_integration_status(
+            integration_id,
+            auth["user_id"],
+            "connected",
+            last_test_message="Dynamics environment connected",
+        )
+        updated = db_reload_integration(integration_id, auth["user_id"]) or updated
     # ponytail: prompt propagation. When the integration's name or
     # configuration changes, regenerate every agent's prompt section
     # for this integration. The reconciliation runs synchronously
@@ -3406,7 +3494,8 @@ def oauth_start_endpoint(
     integ = db_get_integration(integration_id, auth["user_id"])
     if not integ:
         raise HTTPException(status_code=404, detail="Integration not found")
-    if integ["provider"] not in ("salesforce", "google_calendar"):
+    from STT_server.services.oauth_providers import known_oauth_providers
+    if integ["provider"] not in known_oauth_providers():
         raise HTTPException(
             status_code=422,
             detail=f"Provider '{integ['provider']}' is not an OAuth integration",
@@ -3502,6 +3591,7 @@ def _oauth_callback(
     error: Optional[str],
     error_description: Optional[str],
     post_connect_hook: Optional[callable] = None,
+    strict_post_connect: bool = False,
 ):
     """The previous version of this code inlined the consume +
     exchange + persist dance for Salesforce. With Google Calendar
@@ -3522,14 +3612,22 @@ def _oauth_callback(
         frontend_origin = "http://localhost:5173" if env_label in ("development", "dev", "local", "test") else "https://agentiafrontend-production.up.railway.app"
 
     def _redirect_with_error(code: str) -> RedirectResponse:
-        sep = "&" if "?" in frontend_origin else "?"
         return RedirectResponse(
-            url=f"{frontend_origin}/integrations?error={code}{sep}error_description={urllib.parse.quote(error_description or '')}",
+            url=f"{frontend_origin}/integrations?error={code}",
             status_code=302,
         )
 
     if error:
-        log.warning("[oauth.callback] provider error=%s desc=%s", error, error_description)
+        if state:
+            from STT_server.db_integrations import consume_oauth_state, mark_integration_status
+            from STT_server.services.oauth_providers import hash_state
+            failed = consume_oauth_state(hash_state(state))
+            if failed and failed.get("provider") == provider:
+                mark_integration_status(
+                    failed["id"], failed["user_id"], "failed",
+                    last_test_message=f"OAuth authorization failed: {error}"[:500],
+                )
+        log.warning("[oauth.callback] provider=%s error=%s", provider, error)
         return _redirect_with_error(f"oauth_{error}")
     if not code or not state:
         return RedirectResponse(
@@ -3584,6 +3682,12 @@ def _oauth_callback(
         _mark_status(integration_id, user_id, "failed", last_test_message=exc_message[:500])
         return _redirect_with_error(code)
 
+    if integ_provider != provider:
+        return _mark_failed_and_redirect(
+            f"OAuth provider mismatch: expected {integ_provider}, received {provider}",
+            "oauth_provider_mismatch",
+        )
+
     def _finalize_postgres(cur) -> RedirectResponse:
         try:
             cfg = get_oauth_config(integ_provider)
@@ -3606,7 +3710,6 @@ def _oauth_callback(
             creds["expires_at"] = now_plus_seconds(tokens.expires_in)
         if tokens.scope:
             creds["scope"] = tokens.scope
-        encrypted = encrypt_credentials(creds)
         configuration = dict(integ.get("configuration") or {})
         if tokens.instance_url:
             configuration["instance_url"] = tokens.instance_url
@@ -3616,16 +3719,24 @@ def _oauth_callback(
                 if extra:
                     configuration.update(extra)
             except Exception as exc:
+                if strict_post_connect:
+                    conn.rollback()
+                    return _mark_failed_and_redirect(str(exc), "oauth_environment_discovery_failed")
                 log.warning(
                     "[oauth.callback] post_connect_hook failed integration_id=%s err=%s",
                     integration_id, exc,
                 )
+        encrypted = encrypt_credentials(creds)
         saved = complete_oauth_flow(
             integration_id, user_id,
             credentials_encrypted=encrypted,
             configuration=configuration,
-            scope=tokens.scope,
-            connection_status="connected",
+            scope=creds.get("scope") or tokens.scope,
+            connection_status=(
+                "pending"
+                if integ_provider == "dynamics365" and not configuration.get("environment_url")
+                else "connected"
+            ),
             cur=cur,
         )
         if not saved:
@@ -3669,7 +3780,6 @@ def _oauth_callback(
         creds["expires_at"] = now_plus_seconds(tokens.expires_in)
     if tokens.scope:
         creds["scope"] = tokens.scope
-    encrypted = encrypt_credentials(creds)
     configuration = dict(integ.get("configuration") or {})
     if tokens.instance_url:
         configuration["instance_url"] = tokens.instance_url
@@ -3679,16 +3789,23 @@ def _oauth_callback(
             if extra:
                 configuration.update(extra)
         except Exception as exc:
+            if strict_post_connect:
+                return _mark_failed_and_redirect(str(exc), "oauth_environment_discovery_failed")
             log.warning(
                 "[oauth.callback] post_connect_hook failed integration_id=%s err=%s",
                 integration_id, exc,
             )
+    encrypted = encrypt_credentials(creds)
     saved = complete_oauth_flow(
         integration_id, user_id,
         credentials_encrypted=encrypted,
         configuration=configuration,
-        scope=tokens.scope,
-        connection_status="connected",
+        scope=creds.get("scope") or tokens.scope,
+        connection_status=(
+            "pending"
+            if integ_provider == "dynamics365" and not configuration.get("environment_url")
+            else "connected"
+        ),
     )
     if not saved:
         log.error(
@@ -3735,6 +3852,29 @@ def oauth_google_calendar_callback_endpoint(
     )
 
 
+@api_router.get("/integrations/dynamics365/oauth/callback")
+def oauth_dynamics365_callback_endpoint(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    return _oauth_callback(
+        provider="dynamics365",
+        code=code,
+        state=state,
+        error=error,
+        error_description=error_description,
+        post_connect_hook=_dynamics365_post_connect,
+        strict_post_connect=True,
+    )
+
+
+def _dynamics365_post_connect(integration_id: str, user_id: str, decrypted_credentials: dict) -> dict:
+    from STT_server.services.dynamics365 import prepare_oauth_connection
+    return prepare_oauth_connection(decrypted_credentials)
+
+
 def _google_calendar_post_connect(integration_id: str, user_id: str, decrypted_credentials: dict) -> dict:
     """After the OAuth handshake lands tokens, fetch the user's
     primary email + timezone from Google and prefill
@@ -3754,7 +3894,7 @@ def _google_calendar_post_connect(integration_id: str, user_id: str, decrypted_c
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
             if 200 <= resp.status < 300:
-                payload = _json.loads(resp.read())
+                payload = json.loads(resp.read())
             else:
                 payload = {}
     except Exception as exc:
@@ -3775,7 +3915,7 @@ def _provider_post_connect_query(provider: str) -> str:
     routes to a configuration step. Google Calendar needs the
     operator to pick calendar_id + timezone before they assign
     tools; Salesforce is ready to use immediately after connect."""
-    if provider == "google_calendar":
+    if provider in ("google_calendar", "dynamics365"):
         return "&configure=1"
     return ""
 
@@ -3975,6 +4115,11 @@ def internal_get_integration_credentials(
         )
         raise HTTPException(status_code=404, detail="Integration not found")
     provider = row.get("provider")
+    if provider == "dynamics365":
+        raise HTTPException(
+            status_code=403,
+            detail="Dynamics 365 credentials never leave the backend; use the execute endpoint",
+        )
     cipher = row.get("credentials_cipher") or "fernet-v1"
     encrypted = row.get("credentials_encrypted")
     if not encrypted:
@@ -4254,6 +4399,20 @@ def internal_execute_integration_action(
         raise HTTPException(status_code=404, detail="Integration not found")
     provider = row.get("provider") or ""
     config = row.get("configuration") or {}
+    if provider == "dynamics365" and (
+        row.get("connection_status") != "connected" or not config.get("environment_url")
+    ):
+        reason = (
+            "reauthentication_required"
+            if row.get("connection_status") in ("failed", "disconnected")
+            else "environment_required"
+        )
+        return {
+            "success": False,
+            "action": body.action,
+            "data": None,
+            "error": reason,
+        }
     cipher = row.get("credentials_cipher") or "fernet-v1"
     encrypted = row.get("credentials_encrypted")
     if not encrypted:
@@ -4318,7 +4477,17 @@ def internal_execute_integration_action(
                             )
                         try:
                             cfg = _get_oauth_config(provider)
-                            new_tokens = _refresh_oauth(cfg, rt)
+                            refresh_scopes = None
+                            if provider == "dynamics365" and config.get("environment_url"):
+                                from STT_server.services.dynamics365 import (
+                                    normalize_environment_url,
+                                    oauth_config_for_tenant,
+                                )
+                                cfg = oauth_config_for_tenant(config.get("tenant_id"))
+                                refresh_scopes = (
+                                    f"{normalize_environment_url(config['environment_url'])}/.default",
+                                )
+                            new_tokens = _refresh_oauth(cfg, rt, scopes=refresh_scopes)
                         except _Revoked as exc:
                             _mark_failed(
                                 integration_id, fresh["user_id"], "failed",
