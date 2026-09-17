@@ -115,3 +115,40 @@ def test_validate_integration_fields_unknown_provider():
     from STT_server.services.integrations_catalog import validate_integration_fields
     _, _, errors = validate_integration_fields("made_up", {}, {})
     assert errors and errors[0]["field"] == "provider"
+
+
+def test_dynamics365_customer_insights_capability():
+    """Customer Insights – Data lives under the same dynamics365 provider
+    as capability='customer_insights', reusing the same OAuth/client."""
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec,
+        actions_for_capability,
+        is_valid_action_for_capability,
+    )
+
+    spec = get_integration_provider_spec("dynamics365")
+    assert spec is not None
+    assert spec.id == "dynamics365"  # no new provider
+    # no new provider id
+    from STT_server.services.integrations_catalog import list_integration_providers
+    assert "dynamics365_customer_insights" not in {p.id for p in list_integration_providers()}
+
+    ci_actions = actions_for_capability("dynamics365", "customer_insights")
+    assert len(ci_actions) == 4
+    assert {a.id for a in ci_actions} == {
+        "ci_get_profile",
+        "ci_search_profiles",
+        "ci_get_segments",
+        "ci_get_measures",
+    }
+    for a in ci_actions:
+        assert getattr(a, "capability", None) == "customer_insights"
+
+    # gate: core actions are not valid under customer_insights and vice-versa
+    assert is_valid_action_for_capability("dynamics365", "ci_get_profile", "customer_insights") is True
+    assert is_valid_action_for_capability("dynamics365", "find_customer", "customer_insights") is False
+    assert is_valid_action_for_capability("dynamics365", "find_customer", "core") is True
+
+    # provider still single OAuth / single client
+    assert "customer_insights" in spec.capabilities
+    assert spec.auth_type == "oauth"

@@ -2824,7 +2824,8 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "id": a.id,
             "name": a.name,
             "description": a.description,
-"parameters_schema": a.parameters_schema,
+            "parameters_schema": a.parameters_schema,
+            "capability": getattr(a, "capability", "core"),
         }
 
     def spec_to_wire(s: IntegrationProviderSpec) -> dict:

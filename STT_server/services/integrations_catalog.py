@@ -80,6 +80,7 @@ class ActionSpec:
     parameters_schema: dict = field(default_factory=lambda: {
             "type": "object", "properties": {}, "required": [],
         })
+    capability: str = "core"  # ponytail: gate for Dynamics 365 (core | customer_insights)
 
 
 @dataclass(frozen=True)
@@ -223,6 +224,7 @@ def _a(
     *,
     when_to_use_en: str = "",
     when_to_use_es: str = "",
+    capability: str = "core",
 ) -> ActionSpec:
     """Shorthand constructor with id-format guard."""
     if not _ACTION_ID_PATTERN.match(aid):
@@ -238,6 +240,7 @@ def _a(
         parameters_schema=schema or {
             "type": "object", "properties": {}, "required": [],
         },
+        capability=capability,
     )
 
 
@@ -320,6 +323,11 @@ def _dynamics365_actions() -> tuple[ActionSpec, ...]:
         _a("cancel_booking", "Cancel Booking", "Cancel a Field Service booking with an optional reason saved to its timeline.", _dyn_schema(("booking_id",), booking_id=_DYN_GUID, reason=text("Cancellation reason."))),
         _a("find_service_agreement", "Find Service Agreement", "Search Field Service agreements by name, optionally for one account.", _dyn_schema(("query",), query=text("Agreement name."), account_id=_DYN_GUID)),
         _a("get_service_agreements", "Get Service Agreements", "List Field Service agreements. Defaults to active ones.", _dyn_schema(account_id=_DYN_GUID, active_only={"type": "boolean"}, limit={"type": "integer", "minimum": 1, "maximum": 50})),
+        # ponytail: Customer Insights – Data (capability=customer_insights) — same provider/OAuth/client
+        _a("ci_get_profile", "Get Customer Profile (CI)", "Get a Customer Insights profile by ID.", _dyn_schema(("profile_id",), profile_id=_dyn_text("CI profile ID.")), capability="customer_insights"),
+        _a("ci_search_profiles", "Search Profiles (CI)", "Search Customer Insights profiles.", _dyn_schema(("query",), query=_dyn_text("Search query.")), capability="customer_insights"),
+        _a("ci_get_segments", "Get Segments (CI)", "List Customer Insights segments.", _dyn_schema(limit={"type": "integer", "minimum": 1, "maximum": 50}), capability="customer_insights"),
+        _a("ci_get_measures", "Get Measures (CI)", "List Customer Insights measures.", _dyn_schema(limit={"type": "integer", "minimum": 1, "maximum": 50}), capability="customer_insights"),
     )
 
 
@@ -661,7 +669,7 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         auth_type="oauth",
         oauth_label="Connect Microsoft Dynamics 365",
         oauth_default_scopes=("openid", "profile", "email", "offline_access", "https://globaldisco.crm.dynamics.com/.default"),
-        capabilities=("sales", "customer_service", "field_service"),
+        capabilities=("sales", "customer_service", "field_service", "customer_insights"),
     ),
     IntegrationProviderSpec(
         id="genesys_cloud",
@@ -928,3 +936,25 @@ def is_valid_action(provider_id: str, action: str) -> bool:
         # generic_webhook: any well-formed id is fine
         return True
     return action in action_ids_for_provider(provider_id)
+
+
+# ponytail: Customer Insights — capability gate, same Dynamics365Client path
+def actions_for_capability(provider_id: str, capability: str) -> tuple["ActionSpec", ...]:
+    spec = get_integration_provider_spec(provider_id)
+    if spec is None:
+        return ()
+    if not capability:
+        return spec.actions
+    return tuple(a for a in spec.actions if getattr(a, "capability", "core") == capability)
+
+
+def is_valid_action_for_capability(provider_id: str, action: str, capability: str) -> bool:
+    if not is_valid_action(provider_id, action):
+        return False
+    spec = get_integration_provider_spec(provider_id)
+    if spec is None:
+        return False
+    for a in spec.actions:
+        if a.id == action:
+            return getattr(a, "capability", "core") == (capability or "core")
+    return False
