@@ -482,6 +482,12 @@ class AgentCreate(BaseModel):
     stt_use_own_key: Optional[bool] = None
     llm_use_own_key: Optional[bool] = None
     tts_use_own_key: Optional[bool] = None
+    # ponytail: pre-AI transfer cascade (021_agent_transfer_cascade.sql).
+    # Ordered list of {"destination": E.164, "timeout_sec": 5..60}.
+    # Empty / None = straight to the AI (today's behaviour). Validated
+    # in the create/update handlers so a bad step 400s with a useful
+    # message instead of silently never ringing.
+    transfer_cascade: Optional[list] = None
 
 
 class AgentUpdate(BaseModel):
@@ -539,6 +545,8 @@ class AgentUpdate(BaseModel):
     stt_use_own_key: Optional[bool] = None
     llm_use_own_key: Optional[bool] = None
     tts_use_own_key: Optional[bool] = None
+    # ponytail: pre-AI transfer cascade — see AgentCreate above.
+    transfer_cascade: Optional[list] = None
 
 
 class PhoneNumberCreate(BaseModel):
@@ -943,7 +951,17 @@ def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
         v = getattr(data, k)
         if v and not get_provider_spec(v):
             raise HTTPException(status_code=400, detail=f"Unknown provider '{v}'")
-    return db_create_agent(auth["user_id"], data.dict())
+    payload = data.dict()
+    # ponytail: cascade validation is fail-fast — a bad destination
+    # would otherwise sit on the row forever and the operator would
+    # only discover it when a real caller never gets transferred.
+    if payload.get("transfer_cascade") is not None:
+        from STT_server.services.transfer_cascade import validate_cascade
+        steps, err = validate_cascade(payload["transfer_cascade"])
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        payload["transfer_cascade"] = steps
+    return db_create_agent(auth["user_id"], payload)
 
 
 @api_router.put("/agents/{agent_id}")
@@ -958,6 +976,15 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
                 detail=f"Unknown provider '{v}'",
             )
     payload = data.dict(exclude_none=True)
+    # ponytail: same fail-fast cascade validation as create. An empty
+    # list clears the cascade (back to straight-to-AI); None means
+    # "don't touch" via exclude_none above.
+    if "transfer_cascade" in payload:
+        from STT_server.services.transfer_cascade import validate_cascade
+        steps, err = validate_cascade(payload["transfer_cascade"])
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        payload["transfer_cascade"] = steps
     # ponytail: prompt reconciliation. When the operator saves an agent,
     # we run the reconciler so every assigned tool/integration has a
     # section in `agents.prompt`. If the operator deleted a section by

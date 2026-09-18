@@ -689,25 +689,157 @@ async def voice(
     # agent_id (see [AGENT] has no agent_id in customParameters log).
     # stream_params_str was already joined above for exactly this
     # purpose; use it.
-    if play_section:
-        twiml = f"""
-    <Response>
-        {play_section}
-        <Connect>
-            <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
-        </Connect>
-    </Response>
-    """
-    else:
-        twiml = f"""
-    <Response>
-        <Connect>
-            <Stream url="{ws_url}/media-stream">{stream_params_str}</Stream>
-        </Connect>
-    </Response>
-    """
+    from STT_server.services.transfer_cascade import (
+        parse_cascade, dial_twiml, connect_stream_twiml, cascade_action_url,
+    )
+
+    # ponytail: pre-AI transfer cascade (021). When the agent owns a
+    # non-empty cascade, the caller hears ringing humans first — zero
+    # STT/LLM/TTS runs until every step goes unanswered, then the
+    # call falls through to the normal AI stream below. Empty cascade
+    # = today's behaviour, byte-identical TwiML.
+    if agent_id:
+        try:
+            from STT_server.db_agents import get_agent as _get_agent
+            _agent_row = _get_agent(agent_id)
+            _steps = parse_cascade((_agent_row or {}).get("transfer_cascade"))
+        except Exception as exc:
+            log.warning("[VOICE] cascade lookup failed for agent %s: %s", agent_id, exc)
+            _steps = []
+        if _steps:
+            first = _steps[0]
+            log.warning(
+                "[VOICE] agent %s has %d-step cascade, dialing %s first",
+                agent_id, len(_steps), first["destination"],
+            )
+            return Response(
+                content=dial_twiml(
+                    first["destination"],
+                    first["timeout_sec"],
+                    cascade_action_url(
+                        PUBLIC_URL, agent_id, 1,
+                        tenant_id=tenant_id,
+                    ),
+                ),
+                media_type="application/xml",
+            )
+
+    twiml = connect_stream_twiml(ws_url, stream_params_str, play_section)
 
     return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/voice/cascade")
+async def voice_cascade(
+    agent_id: str = Query(default=None),
+    step: int = Query(default=0),
+    tenant_id: str = Query(default=None),
+    request: Request = None,
+) -> Response:
+    """Next step of a pre-AI transfer cascade. Twilio POSTs here when a
+    <Dial> step ends (DialCallStatus = no-answer / busy / failed /
+    cancel / completed).
+
+    Same signature model as /voice (per-number token from the `To`
+    field). Missing agent/step or an empty cascade falls through to
+    the AI stream so a misconfigured callback never dead-airs the
+    caller. completed = a human picked up → <Hangup>, the call was
+    already handled.
+    """
+    form_dict: dict = {}
+    if request is not None:
+        try:
+            form = await request.form()
+            form_dict = {k: str(v) if v is not None else "" for k, v in form.items()}
+        except Exception:
+            form_dict = {}
+    status = (form_dict.get("DialCallStatus") or "").strip().lower()
+
+    from STT_server.adapters.twilio_api import validate_twilio_signature
+    from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
+    try:
+        called_to = form_dict.get("To") or form_dict.get("to")
+        row = _find_num_for_sig(called_to) if called_to else None
+        token_to_check = (row or {}).get("twilio_auth_token") or None
+    except Exception:
+        token_to_check = None
+    if not token_to_check:
+        # ponytail: same fail-closed rule as /voice — a cascade step
+        # without a resolvable credential never dials. Without this a
+        # number that lost its Settings credential would keep ringing
+        # humans on an unauthenticated callback.
+        return Response(
+            content="Phone number has no Twilio auth token configured.",
+            status_code=503,
+        )
+    sig = request.headers.get("X-Twilio-Signature", "") if request else ""
+    signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
+    if request.url.query:
+        signature_url += f"?{request.url.query}"
+    if not sig or not validate_twilio_signature(
+        token_to_check, signature_url, sig, form_dict
+    ):
+        return Response(content="invalid signature", status_code=403)
+
+    if status == "completed":
+        log.warning("[VOICE] cascade step answered, hanging up (agent=%s)", agent_id)
+        return Response(
+            content="<Response><Hangup/></Response>",
+            media_type="application/xml",
+        )
+
+    from STT_server.services.transfer_cascade import (
+        parse_cascade, dial_twiml, connect_stream_twiml, cascade_action_url,
+    )
+    from STT_server.db_agents import get_agent as _get_agent
+    try:
+        agent_row = _get_agent(agent_id) if agent_id else None
+    except Exception:
+        agent_row = None
+    steps = parse_cascade((agent_row or {}).get("transfer_cascade"))
+
+    ws_url = PUBLIC_URL.rstrip("/")
+    if ws_url.startswith("https://"):
+        ws_url = "wss://" + ws_url[8:]
+    elif ws_url.startswith("http://"):
+        ws_url = "ws://" + ws_url[7:]
+    else:
+        ws_url = "wss://" + ws_url
+    stream_params = []
+    if tenant_id:
+        stream_params.append(f'<Parameter name="tenant_id" value="{tenant_id}" />')
+    if agent_id:
+        stream_params.append(f'<Parameter name="agent_id" value="{agent_id}" />')
+
+    try:
+        idx = int(step)
+    except (TypeError, ValueError):
+        idx = len(steps)
+    if 0 <= idx < len(steps):
+        nxt = steps[idx]
+        log.warning(
+            "[VOICE] cascade step %d/%d for agent %s, dialing %s (prev status=%s)",
+            idx + 1, len(steps), agent_id, nxt["destination"], status or "?",
+        )
+        return Response(
+            content=dial_twiml(
+                nxt["destination"],
+                nxt["timeout_sec"],
+                cascade_action_url(
+                    PUBLIC_URL, agent_id, idx + 1,
+                    tenant_id=tenant_id,
+                ),
+            ),
+            media_type="application/xml",
+        )
+    log.warning(
+        "[VOICE] cascade exhausted for agent %s (status=%s), falling through to AI",
+        agent_id, status or "?",
+    )
+    return Response(
+        content=connect_stream_twiml(ws_url, ''.join(stream_params)),
+        media_type="application/xml",
+    )
 
 
 async def _watchdog_assistant_speaking(session: CallSession) -> None:

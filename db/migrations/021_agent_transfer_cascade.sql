@@ -1,0 +1,32 @@
+-- ============================================================================
+-- 021 · agent_transfer_cascade.sql
+-- ----------------------------------------------------------------------------
+-- Pre-AI call cascade ("hunt group" without any AI in the loop).
+--
+-- When a client calls a number linked to an agent that has a cascade
+-- configured, /voice answers with a chain of <Dial> verbs instead of
+-- connecting straight to the AI media stream:
+--
+--   step 0: <Dial timeout=N action=/voice/cascade?...>dest_1</Dial>
+--   no answer → Twilio hits the action URL → step 1 → dest_2 → …
+--   all steps exhausted (or busy/failed/cancel) → <Connect><Stream>
+--   (the normal AI pipeline: STT → LLM → TTS).
+--
+-- A DialCallStatus=completed means a human picked up, so the cascade
+-- stops there (Twilio bridges the legs; we return <Hangup> on the
+-- action callback instead of sending the caller to the AI).
+--
+-- Shape (JSONB, list — order matters):
+--   [{"destination": "+15550001111", "timeout_sec": 20}, ...]
+--
+-- All columns nullable-with-default so legacy rows keep working: an
+-- empty/missing cascade means "today's behaviour" (straight to AI).
+-- Validation (E.164 destination, timeout 5..60, max 5 steps) lives in
+-- the route layer (routes/api.py::_validate_transfer_cascade), not
+-- here — CHECK constraints can't express "each array element matches
+-- a regex" without a trigger, and a trigger is heavier than the
+-- Python check that already runs on every save.
+-- ============================================================================
+
+ALTER TABLE agents
+  ADD COLUMN IF NOT EXISTS transfer_cascade JSONB NOT NULL DEFAULT '[]'::jsonb;
