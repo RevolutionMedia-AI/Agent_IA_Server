@@ -98,6 +98,43 @@ async def validate_twilio_credentials(account_sid: str, auth_token: str) -> dict
     return await _to_thread(_validate)
 
 
+async def validate_twilio_number_ownership(
+    account_sid: str, auth_token: str, phone_number: str
+) -> dict:
+    """Match check: does `phone_number` belong to this account?
+
+    Same lookup `configure_voice_webhook` uses, without touching the
+    webhook. Returns {'match': True, ...} or {'match': False, 'error'}.
+    """
+    def _check() -> dict:
+        try:
+            client = _get_twilio_client(account_sid, auth_token)
+            numbers = client.incoming_phone_numbers.list(phone_number=phone_number)
+            if not numbers:
+                numbers = client.incoming_phone_numbers.list(
+                    phone_number=phone_number.lstrip("+")
+                )
+            if not numbers:
+                return {
+                    "match": False,
+                    "error": (
+                        f"Phone number '{phone_number}' not found in this "
+                        "Twilio account. Pick the subaccount that owns it."
+                    ),
+                }
+            number = numbers[0]
+            return {
+                "match": True,
+                "sid": number.sid,
+                "friendly_name": getattr(number, "friendly_name", ""),
+            }
+        except Exception as exc:
+            log.warning("Twilio number lookup failed: %s", exc)
+            return {"match": False, "error": str(exc)}
+
+    return await _to_thread(_check)
+
+
 async def configure_voice_webhook(
     account_sid: str,
     auth_token: str,

@@ -2110,6 +2110,45 @@ async def test_twilio_credential(
     return {"valid": res.get("valid"), "message": message, "status": status, "credential": updated}
 
 
+@api_router.post("/twilio-credentials/{credential_id}/validate-number")
+async def validate_twilio_number(
+    credential_id: str, payload: dict, auth: dict = Depends(require_auth)
+):
+    """Match check: does `payload.number` belong to this stored subaccount?
+
+    Same decrypt-then-Twilio pattern as /test, but read-only — it never
+    persists status. The agent modal's Verify button calls it with the
+    typed digits so the operator learns the number↔credential match
+    BEFORE creating the line.
+    """
+    from STT_server import db_twilio_credentials as db_twcreds
+    try:
+        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+    except Exception as exc:
+        if exc.__class__.__name__ == "InvalidToken":
+            raise HTTPException(
+                status_code=400,
+                detail="Credential can't be decrypted. Re-save the SID and Auth Token in Settings → Twilio.",
+            )
+        raise
+    if not full:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    number = str((payload or {}).get("number") or "").strip()
+    if not number.startswith("+"):
+        number = "+" + number
+    if not number[1:].isdigit() or len(number) < 8:
+        raise HTTPException(status_code=400, detail="number must be E.164 digits (e.g. +15550001111)")
+    from STT_server.adapters.twilio_api import validate_twilio_number_ownership
+    res = await validate_twilio_number_ownership(
+        full.get("account_sid") or "", full.get("auth_token") or "", number
+    )
+    return {
+        "match": bool(res.get("match")),
+        "message": res.get("friendly_name") or res.get("error") or "",
+        "sid": res.get("sid"),
+    }
+
+
 # ---------- /settings ----------
 
 def _settings_path(user_id: str) -> str:

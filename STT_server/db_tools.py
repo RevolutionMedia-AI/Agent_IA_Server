@@ -669,16 +669,19 @@ def remove_assignment(tool_id: str, user_id: str, agent_id: str) -> dict | None:
         return out
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # jsonb - operator subtracts elements from the array.
-            # The WHERE clause makes the operation a no-op when the
-            # id isn't present (idempotent).
+            # jsonb `- text` subtracts one element from the array. (The
+            # previous `- %s::jsonb` raised `operator does not exist:
+            # jsonb - jsonb` — the operator takes text, and the
+            # integrations twin already used the text form.) The WHERE
+            # clause makes the operation a no-op when the id isn't
+            # present (idempotent).
             cur.execute(
-                "UPDATE agent_tools SET assignments = COALESCE(assignments, '[]'::jsonb) - %s::jsonb, "
+                "UPDATE agent_tools SET assignments = COALESCE(assignments, '[]'::jsonb) - %s, "
                 "updated_at = NOW() "
                 "WHERE id = %s AND user_id = %s "
                 "AND (COALESCE(assignments, '[]'::jsonb) ? %s) "
                 f"RETURNING {_tool_cols()}",
-                (json.dumps([agent_id]), tool_id, user_id, agent_id),
+                (agent_id, tool_id, user_id, agent_id),
             )
             row = cur.fetchone()
             if row:
