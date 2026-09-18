@@ -44,6 +44,7 @@ fi
 export ADMIN_ID ADMIN_EMAIL ADMIN_NAME ADMIN_ROLE ADMIN_HASH
 python <<'PYEOF'
 import os
+import sys
 ADMIN_ID    = os.environ['ADMIN_ID']
 ADMIN_EMAIL = os.environ['ADMIN_EMAIL']
 ADMIN_NAME  = os.environ['ADMIN_NAME']
@@ -184,16 +185,27 @@ if PG_URL:
                         current.append(c)
                 elif c == ";":
                     stmt = "".join(current).strip()
-                    if stmt:
+                    if stmt and _has_sql(stmt):
                         statements.append(stmt)
                     current = []
                 else:
                     current.append(c)
             i += 1
         last = "".join(current).strip()
-        if last:
+        if last and _has_sql(last):
             statements.append(last)
         return statements
+
+    def _has_sql(stmt_text):
+        # ponytail: 014_service_credentials ended with trailing `--`
+        # comments after the last `;`. The splitter kept them as a
+        # comment-only "statement" and psycopg2 raised `can't execute
+        # an empty query` on every boot. Drop chunks that carry no
+        # SQL (check-only — the original text is what executes).
+        import re
+        no_line = re.sub(r"--[^\n]*", "", stmt_text)
+        no_block = re.sub(r"/\*.*?\*/", "", no_line, flags=re.S)
+        return bool(no_block.strip())
 
     import glob
     for m in sorted(glob.glob('/app/db/migrations/*.sql')):

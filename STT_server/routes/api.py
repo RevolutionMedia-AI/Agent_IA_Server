@@ -2071,7 +2071,20 @@ async def test_twilio_credential(
     card reflects the latest known state without the operator having to
     re-save."""
     from STT_server import db_twilio_credentials as db_twcreds
-    full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+    try:
+        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+    except Exception as exc:
+        # ponytail: a row encrypted with a rotated/lost
+        # CREDENTIAL_ENCRYPTION_KEY raises InvalidToken from Fernet.
+        # That is an ops state (re-save the credential in Settings),
+        # not a 500 — return 400 with the actionable message so the
+        # Verify button shows it instead of "Internal Server Error".
+        if exc.__class__.__name__ == "InvalidToken":
+            raise HTTPException(
+                status_code=400,
+                detail="Credential can't be decrypted (encryption key rotated or value corrupted). Re-save the SID and Auth Token in Settings → Twilio.",
+            )
+        raise
     if not full:
         raise HTTPException(status_code=404, detail="Credential not found")
     sid = full.get("account_sid") or ""

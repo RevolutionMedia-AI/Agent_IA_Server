@@ -34,6 +34,7 @@ from STT_server.config import (
     STT_RECONNECT_MAX_DELAY_MS,
 )
 from STT_server.domain.session import CallSession
+from STT_server.domain.language import normalize_supported_language
 from STT_server.services.audio_codec import ulaw2lin
 from STT_server.services.credentials_resolver import resolve_for_session
 
@@ -208,7 +209,13 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
         return
 
     model_id = _resolve_model(session)
-    language = (session.preferred_language or DEFAULT_CALL_LANGUAGE or "en").strip().lower()
+    # ponytail: agents store words ("english"), Inworld demands BCP-47
+    # ("en"). Passing the raw value through killed STT on every call
+    # ("invalid language tag") with an infinite reconnect loop and a
+    # deaf AI. normalize_supported_language already maps both shapes.
+    language = normalize_supported_language(
+        session.preferred_language or DEFAULT_CALL_LANGUAGE or "en"
+    )
     auth_header_value = f"Basic {api_key}"
     connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
 
