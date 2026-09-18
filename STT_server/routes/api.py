@@ -902,8 +902,14 @@ def list_agents(auth: dict = Depends(require_auth)):
             tools_by_agent[agent_id] = 0
         try:
             integ = _db_integrations.list_integrations(auth["user_id"], agent_id=agent_id)
+            # ponytail: list_integrations(agent_id=X) returns private +
+            # ALL shared (the Assigned+Available view). The badge must
+            # count ASSIGNED only — same predicate as the prompt
+            # reconciler — or every agent shows every shared
+            # integration as its own.
             integrations_by_agent[agent_id] = sum(
                 1 for i in integ if i.get("connection_status") == "connected"
+                and (i.get("agent_id") == agent_id or agent_id in (i.get("assignments") or []))
             )
         except Exception:
             integrations_by_agent[agent_id] = 0
