@@ -508,7 +508,19 @@ def reconcile_agent_prompt(
             return [t for t in _list_tools(_user_id, agent_id=_agent_id) or []]
 
         def list_agent_integrations_fn(_agent_id, _user_id):
-            return _list_integ(_user_id, agent_id=_agent_id) or []
+            # ponytail: list_integrations(agent_id=X) returns private +
+            # ALL shared (the FE per-agent view: Assigned + Available).
+            # The reconciler must only see ASSIGNED ones — otherwise
+            # every PUT /agents/{id} injected prompt sections for
+            # shared integrations the agent never got assigned, and
+            # unassigning one was undone by the next save. Assigned =
+            # private row OR shared row whose assignments holds X.
+            rows = _list_integ(_user_id, agent_id=_agent_id) or []
+            return [
+                r for r in rows
+                if r.get("agent_id") == _agent_id
+                or _agent_id in (r.get("assignments") or [])
+            ]
 
     if get_integration_provider_spec_fn is None:
         from STT_server.services.integrations_catalog import (
