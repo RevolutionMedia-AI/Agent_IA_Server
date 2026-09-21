@@ -1457,6 +1457,25 @@ async def media_stream(ws: WebSocket) -> None:
                     session.agent_tools = _load_agent_tools(session.agent_id, session.user_id)
                     if session.agent_tools:
                         log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
+                    # ponytail: master handoff switch (024). Off =
+                    # Full-AI: transfer tools never reach the LLM
+                    # (tools[] in both adapters is built from this
+                    # list) and the executor refuses them. None
+                    # (legacy row) = on.
+                    session.transfer_enabled = agent_cfg.get("transfer_enabled", True)
+                    if session.transfer_enabled is None:
+                        session.transfer_enabled = True
+                    else:
+                        session.transfer_enabled = bool(session.transfer_enabled)
+                    if not session.transfer_enabled:
+                        session.agent_tools = [
+                            t for t in (session.agent_tools or [])
+                            if isinstance(t, dict) and t.get("kind") != "call_transfer"
+                        ]
+                        log.info(
+                            "[TRANSFER] handoff disabled for agent %s — transfer tools filtered",
+                            session.agent_id,
+                        )
                     # ponytail: tool/integration prompt instructions now
                     # live inside agents.prompt (see agent_prompt_tools.py).
                     # The runtime no longer concatenates anything at call

@@ -34,6 +34,11 @@ class CallSession:
     started_at: float | None = None
     agent_id: str | None = None
     preferred_language: str = field(default_factory=lambda: DEFAULT_CALL_LANGUAGE)
+    # ponytail: master handoff switch (024). Denormalized from the
+    # agent row at call start. False = Full-AI: transfer tools are
+    # filtered from tools[] and invoking one returns a tool error
+    # instead of dialing. Default True (legacy rows predate it).
+    transfer_enabled: bool = True
     # Per-session custom system prompt (overrides default if set)
     custom_prompt: str | None = None
     # ponytail: the agent's welcome message, set on the session at

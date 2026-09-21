@@ -496,6 +496,30 @@ async def _stream_llm_with_tools(
                 except Exception:
                     log.warning("[Tools] Failed to play filler phrase for tool '%s'", tool_name)
             if tool_kind == TOOL_KIND_CALL_TRANSFER:
+                # ponytail: master handoff switch (024). The tools[]
+                # filter at call start normally hides these, but a
+                # session that began before the toggle (or a stale
+                # prompt section) can still emit the call — refuse
+                # with a tool error instead of dialing so the LLM
+                # apologizes and keeps helping.
+                if getattr(session, "transfer_enabled", True) is False:
+                    log.warning(
+                        "[Tools] call_transfer '%s' refused: handoff disabled for agent %s",
+                        tool_name, getattr(session, "agent_id", None),
+                    )
+                    session.history.append({
+                        "role": "tool",
+                        "content": (
+                            f"Tool '{tool_name}' error: human handoff is disabled "
+                            "for this agent. Continue helping the caller yourself; "
+                            "do not try another transfer."
+                        ),
+                    })
+                    record_tool_result(
+                        tool_def.get("id"), False, "invocation",
+                        error="transfer_enabled is False for this agent",
+                    )
+                    continue
                 # ponytail: ordered transfer chain. The LLM invoked ONE
                 # transfer tool (possibly because the caller named that
                 # number) — the runtime rings it first, then the rest

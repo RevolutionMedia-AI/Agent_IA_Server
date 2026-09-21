@@ -494,6 +494,10 @@ class AgentCreate(BaseModel):
     # Empty / None = single-tool dial then back to the AI. Validated
     # in the create/update handlers (list of str, capped).
     transfer_chain: Optional[list] = None
+    # ponytail: master handoff switch (024_transfer_enabled.sql).
+    # None = default on. Explicit false = Full-AI: no transfer
+    # tools reach the LLM, no chain runs.
+    transfer_enabled: Optional[bool] = None
 
 
 class AgentUpdate(BaseModel):
@@ -555,6 +559,8 @@ class AgentUpdate(BaseModel):
     transfer_cascade: Optional[list] = None
     # ponytail: ordered transfer chain — see AgentCreate above.
     transfer_chain: Optional[list] = None
+    # ponytail: master handoff switch — see AgentCreate above.
+    transfer_enabled: Optional[bool] = None
 
 
 class PhoneNumberCreate(BaseModel):

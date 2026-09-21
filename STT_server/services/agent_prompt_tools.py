@@ -585,10 +585,26 @@ def reconcile_agent_prompt(
     new_prompt = current_prompt or ""
     change_log: list[str] = []
 
+    # ponytail: master handoff switch (024). When the agent disabled
+    # transfers, transfer tools are treated as unassigned: no section
+    # is rendered and existing ones are stripped as stale below. Read
+    # defensively — tests inject fake ids, legacy rows lack the flag
+    # (None = on).
+    transfer_on = True
+    try:
+        from STT_server.db_agents import get_agent as _get_agent_row
+        _arow = _get_agent_row(agent_id, user_id)
+        if _arow is not None and _arow.get("transfer_enabled") is False:
+            transfer_on = False
+    except Exception:
+        transfer_on = True
+
     # Collect the assignments the agent SHOULD have a section for.
     expected_sections: dict[tuple[str, str], dict] = {}
 
     for tool in list_agent_tools_fn(agent_id, user_id) or []:
+        if tool.get("kind") == "call_transfer" and not transfer_on:
+            continue
         if tool.get("credentials") and not (tool.get("webhook_url") or tool.get("destination")):
             # Provider-credential rows live in agent_tools with the
             # same table shape; skip them — they aren't callable.
