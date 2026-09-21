@@ -290,6 +290,8 @@ async def transfer_call(
     auth_token: str,
     call_sid: str,
     destination: str,
+    timeout_sec: int = 20,
+    action_url: str | None = None,
 ) -> dict:
     """Redirect a live Twilio call to a new destination.
 
@@ -311,6 +313,14 @@ async def transfer_call(
     would just duplicate the rule. If a stale row slips through (DB
     edit, manual JSON poke), Twilio returns its own 4xx error which
     we surface verbatim.
+
+    ponytail: timeout_sec + action_url power the ordered transfer
+    chain. Without an action URL a no-answer Dial ends the call
+    (the "se cuelga" bug) — with one, Twilio POSTs DialCallStatus to
+    /voice/transfer-fallback, which Dials the next chain link or
+    returns the call to the AI stream. The & in the query string is
+    XML-escaped: raw & inside a TwiML attribute is malformed XML
+    and risks Twilio dropping the callback.
     """
     def _transfer() -> dict:
         try:
@@ -319,17 +329,18 @@ async def transfer_call(
             # the new destination. callerId defaults to the original
             # caller (the agent's Twilio number) so the bridged party
             # sees a familiar number on their display.
-            twiml = (
-                f'<Response><Dial callerId="{{ORIG}}">{destination}</Dial></Response>'
-            )
-            # ponytail: Twilio doesn't actually accept {ORIG} as a
-            # macro — the SDK leaves the caller id as-is. We pass
-            # the destination number through verbatim; the operator
-            # can pre-set callerId at the phone_number level if they
-            # want a specific outbound identity. Keeping the literal
-            # template above in a comment so future readers see what
-            # was intended if Twilio ever adds macros.
-            twiml = f'<Response><Dial>{destination}</Dial></Response>'
+            try:
+                timeout = max(5, min(60, int(timeout_sec or 20)))
+            except (TypeError, ValueError):
+                timeout = 20
+            if action_url:
+                action_esc = action_url.replace("&", "&amp;")
+                twiml = (
+                    f'<Response><Dial timeout="{timeout}" action="{action_esc}" '
+                    f'method="POST">{destination}</Dial></Response>'
+                )
+            else:
+                twiml = f'<Response><Dial timeout="{timeout}">{destination}</Dial></Response>'
             log.info(
                 "[TRANSFER] calls(%s).update(twiml=<Dial>%s</Dial>) via subaccount %s...",
                 call_sid, destination, account_sid[:6] or "?",

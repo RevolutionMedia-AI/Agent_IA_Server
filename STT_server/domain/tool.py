@@ -108,6 +108,10 @@ class AgentTool:
         # forbids this (the destination is the action).
         integration_id: Optional[str] = None,
         action: Optional[str] = None,
+        # ponytail: per-transfer ring budget (023). Seconds Twilio
+        # rings `destination` before the chain fallback fires. None
+        # (legacy rows) means the default; validated to 5..60.
+        ring_timeout_sec: Optional[int] = None,
     ):
         self.id = id or str(uuid.uuid4())
         self.agent_id = agent_id
@@ -161,6 +165,14 @@ class AgentTool:
         # legacy tool.webhook_url path.
         self.integration_id = integration_id or None
         self.action = action or None
+        # ponytail: coerce once — route rows carry int, JSON rows may
+        # carry str/None. Out-of-range values are a validate() error,
+        # not a silent clamp, so the operator learns the 5..60 rule.
+        from STT_server.services.transfer_cascade import DEFAULT_STEP_TIMEOUT_SEC
+        try:
+            self.ring_timeout_sec = int(ring_timeout_sec)
+        except (TypeError, ValueError):
+            self.ring_timeout_sec = DEFAULT_STEP_TIMEOUT_SEC
 
     @staticmethod
     def _now_iso() -> str:
@@ -180,6 +192,7 @@ class AgentTool:
             # table) preserves the operator's intent.
             "kind": self.kind,
             "destination": self.destination,
+            "ring_timeout_sec": self.ring_timeout_sec,
             "assignments": list(self.assignments),
             "function_name": self.function_name,
             "created_at": self.created_at,
@@ -243,6 +256,7 @@ class AgentTool:
             # working until the operator switches to explicit
             # assignment via the Assign/Unassign buttons.
             assignments=data.get("assignments"),
+            ring_timeout_sec=data.get("ring_timeout_sec"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             last_tested_at=data.get("last_tested_at"),
@@ -280,6 +294,14 @@ class AgentTool:
                 errors.append("call_transfer tools cannot reference an integration")
             if not self.destination or not E164_PATTERN.match(self.destination.strip()):
                 errors.append("destination must be E.164 (e.g. +15071234567)")
+            from STT_server.services.transfer_cascade import (
+                MIN_STEP_TIMEOUT_SEC, MAX_STEP_TIMEOUT_SEC,
+            )
+            if not MIN_STEP_TIMEOUT_SEC <= self.ring_timeout_sec <= MAX_STEP_TIMEOUT_SEC:
+                errors.append(
+                    f"ring_timeout_sec must be between "
+                    f"{MIN_STEP_TIMEOUT_SEC} and {MAX_STEP_TIMEOUT_SEC} seconds"
+                )
         else:
             if self.integration_id:
                 # ponytail: bound to an integration — webhook_url is

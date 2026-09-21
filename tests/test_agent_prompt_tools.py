@@ -283,7 +283,9 @@ def test_reconcile_is_idempotent_on_clean_prompt():
 
 
 def test_reconcile_skips_call_transfer_and_credential_rows():
-    """call_transfer has no LLM parameters; provider-credential rows aren't tools."""
+    """call_transfer renders a transfer section (name/destination/
+    when-to-use) so the LLM stops invoking blind; provider-credential
+    rows still render nothing."""
     prompt, log = reconcile_agent_prompt(
         "agent_1", "user_1", "",
         list_agent_tools_fn=_fake_tools(
@@ -302,10 +304,10 @@ def test_reconcile_skips_call_transfer_and_credential_rows():
         ),
         list_agent_integrations_fn=_fake_integrations(),
     )
-    # Neither should generate a section.
-    assert "tool_ct" not in prompt
+    # Transfer section present with destination; creds row absent.
+    assert "tool_ct" in prompt
+    assert "+15071234567" in prompt
     assert "openai_creds" not in prompt
-    assert log == []
 
 
 def test_reconcile_propagates_integration_changes():

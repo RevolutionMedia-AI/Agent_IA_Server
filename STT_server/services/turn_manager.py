@@ -496,17 +496,39 @@ async def _stream_llm_with_tools(
                 except Exception:
                     log.warning("[Tools] Failed to play filler phrase for tool '%s'", tool_name)
             if tool_kind == TOOL_KIND_CALL_TRANSFER:
-                # ponytail: call_transfer branch. Twilio API call to
-                # redirect the live call. Missing Twilio creds on the
-                # session is a config bug (the phone row had no
-                # auth_token) — we surface it as a tool error to the
-                # LLM so it can apologize and recover instead of
-                # silently dropping the call.
+                # ponytail: ordered transfer chain. The LLM invoked ONE
+                # transfer tool (possibly because the caller named that
+                # number) — the runtime rings it first, then the rest
+                # of the user's configured chain in order, then falls
+                # back to the AI stream when nobody answers. The Dial
+                # carries an action URL so a no-answer never ends the
+                # call (the old blind Dial hung up on silence).
+                from STT_server.config import PUBLIC_URL as _PUBLIC_URL
+                from STT_server.services.transfer_cascade import (
+                    build_transfer_chain, transfer_fallback_url,
+                )
                 destination = tool_def.get("destination")
                 account_sid = getattr(session, "twilio_account_sid", None)
                 auth_token = getattr(session, "twilio_auth_token", None)
                 call_sid = getattr(session, "call_sid", None)
-                if not (account_sid and auth_token and call_sid and destination):
+                tools_by_id = {
+                    t.get("id"): t for t in agent_tools
+                    if isinstance(t, dict) and t.get("id")
+                }
+                chain_cfg: list = []
+                try:
+                    from STT_server.db_agents import get_agent as _get_agent
+                    _arow = _get_agent(
+                        getattr(session, "agent_id", None),
+                        getattr(session, "user_id", None),
+                    )
+                    chain_cfg = (_arow or {}).get("transfer_chain") or []
+                except Exception as exc:
+                    log.warning("[Tools] transfer chain lookup failed: %s", exc)
+                chain = build_transfer_chain(
+                    tool_def.get("id"), chain_cfg, tools_by_id,
+                )
+                if not (account_sid and auth_token and call_sid) or not chain:
                     log.warning(
                         "[Tools] call_transfer '%s' skipped: missing creds "
                         "(sid=%s token=%s call_sid=%s destination=%s)",
@@ -527,28 +549,46 @@ async def _stream_llm_with_tools(
                         error="call_transfer not configured (missing Twilio auth or destination)",
                     )
                     continue
+                first, rest = chain[0], chain[1:]
+                action = (
+                    transfer_fallback_url(
+                        _PUBLIC_URL,
+                        getattr(session, "agent_id", None),
+                        [s["id"] for s in rest],
+                        tenant_id=getattr(session, "tenant_id", None),
+                    )
+                    if _PUBLIC_URL else None
+                )
                 try:
                     transfer_result = await execute_call_transfer(
-                        account_sid, auth_token, call_sid, destination, tool_name,
+                        account_sid, auth_token, call_sid,
+                        first["destination"], tool_name,
+                        timeout_sec=first["timeout_sec"],
+                        action_url=action,
                     )
                     log.info(
-                        "[Tools] call_transfer '%s' ok -> %s",
-                        tool_name, destination,
+                        "[Tools] call_transfer '%s' ok -> %s (chain %d of %d)",
+                        tool_name, first["destination"],
+                        1, len(chain),
                     )
                     record_tool_result(tool_def.get("id"), True, "invocation")
                     session.history.append({
                         "role": "tool",
                         "content": (
-                            f"Tool '{tool_name}' result: call transferred to "
-                            f"{destination}. End the conversation politely."
+                            f"Tool '{tool_name}' result: transferring the call to "
+                            f"{first['destination']}. The system rings it, then "
+                            f"continues the chain or returns the call to you. "
+                            f"End this turn politely."
                         ),
                     })
-                    # ponytail: the call leaves our WebSocket as soon as
-                    # Twilio accepts the redirect — anything we queue
-                    # after this may not reach the caller. Mark the
-                    # session closed so the monitors and the playback
-                    # loop tear down cleanly instead of dead-airing.
-                    session.closed = True
+                    # ponytail: do NOT mark the session closed (the old
+                    # code did). Twilio tears down our WebSocket when
+                    # the Dial starts; either a human answers (call
+                    # bridged, cleanup runs on WS death) or the
+                    # fallback action re-attaches a fresh stream to
+                    # this same call_sid. Closing here would kill the
+                    # fallback path. Break: further tool calls in this
+                    # turn are pointless once the stream is leaving.
                     break  # no point processing further tool calls
                 except Exception as exc:
                     log.error(

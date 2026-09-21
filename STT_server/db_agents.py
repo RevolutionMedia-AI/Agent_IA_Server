@@ -87,6 +87,7 @@ _AGENT_COLS = (
     "stt_use_own_key, llm_use_own_key, tts_use_own_key, "
     f"{_IDLE_COLS}, "
     "transfer_cascade, "
+    "transfer_chain, "
     "calls, perf, created_at, updated_at"
 )
 
@@ -120,6 +121,15 @@ def _row_to_agent(row: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             tc = []
     out["transfer_cascade"] = tc if isinstance(tc, list) else []
+    # ponytail: transfer_chain (023) — same JSONB normalize as the
+    # cascade above. Ordered call_transfer tool ids; [] = no chain.
+    ch = out.get("transfer_chain")
+    if isinstance(ch, str):
+        try:
+            ch = json.loads(ch)
+        except (json.JSONDecodeError, TypeError):
+            ch = []
+    out["transfer_chain"] = [c for c in ch] if isinstance(ch, list) else []
     # The DB stores a few optional columns as None; the FE is happy with
     # either null or empty string but null is the contract we kept.
     return out
@@ -209,13 +219,12 @@ def create_agent(user_id: str, payload: dict) -> dict:
             "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
             "idle_subsequent_timeout_sec", "idle_final_message",
             "idle_disconnect_timeout_sec", "idle_max_attempts",
-            "transfer_cascade"]
-    # ponytail: transfer_cascade is the first JSONB column on this
-    # table — it needs an explicit ::jsonb cast, the rest stay plain
-    # %s. One special-case in the placeholder list beats rewriting
-    # the whole insert.
+            "transfer_cascade", "transfer_chain"]
+    # ponytail: transfer_cascade + transfer_chain are the JSONB columns
+    # on this table — both need an explicit ::jsonb cast, the rest
+    # stay plain %s.
     placeholders = ", ".join(
-        "%s::jsonb" if c == "transfer_cascade" else "%s" for c in cols
+        "%s::jsonb" if c in ("transfer_cascade", "transfer_chain") else "%s" for c in cols
     )
     insert_cols = ", ".join(cols)
     values = [agent_id, user_id, payload.get("name", "Untitled"),
@@ -240,7 +249,8 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("idle_final_message"),
               payload.get("idle_disconnect_timeout_sec"),
               payload.get("idle_max_attempts"),
-              json.dumps(payload.get("transfer_cascade") or [])]
+              json.dumps(payload.get("transfer_cascade") or []),
+              json.dumps(payload.get("transfer_chain") or [])]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -288,10 +298,10 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                      "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
                      "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
                      "idle_subsequent_timeout_sec", "idle_final_message",
-                     "idle_disconnect_timeout_sec", "idle_max_attempts",
-                     "transfer_cascade"}:
+                      "idle_disconnect_timeout_sec", "idle_max_attempts",
+                      "transfer_cascade", "transfer_chain"}:
             continue
-        if k == "transfer_cascade":
+        if k in ("transfer_cascade", "transfer_chain"):
             # ponytail: same ::jsonb cast as the INSERT above. Accept
             # list (normal) or pre-serialized str (defensive).
             v = v if isinstance(v, str) else json.dumps(v or [])

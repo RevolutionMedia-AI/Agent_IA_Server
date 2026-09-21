@@ -23,6 +23,7 @@ DEFAULT_STEP_TIMEOUT_SEC = 20
 MIN_STEP_TIMEOUT_SEC = 5
 MAX_STEP_TIMEOUT_SEC = 60
 MAX_CASCADE_STEPS = 5
+MAX_CHAIN_TOOLS = 10
 
 
 def parse_cascade(raw) -> list[dict]:
@@ -100,9 +101,15 @@ def dial_twiml(
 ) -> str:
     """One <Dial> step. Twilio rings `destination` for `timeout_sec`
     seconds, then POSTs DialCallStatus to `action_url` (no-answer /
-    busy / failed / cancel / completed)."""
+    busy / failed / cancel / completed).
+
+    ponytail: the action URL rides in an XML attribute, so its query
+    & separators are escaped to &amp;. Raw & is malformed TwiML and
+    Twilio may drop the callback — which looks exactly like "the
+    cascade dials but never falls through"."""
+    action_esc = action_url.replace("&", "&amp;")
     return f"""<Response>
-        <Dial timeout="{timeout_sec}" action="{action_url}" method="POST">
+        <Dial timeout="{timeout_sec}" action="{action_esc}" method="POST">
             <Number>{destination}</Number>
         </Dial>
     </Response>"""
@@ -150,6 +157,80 @@ def cascade_action_url(
     return f"{public_url.rstrip('/')}/voice/cascade?{urllib.parse.urlencode(qs)}"
 
 
+def validate_transfer_chain(raw) -> tuple[list[str] | None, str | None]:
+    """Strict version for the agent save path. A chain is an ordered
+    list of call_transfer tool ids (user-ordered: phone 1, phone 2,
+    ...). Returns (chain, None) or (None, error). Dedupe preserves
+    first-seen order so a double-click in the UI can't ring twice."""
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list):
+        return None, "transfer_chain must be a list of tool ids"
+    if len(raw) > MAX_CHAIN_TOOLS:
+        return None, f"transfer_chain supports at most {MAX_CHAIN_TOOLS} tools"
+    chain: list[str] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, str) or not entry.strip():
+            return None, f"transfer_chain[{i}] must be a tool id string"
+        tid = entry.strip()
+        if tid not in chain:
+            chain.append(tid)
+    return chain, None
+
+
+def build_transfer_chain(
+    invoked_tool_id: str,
+    chain: list | None,
+    tools_by_id: dict,
+) -> list[dict]:
+    """Order the Dial chain for one transfer invocation.
+
+    The invoked tool rings first (the LLM picked it — possibly because
+    the caller named that number), then the rest of the user's
+    configured chain after it. Tools missing a destination are
+    dropped — the executor must never Dial a bare id. Returns tool
+    rows (with destination + ring_timeout_sec) in ring order.
+    """
+    chain = [c for c in (chain or []) if isinstance(c, str)]
+    ordered_ids = [invoked_tool_id] + [c for c in chain if c != invoked_tool_id]
+    out: list[dict] = []
+    for tid in ordered_ids[:MAX_CHAIN_TOOLS]:
+        tool = tools_by_id.get(tid)
+        if not isinstance(tool, dict):
+            continue
+        dest = str(tool.get("destination") or "").strip()
+        if not E164_PATTERN.match(dest):
+            continue
+        try:
+            timeout = int(tool.get("ring_timeout_sec") or DEFAULT_STEP_TIMEOUT_SEC)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_STEP_TIMEOUT_SEC
+        timeout = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, timeout))
+        out.append({
+            "id": tid,
+            "name": tool.get("name") or tid,
+            "destination": dest,
+            "timeout_sec": timeout,
+        })
+    return out
+
+
+def transfer_fallback_url(
+    public_url: str,
+    agent_id: str,
+    remaining_ids: list[str],
+    tenant_id: str | None = None,
+) -> str:
+    """Action URL for a chain <Dial>. Same stateless contract as the
+    cascade callback: remaining tool ids ride in the query so
+    /voice/transfer-fallback can Dial the next one (or fall back to
+    the AI stream when the chain is exhausted)."""
+    qs = {"agent_id": agent_id, "remaining": ",".join(remaining_ids or [])}
+    if tenant_id:
+        qs["tenant_id"] = tenant_id
+    return f"{public_url.rstrip('/')}/voice/transfer-fallback?{urllib.parse.urlencode(qs)}"
+
+
 if __name__ == "__main__":  # smoke
     steps, err = validate_cascade([
         {"destination": "+15550001111", "timeout_sec": 25},
@@ -164,4 +245,18 @@ if __name__ == "__main__":  # smoke
     assert parse_cascade([{"destination": "bad"}, {"destination": "+15550002222", "timeout_sec": 99}]) == [
         {"destination": "+15550002222", "timeout_sec": MAX_STEP_TIMEOUT_SEC}
     ]
+    chain, err = validate_transfer_chain(["t1", "t2", "t1", ""])
+    assert chain is None and "tool id" in err
+    chain, err = validate_transfer_chain(["t1", "t2", "t1"])
+    assert err is None and chain == ["t1", "t2"]
+    tools = {
+        "t1": {"name": "Sales", "destination": "+15550001111", "ring_timeout_sec": 25},
+        "t2": {"name": "NoDest", "destination": "", "ring_timeout_sec": 10},
+        "t3": {"name": "Support", "destination": "+15550003333"},
+    }
+    # invoked tool first, then chain order; destination-less dropped
+    got = build_transfer_chain("t3", ["t1", "t2", "t3"], tools)
+    assert [g["id"] for g in got] == ["t3", "t1"], got
+    assert got[0]["timeout_sec"] == DEFAULT_STEP_TIMEOUT_SEC
+    assert got[1]["timeout_sec"] == 25
     print("transfer_cascade: OK")

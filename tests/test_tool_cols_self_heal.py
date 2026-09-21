@@ -155,6 +155,9 @@ def test_postgres_path_self_heals_when_credentials_column_missing():
     ponytail: 016 — the self-heal now also handles integration_id +
     action. The fixture says "all three missing" so two ALTERs run,
     one for credentials and one for the new pair.
+
+    ponytail: 023 — ring_timeout_sec joins the same machinery. The
+    fixture says "all four missing" so three ALTERs run.
     """
     from STT_server import db_tools
 
@@ -164,9 +167,11 @@ def test_postgres_path_self_heals_when_credentials_column_missing():
             ("credentials",),           # post-ALTER confirm creds col added
             ("integration_id",),        # ... but new cols not yet there
             ("action",),                # ... ditto
-            ("credentials",             # final confirm: all three present
+            ("ring_timeout_sec",),      # ... ditto
+            ("credentials",             # final confirm: all four present
              "integration_id",
-             "action"),
+             "action",
+             "ring_timeout_sec"),
         ],
     )
 
@@ -178,16 +183,18 @@ def test_postgres_path_self_heals_when_credentials_column_missing():
         cols = db_tools._tool_cols()
 
     assert "credentials" in cols
+    assert "ring_timeout_sec" in cols
     assert db_tools._columns_check_done is True
     assert "credentials" in db_tools._TOOL_COLS_EXTRA
 
-    # Two ALTERs run (one for credentials, one for integration_id + action),
-    # each followed by a re-check. The fixture feeds back partial state
-    # to mirror the production race.
+    # Three ALTERs run (credentials, integration_id + action,
+    # ring_timeout_sec), each followed by a re-check. The fixture
+    # feeds back partial state to mirror the production race.
     alter_calls = [q for q, _ in cursor.executed if "ALTER TABLE" in q.upper()]
-    assert len(alter_calls) == 2, f"expected 2 ALTERs, got {len(alter_calls)}: {cursor.executed}"
+    assert len(alter_calls) == 3, f"expected 3 ALTERs, got {alter_calls}: {cursor.executed}"
     assert "credentials JSONB" in alter_calls[0]
     assert "integration_id" in alter_calls[1] and "action" in alter_calls[1]
+    assert "ring_timeout_sec" in alter_calls[2]
 
 
 def test_postgres_path_no_alter_when_credentials_column_present():
@@ -196,9 +203,9 @@ def test_postgres_path_no_alter_when_credentials_column_present():
     against a half-applied ALTER on a previous deploy)."""
     from STT_server import db_tools
 
-    # Static row returns all three column names on every fetchone call.
+    # Static row returns all four column names on every fetchone call.
     cursor = _ScriptedCursor(
-        fetchone_static=("credentials", "integration_id", "action"),
+        fetchone_static=("credentials", "integration_id", "action", "ring_timeout_sec"),
     )
 
     db_tools._TOOL_COLS_EXTRA = []
@@ -224,7 +231,7 @@ def test_postgres_path_second_call_does_not_re_check():
     from STT_server import db_tools
 
     cursor = _ScriptedCursor(
-        fetchone_static=("credentials", "integration_id", "action"),
+        fetchone_static=("credentials", "integration_id", "action", "ring_timeout_sec"),
     )
 
     db_tools._TOOL_COLS_EXTRA = []

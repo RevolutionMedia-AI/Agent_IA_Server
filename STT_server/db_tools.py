@@ -59,9 +59,9 @@ _TOOL_COLS_BASE = (
     "created_at, updated_at"
 )
 # ponytail: integration_id + action columns added by 016_agent_tools_integration.sql.
-# Same self-heal pattern as credentials (014): detected on first call, ALTER'd
-# inline if missing, then cached. Tools created before the migration keep
-# working — both columns are NULL for legacy rows.
+# ring_timeout_sec added by 023_transfer_chain.sql (per-transfer ring
+# budget). Same self-heal pattern as credentials (014): detected on
+# first call, ALTER'd inline if missing, then cached.
 _TOOL_COLS_BASE_V2 = _TOOL_COLS_BASE + ", integration_id, action"
 _TOOL_COLS_EXTRA: list[str] = []  # appended to _TOOL_COLS_BASE when present
 _columns_check_done: bool = False
@@ -99,7 +99,7 @@ def _ensure_tool_columns() -> None:
             return
         if not is_postgres():
             # JSON path: no schema to check, every field is supported.
-            _TOOL_COLS_EXTRA = ["credentials", "integration_id", "action"]
+            _TOOL_COLS_EXTRA = ["credentials", "integration_id", "action", "ring_timeout_sec"]
             _columns_check_done = True
             return
         try:
@@ -108,7 +108,7 @@ def _ensure_tool_columns() -> None:
                     cur.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'agent_tools' "
-                        "AND column_name IN ('credentials', 'integration_id', 'action')"
+                        "AND column_name IN ('credentials', 'integration_id', 'action', 'ring_timeout_sec')"
                     )
                     # ponytail: use fetchone in a loop so test stubs
                     # that only implement fetchone (not fetchall)
@@ -122,10 +122,19 @@ def _ensure_tool_columns() -> None:
                     # column_name key, (b) plain tuples with a single
                     # column name, or (c) test-stub composite rows
                     # that bundle multiple names — handle all three.
-                    expected = ("credentials", "integration_id", "action")
+                    expected = ("credentials", "integration_id", "action", "ring_timeout_sec")
                     present: set = set()
                     bad_rows = 0
+                    # ponytail: hard cap. The non-empty branch below
+                    # `continue`s without a bound — a stub (or a DB
+                    # whose ALTER silently no-ops) returning the same
+                    # partial set forever used to spin forever. 16 is
+                    # far above the 4 names we collect.
+                    iters = 0
                     while True:
+                        iters += 1
+                        if iters > 16:
+                            break
                         row = cur.fetchone()
                         if row is None:
                             break
@@ -167,6 +176,16 @@ def _ensure_tool_columns() -> None:
                             "ADD COLUMN IF NOT EXISTS integration_id TEXT, "
                             "ADD COLUMN IF NOT EXISTS action TEXT"
                         )
+            if "ring_timeout_sec" not in present:
+                log.warning(
+                    "[db_tools] agent_tools.ring_timeout_sec missing - applying 023 inline"
+                )
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE agent_tools "
+                            "ADD COLUMN IF NOT EXISTS ring_timeout_sec INT NOT NULL DEFAULT 20"
+                        )
             # Confirm presence after the inline ALTERs. Cheap and
             # avoids a false positive if ALTER silently no-ops.
             with get_conn() as conn:
@@ -174,11 +193,15 @@ def _ensure_tool_columns() -> None:
                     cur.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'agent_tools' "
-                        "AND column_name IN ('credentials', 'integration_id', 'action')"
+                        "AND column_name IN ('credentials', 'integration_id', 'action', 'ring_timeout_sec')"
                     )
                     present = set()
                     bad_rows = 0
+                    iters = 0
                     while True:
+                        iters += 1
+                        if iters > 16:
+                            break
                         row = cur.fetchone()
                         if row is None:
                             break
@@ -199,7 +222,7 @@ def _ensure_tool_columns() -> None:
                             continue
                         if present.issuperset(expected):
                             break
-            _TOOL_COLS_EXTRA = [c for c in ("credentials", "integration_id", "action") if c in present]
+            _TOOL_COLS_EXTRA = [c for c in ("credentials", "integration_id", "action", "ring_timeout_sec") if c in present]
             _columns_check_done = True
             log.info(
                 "[db_tools] self-heal complete: tool cols extra=%s",
@@ -274,6 +297,13 @@ def _row_to_tool(row: dict) -> dict:
               "created_at", "updated_at"):
         if hasattr(out.get(k), "isoformat"):
             out[k] = out[k].isoformat() + "Z"
+    # ponytail: ring_timeout_sec (023) rides the EXTRA cols — coerce
+    # legacy/NULL rows to the default so the executor never defends
+    # against None mid-call.
+    try:
+        out["ring_timeout_sec"] = int(out.get("ring_timeout_sec") or 20)
+    except (TypeError, ValueError):
+        out["ring_timeout_sec"] = 20
     return out
 
 
@@ -431,6 +461,13 @@ def create_tool(
         extra_cols_sql += ", action"
         extra_vals_sql += ", %s"
         extra_params.append(action)
+    if "ring_timeout_sec" in _TOOL_COLS_EXTRA:
+        extra_cols_sql += ", ring_timeout_sec"
+        extra_vals_sql += ", %s"
+        try:
+            extra_params.append(int(payload.get("ring_timeout_sec") or 20))
+        except (TypeError, ValueError):
+            extra_params.append(20)
     with get_conn() as conn:
         with conn.cursor() as cur:
             credentials_json = json.dumps(payload.get("credentials")) if payload.get("credentials") is not None else None

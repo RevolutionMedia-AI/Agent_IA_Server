@@ -503,6 +503,8 @@ async def execute_call_transfer(
     call_sid: str,
     destination: str,
     tool_name: str,
+    timeout_sec: int = 20,
+    action_url: str | None = None,
 ) -> dict:
     """Ask Twilio to redirect a live call to ``destination``.
 
@@ -512,6 +514,11 @@ async def execute_call_transfer(
     connects; success here means "Twilio accepted the redirect", not
     "the destination picked up". That's a Twilio-side concern.
 
+    With action_url set (ordered chain), a no-answer/busy/failed Dial
+    POSTs back to /voice/transfer-fallback instead of ending the
+    call — the chain continues or the AI resumes. Without it the
+    Dial ends the call on no-answer (legacy behaviour).
+
     Raises ToolExecutionError when the auth pair doesn't own the
     call_sid or the destination is rejected at the Twilio layer.
     The caller (turn_manager) catches this and routes the error back
@@ -519,11 +526,14 @@ async def execute_call_transfer(
     """
     from STT_server.adapters.twilio_api import transfer_call
     log.info(
-        "[ToolExecutor] call_transfer '%s' call_sid=%s -> %s",
-        tool_name, call_sid, destination,
+        "[ToolExecutor] call_transfer '%s' call_sid=%s -> %s (timeout=%s fallback=%s)",
+        tool_name, call_sid, destination, timeout_sec, bool(action_url),
     )
     try:
-        result = await transfer_call(account_sid, auth_token, call_sid, destination)
+        result = await transfer_call(
+            account_sid, auth_token, call_sid, destination,
+            timeout_sec=timeout_sec, action_url=action_url,
+        )
     except Exception as exc:
         log.exception(
             "[ToolExecutor] call_transfer '%s' transport error", tool_name,

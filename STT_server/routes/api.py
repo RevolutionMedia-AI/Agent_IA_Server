@@ -488,6 +488,12 @@ class AgentCreate(BaseModel):
     # in the create/update handlers so a bad step 400s with a useful
     # message instead of silently never ringing.
     transfer_cascade: Optional[list] = None
+    # ponytail: ordered transfer chain (023_transfer_chain.sql).
+    # List of call_transfer tool ids in the order the user wants the
+    # handoff chain to run (AI first, then phone 1, phone 2, ...).
+    # Empty / None = single-tool dial then back to the AI. Validated
+    # in the create/update handlers (list of str, capped).
+    transfer_chain: Optional[list] = None
 
 
 class AgentUpdate(BaseModel):
@@ -547,6 +553,8 @@ class AgentUpdate(BaseModel):
     tts_use_own_key: Optional[bool] = None
     # ponytail: pre-AI transfer cascade — see AgentCreate above.
     transfer_cascade: Optional[list] = None
+    # ponytail: ordered transfer chain — see AgentCreate above.
+    transfer_chain: Optional[list] = None
 
 
 class PhoneNumberCreate(BaseModel):
@@ -967,6 +975,12 @@ def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
         if err:
             raise HTTPException(status_code=400, detail=err)
         payload["transfer_cascade"] = steps
+    if payload.get("transfer_chain") is not None:
+        from STT_server.services.transfer_cascade import validate_transfer_chain
+        chain, err = validate_transfer_chain(payload["transfer_chain"])
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        payload["transfer_chain"] = chain
     return db_create_agent(auth["user_id"], payload)
 
 
@@ -991,6 +1005,12 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
         if err:
             raise HTTPException(status_code=400, detail=err)
         payload["transfer_cascade"] = steps
+    if "transfer_chain" in payload:
+        from STT_server.services.transfer_cascade import validate_transfer_chain
+        chain, err = validate_transfer_chain(payload["transfer_chain"])
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        payload["transfer_chain"] = chain
     # ponytail: prompt reconciliation. When the operator saves an agent,
     # we run the reconciler so every assigned tool/integration has a
     # section in `agents.prompt`. If the operator deleted a section by
@@ -1093,6 +1113,7 @@ def _build_tool_payload(agent_id: str, data: "ToolCreate", user_id: str | None =
         parameters=data.parameters,
         kind=data.kind,
         destination=data.destination,
+        ring_timeout_sec=getattr(data, "ring_timeout_sec", None),
         # ponytail: 016 — integration binding is optional on the
         # payload. Existing tests / callers that don't know about
         # the new fields still pass a Body-shaped object whose
@@ -1277,6 +1298,10 @@ class ToolCreate(BaseModel):
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}, "required": []})
     kind: Optional[str] = None  # "webhook" (default) | "call_transfer"
     destination: Optional[str] = None  # E.164 for call_transfer
+    # ponytail: per-transfer ring budget (023). Seconds Twilio rings
+    # the destination before the chain fallback fires. None = default
+    # 20; AgentTool.validate() enforces 5..60.
+    ring_timeout_sec: Optional[int] = None
     # ponytail: which OpenAI model the BE test_data_generator uses
     # when the operator hits Test on this tool. Pydantic v2's default
     # extra="ignore" would drop this from the body if it stayed out
@@ -1296,7 +1321,16 @@ class ToolCreate(BaseModel):
 def create_agent_tool(agent_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Create a new tool for an agent."""
     payload = _build_tool_payload(agent_id, data, user_id=auth["user_id"])
-    return db_create_tool(auth["user_id"], payload)
+    created = db_create_tool(auth["user_id"], payload)
+    # ponytail: per-agent transfer tools join the chain immediately
+    # so the ordered handoff works without a separate assign step
+    # (per-agent rows are implicitly assigned to their own agent).
+    if (payload.get("kind") or "") == "call_transfer" and created and created.get("id"):
+        from STT_server.db_agents import get_agent as _get_agent
+        agent = _get_agent(agent_id, auth["user_id"])
+        if agent:
+            _chain_append(agent, created["id"], auth["user_id"])
+    return created
 
 
 @api_router.put("/agents/{agent_id}/tools/{tool_id}")
@@ -1326,36 +1360,28 @@ def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict 
         raise HTTPException(status_code=404, detail="Tool not found")
     # Prompt regeneration — only when the tool is actually callable
     # by this agent (per-agent rows always; shared rows only when
-    # assigned). call_transfer has no LLM-controlled parameters and
-    # is skipped.
+    # assigned). patch_agent_tool_in_prompt renders the webhook
+    # schema block or the transfer section depending on kind.
     change_log: list[str] = []
-    if updated.get("kind") != "call_transfer":
-        from STT_server.db_agents import get_agent as _get_agent
-        from STT_server.services.agent_prompt_tools import (
-            add_or_update_section, KIND_AGENT_TOOL, build_agent_tool_section,
-        )
-        is_per_agent = updated.get("agent_id") == agent_id
-        is_shared_assigned = (
-            updated.get("agent_id") == SHARED_TOOL_AGENT_ID
-            and isinstance(updated.get("assignments"), list)
-            and agent_id in updated["assignments"]
-        )
-        if is_per_agent or is_shared_assigned:
-            agent = _get_agent(agent_id, auth["user_id"])
-            if agent:
-                body = build_agent_tool_section(
-                    tool_id=tool_id,
-                    name=updated.get("name") or tool_id,
-                    description=updated.get("description") or "",
-                    parameters_schema=updated.get("parameters") or {},
-                )
-                new_prompt = add_or_update_section(
-                    agent.get("prompt") or "",
-                    KIND_AGENT_TOOL, tool_id, body,
-                )
-                if new_prompt != (agent.get("prompt") or ""):
-                    db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
-                    change_log.append(f"AGENT_TOOL:{tool_id} section updated")
+    from STT_server.db_agents import get_agent as _get_agent
+    from STT_server.services.agent_prompt_tools import (
+        patch_agent_tool_in_prompt,
+    )
+    is_per_agent = updated.get("agent_id") == agent_id
+    is_shared_assigned = (
+        updated.get("agent_id") == SHARED_TOOL_AGENT_ID
+        and isinstance(updated.get("assignments"), list)
+        and agent_id in updated["assignments"]
+    )
+    if is_per_agent or is_shared_assigned:
+        agent = _get_agent(agent_id, auth["user_id"])
+        if agent:
+            new_prompt = patch_agent_tool_in_prompt(
+                agent.get("prompt") or "", updated,
+            )
+            if new_prompt != (agent.get("prompt") or ""):
+                db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+                change_log.append(f"AGENT_TOOL:{tool_id} section updated")
     return {
         "tool": updated,
         "change_log": change_log,
@@ -1377,6 +1403,22 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
 # each shared tool. Per-agent tools (agent_id == agent_id) are
 # ignored here — they're implicitly available to their own agent and
 # can't be unassigned (delete the tool instead).
+# ponytail: transfer_chain maintenance (023). The agent's ordered
+# transfer chain is just ids — assign appends, unassign removes, the
+# modal editor rewrites the whole array. Helpers keep the three call
+# sites (assign / unassign / per-agent create) to one line each.
+def _chain_append(agent: dict, tool_id: str, user_id: str) -> None:
+    chain = [c for c in (agent.get("transfer_chain") or []) if isinstance(c, str)]
+    if tool_id not in chain:
+        db_update_agent(agent["id"], user_id, {"transfer_chain": chain + [tool_id]})
+
+
+def _chain_remove(agent: dict, tool_id: str, user_id: str) -> None:
+    chain = [c for c in (agent.get("transfer_chain") or []) if isinstance(c, str)]
+    if tool_id in chain:
+        db_update_agent(agent["id"], user_id, {"transfer_chain": [c for c in chain if c != tool_id]})
+
+
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/assign")
 def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
     """Assign a shared tool to an agent. Idempotent.
@@ -1424,33 +1466,23 @@ def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require
     except Exception as exc:
         log.exception("assign tool %s to %s failed", tool_id, agent_id)
         raise HTTPException(status_code=500, detail=f"assign failed: {exc}")
-    # ponytail: persist the tool's section into agents.prompt. Skip
-    # call_transfer (no LLM-controlled parameters) and the
-    # tool-already-on-this-agent case (the section is already
-    # present, but add_or_update_section is idempotent so we let it
-    # re-write rather than duplicate the logic).
+    # ponytail: persist the tool's section into agents.prompt — the
+    # webhook schema block or the transfer section depending on kind
+    # (patch_agent_tool_in_prompt branches). Skip only the
+    # tool-already-on-this-agent case... no: add_or_update_section is
+    # idempotent so we let it re-write rather than duplicate logic.
     change_log: list[str] = []
-    if tool.get("kind") != "call_transfer":
-        from STT_server.services.agent_prompt_tools import (
-            add_or_update_section,
-            KIND_AGENT_TOOL,
-        )
-        from STT_server.services.agent_prompt_tools import (
-            build_agent_tool_section,
-        )
-        body = build_agent_tool_section(
-            tool_id=tool_id,
-            name=tool.get("name") or tool_id,
-            description=tool.get("description") or "",
-            parameters_schema=tool.get("parameters") or {},
-        )
-        new_prompt = add_or_update_section(
-            agent.get("prompt") or "",
-            KIND_AGENT_TOOL, tool_id, body,
-        )
-        if new_prompt != (agent.get("prompt") or ""):
-            db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
-            change_log.append(f"AGENT_TOOL:{tool_id} section added")
+    from STT_server.services.agent_prompt_tools import (
+        patch_agent_tool_in_prompt,
+    )
+    new_prompt = patch_agent_tool_in_prompt(
+        agent.get("prompt") or "", tool,
+    )
+    if new_prompt != (agent.get("prompt") or ""):
+        db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
+        change_log.append(f"AGENT_TOOL:{tool_id} section added")
+    if tool.get("kind") == "call_transfer":
+        _chain_append(agent, tool_id, auth["user_id"])
     return {
         "tool": updated_tool,
         "agent": db_get_agent(agent_id, auth["user_id"]),
@@ -1492,6 +1524,8 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
     if new_prompt != (agent.get("prompt") or ""):
         db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
         change_log.append(f"AGENT_TOOL:{tool_id} section removed")
+    if tool.get("kind") == "call_transfer":
+        _chain_remove(agent, tool_id, auth["user_id"])
     return {
         "tool": result,
         "agent": db_get_agent(agent_id, auth["user_id"]),

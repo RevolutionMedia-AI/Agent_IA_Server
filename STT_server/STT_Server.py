@@ -768,6 +768,11 @@ async def voice_cascade(
         # without a resolvable credential never dials. Without this a
         # number that lost its Settings credential would keep ringing
         # humans on an unauthenticated callback.
+        log.warning(
+            "[VOICE] cascade callback without resolvable credential "
+            "(agent=%s step=%s) — refusing with 503",
+            agent_id, step,
+        )
         return Response(
             content="Phone number has no Twilio auth token configured.",
             status_code=503,
@@ -779,6 +784,10 @@ async def voice_cascade(
     if not sig or not validate_twilio_signature(
         token_to_check, signature_url, sig, form_dict
     ):
+        log.warning(
+            "[VOICE] cascade callback invalid signature (agent=%s step=%s) — 403",
+            agent_id, step,
+        )
         return Response(content="invalid signature", status_code=403)
 
     if status == "completed":
@@ -836,6 +845,140 @@ async def voice_cascade(
         "[VOICE] cascade exhausted for agent %s (status=%s), falling through to AI",
         agent_id, status or "?",
     )
+    return Response(
+        content=connect_stream_twiml(ws_url, ''.join(stream_params)),
+        media_type="application/xml",
+    )
+
+
+@app.post("/voice/transfer-fallback")
+async def voice_transfer_fallback(
+    agent_id: str = Query(default=None),
+    remaining: str = Query(default=""),
+    tenant_id: str = Query(default=None),
+    request: Request = None,
+) -> Response:
+    """Next link of an ordered transfer chain. Twilio POSTs here when a
+    chain <Dial> ends (no-answer / busy / failed / cancel / completed).
+
+    Same signature model as /voice/cascade (per-number token from the
+    `To` field, fail-closed 503/403). completed = a human picked up →
+    <Hangup>, the call was handled. Otherwise Dial the next remaining
+    tool id; when none remain, fall back to <Connect><Stream> so the
+    AI resumes the call (transfer_resume=1 tells the stream setup to
+    skip the greeting and note the failed handoff in history).
+
+    Stateless: remaining ids ride the query; destinations/timeouts are
+    re-resolved from the tool rows so an edited tool applies to
+    in-flight chains.
+    """
+    form_dict: dict = {}
+    if request is not None:
+        try:
+            form = await request.form()
+            form_dict = {k: str(v) if v is not None else "" for k, v in form.items()}
+        except Exception:
+            form_dict = {}
+    status = (form_dict.get("DialCallStatus") or "").strip().lower()
+
+    from STT_server.adapters.twilio_api import validate_twilio_signature
+    from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
+    try:
+        called_to = form_dict.get("To") or form_dict.get("to")
+        row = _find_num_for_sig(called_to) if called_to else None
+        token_to_check = (row or {}).get("twilio_auth_token") or None
+    except Exception:
+        token_to_check = None
+    if not token_to_check:
+        log.warning(
+            "[VOICE] transfer-fallback without resolvable credential "
+            "(agent=%s) — refusing with 503",
+            agent_id,
+        )
+        return Response(
+            content="Phone number has no Twilio auth token configured.",
+            status_code=503,
+        )
+    sig = request.headers.get("X-Twilio-Signature", "") if request else ""
+    signature_url = f"{PUBLIC_URL.rstrip('/')}{request.url.path}"
+    if request.url.query:
+        signature_url += f"?{request.url.query}"
+    if not sig or not validate_twilio_signature(
+        token_to_check, signature_url, sig, form_dict
+    ):
+        log.warning(
+            "[VOICE] transfer-fallback invalid signature (agent=%s) — 403",
+            agent_id,
+        )
+        return Response(content="invalid signature", status_code=403)
+
+    if status == "completed":
+        log.warning("[VOICE] transfer chain answered, hanging up (agent=%s)", agent_id)
+        return Response(
+            content="<Response><Hangup/></Response>",
+            media_type="application/xml",
+        )
+
+    from STT_server.services.transfer_cascade import (
+        dial_twiml, connect_stream_twiml, transfer_fallback_url,
+        build_transfer_chain,
+    )
+    from STT_server.db_agents import get_agent as _get_agent
+    from STT_server.db_tools import list_tools as _list_tools
+    try:
+        agent_row = _get_agent(agent_id) if agent_id else None
+    except Exception:
+        agent_row = None
+    ids = [x.strip() for x in (remaining or "").split(",") if x.strip()]
+    tools_by_id: dict = {}
+    try:
+        if agent_row and agent_row.get("user_id"):
+            for t in _list_tools(agent_row["user_id"], agent_id=agent_id) or []:
+                if isinstance(t, dict) and t.get("id"):
+                    tools_by_id[t["id"]] = t
+    except Exception as exc:
+        log.warning("[VOICE] transfer-fallback tool lookup failed: %s", exc)
+
+    ws_url = PUBLIC_URL.rstrip("/")
+    if ws_url.startswith("https://"):
+        ws_url = "wss://" + ws_url[8:]
+    elif ws_url.startswith("http://"):
+        ws_url = "ws://" + ws_url[7:]
+    else:
+        ws_url = "wss://" + ws_url
+    stream_params = []
+    if tenant_id:
+        stream_params.append(f'<Parameter name="tenant_id" value="{tenant_id}" />')
+    if agent_id:
+        stream_params.append(f'<Parameter name="agent_id" value="{agent_id}" />')
+
+    # ponytail: ids[0] rings next. build_transfer_chain(ids[0], ids)
+    # keeps ids[0] first and preserves the rest in order; tools that
+    # lost their destination (edited mid-chain) are dropped.
+    chain = build_transfer_chain(ids[0] if ids else "", ids, tools_by_id)
+    if chain:
+        nxt = chain[0]
+        after = [s["id"] for s in chain[1:]]
+        log.warning(
+            "[VOICE] transfer chain next for agent %s: %s (%s, prev status=%s, %d left)",
+            agent_id, nxt["destination"], nxt["name"], status or "?", len(after),
+        )
+        return Response(
+            content=dial_twiml(
+                nxt["destination"],
+                nxt["timeout_sec"],
+                transfer_fallback_url(
+                    PUBLIC_URL, agent_id, after,
+                    tenant_id=tenant_id,
+                ),
+            ),
+            media_type="application/xml",
+        )
+    log.warning(
+        "[VOICE] transfer chain exhausted for agent %s (status=%s), returning to AI",
+        agent_id, status or "?",
+    )
+    stream_params.append('<Parameter name="transfer_resume" value="1" />')
     return Response(
         content=connect_stream_twiml(ws_url, ''.join(stream_params)),
         media_type="application/xml",
@@ -1320,6 +1463,48 @@ async def media_stream(ws: WebSocket) -> None:
                     # start — the LLM reads the persisted sections as part
                     # of the system message. This block intentionally
                     # does nothing for prompt augmentation.
+                    # ponytail: transfer-chain resume. This stream is the
+                    # fallback tail of a transfer chain (nobody answered
+                    # the Dialed numbers). Same callSid as the dead
+                    # session, so sessions[call_sid] is simply
+                    # overwritten on register — no surgery. Override the
+                    # greeting (replaying "hello" mid-call is absurd)
+                    # and seed a history note so the LLM knows the
+                    # handoff failed and keeps helping instead of
+                    # re-transferring in a loop.
+                    _resume = (custom_params.get("transfer_resume") if isinstance(custom_params, dict) else None)
+                    if _resume:
+                        _lang = (session.preferred_language or "es").strip().lower()
+                        if _lang.startswith("en"):
+                            session.welcome_message = (
+                                "Sorry, nobody answered the transfer. "
+                                "How else can I help you?"
+                            )
+                            _note = (
+                                "System note: you just tried to transfer this call, "
+                                "but nobody answered and the call returned to you. "
+                                "Tell the caller briefly and continue helping. "
+                                "Do NOT immediately re-invoke a transfer tool."
+                            )
+                        else:
+                            session.welcome_message = (
+                                "Disculpa, nadie contestó la transferencia. "
+                                "¿En qué más te puedo ayudar?"
+                            )
+                            _note = (
+                                "Nota del sistema: acabas de intentar transferir esta "
+                                "llamada, pero nadie contestó y la llamada volvió contigo. "
+                                "Díselo brevemente al cliente y sigue ayudando. "
+                                "NO invoques de inmediato otra herramienta de transferencia."
+                            )
+                        try:
+                            session.history.append({"role": "system", "content": _note})
+                        except Exception:
+                            session.history = [{"role": "system", "content": _note}]
+                        log.info(
+                            "[TRANSFER] resume session %s (agent=%s): greeting overridden, history seeded",
+                            session.session_key, session.agent_id,
+                        )
                 # ponytail: helper that closes over `session` so the
                 # caller can `await _enqueue_transcript(item)` instead
                 # of `await lambda item: enqueue_transcript_event(session, item)`.

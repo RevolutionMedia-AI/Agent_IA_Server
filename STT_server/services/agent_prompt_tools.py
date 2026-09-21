@@ -298,6 +298,47 @@ def build_agent_tool_section(
     return "\n".join(parts)
 
 
+def build_call_transfer_section(
+    tool_id: str,
+    name: str,
+    description: str,
+    destination: str,
+    ring_timeout_sec: int = 20,
+) -> str:
+    """Render the bilingual prompt block for one call_transfer tool.
+
+    Same AGENT_TOOL delimiters as webhook tools, so assign/unassign/
+    reconciler treat both kinds uniformly. The destination is fixed
+    on the tool row — the block tells the LLM WHEN to invoke (the
+    operator's description) and states the number explicitly so it
+    never asks the caller for one and never invents one. The chain
+    rules (ring budget, try-next, back-to-AI) are stated so the model
+    announces the handoff and then simply invokes — the runtime owns
+    the Dial sequence.
+    """
+    when = (description or "").strip() or f"the caller needs {name}"
+    dest = (destination or "").strip() or "(not configured)"
+    try:
+        timeout = int(ring_timeout_sec or 20)
+    except (TypeError, ValueError):
+        timeout = 20
+    parts: list[str] = []
+    parts.append(f"## Transfer: {name}")
+    parts.append("")
+    parts.append("ENGLISH:")
+    parts.append(f"Invoke this transfer when: {when}")
+    parts.append(f"The destination number is {dest} — fixed. Never ask the caller for a number and never dial any other number for this transfer.")
+    parts.append(f"Before invoking, say a brief handoff sentence (e.g. \"Let me transfer you now.\"). After invoking, the call leaves you: end politely. The system rings the destination for up to {timeout} seconds; if nobody answers it tries the next configured transfer, and if none answer the call returns to you — continue helping the caller.")
+    parts.append("Only invoke when the caller asks for a human/escalation or the condition above is clearly met. Never invoke speculatively.")
+    parts.append("")
+    parts.append("ESPAÑOL:")
+    parts.append(f"Invoca esta transferencia cuando: {when}")
+    parts.append(f"El número destino es {dest} — fijo. Nunca pidas un número al cliente ni marques otro número para esta transferencia.")
+    parts.append(f"Antes de invocar, di una frase breve de handoff (ej. \"Te transfiero ahora mismo.\"). Tras invocar, la llamada te deja: despídete con cortesía. El sistema timbra el destino hasta {timeout} segundos; si nadie contesta intenta la siguiente transferencia configurada, y si ninguna contesta la llamada vuelve contigo — sigue ayudando al cliente.")
+    parts.append("Invoca solo cuando el cliente pida un humano/escalación o la condición anterior se cumpla claramente. Nunca invoques por especulación.")
+    return "\n".join(parts)
+
+
 def build_integration_section(
     integration_id: str,
     provider_name: str,
@@ -406,11 +447,20 @@ def patch_agent_tool_in_prompt(prompt: str, tool_row: dict) -> str:
 
     `tool_row` is the canonical row from db_list_tools / db_get_tool
     (must include `id`, `name`, `description`, `parameters`,
-    `kind`). We skip call_transfer tools because they don't take
-    parameters from the LLM — the destination is operator-set.
+    `kind`). call_transfer rows render the transfer section (name,
+    destination, when-to-use) instead of the webhook schema block —
+    the destination is operator-set, but the LLM still needs to know
+    WHEN to invoke it or it transfers blindly.
     """
     if tool_row.get("kind") == "call_transfer":
-        return prompt
+        body = build_call_transfer_section(
+            tool_id=tool_row["id"],
+            name=tool_row.get("name") or tool_row["id"],
+            description=tool_row.get("description") or "",
+            destination=tool_row.get("destination") or "",
+            ring_timeout_sec=tool_row.get("ring_timeout_sec") or 20,
+        )
+        return add_or_update_section(prompt, KIND_AGENT_TOOL, tool_row["id"], body)
     body = build_agent_tool_section(
         tool_id=tool_row["id"],
         name=tool_row.get("name") or tool_row["id"],
@@ -539,8 +589,6 @@ def reconcile_agent_prompt(
     expected_sections: dict[tuple[str, str], dict] = {}
 
     for tool in list_agent_tools_fn(agent_id, user_id) or []:
-        if tool.get("kind") == "call_transfer":
-            continue
         if tool.get("credentials") and not (tool.get("webhook_url") or tool.get("destination")):
             # Provider-credential rows live in agent_tools with the
             # same table shape; skip them — they aren't callable.
@@ -590,7 +638,16 @@ def reconcile_agent_prompt(
     existing = set(list_sections(new_prompt))
     regenerated: list[tuple[str, str, str]] = []  # (kind, id, op)
     for (kind, eid), payload in expected_sections.items():
-        if kind == KIND_AGENT_TOOL:
+        if kind == KIND_AGENT_TOOL and payload["tool"].get("kind") == "call_transfer":
+            tool = payload["tool"]
+            body = build_call_transfer_section(
+                tool_id=eid,
+                name=tool.get("name") or eid,
+                description=tool.get("description") or "",
+                destination=tool.get("destination") or "",
+                ring_timeout_sec=tool.get("ring_timeout_sec") or 20,
+            )
+        elif kind == KIND_AGENT_TOOL:
             body = build_agent_tool_section(
                 tool_id=eid,
                 name=payload["tool"].get("name") or eid,
@@ -652,6 +709,7 @@ __all__ = [
     "remove_section",
     "list_sections",
     "build_agent_tool_section",
+    "build_call_transfer_section",
     "build_integration_section",
     "patch_agent_tool_in_prompt",
     "patch_integration_in_prompt",
