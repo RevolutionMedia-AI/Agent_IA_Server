@@ -790,13 +790,14 @@ async def voice_cascade(
         )
         return Response(content="invalid signature", status_code=403)
 
-    # ponytail: completed = human answered then hung up. The
-    # caller leg remains; continue to next destination instead of
-    # terminating the session. Never lose the original call.
+    call_sid_log = (form_dict.get("CallSid") or form_dict.get("callSid") or "")[:20]
+    # ponytail: completed = human answered then Dial leg completed. Keep
+    # the caller — advance to next destination instead of Hangup. The
+    # wording avoids claiming who hung up (Twilio only says completed).
     if status == "completed":
         log.warning(
-            "[VOICE] cascade step answered then finished (agent=%s step=%s) — continuing to next destination",
-            agent_id, step,
+            "[VOICE] cascade destination answered and Dial leg completed — advancing (agent=%s step=%s callSid=%s)",
+            agent_id, step, call_sid_log or "?",
         )
 
     from STT_server.services.transfer_cascade import (
@@ -828,9 +829,13 @@ async def voice_cascade(
         idx = len(steps)
     if 0 <= idx < len(steps):
         nxt = steps[idx]
+        # ponytail: detailed routing log per spec 9 — pos, dest type,
+        # Dial result, reason, next. Remaining humans after this Dial
+        # are steps[idx+1:]; AI is the fallback after exhaust.
+        next_dest = steps[idx + 1]["destination"] if idx + 1 < len(steps) else "AI"
         log.warning(
-            "[VOICE] cascade step %d/%d for agent %s, dialing %s (prev status=%s)",
-            idx + 1, len(steps), agent_id, nxt["destination"], status or "?",
+            "[VOICE] routing next human for CallSid=%s pos=%d/%d agent=%s dest=%s type=human timeout=%s prev_status=%s reason=advance next=%s",
+            call_sid_log or "?", idx, len(steps), agent_id, nxt["destination"], nxt["timeout_sec"], status or "?", next_dest,
         )
         return Response(
             content=dial_twiml(
@@ -844,7 +849,8 @@ async def voice_cascade(
             media_type="application/xml",
         )
     log.warning(
-        "[VOICE] cascade exhausted for agent %s (status=%s), falling through to AI",
+        "[VOICE] routing cascade exhausted for CallSid=%s agent=%s pos=%d DialStatus=%s — falling through to AI (type=ai) reason=sequence_exhausted next=ai",
+        call_sid_log or "?", agent_id, idx, status or "?",
         agent_id, status or "?",
     )
     return Response(
@@ -914,13 +920,12 @@ async def voice_transfer_fallback(
         )
         return Response(content="invalid signature", status_code=403)
 
-    # ponytail: completed = human answered then hung up. Keep the
-    # caller — advance to next destination or return to AI instead
-    # of Hangup. The original session is authoritative.
+    call_sid_log2 = (form_dict.get("CallSid") or form_dict.get("callSid") or "")[:20]
+    # ponytail: completed = Dial leg completed after answer. Keep caller.
     if status == "completed":
         log.warning(
-            "[VOICE] transfer chain answered then finished (agent=%s) — continuing to next destination (prev status=%s)",
-            agent_id, status or "?",
+            "[VOICE] transfer chain destination answered and Dial leg completed — advancing (agent=%s callSid=%s)",
+            agent_id, call_sid_log2 or "?",
         )
 
     from STT_server.services.transfer_cascade import (
@@ -956,16 +961,17 @@ async def voice_transfer_fallback(
     if agent_id:
         stream_params.append(f'<Parameter name="agent_id" value="{agent_id}" />')
 
-    # ponytail: ids[0] rings next. build_transfer_chain(ids[0], ids)
-    # keeps ids[0] first and preserves the rest in order; tools that
-    # lost their destination (edited mid-chain) are dropped.
+    # ponytail: explicit vs sequential. build_transfer_chain returns a
+    # suffix from the invoked position, so an explicit "Recruiting" skips
+    # earlier "Cafeteria" and remaining is suffix[1:] — never restart.
     chain = build_transfer_chain(ids[0] if ids else "", ids, tools_by_id)
     if chain:
         nxt = chain[0]
         after = [s["id"] for s in chain[1:]]
+        next_label = after[0] if after else "AI"
         log.warning(
-            "[VOICE] transfer chain next for agent %s: %s (%s, prev status=%s, %d left)",
-            agent_id, nxt["destination"], nxt["name"], status or "?", len(after),
+            "[VOICE] routing next human for CallSid=%s agent=%s dest=%s (%s) type=human timeout=%s prev_status=%s reason=advance next=%s remaining=%d",
+            call_sid_log2 or "?", agent_id, nxt["destination"], nxt["name"], nxt["timeout_sec"], status or "?", next_label, len(after),
         )
         return Response(
             content=dial_twiml(
@@ -979,8 +985,8 @@ async def voice_transfer_fallback(
             media_type="application/xml",
         )
     log.warning(
-        "[VOICE] transfer chain exhausted for agent %s (status=%s), returning to AI",
-        agent_id, status or "?",
+        "[VOICE] routing exhausted for CallSid=%s agent=%s DialStatus=%s — returning to AI (type=ai) reason=sequence_exhausted next=ai",
+        call_sid_log2 or "?", agent_id, status or "?",
     )
     stream_params.append('<Parameter name="transfer_resume" value="1" />')
     return Response(

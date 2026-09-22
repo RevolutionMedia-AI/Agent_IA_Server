@@ -185,14 +185,24 @@ def build_transfer_chain(
 ) -> list[dict]:
     """Order the Dial chain for one transfer invocation.
 
-    The invoked tool rings first (the LLM picked it — possibly because
-    the caller named that number), then the rest of the user's
-    configured chain after it. Tools missing a destination are
-    dropped — the executor must never Dial a bare id. Returns tool
-    rows (with destination + ring_timeout_sec) in ring order.
+    Sequential routing (spec 1-2): the chain is the ordered list
+    after the AI. For an explicit named request the LLM invokes the
+    tool for that exact destination — route directly there instead of
+    forcing the caller through earlier entries. That is a suffix of
+    the configured chain starting at the invoked id. For the normal
+    sequential case the invoked id is the next expected (first in
+    chain), so the suffix is the whole chain. Tools missing a
+    destination are dropped. Returns rows in ring order.
     """
     chain = [c for c in (chain or []) if isinstance(c, str)]
-    ordered_ids = [invoked_tool_id] + [c for c in chain if c != invoked_tool_id]
+    if invoked_tool_id in chain:
+        # explicit or sequential — start at its position, not from 0
+        idx = chain.index(invoked_tool_id)
+        ordered_ids = chain[idx:]
+    else:
+        # invoked not in configured chain (per-agent tool or legacy)
+        # — dial it, then the configured chain as fallback
+        ordered_ids = [invoked_tool_id] + [c for c in chain if c != invoked_tool_id]
     out: list[dict] = []
     for tid in ordered_ids[:MAX_CHAIN_TOOLS]:
         tool = tools_by_id.get(tid)
@@ -213,6 +223,46 @@ def build_transfer_chain(
             "timeout_sec": timeout,
         })
     return out
+
+
+def build_unified_routing(
+    cascade_steps: list[dict],
+    chain_ids: list[str],
+    tools_by_id: dict,
+) -> list[dict]:
+    """Combine cascade (before AI) + AI + chain (after AI) into one
+    ordered list for logging / diagnostics. Each entry has
+    ``type`` ``human`` or ``ai``. Human entries carry
+    ``destination``/``timeout_sec``. Used by tests and the /voice
+    routing helpers to reason about a single sequence without creating
+    a new DB column — the two stored lists remain the source of truth.
+    """
+    unified: list[dict] = []
+    for s in cascade_steps or []:
+        dest = str(s.get("destination") or "").strip()
+        if not E164_PATTERN.match(dest):
+            continue
+        try:
+            timeout = int(s.get("timeout_sec") or DEFAULT_STEP_TIMEOUT_SEC)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_STEP_TIMEOUT_SEC
+        timeout = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, timeout))
+        unified.append({"type": "human", "destination": dest, "timeout_sec": timeout, "label": dest})
+    unified.append({"type": "ai", "label": "AI agent"})
+    for tid in chain_ids or []:
+        tool = tools_by_id.get(tid) if isinstance(tools_by_id, dict) else None
+        if not isinstance(tool, dict):
+            continue
+        dest = str(tool.get("destination") or "").strip()
+        if not E164_PATTERN.match(dest):
+            continue
+        try:
+            timeout = int(tool.get("ring_timeout_sec") or DEFAULT_STEP_TIMEOUT_SEC)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_STEP_TIMEOUT_SEC
+        timeout = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, timeout))
+        unified.append({"type": "human", "destination": dest, "timeout_sec": timeout, "label": tool.get("name") or tid, "tool_id": tid})
+    return unified
 
 
 def transfer_fallback_url(
@@ -254,9 +304,18 @@ if __name__ == "__main__":  # smoke
         "t2": {"name": "NoDest", "destination": "", "ring_timeout_sec": 10},
         "t3": {"name": "Support", "destination": "+15550003333"},
     }
-    # invoked tool first, then chain order; destination-less dropped
-    got = build_transfer_chain("t3", ["t1", "t2", "t3"], tools)
+    # invoked not in chain → invoked + chain
+    got = build_transfer_chain("t3", ["t1", "t2"], tools)
     assert [g["id"] for g in got] == ["t3", "t1"], got
     assert got[0]["timeout_sec"] == DEFAULT_STEP_TIMEOUT_SEC
     assert got[1]["timeout_sec"] == 25
+    # invoked in chain → suffix from its position (explicit skip)
+    tools2 = {
+        "caf": {"name": "Cafeteria", "destination": "+15550001111", "ring_timeout_sec": 20},
+        "rec": {"name": "Recruiting", "destination": "+15550002222", "ring_timeout_sec": 20},
+    }
+    got2 = build_transfer_chain("rec", ["caf", "rec"], tools2)
+    assert [g["id"] for g in got2] == ["rec"], got2
+    got3 = build_transfer_chain("caf", ["caf", "rec"], tools2)
+    assert [g["id"] for g in got3] == ["caf", "rec"], got3
     print("transfer_cascade: OK")
