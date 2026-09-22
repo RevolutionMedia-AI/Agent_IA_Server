@@ -1399,6 +1399,22 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
     """Delete a tool from an agent."""
     if not db_delete_tool(tool_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Tool not found")
+    # ponytail: keep transfer_chain in sync — a deleted transfer tool
+    # lingering in the chain renders as a ghost row (id only) and Dial
+    # would try to look it up and skip, breaking the ordered routing.
+    try:
+        from STT_server.db_agents import get_agent as _get_agent, list_agents as _list_agents
+
+        # per-agent tool: clean its owner's chain
+        agent = _get_agent(agent_id, auth["user_id"])
+        if agent:
+            _chain_remove(agent, tool_id, auth["user_id"])
+        # shared tool deleted via per-agent route (unlikely) — also clean all agents of this user
+        if agent and agent.get("agent_id") == "__shared__":
+            for a in _list_agents(auth["user_id"]):
+                _chain_remove(a, tool_id, auth["user_id"])
+    except Exception:
+        pass
     return {"success": True}
 
 
@@ -1749,6 +1765,17 @@ def delete_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
     """Delete a shared n8n tool owned by the current user."""
     if not db_delete_tool(tool_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Tool not found")
+    # ponytail: shared transfer tool deleted — scrub it from every
+    # agent's transfer_chain for this user so Handoff chain doesn't
+    # keep a ghost row (the previous bug: chain still held the id,
+    # UI rendered it as id-only, and routing would skip it).
+    try:
+        from STT_server.db_agents import list_agents as _list_agents
+
+        for a in _list_agents(auth["user_id"]):
+            _chain_remove(a, tool_id, auth["user_id"])
+    except Exception:
+        pass
     return {"success": True}
 
 
