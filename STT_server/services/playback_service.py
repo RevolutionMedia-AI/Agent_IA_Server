@@ -196,47 +196,39 @@ async def play_initial_greeting(session: CallSession) -> None:
         )
         return
 
-    # ponytail: cap ONLY the platform fallback greeting, never the
-    # operator's per-agent welcome_message. Operators typed a
-    # personalized opener for a reason; truncating it mid-sentence
-    # (as the previous version did for any greeting over
-    # INITIAL_GREETING_MAX_CHARS=200 chars) cut "Hello, this is
-    # Danielle with altRx…didn't get a chance to finish the process."
-    # and silently dropped the rest of the operator's copy. Long
-    # operator greetings still pay TTFB + TTS latency, but that's
-    # the operator's call — not the platform's.
-    if greeting_source != "agent.welcome_message":
-        from STT_server.config import INITIAL_GREETING_MAX_CHARS
-        if len(greeting) > INITIAL_GREETING_MAX_CHARS:
-            cap = INITIAL_GREETING_MAX_CHARS
-            truncated = greeting[:cap]
-            # Cut at the LAST sentence terminator within the cap so the
-            # greeting still ends naturally — never mid-word. We accept
-            # any position for the terminator (no lower bound) so tight
-            # caps like 50 chars still produce a sentence fragment rather
-            # than a mid-word cut. The terminator set is ordered so we
-            # prefer ". " (cleanest cut) over bare "." (acceptable) over
-            # punctuation that would only land mid-word.
-            last_terminator_idx = -1
-            last_terminator_len = 0
-            for terminator in (". ", "! ", "? ", "¡", "¿", ".", "!", "?"):
-                idx = truncated.rfind(terminator)
-                if idx > last_terminator_idx:
-                    last_terminator_idx = idx
-                    last_terminator_len = len(terminator)
-            if last_terminator_idx >= 0:
-                greeting = truncated[: last_terminator_idx + last_terminator_len].strip()
-            else:
-                # No sentence terminator within the cap. Hard cut.
-                greeting = truncated.rstrip()
-            log.info(
-                "[PLAYBACK] greeting truncated from %d to %d chars "
-                "(INITIAL_GREETING_MAX_CHARS=%d) session=%s",
-                len(welcome) if welcome else len(greeting),
-                len(greeting),
-                cap,
-                session.session_key,
-            )
+    # ponytail: cap BOTH platform fallback and operator-supplied
+    # welcome_message. INITIAL_GREETING_MAX_CHARS defaults to 500 —
+    # long enough for a personalized opener (~30s of speech at
+    # speakingRate=1.0) but bounded so a runaway 5000-char paste
+    # doesn't pin the TTS provider for ~5 minutes. We try to cut at
+    # the LAST sentence terminator within the cap so the greeting
+    # still ends naturally — never mid-word. If no terminator fits we
+    # hard-cut. The operator-facing input on the FE has its own live
+    # character counter at 500, so they see the limit before saving.
+    from STT_server.config import INITIAL_GREETING_MAX_CHARS
+    if len(greeting) > INITIAL_GREETING_MAX_CHARS:
+        cap = INITIAL_GREETING_MAX_CHARS
+        truncated = greeting[:cap]
+        last_terminator_idx = -1
+        last_terminator_len = 0
+        for terminator in (". ", "! ", "? ", "¡", "¿", ".", "!", "?"):
+            idx = truncated.rfind(terminator)
+            if idx > last_terminator_idx:
+                last_terminator_idx = idx
+                last_terminator_len = len(terminator)
+        if last_terminator_idx >= 0:
+            greeting = truncated[: last_terminator_idx + last_terminator_len].strip()
+        else:
+            greeting = truncated.rstrip()
+        log.info(
+            "[PLAYBACK] greeting truncated from %d to %d chars "
+            "(INITIAL_GREETING_MAX_CHARS=%d, source=%s) session=%s",
+            len(welcome) if welcome else len(greeting),
+            len(greeting),
+            cap,
+            greeting_source,
+            session.session_key,
+        )
 
     log.info(
         "[PLAYBACK] playing initial greeting (source=%s, %d chars, lang=%s) for session=%s",

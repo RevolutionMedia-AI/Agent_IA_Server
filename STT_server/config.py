@@ -167,7 +167,7 @@ INITIAL_GREETING_TEXT_ES = os.getenv(
 # cap the greeting to a length that plays in < ~10 s, regardless
 # of what the agent row has stored. Default 200 chars (~10 s of
 # speech at 1.15x). Set via env var.
-INITIAL_GREETING_MAX_CHARS = int(os.getenv("INITIAL_GREETING_MAX_CHARS", "200"))
+INITIAL_GREETING_MAX_CHARS = int(os.getenv("INITIAL_GREETING_MAX_CHARS", "500"))
 # ponytail: 2026-08-14 — opt-in TwiML ``<Play>`` of a pre-generated
 # static greeting. The operator reported that the previous default
 # (always include ``<Play>`` when the static file exists) caused
