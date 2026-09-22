@@ -790,11 +790,13 @@ async def voice_cascade(
         )
         return Response(content="invalid signature", status_code=403)
 
+    # ponytail: completed = human answered then hung up. The
+    # caller leg remains; continue to next destination instead of
+    # terminating the session. Never lose the original call.
     if status == "completed":
-        log.warning("[VOICE] cascade step answered, hanging up (agent=%s)", agent_id)
-        return Response(
-            content="<Response><Hangup/></Response>",
-            media_type="application/xml",
+        log.warning(
+            "[VOICE] cascade step answered then finished (agent=%s step=%s) — continuing to next destination",
+            agent_id, step,
         )
 
     from STT_server.services.transfer_cascade import (
@@ -912,11 +914,13 @@ async def voice_transfer_fallback(
         )
         return Response(content="invalid signature", status_code=403)
 
+    # ponytail: completed = human answered then hung up. Keep the
+    # caller — advance to next destination or return to AI instead
+    # of Hangup. The original session is authoritative.
     if status == "completed":
-        log.warning("[VOICE] transfer chain answered, hanging up (agent=%s)", agent_id)
-        return Response(
-            content="<Response><Hangup/></Response>",
-            media_type="application/xml",
+        log.warning(
+            "[VOICE] transfer chain answered then finished (agent=%s) — continuing to next destination (prev status=%s)",
+            agent_id, status or "?",
         )
 
     from STT_server.services.transfer_cascade import (

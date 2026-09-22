@@ -322,20 +322,24 @@ def build_call_transfer_section(
         timeout = int(ring_timeout_sec or 20)
     except (TypeError, ValueError):
         timeout = 20
+    # ponytail: routing policy (timeout, chain order, fallback to AI)
+    # lives in application + Twilio layer, not in prompt. The
+    # previous version injected the whole routing description here in
+    # both languages; that is now removed. The block only states WHEN
+    # to invoke and the fixed destination so the model never asks the
+    # caller for a number.
     parts: list[str] = []
     parts.append(f"## Transfer: {name}")
     parts.append("")
     parts.append("ENGLISH:")
     parts.append(f"Invoke this transfer when: {when}")
     parts.append(f"The destination number is {dest} — fixed. Never ask the caller for a number and never dial any other number for this transfer.")
-    parts.append(f"Before invoking, say a brief handoff sentence (e.g. \"Let me transfer you now.\"). After invoking, the call leaves you: end politely. The system rings the destination for up to {timeout} seconds; if nobody answers it tries the next configured transfer, and if none answer the call returns to you — continue helping the caller.")
-    parts.append("Only invoke when the caller asks for a human/escalation or the condition above is clearly met. Never invoke speculatively.")
+    parts.append(f"Before invoking, say a brief handoff sentence (e.g. \"Let me transfer you now.\"). After invoking, the call leaves you: end politely.")
     parts.append("")
     parts.append("ESPAÑOL:")
     parts.append(f"Invoca esta transferencia cuando: {when}")
     parts.append(f"El número destino es {dest} — fijo. Nunca pidas un número al cliente ni marques otro número para esta transferencia.")
-    parts.append(f"Antes de invocar, di una frase breve de handoff (ej. \"Te transfiero ahora mismo.\"). Tras invocar, la llamada te deja: despídete con cortesía. El sistema timbra el destino hasta {timeout} segundos; si nadie contesta intenta la siguiente transferencia configurada, y si ninguna contesta la llamada vuelve contigo — sigue ayudando al cliente.")
-    parts.append("Invoca solo cuando el cliente pida un humano/escalación o la condición anterior se cumpla claramente. Nunca invoques por especulación.")
+    parts.append(f"Antes de invocar, di una frase breve de handoff (ej. \"Te transfiero ahora mismo.\"). Tras invocar, la llamada te deja: despídete con cortesía.")
     return "\n".join(parts)
 
 
