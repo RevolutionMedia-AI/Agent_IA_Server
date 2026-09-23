@@ -487,6 +487,23 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
             # clears assistant_speaking; the transition above then starts
             # the full next interval.
             deadline = sub_timeout
+            # ponytail: 2026-09-23 — the operator can configure
+            # first_timeout/sub_timeout freely; some use long values
+            # (e.g. 30s) so the LLM has room for a real reply. A 5s
+            # short pause during the LLM's long answer (the same
+            # listener-pause we just fixed for the initial greeting)
+            # would otherwise fire the next idle prompt mid-reply. We
+            # already wait for assistant_speaking above; what we
+            # additionally seed here is the baseline so the FIRST
+            # transition out of this speaking phase measures the
+            # next interval from the moment the caller had the chance
+            # to think, not from when we queued the prompt.
+            if session.assistant_started_at is not None:
+                prompt_ended = time.monotonic()
+                if getattr(session, "last_idle_prompt_ended_at", None) is not None:
+                    prompt_ended = max(prompt_ended, session.last_idle_prompt_ended_at)
+                last_seen_activity = max(last_seen_activity, prompt_ended)
+                silence_started_at = max(silence_started_at, prompt_ended)
             await asyncio.sleep(IDLE_MONITOR_POLL_SEC)
     except asyncio.CancelledError:
         return

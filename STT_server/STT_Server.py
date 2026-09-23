@@ -1727,6 +1727,12 @@ async def media_stream(ws: WebSocket) -> None:
                             # activity, not silence.
                             if getattr(session, "initial_greeting_ended_at", None) is None:
                                 session.initial_greeting_ended_at = time.monotonic()
+                            # ponytail: 2026-09-23 — every subsequent
+                            # mark_ack on the active generation also
+                            # stamps last_idle_prompt_ended_at so a long
+                            # prompt's silence baseline doesn't start
+                            # before the caller had a chance to think.
+                            session.last_idle_prompt_ended_at = time.monotonic()
                             log.info(
                                 "[MARK_ACK] generation=%s fully played — assistant_speaking -> False for session=%s",
                                 _ack_generation, session.session_key,

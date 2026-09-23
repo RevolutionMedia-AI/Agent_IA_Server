@@ -54,6 +54,11 @@ class CallSession:
     # ~5s after the TTS playback ends, which is normal pause-for-thought
     # time. None until set by the mark_ack handler.
     initial_greeting_ended_at: float | None = None
+    # ponytail: 2026-09-23 — symmetric for idle prompts. Same problem
+    # class: long first_timeout/sub_timeout + a slow LLM reply can
+    # make the silence baseline stale. The monitor seeds the next
+    # interval's baseline from the last mark_ack for any idle prompt.
+    last_idle_prompt_ended_at: float | None = None
     # Per-session TTS provider: "elevenlabs" or "rime"
     tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
     # ponytail: tts_model = concrete model id sent to the TTS provider.
