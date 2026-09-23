@@ -1718,6 +1718,15 @@ async def media_stream(ws: WebSocket) -> None:
                         if session.pending_playback_marks == 0 and session.assistant_speaking:
                             session.assistant_speaking = False
                             session.assistant_started_at = None
+                            # ponytail: 2026-09-23 — first generation fully
+                            # played is the initial greeting (only one
+                            # queued audio before the user speaks). Mark
+                            # the moment Twilio confirms the caller heard
+                            # it so the idle silence monitor can treat
+                            # the time the user spent LISTENING as
+                            # activity, not silence.
+                            if getattr(session, "initial_greeting_ended_at", None) is None:
+                                session.initial_greeting_ended_at = time.monotonic()
                             log.info(
                                 "[MARK_ACK] generation=%s fully played — assistant_speaking -> False for session=%s",
                                 _ack_generation, session.session_key,

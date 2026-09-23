@@ -321,7 +321,16 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                 if session.assistant_speaking:
                     await asyncio.sleep(IDLE_MONITOR_POLL_SEC)
                     continue
-                remaining = IDLE_SILENCE_TIMEOUT_SEC - (time.monotonic() - session.last_activity_at)
+                # ponytail: 2026-09-23 — same greeting-end baseline for
+                # the legacy global-timeout path. If the initial
+                # greeting ended at T, treat T as the activity baseline
+                # so the global IDLE_SILENCE_TIMEOUT_SEC countdown
+                # starts after the caller has heard the opener.
+                baseline = max(
+                    session.last_activity_at,
+                    getattr(session, "initial_greeting_ended_at", None) or 0.0,
+                )
+                remaining = IDLE_SILENCE_TIMEOUT_SEC - (time.monotonic() - baseline)
                 if remaining <= 0:
                     log.info(
                         "Idle silence timeout (%.0fs) en %s, cerrando llamada",
@@ -359,6 +368,21 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
     last_seen_activity = session.last_activity_at
     silence_started_at = last_seen_activity
     assistant_was_speaking = session.assistant_speaking
+    # ponytail: 2026-09-23 — the initial greeting runs in a
+    # separate task, and the mark ack fires before the user has a
+    # chance to speak. Without seeding last_activity_at to the
+    # greeting-end time, the first idle deadline starts ticking
+    # immediately after the TTS finishes — and a caller who is
+    # quietly listening to a 30s greeting gets flagged "silent" and
+    # hears "Are you still there?" before they finished processing
+    # the opener. Treat greeting-end as the baseline; user activity
+    # that arrives during the greeting (rare but possible with barge
+    # in) still resets the clock via the standard last_activity_at
+    # path.
+    greeting_ended = getattr(session, "initial_greeting_ended_at", None)
+    if greeting_ended is not None:
+        last_seen_activity = max(last_seen_activity, greeting_ended)
+        silence_started_at = max(silence_started_at, greeting_ended)
 
     # ponytail: lazily imported here so the module doesn't take the
     # circular-import cost when this monitor is never reached (e.g. the
@@ -387,6 +411,16 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
             if assistant_was_speaking:
                 assistant_was_speaking = False
                 silence_started_at = time.monotonic()
+                # ponytail: 2026-09-23 — first playback ends (initial
+                # greeting or first idle prompt). Reset the silence
+                # clock so the caller has the configured first_timeout
+                # to respond, not whatever wall-clock time elapsed
+                # since the last_activity_at baseline. For subsequent
+                # idle prompts the silence_started_at is updated
+                # independently, so this only matters for the first
+                # transition after the call connects.
+                if getattr(session, "initial_greeting_ended_at", None) is None:
+                    last_seen_activity = time.monotonic()
 
             # 3) Has the current deadline elapsed?
             remaining = deadline - (time.monotonic() - silence_started_at)

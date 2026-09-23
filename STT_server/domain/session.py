@@ -46,6 +46,14 @@ class CallSession:
     # played by play_initial_greeting() so the caller hears the
     # agent speak first.
     welcome_message: str | None = None
+    # ponytail: 2026-09-23 — wall-clock time of the initial greeting
+    # mark_ack (when Twilio confirms the caller has heard it). The idle
+    # silence monitor uses this to skip the first deadline after the
+    # greeting so the user isn't flagged "silent" while they're still
+    # listening. Without this the monitor fires "Are you still there?"
+    # ~5s after the TTS playback ends, which is normal pause-for-thought
+    # time. None until set by the mark_ack handler.
+    initial_greeting_ended_at: float | None = None
     # Per-session TTS provider: "elevenlabs" or "rime"
     tts_provider: str = field(default_factory=lambda: DEFAULT_TTS_PROVIDER)
     # ponytail: tts_model = concrete model id sent to the TTS provider.
