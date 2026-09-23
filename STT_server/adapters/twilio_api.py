@@ -354,8 +354,39 @@ async def transfer_call(
         except Exception as exc:
             log.exception(
                 "[TRANSFER] call_sid=%s destination=%s failed",
-                call_sid, destination,
+                call_sid,
             )
             return {"success": False, "error": str(exc)}
+
+
+async def hangup_call(
+    account_sid: str, auth_token: str, call_sid: str
+) -> dict:
+    """End a live Twilio call from the server side.
+
+    ``ws.close()`` only tears down the media stream — Twilio keeps
+    charging the call until the REST side tells it to stop. This calls
+    ``calls(call_sid).update(status='completed')`` so Twilio actually
+    ends the call on its switch. Best-effort: any exception surfaces
+    as ``success=False`` so the caller can decide whether to retry or
+    fall back to the WS close.
+    """
+    def _hangup() -> dict:
+        try:
+            client = _get_twilio_client(account_sid, auth_token)
+            log.info(
+                "[HANGUP] calls(%s).update(status=completed) via subaccount %s...",
+                call_sid, account_sid[:6] or "?",
+            )
+            client.calls(call_sid).update(status="completed")
+            return {"success": True, "call_sid": call_sid}
+        except Exception as exc:
+            log.exception(
+                "[HANGUP] call_sid=%s failed",
+                call_sid,
+            )
+            return {"success": False, "error": str(exc)}
+
+    return await _to_thread(_hangup)
 
     return await _to_thread(_transfer)

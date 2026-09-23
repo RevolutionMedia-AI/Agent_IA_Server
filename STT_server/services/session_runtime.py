@@ -18,6 +18,28 @@ log = logging.getLogger("stt_server")
 
 sessions: dict[str, CallSession] = {}
 
+
+async def _hangup_twilio_call(session: CallSession) -> None:
+    """End the call on Twilio's side via REST, then close the WS.
+
+    ``ws.close()`` only tears down the media stream; the call keeps
+    billing on Twilio's side until the REST API tells it to stop.
+    Used by the idle-disconnect + max-call-duration monitors so the
+    caller hangs up for real, not just for us.
+    """
+    account_sid = getattr(session, "twilio_account_sid", None)
+    auth_token = getattr(session, "twilio_auth_token", None)
+    call_sid = getattr(session, "call_sid", None)
+    if account_sid and auth_token and call_sid:
+        try:
+            from STT_server.adapters.twilio_api import hangup_call
+            await hangup_call(account_sid, auth_token, call_sid)
+        except Exception:
+            log.exception(
+                "[HANGUP] Twilio hangup failed for %s — falling back to WS close",
+                session.session_key,
+            )
+
 # ponytail: idle/duration monitor polling cadence. Landed here (instead of
 # config.py) so the constant is colocated with the only two functions that
 # read it. Kept tiny — the goal is "responsive shutdown on tear-down",
@@ -337,6 +359,10 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                         IDLE_SILENCE_TIMEOUT_SEC,
                         session.session_key,
                     )
+                    # ponytail: 2026-09-23 — same as the per-agent
+                    # disconnect path: tell Twilio first so the leg
+                    # actually ends, then tear down the WS.
+                    await _hangup_twilio_call(session)
                     try:
                         await ws.close()
                     except Exception:
@@ -448,6 +474,12 @@ async def monitor_idle_silence(session: CallSession, ws: WebSocket) -> None:
                         attempts_played = 0
                         deadline = first_timeout
                         continue
+                # ponytail: 2026-09-23 — WS close alone does NOT end the
+                # Twilio leg; Twilio keeps charging until the REST API
+                # tells it to stop. Tell Twilio first, then tear down
+                # the WS. The REST call is best-effort — if it fails
+                # we still close the WS so the process exits cleanly.
+                await _hangup_twilio_call(session)
                 try:
                     await ws.close()
                 except Exception:
@@ -537,6 +569,9 @@ async def monitor_max_call_duration(session: CallSession, ws: WebSocket) -> None
                     session.started_at,
                     elapsed,
                 )
+                # ponytail: 2026-09-23 — WS close alone does not end
+                # the Twilio leg. Tell Twilio first, then close the WS.
+                await _hangup_twilio_call(session)
                 try:
                     await ws.close()
                 except Exception:
@@ -575,6 +610,13 @@ async def _demo() -> None:
     sess.idle_final_message = "hanging up now."
     sess.idle_disconnect_timeout_sec = 1
     sess.idle_max_attempts = 2
+    # ponytail: 2026-09-23 — the monitor now calls Twilio hangup_call
+    # before closing the WS. We don't have a Twilio subaccount in the
+    # self-test, so leave the creds unset; _hangup_twilio_call skips
+    # the REST call and falls through to ws.close() in that case.
+    sess.call_sid = ""
+    sess.twilio_account_sid = None
+    sess.twilio_auth_token = None
     ws = _FakeWS()
 
     # The monitor's poll cadence is 5s. For the demo we don't want to
