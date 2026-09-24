@@ -711,7 +711,8 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
     )
 
     from STT_server.services.usage_store import aggregate_usage
-    usage = aggregate_usage(auth["user_id"]).get("totals") or {}
+    usage_full = aggregate_usage(auth["user_id"])
+    usage = usage_full.get("totals") or {}
 
     from STT_server import db_tools as _db_tools
     from STT_server import db_integrations as _db_integrations
@@ -767,11 +768,10 @@ def dashboard_stats(auth: dict = Depends(require_auth)):
     # ponytail: split per-agent usage minutes so the FE's per-row
     # counters don't have to re-fetch /usage and join themselves.
     # Compute the rate-aware cost the same way the per-agent rows do,
-    # then expose it on the response as `pricing`. Aggregating twice
-    # here (totals.cost_usd + manual re-sum) keeps the dashboard card
-    # consistent with the per-minute figure the Usage page shows
-    # for the same rows.
-    usage_full = aggregate_usage(auth["user_id"])
+    # then expose it on the response as `pricing`. usage_full was already
+    # computed once at the top of dashboard_stats (Ticket 2 dedup);
+    # the per-minute figure the Usage page shows stays consistent
+    # because both pages call aggregate_usage independently.
     usage_breakdown = usage_full.get("per_agent") or []
     minutes_by_agent: dict[str, float] = {
         (row.get("agent_id") or ""): float(row.get("duration_seconds") or 0) / 60.0

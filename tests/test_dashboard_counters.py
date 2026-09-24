@@ -313,3 +313,141 @@ def test_agents_api_no_longer_round_trips_tool_counts_per_card():
     assert "minutes_usage" in src
     assert "Minutes Usage" in src
     assert "agent.perf" not in src  # no more agent.perf references
+
+
+# ── Ticket 2: aggregate_usage dedup characterization ─────────────────────────
+
+
+def test_dashboard_stats_aggregate_usage_call_count(monkeypatch):
+    """Pin the contract: dashboard_stats must call aggregate_usage
+    exactly once per request. Ticket 2 dedup'd the duplicate call at
+    api.py:714 + api.py:774. If a future refactor reintroduces the
+    duplicate, this test fires.
+    """
+    api = _import_api()
+
+    call_log: list[str] = []
+
+    fake_usage = {
+        "totals": {
+            "calls": 5,
+            "duration_seconds": 600.0,
+            "platform_duration_seconds": 200.0,
+            "own_duration_seconds": 400.0,
+            "cost_usd": 0.42,
+        },
+        "per_agent": [],
+        "rates": {
+            "own_per_min": 0.0828,
+            "platform_per_min": 0.14,
+            "currency": "USD",
+        },
+    }
+
+    def fake_aggregate_usage(user_id):
+        call_log.append(user_id)
+        return fake_usage
+
+    monkeypatch.setattr("STT_server.db.is_postgres", lambda: True)
+    monkeypatch.setattr(api, "db_list_agents", lambda user_id: [])
+    monkeypatch.setattr(api, "_load", lambda path, default: [])
+    monkeypatch.setattr(
+        "STT_server.services.usage_store.aggregate_usage", fake_aggregate_usage
+    )
+    monkeypatch.setattr("STT_server.db_tools.list_tools", lambda user_id: [])
+    monkeypatch.setattr(
+        "STT_server.db_integrations.list_integrations", lambda user_id: []
+    )
+    monkeypatch.setattr(
+        "STT_server.db_call_sessions.count_open_sessions", lambda **kw: 0
+    )
+    monkeypatch.setattr(
+        "STT_server.db_call_sessions.list_active_for_user", lambda **kw: []
+    )
+
+    out = api.dashboard_stats(auth={"user_id": "user-1"})
+
+    # The dedup contract: exactly one aggregate_usage call per request.
+    assert call_log == ["user-1"], (
+        f"aggregate_usage called {len(call_log)} times: {call_log}; expected 1"
+    )
+
+    # Response still correct: usage block derived from the single result.
+    assert out["usage"]["calls"] == 5
+    assert out["usage"]["total_minutes"] == 10.0
+    assert out["usage"]["own_per_min"] == 0.0828
+    assert out["usage"]["platform_per_min"] == 0.14
+
+
+def test_dashboard_stats_aggregate_usage_failure_isolated(monkeypatch):
+    """If aggregate_usage raises, the request fails. The dedup must
+    not change error semantics: still HTTP 500, still no partial
+    response leaked. (Both old call sites were unprotected, so
+    removing the duplicate does not alter failure mode.)
+    """
+    api = _import_api()
+
+    def fake_aggregate_usage(user_id):
+        raise RuntimeError("ledger unreachable")
+
+    monkeypatch.setattr("STT_server.db.is_postgres", lambda: True)
+    monkeypatch.setattr(api, "db_list_agents", lambda user_id: [])
+    monkeypatch.setattr(api, "_load", lambda path, default: [])
+    monkeypatch.setattr(
+        "STT_server.services.usage_store.aggregate_usage", fake_aggregate_usage
+    )
+
+    with pytest.raises(RuntimeError, match="ledger unreachable"):
+        api.dashboard_stats(auth={"user_id": "user-1"})
+
+
+def test_dashboard_stats_per_user_no_carry_over(monkeypatch):
+    """Two consecutive requests with different user_ids must each
+    call aggregate_usage once. No cross-user caching.
+    """
+    api = _import_api()
+
+    call_log: list[str] = []
+
+    def fake_aggregate_usage(user_id):
+        call_log.append(user_id)
+        return {
+            "totals": {
+                "calls": 0,
+                "duration_seconds": 0.0,
+                "platform_duration_seconds": 0.0,
+                "own_duration_seconds": 0.0,
+                "cost_usd": 0.0,
+            },
+            "per_agent": [],
+            "rates": {
+                "own_per_min": 0.0828,
+                "platform_per_min": 0.14,
+                "currency": "USD",
+            },
+        }
+
+    monkeypatch.setattr("STT_server.db.is_postgres", lambda: True)
+    monkeypatch.setattr(api, "db_list_agents", lambda user_id: [])
+    monkeypatch.setattr(api, "_load", lambda path, default: [])
+    monkeypatch.setattr(
+        "STT_server.services.usage_store.aggregate_usage", fake_aggregate_usage
+    )
+    monkeypatch.setattr("STT_server.db_tools.list_tools", lambda user_id: [])
+    monkeypatch.setattr(
+        "STT_server.db_integrations.list_integrations", lambda user_id: []
+    )
+    monkeypatch.setattr(
+        "STT_server.db_call_sessions.count_open_sessions", lambda **kw: 0
+    )
+    monkeypatch.setattr(
+        "STT_server.db_call_sessions.list_active_for_user", lambda **kw: []
+    )
+
+    api.dashboard_stats(auth={"user_id": "user-A"})
+    api.dashboard_stats(auth={"user_id": "user-B"})
+    api.dashboard_stats(auth={"user_id": "user-A"})
+
+    assert call_log == ["user-A", "user-B", "user-A"], (
+        f"each request must trigger its own aggregate_usage; got {call_log}"
+    )
