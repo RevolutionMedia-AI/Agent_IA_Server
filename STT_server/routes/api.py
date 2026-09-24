@@ -498,6 +498,12 @@ class AgentCreate(BaseModel):
     # None = default on. Explicit false = Full-AI: no transfer
     # tools reach the LLM, no chain runs.
     transfer_enabled: Optional[bool] = None
+    # ponytail: unified handoff order (canonical config). List of nodes:
+    # {"type":"ai"} | {"type":"transfer_tool","tool_id":...} |
+    # {"type":"phone_destination","destination":...,"timeout_sec":...}.
+    # The handler splits it into transfer_cascade + transfer_chain
+    # atomically. Send this XOR the two halves, never both.
+    handoff_order: Optional[list] = None
 
 
 class AgentUpdate(BaseModel):
@@ -561,6 +567,8 @@ class AgentUpdate(BaseModel):
     transfer_chain: Optional[list] = None
     # ponytail: master handoff switch — see AgentCreate above.
     transfer_enabled: Optional[bool] = None
+    # ponytail: unified handoff order — see AgentCreate above.
+    handoff_order: Optional[list] = None
 
 
 class PhoneNumberCreate(BaseModel):
@@ -963,6 +971,132 @@ def list_agents(auth: dict = Depends(require_auth)):
     return rows
 
 
+def _transfer_tools_by_id(user_id: str, agent_id: str | None) -> dict:
+    """Available call_transfer tools for an agent, keyed by id.
+
+    ponytail: the membership oracle for every handoff write (canonical
+    order, chain halves, cascade tool links). agent_id=None (create
+    path) yields {} — nothing can be assigned before the agent exists.
+    """
+    if not agent_id:
+        return {}
+    try:
+        rows = db_list_tools(user_id, agent_id=agent_id) or []
+    except Exception:
+        return {}
+    out = {}
+    for t in rows:
+        if not isinstance(t, dict) or not t.get("id"):
+            continue
+        if t.get("kind") != "call_transfer":
+            continue
+        try:
+            if not _is_real_tool(t):
+                continue
+        except Exception:
+            continue
+        out[t["id"]] = t
+    return out
+
+
+def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) -> None:
+    """Validate handoff routing keys in-place (raises HTTPException).
+
+    ponytail: single guardian for all handoff writes. Accepts either the
+    canonical `handoff_order` (split atomically into the two persisted
+    halves) or the halves directly (legacy callers) — never both.
+    Guarantees: AI validity + shape (via transfer_cascade helpers), every
+    referenced tool is an assigned call_transfer tool, no tool on both
+    sides, no duplicates.
+    """
+    from STT_server.services.transfer_cascade import (
+        split_handoff_order,
+        validate_cascade,
+        validate_handoff_order,
+        validate_transfer_chain,
+    )
+    has_canonical = payload.get("handoff_order") is not None
+    has_halves = "transfer_cascade" in payload or "transfer_chain" in payload
+    if has_canonical and has_halves:
+        raise HTTPException(
+            status_code=400,
+            detail="send handoff_order xor transfer_cascade/transfer_chain, not both",
+        )
+    if has_canonical:
+        nodes, err = validate_handoff_order(payload.get("handoff_order"))
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        tools_by_id = _transfer_tools_by_id(user_id, agent_id)
+        (halves, err) = split_handoff_order(nodes, tools_by_id)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        cascade, chain = halves
+        payload["transfer_cascade"] = cascade
+        payload["transfer_chain"] = chain
+        return
+    # Legacy halves path — same membership guarantees as canonical.
+    cascade = None
+    if "transfer_cascade" in payload:
+        steps, err = validate_cascade(payload["transfer_cascade"])
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        payload["transfer_cascade"] = steps
+        cascade = steps
+    chain = None
+    if "transfer_chain" in payload:
+        ids, err = validate_transfer_chain(payload["transfer_chain"])
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        payload["transfer_chain"] = ids
+        chain = ids
+    if cascade is None and chain is None:
+        return
+    tools_by_id = _transfer_tools_by_id(user_id, agent_id)
+    cascade_tool_ids = [
+        s.get("tool_id") for s in (cascade or [])
+        if isinstance(s, dict) and s.get("tool_id")
+    ]
+    for tid in cascade_tool_ids:
+        tool = tools_by_id.get(tid)
+        if not isinstance(tool, dict) or tool.get("kind") != "call_transfer":
+            raise HTTPException(
+                status_code=400,
+                detail=f"transfer_cascade references unassigned/unknown call_transfer tool: {tid}",
+            )
+    for tid in chain or []:
+        if tid not in tools_by_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"transfer_chain contains unassigned/unknown call_transfer tools: {[tid]}",
+            )
+    overlap = [tid for tid in (chain or []) if tid in set(cascade_tool_ids)]
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"handoff tools must appear exactly once (both sides): {overlap}",
+        )
+    # ponytail: single source of truth for ring timeout = the tool row.
+    # A legacy halves-write may carry a stale timeout on a tool-linked
+    # cascade entry (edited before the tool row, reordered elsewhere);
+    # normalize it so the entry can never diverge from the tool.
+    if cascade:
+        from STT_server.services.transfer_cascade import (
+            DEFAULT_STEP_TIMEOUT_SEC,
+            MAX_STEP_TIMEOUT_SEC,
+            MIN_STEP_TIMEOUT_SEC,
+        )
+        for s in cascade:
+            tid = s.get("tool_id") if isinstance(s, dict) else None
+            if not tid:
+                continue
+            try:
+                t = int((tools_by_id.get(tid) or {}).get("ring_timeout_sec")
+                        or DEFAULT_STEP_TIMEOUT_SEC)
+            except (TypeError, ValueError):
+                t = DEFAULT_STEP_TIMEOUT_SEC
+            s["timeout_sec"] = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, t))
+
+
 @api_router.post("/agents")
 def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
     # ponytail: validate provider ids BEFORE the agent hits disk so a
@@ -972,21 +1106,13 @@ def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
         if v and not get_provider_spec(v):
             raise HTTPException(status_code=400, detail=f"Unknown provider '{v}'")
     payload = data.dict()
-    # ponytail: cascade validation is fail-fast — a bad destination
-    # would otherwise sit on the row forever and the operator would
-    # only discover it when a real caller never gets transferred.
-    if payload.get("transfer_cascade") is not None:
-        from STT_server.services.transfer_cascade import validate_cascade
-        steps, err = validate_cascade(payload["transfer_cascade"])
-        if err:
-            raise HTTPException(status_code=400, detail=err)
-        payload["transfer_cascade"] = steps
-    if payload.get("transfer_chain") is not None:
-        from STT_server.services.transfer_cascade import validate_transfer_chain
-        chain, err = validate_transfer_chain(payload["transfer_chain"])
-        if err:
-            raise HTTPException(status_code=400, detail=err)
-        payload["transfer_chain"] = chain
+    # ponytail: handoff routing validation (fail-fast). On create no tools
+    # can be assigned yet, so membership checks run against an empty set —
+    # any transfer_tool reference 400s; post-create assigns append to chain.
+    _apply_handoff_payload(payload, auth["user_id"], agent_id=None)
+    # db_create_agent would persist a raw handoff_order key as an unknown
+    # column — _apply_handoff_payload already consumed it into the halves.
+    payload.pop("handoff_order", None)
     return db_create_agent(auth["user_id"], payload)
 
 
@@ -1002,21 +1128,15 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
                 detail=f"Unknown provider '{v}'",
             )
     payload = data.dict(exclude_none=True)
-    # ponytail: same fail-fast cascade validation as create. An empty
-    # list clears the cascade (back to straight-to-AI); None means
-    # "don't touch" via exclude_none above.
-    if "transfer_cascade" in payload:
-        from STT_server.services.transfer_cascade import validate_cascade
-        steps, err = validate_cascade(payload["transfer_cascade"])
-        if err:
-            raise HTTPException(status_code=400, detail=err)
-        payload["transfer_cascade"] = steps
-    if "transfer_chain" in payload:
-        from STT_server.services.transfer_cascade import validate_transfer_chain
-        chain, err = validate_transfer_chain(payload["transfer_chain"])
-        if err:
-            raise HTTPException(status_code=400, detail=err)
-        payload["transfer_chain"] = chain
+    # ponytail: unified handoff validation. handoff_order (canonical) is
+    # split into transfer_cascade + transfer_chain atomically; the halves
+    # sent directly (legacy callers) get the same membership guarantees.
+    # An empty list clears that half; None = "don't touch".
+    _apply_handoff_payload(payload, auth["user_id"], agent_id=agent_id)
+    # ponytail: handoff_order is config-only, not a DB column — the halves
+    # above already carry it. Dropping it keeps db_update_agent's whitelist
+    # (and the JSON-file path) from persisting an unknown key.
+    payload.pop("handoff_order", None)
     # ponytail: prompt reconciliation. When the operator saves an agent,
     # we run the reconciler so every assigned tool/integration has a
     # section in `agents.prompt`. If the operator deleted a section by
@@ -1357,6 +1477,14 @@ def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict 
     prompt section to update.
     """
     payload = _build_tool_payload(agent_id, data, user_id=auth["user_id"])
+    # ponytail: edits must never rewrite ownership or membership. The
+    # payload is built from a fresh AgentTool whose agent_id defaults to
+    # the URL agent and whose assignments default to [] — persisting
+    # those would silently convert a shared tool into a per-agent row
+    # and wipe every assignment. Both are managed by the create/assign
+    # flows, never by edits.
+    payload.pop("agent_id", None)
+    payload.pop("assignments", None)
     # ponytail: db_update_tool patches with the payload keys it
     # receives — passing the full dict keeps the row's id intact.
     # The user_id check on the WHERE clause prevents an operator from
@@ -1388,9 +1516,20 @@ def update_agent_tool(agent_id: str, tool_id: str, data: ToolCreate, auth: dict 
             if new_prompt != (agent.get("prompt") or ""):
                 db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
                 change_log.append(f"AGENT_TOOL:{tool_id} section updated")
+    # ponytail: timeout atomicity — one logical operation. Refresh every
+    # materialized cascade snapshot for this tool (all assigned agents;
+    # the row is global for shared tools) in the same request, so the
+    # FE never needs a second sync PUT that could fail halfway.
+    cascade_sync = _sync_transfer_cascade_for_tool(auth["user_id"], updated)
+    if cascade_sync["failed"]:
+        change_log.append(
+            f"CASCADE_SYNC:{tool_id} partial "
+            f"({len(cascade_sync['failed'])} agents stale — retry saves it)"
+        )
     return {
         "tool": updated,
         "change_log": change_log,
+        "cascade_sync": cascade_sync,
     }
 
 
@@ -1399,20 +1538,22 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
     """Delete a tool from an agent."""
     if not db_delete_tool(tool_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Tool not found")
-    # ponytail: keep transfer_chain in sync — a deleted transfer tool
+    # ponytail: keep handoff halves in sync — a deleted transfer tool
     # lingering in the chain renders as a ghost row (id only) and Dial
     # would try to look it up and skip, breaking the ordered routing.
+    # _handoff_remove scrubs both the chain and tool-linked cascade
+    # entries by exact tool_id.
     try:
         from STT_server.db_agents import get_agent as _get_agent, list_agents as _list_agents
 
-        # per-agent tool: clean its owner's chain
+        # per-agent tool: clean its owner's handoff
         agent = _get_agent(agent_id, auth["user_id"])
         if agent:
-            _chain_remove(agent, tool_id, auth["user_id"])
+            _handoff_remove(agent, tool_id, auth["user_id"])
         # shared tool deleted via per-agent route (unlikely) — also clean all agents of this user
         if agent and agent.get("agent_id") == "__shared__":
             for a in _list_agents(auth["user_id"]):
-                _chain_remove(a, tool_id, auth["user_id"])
+                _handoff_remove(a, tool_id, auth["user_id"])
     except Exception:
         pass
     return {"success": True}
@@ -1429,9 +1570,24 @@ def delete_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_
 # transfer chain is just ids — assign appends, unassign removes, the
 # modal editor rewrites the whole array. Helpers keep the three call
 # sites (assign / unassign / per-agent create) to one line each.
+#
+# ponytail: unified-handoff note. The canonical order is split into
+# transfer_cascade (tool-linked entries keep tool_id) + transfer_chain.
+# A tool lives on exactly one side, so append skips when the id is on
+# either side (idempotent, preserves position) and removal scrubs both
+# sides by exact tool_id — sibling tools sharing a destination are
+# never confused.
+def _cascade_tool_ids(agent: dict) -> set:
+    out = set()
+    for entry in agent.get("transfer_cascade") or []:
+        if isinstance(entry, dict) and entry.get("tool_id"):
+            out.add(entry["tool_id"])
+    return out
+
+
 def _chain_append(agent: dict, tool_id: str, user_id: str) -> None:
     chain = [c for c in (agent.get("transfer_chain") or []) if isinstance(c, str)]
-    if tool_id not in chain:
+    if tool_id not in chain and tool_id not in _cascade_tool_ids(agent):
         db_update_agent(agent["id"], user_id, {"transfer_chain": chain + [tool_id]})
 
 
@@ -1439,6 +1595,102 @@ def _chain_remove(agent: dict, tool_id: str, user_id: str) -> None:
     chain = [c for c in (agent.get("transfer_chain") or []) if isinstance(c, str)]
     if tool_id in chain:
         db_update_agent(agent["id"], user_id, {"transfer_chain": [c for c in chain if c != tool_id]})
+
+
+def _cascade_tool_remove(agent: dict, tool_id: str, user_id: str) -> None:
+    cascade = agent.get("transfer_cascade") or []
+    if isinstance(cascade, list) and any(
+        isinstance(c, dict) and c.get("tool_id") == tool_id for c in cascade
+    ):
+        db_update_agent(agent["id"], user_id, {
+            "transfer_cascade": [
+                c for c in cascade
+                if not (isinstance(c, dict) and c.get("tool_id") == tool_id)
+            ],
+        })
+
+
+def _handoff_remove(agent: dict, tool_id: str, user_id: str) -> None:
+    """Remove a transfer tool from both handoff halves by exact tool_id."""
+    _chain_remove(agent, tool_id, user_id)
+    _cascade_tool_remove(agent, tool_id, user_id)
+
+
+def _sync_transfer_cascade_for_tool(user_id: str, tool: dict) -> dict:
+    """Re-materialize every cascade snapshot linked to a transfer tool.
+
+    ponytail: timeout atomicity. ring_timeout_sec (and destination) live
+    on the tool row — ONE shared row for shared tools (global across all
+    assigned agents), one row per agent for per-agent tools. Cascade
+    entries are derived copies consumed by /voice. After any tool-row
+    write, refresh all copies in one backend pass so no second client
+    request is needed and a partial client failure can never leave
+    tool=37/cascade=20 behind. Returns
+    {"updated": [agent_ids], "failed": [agent_ids]}; per-agent writes
+    stay independent (same pattern as the rest of this module — one
+    get_conn transaction each), so a single agent failure is reported,
+    not hidden, and the next halves-write heals it via normalization.
+    A tool flipped away from call_transfer gets its links stripped
+    from both halves instead (orphan prevention).
+    """
+    from STT_server.services.transfer_cascade import (
+        DEFAULT_STEP_TIMEOUT_SEC,
+        E164_PATTERN,
+        MAX_STEP_TIMEOUT_SEC,
+        MIN_STEP_TIMEOUT_SEC,
+    )
+    status = {"updated": [], "failed": []}
+    tool_id = (tool or {}).get("id")
+    if not tool_id:
+        return status
+    is_transfer = (tool or {}).get("kind") == "call_transfer"
+    try:
+        agents = db_list_agents(user_id) or []
+    except Exception:
+        log.exception("[cascade-sync] list_agents failed for tool %s", tool_id)
+        return status
+    dest = str((tool or {}).get("destination") or "").strip()
+    try:
+        timeout = int((tool or {}).get("ring_timeout_sec") or DEFAULT_STEP_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_STEP_TIMEOUT_SEC
+    timeout = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, timeout))
+    dest_ok = bool(E164_PATTERN.match(dest))
+    for agent in agents:
+        if not isinstance(agent, dict) or not agent.get("id"):
+            continue
+        cascade = agent.get("transfer_cascade") or []
+        chain = agent.get("transfer_chain") or []
+        if not isinstance(cascade, list):
+            continue
+        linked = [c for c in cascade
+                  if isinstance(c, dict) and c.get("tool_id") == tool_id]
+        in_chain = tool_id in chain if isinstance(chain, list) else False
+        if not linked and not in_chain:
+            continue
+        try:
+            if is_transfer and dest_ok:
+                new_cascade = [
+                    {"destination": dest, "timeout_sec": timeout, "tool_id": tool_id}
+                    if (isinstance(c, dict) and c.get("tool_id") == tool_id) else c
+                    for c in cascade
+                ]
+                db_update_agent(agent["id"], user_id, {"transfer_cascade": new_cascade})
+            else:
+                # flipped away from call_transfer (or destination broke):
+                # strip links from both halves, never leave orphans that
+                # would 400 every future halves-write.
+                new_cascade = [c for c in cascade
+                               if not (isinstance(c, dict) and c.get("tool_id") == tool_id)]
+                new_chain = [c for c in (chain or []) if c != tool_id]
+                db_update_agent(agent["id"], user_id,
+                                {"transfer_cascade": new_cascade, "transfer_chain": new_chain})
+            status["updated"].append(agent["id"])
+        except Exception:
+            log.exception("[cascade-sync] agent %s failed for tool %s",
+                          agent.get("id"), tool_id)
+            status["failed"].append(agent["id"])
+    return status
 
 
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/assign")
@@ -1538,6 +1790,13 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
     except Exception as exc:
         log.exception("unassign tool %s from %s failed", tool_id, agent_id)
         raise HTTPException(status_code=500, detail=f"unassign failed: {exc}")
+    # ponytail: unified-handoff removal by tool_id (exact). Cascade entries
+    # materialized from this tool carry its tool_id, so removal is exact
+    # even when sibling tools share the destination — the old
+    # destination-match heuristic (with its ambiguity skip) is gone.
+    # Raw entries never belong to a tool and are never auto-removed.
+    if tool.get("kind") == "call_transfer":
+        _handoff_remove(agent, tool_id, auth["user_id"])
     change_log: list[str] = []
     from STT_server.services.agent_prompt_tools import (
         remove_section, KIND_AGENT_TOOL,
@@ -1546,8 +1805,6 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
     if new_prompt != (agent.get("prompt") or ""):
         db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
         change_log.append(f"AGENT_TOOL:{tool_id} section removed")
-    if tool.get("kind") == "call_transfer":
-        _chain_remove(agent, tool_id, auth["user_id"])
     return {
         "tool": result,
         "agent": db_get_agent(agent_id, auth["user_id"]),
@@ -1754,9 +2011,21 @@ def create_shared_tool(data: ToolCreate, auth: dict = Depends(require_auth)):
 def update_shared_tool(tool_id: str, data: ToolCreate, auth: dict = Depends(require_auth)):
     """Update an existing shared n8n tool owned by the current user."""
     payload = _build_tool_payload(SHARED_TOOL_AGENT_ID, data, user_id=auth["user_id"])
+    # ponytail: same ownership guard as the per-agent route — edits never
+    # touch agent_id/assignments (see above); membership is assign-only.
+    payload.pop("agent_id", None)
+    payload.pop("assignments", None)
     updated = db_update_tool(tool_id, auth["user_id"], payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Tool not found")
+    # ponytail: same timeout-atomicity sync as the per-agent route, but
+    # the bare-tool response shape is kept (IntegrationDetail consumes
+    # it directly). Failures land in the server log; the next
+    # halves-write heals via normalization.
+    try:
+        _sync_transfer_cascade_for_tool(auth["user_id"], updated)
+    except Exception:
+        log.exception("[cascade-sync] shared tool %s sync failed", tool_id)
     return updated
 
 
@@ -1766,14 +2035,14 @@ def delete_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
     if not db_delete_tool(tool_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Tool not found")
     # ponytail: shared transfer tool deleted — scrub it from every
-    # agent's transfer_chain for this user so Handoff chain doesn't
+    # agent's handoff halves for this user so Handoff chain doesn't
     # keep a ghost row (the previous bug: chain still held the id,
     # UI rendered it as id-only, and routing would skip it).
     try:
         from STT_server.db_agents import list_agents as _list_agents
 
         for a in _list_agents(auth["user_id"]):
-            _chain_remove(a, tool_id, auth["user_id"])
+            _handoff_remove(a, tool_id, auth["user_id"])
     except Exception:
         pass
     return {"success": True}

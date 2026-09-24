@@ -690,7 +690,8 @@ async def voice(
     # stream_params_str was already joined above for exactly this
     # purpose; use it.
     from STT_server.services.transfer_cascade import (
-        parse_cascade, dial_twiml, connect_stream_twiml, cascade_action_url,
+        parse_cascade_with_ids, resolve_cascade_steps,
+        dial_twiml, connect_stream_twiml, cascade_action_url,
     )
 
     # ponytail: pre-AI transfer cascade (021). When the agent owns a
@@ -702,7 +703,32 @@ async def voice(
         try:
             from STT_server.db_agents import get_agent as _get_agent
             _agent_row = _get_agent(agent_id)
-            _steps = parse_cascade((_agent_row or {}).get("transfer_cascade"))
+            _raw_cascade = (_agent_row or {}).get("transfer_cascade")
+            # ponytail: timeout atomicity (runtime half). Tool-linked
+            # entries resolve destination + timeout from the live tool
+            # rows, so a stale persisted snapshot (tool=37/snapshot=20
+            # after an arbitrary failure) still rings 37. Raw entries
+            # keep their snapshot values. A TECHNICAL lookup failure is
+            # NOT a missing tool: we pass None so the resolver returns
+            # snapshots verbatim AND log at error — degraded, explicit,
+            # never mistaken for a legacy broken reference. Same pattern
+            # (and cost: one indexed tools query per call) the
+            # transfer-fallback path already pays.
+            _tools_by_id: dict | None = {}
+            try:
+                if _agent_row and _agent_row.get("user_id"):
+                    from STT_server.db_tools import list_tools as _list_tools
+                    for _t in _list_tools(_agent_row["user_id"], agent_id=agent_id) or []:
+                        if isinstance(_t, dict) and _t.get("id"):
+                            _tools_by_id[_t["id"]] = _t
+            except Exception as _txc:
+                log.error(
+                    "[VOICE] cascade tool lookup FAILED for agent %s (%s) — "
+                    "ringing snapshot timeouts, which may be stale",
+                    agent_id, _txc,
+                )
+                _tools_by_id = None
+            _steps = resolve_cascade_steps(parse_cascade_with_ids(_raw_cascade), _tools_by_id)
         except Exception as exc:
             log.warning("[VOICE] cascade lookup failed for agent %s: %s", agent_id, exc)
             _steps = []
@@ -801,14 +827,41 @@ async def voice_cascade(
         )
 
     from STT_server.services.transfer_cascade import (
-        parse_cascade, dial_twiml, connect_stream_twiml, cascade_action_url,
+        parse_cascade_with_ids, resolve_cascade_steps,
+        dial_twiml, connect_stream_twiml, cascade_action_url,
     )
     from STT_server.db_agents import get_agent as _get_agent
     try:
         agent_row = _get_agent(agent_id) if agent_id else None
     except Exception:
         agent_row = None
-    steps = parse_cascade((agent_row or {}).get("transfer_cascade"))
+    # ponytail: same canonical resolution as /voice (see above) — every
+    # cascade step re-resolves tool-linked entries from the live tool
+    # rows so a new call never rings a stale snapshot timeout. Technical
+    # lookup failure passes None (verbatim snapshots + error log), never
+    # disguised as missing tools.
+    try:
+        _cascade_tools_by_id: dict | None = {}
+        if agent_row and agent_row.get("user_id"):
+            from STT_server.db_tools import list_tools as _list_tools
+            for _t in _list_tools(agent_row["user_id"], agent_id=agent_id) or []:
+                if isinstance(_t, dict) and _t.get("id"):
+                    _cascade_tools_by_id[_t["id"]] = _t
+    except Exception as exc:
+        log.error(
+            "[VOICE] cascade tool lookup FAILED for agent %s (%s) — "
+            "ringing snapshot timeouts, which may be stale",
+            agent_id, exc,
+        )
+        _cascade_tools_by_id = None
+    try:
+        steps = resolve_cascade_steps(
+            parse_cascade_with_ids((agent_row or {}).get("transfer_cascade")),
+            _cascade_tools_by_id,
+        )
+    except Exception as exc:
+        log.warning("[VOICE] cascade resolve failed for agent %s: %s", agent_id, exc)
+        steps = parse_cascade_with_ids((agent_row or {}).get("transfer_cascade"))
 
     ws_url = PUBLIC_URL.rstrip("/")
     if ws_url.startswith("https://"):
