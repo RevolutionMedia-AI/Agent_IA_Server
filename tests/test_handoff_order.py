@@ -377,8 +377,9 @@ async def test_create_with_tool_order_rejected(
 async def test_raw_entries_survive_unassign(
     client: AsyncClient, auth_token: str,
 ):
-    """Raw legacy entries belong to no tool: unassigning a transfer tool
-    (even with the same destination) must never remove them."""
+    """Unrelated raw rows belong to no tool: unassigning a transfer tool
+    never removes them. (A same-destination raw would have been promoted
+    to the tool at assign time — only genuinely unrelated raws remain.)"""
     agent_id = _fresh("agent-rawsurv")
     tool_id = await _make_tool(client, auth_token, dest=A)
     await _make_agent(agent_id)
@@ -387,7 +388,6 @@ async def test_raw_entries_survive_unassign(
     r = await client.put(
         f"/agents/{agent_id}",
         json={"transfer_cascade": [
-            {"destination": A, "timeout_sec": 20},
             {"destination": B, "timeout_sec": 15},
         ], "transfer_chain": [tool_id]},
         headers={"Authorization": f"Bearer {auth_token}"})
@@ -397,8 +397,7 @@ async def test_raw_entries_survive_unassign(
         headers={"Authorization": f"Bearer {auth_token}"})
     assert r.status_code == 200, r.text
     cascade, chain = await _halves(agent_id)
-    assert cascade == [{"destination": A, "timeout_sec": 20},
-                       {"destination": B, "timeout_sec": 15}], cascade
+    assert cascade == [{"destination": B, "timeout_sec": 15}], cascade
     assert chain == [], chain
 
 
@@ -646,13 +645,13 @@ async def _set_tool_timeout(client, auth_token, agent_id, tool_id, timeout):
     assert r.status_code == 200, r.text
 
 
-async def test_T1_raw_and_assigned_tool_same_destination_coexist(
+async def test_B1_assign_over_unique_legacy_raw_promotes_in_place(
     client: AsyncClient, auth_token: str,
 ):
-    """BUG1: identity is tool_id, not destination. A raw row and an
-    assigned tool sharing one number are two distinct nodes — the tool
-    must NOT be hidden."""
-    agent_id = _fresh("agent-t1")
+    """B1: legacy cascade [RAW A] + assign tool A(dest A) promotes the raw
+    IN PLACE to a tool-linked entry — one node, same position, identity
+    becomes tool_id. The destination rings exactly once."""
+    agent_id = _fresh("agent-b1")
     await _make_agent(agent_id)
     r = await client.put(
         f"/agents/{agent_id}",
@@ -664,18 +663,59 @@ async def test_T1_raw_and_assigned_tool_same_destination_coexist(
                           headers={"Authorization": f"Bearer {auth_token}"})
     assert r.status_code == 200, r.text
     cascade, chain = await _halves(agent_id)
+    assert cascade == [{"destination": SAME, "timeout_sec": 20,
+                        "tool_id": a}], cascade
+    assert chain == [], chain
     order = derive_handoff_order(cascade, chain)
-    # raw row intact AND tool present exactly once, distinguishable
-    assert {"type": "phone_destination", "destination": SAME,
-            "timeout_sec": 20} in order
-    assert {"type": "transfer_tool", "tool_id": a} in order
-    assert [n.get("tool_id", n["type"]) for n in order].count(a) == 1
+    assert order == [{"type": "transfer_tool", "tool_id": a},
+                     {"type": "ai"}], order
+    # runtime materializes the destination exactly once
+    resolved = resolve_cascade_steps(
+        parse_cascade_with_ids(cascade),
+        await _tools_by_id(client, auth_token, agent_id))
+    assert [s["destination"] for s in resolved] == [SAME]
 
 
-async def test_T2_unassign_leaves_same_destination_raw(
+async def test_B2_contaminated_duplicate_normalizes_on_save(
     client: AsyncClient, auth_token: str,
 ):
-    agent_id = _fresh("agent-t2")
+    """B2: pre-existing contamination [RAW A, linked A] heals on the next
+    handoff save — one tool-linked representation survives."""
+    agent_id = _fresh("agent-b2")
+    a = await _make_tool(client, auth_token, dest=A, name="ta")
+    H = {"Authorization": f"Bearer {auth_token}"}
+    # contaminate directly at the DB layer (legacy shape the old UI
+    # produced): validated writes would already heal this, so seeding
+    # must bypass them — exactly like the production rows did.
+    from STT_server.db_agents import create_agent as db_create_agent
+    db_create_agent("user-test-001", {
+        "id": agent_id, "name": "Test",
+        "transfer_cascade": [
+            {"destination": A, "timeout_sec": 20},
+            {"destination": A, "timeout_sec": 20, "tool_id": a},
+        ],
+        "transfer_chain": [],
+    })
+    # tool assignment row (as production has it)
+    await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+    cascade, _ = await _halves(agent_id)
+    assert len(cascade) == 2  # contaminated as production shows
+    # next canonical save consolidates (derived order re-sent, as FE does)
+    nodes = ([{"type": "phone_destination", "destination": A, "timeout_sec": 20},
+              {"type": "transfer_tool", "tool_id": a}, {"type": "ai"}])
+    r = await _put_order(client, auth_token, agent_id, nodes)
+    assert r.status_code == 200, r.text
+    cascade, chain = await _halves(agent_id)
+    assert cascade == [{"destination": A, "timeout_sec": 20, "tool_id": a}]
+    assert chain == []
+
+
+async def test_B3_unassign_after_promotion_leaves_AI_only(
+    client: AsyncClient, auth_token: str,
+):
+    """B3: promoted [Tool A, AI] + unassign A -> [AI]. The legacy raw
+    was REPLACED at promotion, so nothing resurrects."""
+    agent_id = _fresh("agent-b3promo")
     await _make_agent(agent_id)
     await client.put(
         f"/agents/{agent_id}",
@@ -684,11 +724,14 @@ async def test_T2_unassign_leaves_same_destination_raw(
     a = await _make_tool(client, auth_token, dest=SAME, name="ta")
     H = {"Authorization": f"Bearer {auth_token}"}
     await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+    cascade, _ = await _halves(agent_id)
+    assert any(c.get("tool_id") == a for c in cascade)
     r = await client.delete(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
     assert r.status_code == 200, r.text
     cascade, chain = await _halves(agent_id)
-    assert cascade == [{"destination": SAME, "timeout_sec": 20}], cascade
+    assert cascade == [], cascade
     assert chain == [], chain
+    assert derive_handoff_order(cascade, chain) == [{"type": "ai"}]
 
 
 async def test_T3_timeout_survives_AI_crossings(
@@ -1039,8 +1082,8 @@ async def test_T4_multi_agent_halfway_failure_no_partial_runtime(
 async def test_T5_raw_timeout_independent_of_tool_update(
     client: AsyncClient, auth_token: str,
 ):
-    """T5: raw rows are their own source of truth — a tool timeout PUT
-    never rewrites them, even sharing the destination."""
+    """T5: UNRELATED raw rows are their own source of truth — a tool
+    timeout PUT never rewrites them."""
     agent_id = _fresh("agent-t5raw")
     a = await _make_tool(client, auth_token, dest=A, name="ta")
     await _make_agent(agent_id)
@@ -1048,16 +1091,178 @@ async def test_T5_raw_timeout_independent_of_tool_update(
     await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
     await client.put(
         f"/agents/{agent_id}",
-        json={"transfer_cascade": [{"destination": A, "timeout_sec": 15}],
+        json={"transfer_cascade": [{"destination": B, "timeout_sec": 15}],
               "transfer_chain": [a]}, headers=H)
     await _set_tool_timeout(client, auth_token, agent_id, a, 37)
     cascade, chain = await _halves(agent_id)
-    assert cascade == [{"destination": A, "timeout_sec": 15}], cascade
+    assert cascade == [{"destination": B, "timeout_sec": 15}], cascade
     assert chain == [a]
     resolved = resolve_cascade_steps(
         parse_cascade_with_ids(cascade),
         await _tools_by_id(client, auth_token, agent_id))
-    assert resolved == [{"destination": A, "timeout_sec": 15}]
+    assert resolved == [{"destination": B, "timeout_sec": 15}]
+
+
+async def test_B4_runtime_rings_tool_once(
+    client: AsyncClient, auth_token: str,
+):
+    """B4: normalized [Reception, AI] materializes the destination
+    exactly once pre-AI (no raw+tool double ring)."""
+    agent_id = _fresh("agent-b4rt")
+    await _make_agent(agent_id)
+    await client.put(
+        f"/agents/{agent_id}",
+        json={"transfer_cascade": [{"destination": SAME, "timeout_sec": 20}]},
+        headers={"Authorization": f"Bearer {auth_token}"})
+    a = await _make_tool(client, auth_token, dest=SAME, name="ta")
+    H = {"Authorization": f"Bearer {auth_token}"}
+    await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+    cascade, chain = await _halves(agent_id)
+    resolved = resolve_cascade_steps(
+        parse_cascade_with_ids(cascade),
+        await _tools_by_id(client, auth_token, agent_id))
+    assert [s["destination"] for s in resolved] == [SAME]
+    assert chain == []
+
+
+async def test_B5_reassign_never_duplicates(
+    client: AsyncClient, auth_token: str,
+):
+    """B5: AI + assign A -> AI,A; unassign -> AI; assign -> AI,A."""
+    agent_id = _fresh("agent-b5")
+    a = await _make_tool(client, auth_token, dest=A, name="ta")
+    await _make_agent(agent_id)
+    H = {"Authorization": f"Bearer {auth_token}"}
+    for _ in range(2):
+        r = await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+        assert r.status_code == 200, r.text
+        assert await _order_ids(agent_id) == ["ai", a]
+        r = await client.delete(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+        assert r.status_code == 200, r.text
+        assert await _order_ids(agent_id) == ["ai"]
+
+
+async def test_B6_two_tools_same_destination_stay_distinct(
+    client: AsyncClient, auth_token: str,
+):
+    """B6: A(X)+B(X), no raw — both assigned tools coexist as two tool
+    nodes. No destination dedupe, ever."""
+    agent_id = _fresh("agent-b6")
+    a = await _make_tool(client, auth_token, dest=SAME, name="sa")
+    b = await _make_tool(client, auth_token, dest=SAME, name="sb")
+    await _make_agent(agent_id)
+    H = {"Authorization": f"Bearer {auth_token}"}
+    for tid in (a, b):
+        r = await client.post(f"/agents/{agent_id}/tools/{tid}/assign", headers=H)
+        assert r.status_code == 200, r.text
+    assert await _order_ids(agent_id) == ["ai", a, b]
+    r = await _put_order(client, auth_token, agent_id, [_tool(b), _ai(), _tool(a)])
+    assert r.status_code == 200, r.text
+    assert await _order_ids(agent_id) == [b, "ai", a]
+
+
+async def test_B7_ambiguous_raw_never_promoted_nor_dropped(
+    client: AsyncClient, auth_token: str,
+):
+    """B7: RAW X + assigned A(X) + assigned B(X) — destination cannot
+    identify the owner, so the raw is preserved AND both tools persist.
+    Documented coexistence (ambiguous case only)."""
+    agent_id = _fresh("agent-b7")
+    a = await _make_tool(client, auth_token, dest=SAME, name="sa")
+    b = await _make_tool(client, auth_token, dest=SAME, name="sb")
+    await _make_agent(agent_id)
+    H = {"Authorization": f"Bearer {auth_token}"}
+    for tid in (a, b):
+        await client.post(f"/agents/{agent_id}/tools/{tid}/assign", headers=H)
+    # legacy halves write carrying all three: accepted as-is, no
+    # destructive reconciliation
+    r = await client.put(
+        f"/agents/{agent_id}",
+        json={"transfer_cascade": [{"destination": SAME, "timeout_sec": 20}],
+              "transfer_chain": [a, b]}, headers=H)
+    assert r.status_code == 200, r.text
+    cascade, chain = await _halves(agent_id)
+    assert cascade == [{"destination": SAME, "timeout_sec": 20}], cascade
+    assert chain == [a, b], chain
+    # and assigning a THIRD same-dest tool appends (no promotion either)
+    c = await _make_tool(client, auth_token, dest=SAME, name="sc")
+    r = await client.post(f"/agents/{agent_id}/tools/{c}/assign", headers=H)
+    assert r.status_code == 200, r.text
+    cascade, chain = await _halves(agent_id)
+    assert cascade == [{"destination": SAME, "timeout_sec": 20}], cascade
+    assert chain == [a, b, c], chain
+
+
+async def test_B8_unrelated_raw_accepted_and_kept(
+    client: AsyncClient, auth_token: str,
+):
+    """B8: RAW Y (no tool claims it) + tool A(X) persist side by side."""
+    agent_id = _fresh("agent-b8")
+    a = await _make_tool(client, auth_token, dest=A, name="ta")
+    await _make_agent(agent_id)
+    H = {"Authorization": f"Bearer {auth_token}"}
+    r = await client.put(
+        f"/agents/{agent_id}",
+        json={"transfer_cascade": [{"destination": B, "timeout_sec": 15}]},
+        headers=H)
+    assert r.status_code == 200, r.text
+    await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+    cascade, chain = await _halves(agent_id)
+    assert cascade == [{"destination": B, "timeout_sec": 15}], cascade
+    assert chain == [a], chain
+    order = derive_handoff_order(cascade, chain)
+    assert order[0] == {"type": "phone_destination", "destination": B,
+                        "timeout_sec": 15}
+    assert order[-1] == {"type": "transfer_tool", "tool_id": a}
+
+
+async def test_B9_assign_preserves_raw_position(
+    client: AsyncClient, auth_token: str,
+):
+    """B9: [RAW A, AI, B] + assign A -> [A, AI, B]. In-place promotion,
+    never append-to-end."""
+    agent_id = _fresh("agent-b9")
+    b = await _make_tool(client, auth_token, dest=B, name="tb")
+    await _make_agent(agent_id)
+    H = {"Authorization": f"Bearer {auth_token}"}
+    await client.post(f"/agents/{agent_id}/tools/{b}/assign", headers=H)
+    r = await client.put(
+        f"/agents/{agent_id}",
+        json={"transfer_cascade": [{"destination": A, "timeout_sec": 20}]},
+        headers=H)
+    assert r.status_code == 200, r.text
+    a = await _make_tool(client, auth_token, dest=A, name="ta")
+    r = await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+    assert r.status_code == 200, r.text
+    assert await _order_ids(agent_id) == [a, "ai", b]
+
+
+async def test_B10_promotion_keeps_canonical_timeout(
+    client: AsyncClient, auth_token: str,
+):
+    """B10: raw timeout=20, tool ring_timeout_sec=37 -> promoted snapshot
+    and runtime use 37. Never copied raw->tool."""
+    agent_id = _fresh("agent-b10")
+    await _make_agent(agent_id)
+    await client.put(
+        f"/agents/{agent_id}",
+        json={"transfer_cascade": [{"destination": A, "timeout_sec": 20}]},
+        headers={"Authorization": f"Bearer {auth_token}"})
+    a = await _make_tool(client, auth_token, dest=A, name="ta")
+    H = {"Authorization": f"Bearer {auth_token}"}
+    await client.post(f"/agents/{agent_id}/tools/{a}/assign", headers=H)
+    await _set_tool_timeout(client, auth_token, agent_id, a, 37)
+    # move after AI and back to prove nothing was lost/reset
+    await _put_order(client, auth_token, agent_id, [_ai(), _tool(a)])
+    await _put_order(client, auth_token, agent_id, [_tool(a), _ai()])
+    cascade, chain = await _halves(agent_id)
+    assert cascade == [{"destination": A, "timeout_sec": 37, "tool_id": a}]
+    assert chain == []
+    assert await _tool_timeout(client, auth_token, agent_id, a) == 37
+    resolved = resolve_cascade_steps(
+        parse_cascade_with_ids(cascade),
+        await _tools_by_id(client, auth_token, agent_id))
+    assert resolved[0]["timeout_sec"] == 37
 
 
 def test_T6_after_AI_chain_uses_tool_row():

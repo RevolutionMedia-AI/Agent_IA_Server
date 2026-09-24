@@ -565,6 +565,100 @@ def resolve_cascade_steps(steps: list | None, tools_by_id: dict | None) -> list[
     return out
 
 
+def tools_with_destination(tools_by_id: dict | None, destination: str) -> list[str]:
+    """Available call_transfer tool ids with exactly this E.164
+    destination. Sorted for determinism. Identity stays tool_id —
+    destination is only ever used to reconcile legacy raw rows."""
+    dest = str(destination or "").strip()
+    if not E164_PATTERN.match(dest):
+        return []
+    tools_by_id = tools_by_id if isinstance(tools_by_id, dict) else {}
+    return sorted(
+        tid for tid, t in tools_by_id.items()
+        if isinstance(t, dict) and t.get("kind") == "call_transfer"
+        and str(t.get("destination") or "").strip() == dest
+    )
+
+
+def find_promotable_raw_index(
+    cascade: list | None,
+    tool_id: str,
+    tools_by_id: dict | None,
+) -> int | None:
+    """Index of the unique raw entry promotable to tool_id, else None.
+
+    Safe promotion requires ALL of:
+      * tool_id belongs to an available call_transfer tool with a valid
+        destination D;
+      * exactly ONE raw entry (no tool_id) in cascade has destination D;
+      * NO other available tool shares D (ambiguity guard — see B7);
+      * tool_id is not already cascade-linked (no double representation).
+    On None the caller falls back to the normal insert rule.
+    """
+    tools_by_id = tools_by_id if isinstance(tools_by_id, dict) else {}
+    tool = tools_by_id.get(tool_id)
+    if not isinstance(tool, dict) or tool.get("kind") != "call_transfer":
+        return None
+    dest = str(tool.get("destination") or "").strip()
+    if not E164_PATTERN.match(dest):
+        return None
+    if sorted(tools_with_destination(tools_by_id, dest)) != [tool_id]:
+        return None
+    cascade = cascade if isinstance(cascade, list) else []
+    if any(isinstance(c, dict) and c.get("tool_id") == tool_id for c in cascade):
+        return None
+    matches = [i for i, c in enumerate(cascade)
+               if isinstance(c, dict) and not c.get("tool_id")
+               and str(c.get("destination") or "").strip() == dest]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def consolidate_legacy_duplicates(
+    cascade: list | None,
+    chain: list | None,
+    tools_by_id: dict | None,
+) -> tuple[list, list, bool]:
+    """Drop unique-shadow raws from persisted halves.
+
+    For each destination D: when exactly ONE raw entry carries D, the
+    ONLY available tool with D is represented (chain id or cascade
+    link), that raw is the tool's legacy shadow — remove it, keeping
+    the tool's position. Anything ambiguous (several raws, several
+    tools with D, tool unrepresented) is left untouched: no arbitrary
+    deletion. Returns (new_cascade, chain, changed); chain is never
+    reordered. Timeout canonicality is the caller's job (split already
+    materializes from tool rows; the halves path normalizes).
+    """
+    cascade = list(cascade) if isinstance(cascade, list) else []
+    chain = list(chain) if isinstance(chain, list) else []
+    tools_by_id = tools_by_id if isinstance(tools_by_id, dict) else {}
+    linked_ids = {c for c in chain if isinstance(c, str)}
+    linked_ids.update(
+        c.get("tool_id") for c in cascade
+        if isinstance(c, dict) and c.get("tool_id")
+    )
+    drop_idx: set[int] = set()
+    seen_dest: set[str] = set()
+    for i, c in enumerate(cascade):
+        if not isinstance(c, dict) or c.get("tool_id"):
+            continue
+        dest = str(c.get("destination") or "").strip()
+        if not E164_PATTERN.match(dest) or dest in seen_dest:
+            continue
+        seen_dest.add(dest)
+        raws = [j for j, e in enumerate(cascade)
+                if isinstance(e, dict) and not e.get("tool_id")
+                and str(e.get("destination") or "").strip() == dest]
+        candidates = tools_with_destination(tools_by_id, dest)
+        if len(raws) == 1 and len(candidates) == 1 and candidates[0] in linked_ids:
+            drop_idx.add(raws[0])
+    if not drop_idx:
+        return cascade, chain, False
+    return [c for i, c in enumerate(cascade) if i not in drop_idx], chain, True
+
+
 if __name__ == "__main__":  # smoke
     steps, err = validate_cascade([
         {"destination": "+15550001111", "timeout_sec": 25},

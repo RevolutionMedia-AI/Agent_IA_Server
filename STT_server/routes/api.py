@@ -1007,9 +1007,12 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
     halves) or the halves directly (legacy callers) — never both.
     Guarantees: AI validity + shape (via transfer_cascade helpers), every
     referenced tool is an assigned call_transfer tool, no tool on both
-    sides, no duplicates.
+    sides, no duplicates. Finally, unique legacy shadows (one raw + one
+    linked tool sharing a destination nobody else claims) are
+    consolidated so forbidden raw+tool duplicates cannot persist.
     """
     from STT_server.services.transfer_cascade import (
+        consolidate_legacy_duplicates,
         split_handoff_order,
         validate_cascade,
         validate_handoff_order,
@@ -1031,6 +1034,7 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
         if err:
             raise HTTPException(status_code=400, detail=err)
         cascade, chain = halves
+        cascade, chain, _ = consolidate_legacy_duplicates(cascade, chain, tools_by_id)
         payload["transfer_cascade"] = cascade
         payload["transfer_chain"] = chain
         return
@@ -1052,8 +1056,27 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
     if cascade is None and chain is None:
         return
     tools_by_id = _transfer_tools_by_id(user_id, agent_id)
+    # ponytail: partial halves-writes decide against the EFFECTIVE pair
+    # (sent halves overlaid on stored halves). Otherwise a cascade-only
+    # PUT cannot see chain membership (overlap check + consolidation
+    # would decide on half the picture and could corrupt the other).
+    stored_cascade: list = []
+    stored_chain: list = []
+    if (cascade is None or chain is None) and agent_id:
+        try:
+            from STT_server.db_agents import get_agent as _get_agent
+            _row = _get_agent(agent_id, user_id)
+            if isinstance(_row, dict):
+                if isinstance(_row.get("transfer_cascade"), list):
+                    stored_cascade = _row["transfer_cascade"]
+                if isinstance(_row.get("transfer_chain"), list):
+                    stored_chain = _row["transfer_chain"]
+        except Exception:
+            pass
+    eff_cascade = cascade if cascade is not None else stored_cascade
+    eff_chain = chain if chain is not None else stored_chain
     cascade_tool_ids = [
-        s.get("tool_id") for s in (cascade or [])
+        s.get("tool_id") for s in (eff_cascade or [])
         if isinstance(s, dict) and s.get("tool_id")
     ]
     for tid in cascade_tool_ids:
@@ -1063,13 +1086,13 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
                 status_code=400,
                 detail=f"transfer_cascade references unassigned/unknown call_transfer tool: {tid}",
             )
-    for tid in chain or []:
+    for tid in eff_chain or []:
         if tid not in tools_by_id:
             raise HTTPException(
                 status_code=400,
                 detail=f"transfer_chain contains unassigned/unknown call_transfer tools: {[tid]}",
             )
-    overlap = [tid for tid in (chain or []) if tid in set(cascade_tool_ids)]
+    overlap = [tid for tid in (eff_chain or []) if tid in set(cascade_tool_ids)]
     if overlap:
         raise HTTPException(
             status_code=400,
@@ -1079,13 +1102,20 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
     # A legacy halves-write may carry a stale timeout on a tool-linked
     # cascade entry (edited before the tool row, reordered elsewhere);
     # normalize it so the entry can never diverge from the tool.
-    if cascade:
+    # ponytail: legacy duplicate reconciliation on the effective pair
+    # (see above). Only SENT keys are persisted — except a healed
+    # cascade dropped by consolidation, which is persisted even on a
+    # chain-only write (otherwise the shadow raw would survive against
+    # the invariant). The full agent row in the response shows it.
+    new_cascade, new_chain, healed = consolidate_legacy_duplicates(
+        eff_cascade, eff_chain, tools_by_id)
+    if cascade is not None:
         from STT_server.services.transfer_cascade import (
             DEFAULT_STEP_TIMEOUT_SEC,
             MAX_STEP_TIMEOUT_SEC,
             MIN_STEP_TIMEOUT_SEC,
         )
-        for s in cascade:
+        for s in new_cascade:
             tid = s.get("tool_id") if isinstance(s, dict) else None
             if not tid:
                 continue
@@ -1095,6 +1125,11 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
             except (TypeError, ValueError):
                 t = DEFAULT_STEP_TIMEOUT_SEC
             s["timeout_sec"] = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, t))
+        payload["transfer_cascade"] = new_cascade
+    if chain is not None:
+        payload["transfer_chain"] = new_chain
+    elif healed:
+        payload["transfer_cascade"] = new_cascade
 
 
 @api_router.post("/agents")
@@ -1616,6 +1651,92 @@ def _handoff_remove(agent: dict, tool_id: str, user_id: str) -> None:
     _cascade_tool_remove(agent, tool_id, user_id)
 
 
+def _assign_transfer_to_handoff(agent_id: str, tool: dict, user_id: str) -> None:
+    """Place a newly assigned transfer tool in the handoff halves.
+
+    ponytail: legacy raw reconciliation. When the cascade holds exactly
+    one raw entry that unambiguously represents this same transfer
+    (unique destination match, see find_promotable_raw_index), the raw
+    is PROMOTED in place to a tool-linked entry — same position, same
+    order, identity becomes tool_id, timeout materialized from the
+    tool row (canonical; never copied raw->tool). Otherwise the tool
+    appends to the chain (idempotent, preserves existing order).
+    """
+    from STT_server.db_agents import get_agent as _get_agent
+    from STT_server.services.transfer_cascade import (
+        DEFAULT_STEP_TIMEOUT_SEC,
+        E164_PATTERN,
+        MAX_STEP_TIMEOUT_SEC,
+        MIN_STEP_TIMEOUT_SEC,
+        find_promotable_raw_index,
+    )
+    tool_id = tool.get("id")
+    agent = _get_agent(agent_id, user_id)
+    if not agent or not tool_id:
+        return
+    cascade = agent.get("transfer_cascade") or []
+    chain = agent.get("transfer_chain") or []
+    if tool_id in (chain if isinstance(chain, list) else []) \
+            or tool_id in _cascade_tool_ids(agent):
+        return
+    tools_by_id = _transfer_tools_by_id(user_id, agent_id)
+    idx = find_promotable_raw_index(
+        cascade if isinstance(cascade, list) else [], tool_id, tools_by_id)
+    if idx is None:
+        _chain_append(agent, tool_id, user_id)
+        return
+    dest = str(tool.get("destination") or "").strip()
+    if not E164_PATTERN.match(dest):
+        _chain_append(agent, tool_id, user_id)
+        return
+    try:
+        timeout = int(tool.get("ring_timeout_sec") or DEFAULT_STEP_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_STEP_TIMEOUT_SEC
+    timeout = max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, timeout))
+    new_cascade = list(cascade)
+    new_cascade[idx] = {"destination": dest, "timeout_sec": timeout, "tool_id": tool_id}
+    db_update_agent(agent_id, user_id, {"transfer_cascade": new_cascade})
+    log.info("[assign] promoted legacy raw to tool %s at cascade[%d] agent=%s",
+             tool_id, idx, agent_id)
+
+
+def _drop_unique_shadow_raw(agent_id: str, tool: dict, user_id: str) -> None:
+    """Drop the unique legacy shadow of an unassigned tool, if any.
+
+    ponytail: symmetric to assign-time promotion. After the tool link
+    is gone, a raw entry is that tool's shadow ONLY when it is the
+    single raw with the tool's destination and no other available tool
+    shares it (the tool itself just left availability). Genuine
+    unrelated raws always survive.
+    """
+    from STT_server.db_agents import get_agent as _get_agent
+    from STT_server.services.transfer_cascade import tools_with_destination
+    tool_id = (tool or {}).get("id")
+    dest = str((tool or {}).get("destination") or "").strip()
+    if not tool_id or not dest:
+        return
+    agent = _get_agent(agent_id, user_id)
+    if not agent:
+        return
+    cascade = agent.get("transfer_cascade") or []
+    if not isinstance(cascade, list):
+        return
+    raws = [c for c in cascade
+            if isinstance(c, dict) and not c.get("tool_id")
+            and str(c.get("destination") or "").strip() == dest]
+    if len(raws) != 1:
+        return
+    tools_by_id = _transfer_tools_by_id(user_id, agent_id)
+    if tools_with_destination(tools_by_id, dest):
+        return
+    db_update_agent(agent_id, user_id, {
+        "transfer_cascade": [c for c in cascade if c is not raws[0]],
+    })
+    log.info("[unassign] dropped legacy shadow raw for tool %s agent=%s",
+             tool_id, agent_id)
+
+
 def _sync_transfer_cascade_for_tool(user_id: str, tool: dict) -> dict:
     """Re-materialize every cascade snapshot linked to a transfer tool.
 
@@ -1756,7 +1877,7 @@ def assign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(require
         db_update_agent(agent_id, auth["user_id"], {"prompt": new_prompt})
         change_log.append(f"AGENT_TOOL:{tool_id} section added")
     if tool.get("kind") == "call_transfer":
-        _chain_append(agent, tool_id, auth["user_id"])
+        _assign_transfer_to_handoff(agent_id, tool, auth["user_id"])
     return {
         "tool": updated_tool,
         "agent": db_get_agent(agent_id, auth["user_id"]),
@@ -1794,9 +1915,12 @@ def unassign_shared_tool(agent_id: str, tool_id: str, auth: dict = Depends(requi
     # materialized from this tool carry its tool_id, so removal is exact
     # even when sibling tools share the destination — the old
     # destination-match heuristic (with its ambiguity skip) is gone.
-    # Raw entries never belong to a tool and are never auto-removed.
+    # Raw entries never belong to a tool and are never auto-removed,
+    # except the tool's unique legacy shadow (same strict rule as
+    # assign-time promotion, mirrored).
     if tool.get("kind") == "call_transfer":
         _handoff_remove(agent, tool_id, auth["user_id"])
+        _drop_unique_shadow_raw(agent_id, tool, auth["user_id"])
     change_log: list[str] = []
     from STT_server.services.agent_prompt_tools import (
         remove_section, KIND_AGENT_TOOL,
