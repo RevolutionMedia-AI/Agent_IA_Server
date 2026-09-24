@@ -360,6 +360,116 @@ def list_tools(user_id: str, agent_id: str | None = None) -> list[dict]:
             return [_row_to_tool(r) for r in cur.fetchall()]
 
 
+def tools_count_by_agent(user_id: str, agent_ids: list[str]) -> dict[str, int]:
+    """Bulk real-tool count for many agents in one storage round-trip.
+
+    ponytail: Ticket 3 N+1 fix. /agents previously looped over each
+    agent and called ``list_tools(user_id, agent_id=X)`` once per agent.
+    For N agents that was 2N queries (N tools + N integrations); with
+    N=50 the BE took ~100 round-trips. This single bulk call replaces
+    the N-list_tools fan-out with one scan.
+
+    Semantics — must match the per-agent list_tools(agent_id=X) path
+    exactly:
+      * user_id == user_id (tenant scope)
+      * (agent_id == X) OR (agent_id == '__shared__' AND X in assignments)
+      * then ``_is_real_tool(row)`` filter — a provider credential row
+        has neither ``webhook_url`` nor ``destination`` and is excluded
+
+    Returns a dict keyed by agent_id. Agents with zero matches get
+    ``0`` (caller can also ``dict.get(aid, 0)``). Agents not present
+    in agent_ids are not returned.
+    """
+    out: dict[str, int] = {a: 0 for a in agent_ids}
+    if not agent_ids:
+        return out
+    if not is_postgres():
+        # JSON fallback: load once, iterate once.
+        if not _AGENT_TOOLS_FILE.exists():
+            return out
+        try:
+            with open(_AGENT_TOOLS_FILE, "r", encoding="utf-8") as f:
+                rows = json.load(f) or []
+        except (json.JSONDecodeError, IOError, OSError):
+            return out
+        # ponytail: same predicate as list_tools(agent_id=X) for each X
+        # in agent_ids. ``X in assignments`` requires the shared row's
+        # assignments JSONB array to actually contain X (the JSON
+        # fallback stores assignments as a real Python list, so the
+        # ``in`` operator works directly).
+        #
+        # IMPORTANT: a single storage row contributes MAX 1 per agent
+        # (matches the pre-fix legacy semantics where each per-agent
+        # list_tools call sees the row once). Use ``set`` so duplicate
+        # entries in assignments (e.g. ``["A","A"]``) don't inflate
+        # the count. Postgres ?| does the same per-row dedup natively.
+        agent_id_set = set(agent_ids)
+        for r in rows:
+            if not isinstance(r, dict) or r.get("user_id") != user_id:
+                continue
+            r_agent_id = r.get("agent_id")
+            if r_agent_id in agent_id_set:
+                aid = r_agent_id
+            elif r_agent_id == "__shared__":
+                assignments = r.get("assignments") or []
+                # Find which requested agent_ids are in assignments;
+                # dedupe per agent so a row with duplicate assignments
+                # still contributes max 1 per agent.
+                matching = {a for a in assignments if a in agent_id_set}
+                if not matching:
+                    continue
+                # Real-tool filter (provider credential rows excluded).
+                if not (r.get("webhook_url") or r.get("destination")):
+                    continue
+                for aid in matching:
+                    out[aid] += 1
+                continue
+            else:
+                continue
+            # Real-tool filter for per-agent rows.
+            if r.get("webhook_url") or r.get("destination"):
+                out[aid] += 1
+        return out
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Single round-trip: scope to user + agent_ids OR shared
+            # with any of the requested agents. The OR uses jsonb ?|
+            # against an array of requested agent ids; the
+            # ``agent_id IN (...)`` handles the per-agent rows. The
+            # UNION-like effect without DISTINCT-multiplication because
+            # each row matches at most one branch.
+            cur.execute(
+                f"SELECT {_tool_cols()} FROM agent_tools "
+                "WHERE user_id = %s AND ("
+                "  agent_id = ANY(%s) OR "
+                "  (agent_id = '__shared__' AND COALESCE(assignments, '[]'::jsonb) ?| %s)"
+                ") ORDER BY created_at DESC",
+                (user_id, list(agent_ids), list(agent_ids)),
+            )
+            rows = cur.fetchall()
+    agent_id_set = set(agent_ids)
+    for r in rows:
+        r_agent_id = r.get("agent_id")
+        if r_agent_id in agent_id_set:
+            aid = r_agent_id
+        elif r_agent_id == "__shared__":
+            assignments = r.get("assignments") or []
+            matching = [a for a in assignments if a in agent_id_set]
+            if not matching:
+                continue
+            # Real-tool filter inline (same predicate as routes.api._is_real_tool).
+            if not (r.get("webhook_url") or r.get("destination")):
+                continue
+            for aid in matching:
+                out[aid] += 1
+            continue
+        else:
+            continue
+        if r.get("webhook_url") or r.get("destination"):
+            out[aid] += 1
+    return out
+
+
 def get_tool(tool_id: str, user_id: str) -> dict | None:
     if not is_postgres():
         if not _AGENT_TOOLS_FILE.exists():

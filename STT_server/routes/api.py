@@ -913,28 +913,90 @@ def list_agents(auth: dict = Depends(require_auth)):
     integrations_by_agent: dict[str, int] = {}
     active_calls_by_agent: dict[str, int] = {}
 
-    for agent in rows:
-        agent_id = agent.get("id")
-        if not agent_id:
-            continue
-        try:
-            tools = _db_tools.list_tools(auth["user_id"], agent_id=agent_id)
-            tools_by_agent[agent_id] = sum(1 for t in tools if _is_real_tool(t))
-        except Exception:
-            tools_by_agent[agent_id] = 0
-        try:
-            integ = _db_integrations.list_integrations(auth["user_id"], agent_id=agent_id)
-            # ponytail: list_integrations(agent_id=X) returns private +
-            # ALL shared (the Assigned+Available view). The badge must
-            # count ASSIGNED only — same predicate as the prompt
-            # reconciler — or every agent shows every shared
-            # integration as its own.
-            integrations_by_agent[agent_id] = sum(
-                1 for i in integ if i.get("connection_status") == "connected"
-                and (i.get("agent_id") == agent_id or agent_id in (i.get("assignments") or []))
+    # ponytail: Ticket 3 — N+1 fix with bulk-first + per-agent fallback.
+    # The previous implementation called list_tools(agent_id=X) and
+    # list_integrations(agent_id=X) once per agent. With N agents that
+    # was 2N storage calls (N tools + N integrations). For N=50 the
+    # BE took ~100 round-trips per /agents request.
+    #
+    # Happy path: 1 bulk tools call + 1 bulk integrations call = 2
+    # storage round-trips regardless of N. Each helper preserves the
+    # per-agent semantics exactly: same predicate (user_id + agent_id
+    # match OR shared-with-assignments), same _is_real_tool filter for
+    # tools, same connection_status='connected' + assignments check for
+    # integrations.
+    #
+    # Failure path (Ticket 3 finalization): each helper fails
+    # INDEPENDENTLY. If tools_count_by_agent raises, only tools fall
+    # back to per-agent calls (preserving the pre-fix behavior where
+    # only the failing agent had tools_count=0). Same for integrations.
+    # We never silently collapse both counters to zero — that would
+    # change semantics vs the legacy per-agent loop.
+    agent_ids = [a.get("id") for a in rows if a.get("id")]
+
+    def _legacy_tools_counts() -> dict[str, int]:
+        """Per-agent tools loop. Mirrors the pre-Ticket-3 behavior:
+        each agent that fails gets 0; others get their real count.
+        Used only when the bulk helper raises."""
+        out: dict[str, int] = {}
+        for a in agent_ids:
+            try:
+                tools = _db_tools.list_tools(auth["user_id"], agent_id=a)
+                out[a] = sum(1 for t in tools if _is_real_tool(t))
+            except Exception:
+                # ponytail: pre-fix behavior — one failing agent doesn't
+                # affect the others. Don't take down the whole list.
+                out[a] = 0
+        return out
+
+    def _legacy_integrations_counts() -> dict[str, int]:
+        """Per-agent integrations loop. Mirrors the pre-Ticket-3
+        behavior including the inline filter (connection_status ==
+        'connected' AND (agent_id == X OR X in assignments)).
+        Used only when the bulk helper raises."""
+        out: dict[str, int] = {}
+        for a in agent_ids:
+            try:
+                integ = _db_integrations.list_integrations(
+                    auth["user_id"], agent_id=a
+                )
+                # ponytail: pre-fix predicate. list_integrations
+                # returns private + all shared; the badge must count
+                # ASSIGNED only — same predicate as the prompt
+                # reconciler — or every agent shows every shared
+                # integration as its own.
+                out[a] = sum(
+                    1
+                    for i in integ
+                    if i.get("connection_status") == "connected"
+                    and (
+                        i.get("agent_id") == a
+                        or a in (i.get("assignments") or [])
+                    )
+                )
+            except Exception:
+                out[a] = 0
+        return out
+
+    try:
+        tools_by_agent = _db_tools.tools_count_by_agent(
+            auth["user_id"], agent_ids
+        )
+    except Exception:
+        # ponytail: tools bulk failed — fall back to per-agent to
+        # preserve the pre-fix per-agent failure semantics (only the
+        # failing agents get 0; others keep their real counts).
+        tools_by_agent = _legacy_tools_counts()
+    try:
+        integrations_by_agent = (
+            _db_integrations.connected_integrations_count_by_agent(
+                auth["user_id"], agent_ids
             )
-        except Exception:
-            integrations_by_agent[agent_id] = 0
+        )
+    except Exception:
+        # ponytail: integrations bulk failed independently of tools.
+        # Fall back to per-agent. Do NOT zero tools too.
+        integrations_by_agent = _legacy_integrations_counts()
 
     # ponytail: 2026-09-03 — count active call sessions per agent so
     # the FE can show a "On a call" pulse next to each agent without

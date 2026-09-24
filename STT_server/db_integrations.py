@@ -327,6 +327,84 @@ def list_integrations(user_id: str, agent_id: str | None = None) -> list[dict]:
             return [_row_to_integration(r) for r in cur.fetchall()]
 
 
+def connected_integrations_count_by_agent(
+    user_id: str, agent_ids: list[str]
+) -> dict[str, int]:
+    """Bulk connected-integration count for many agents in one storage
+    round-trip. Ticket 3 N+1 fix.
+
+    ponytail: matches the inline filter that ``/agents`` previously
+    applied per agent inside the for-loop:
+
+      1. ``user_id == user_id`` (tenant scope)
+      2. ``connection_status == "connected"``
+      3. (``agent_id == X``) OR (``agent_id == "__shared__"`` AND
+         ``X in assignments``)
+
+    Step 3 differs from db_tools.tools_count_by_agent in that the
+    per-agent row is always assigned to X (it's the agent's private
+    integration), and a shared row only counts when ``X in assignments``
+    (matches the prompt reconciler predicate).
+
+    Returns a dict keyed by agent_id; agents with zero matches get
+    ``0``. The Postgres query below uses ANY() for the per-agent
+    branch and jsonb ``?|`` for the shared-with-assignments branch.
+    """
+    out: dict[str, int] = {a: 0 for a in agent_ids}
+    if not agent_ids:
+        return out
+    if not is_postgres():
+        # JSON fallback: load once, iterate once.
+        rows = _list_integrations_json(user_id, agent_id=None)
+        agent_id_set = set(agent_ids)
+        for i in rows:
+            if not isinstance(i, dict):
+                continue
+            if i.get("user_id") != user_id:
+                continue
+            if i.get("connection_status") != "connected":
+                continue
+            i_agent_id = i.get("agent_id")
+            if i_agent_id in agent_id_set:
+                # Per-agent integration always counts (it's the agent's
+                # own). Step 3 condition: agent_id == X satisfied.
+                out[i_agent_id] += 1
+            elif i_agent_id == "__shared__":
+                assignments = i.get("assignments") or []
+                # Find which requested agent_ids are in assignments;
+                # dedupe per agent so a row with duplicate assignments
+                # still contributes max 1 per agent. Matches the
+                # Postgres ?| operator's per-row dedup semantics.
+                matching = {a for a in assignments if a in agent_id_set}
+                for aid in matching:
+                    # Shared integration counts only when agent is
+                    # assigned. Step 3 condition: X in assignments.
+                    out[aid] += 1
+        return out
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_integrations_cols()} FROM integrations "
+                "WHERE user_id = %s AND connection_status = 'connected' AND ("
+                "  agent_id = ANY(%s) OR "
+                "  (agent_id = '__shared__' AND COALESCE(assignments, '[]'::jsonb) ?| %s)"
+                ")",
+                (user_id, list(agent_ids), list(agent_ids)),
+            )
+            rows = cur.fetchall()
+    agent_id_set = set(agent_ids)
+    for i in rows:
+        i_agent_id = i.get("agent_id")
+        if i_agent_id in agent_id_set:
+            out[i_agent_id] += 1
+        elif i_agent_id == "__shared__":
+            assignments = i.get("assignments") or []
+            matching = [a for a in assignments if a in agent_id_set]
+            for aid in matching:
+                out[aid] += 1
+    return out
+
+
 def get_integration(integration_id: str, user_id: str) -> dict | None:
     """Fetch a single integration by id. Ownership scoped by user_id so
     a token from user A can't read user B's row."""
