@@ -27,6 +27,10 @@ from STT_server.domain.language import (
 )
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop
+from STT_server.services.provider_capabilities import (
+    capabilities as _provider_caps,
+    supports_realtime as _provider_supports_realtime,
+)
 from STT_server.services.credentials_resolver import resolve_for_session
 
 
@@ -301,6 +305,26 @@ async def run_realtime_session(session: CallSession) -> None:
     # three Realtime-capable IDs (gpt-realtime, gpt-4o-realtime-preview,
     # gpt-4o-mini-realtime-preview). If the agent picked something else,
     # fail loud here so the operator sees which row is misconfigured.
+    #
+    # Ponytail (Ticket 3 finalization): the single source of truth for
+    # provider capabilities lives in
+    # STT_server.services.provider_capabilities. The Realtime adapter
+    # runs only when llm_provider is OpenAI today. If a future provider
+    # adds a Realtime path, register it there — no branching in this
+    # file should be needed. Until then, an agent with a non-OpenAI
+    # llm_provider routed through Realtime would still fail at the
+    # WebSocket layer; we surface a clear log here for the operator.
+    llm_provider = (
+        getattr(session, "llm_provider", None) or "openai"
+    )
+    if not _provider_supports_realtime(llm_provider):
+        log.error(
+            "[REALTIME] session=%s llm_provider=%r has no Realtime path "
+            "(see provider_capabilities for supported providers). The "
+            "transfer path is not available for this provider.",
+            session.session_key, llm_provider,
+        )
+
     realtime_per_user = creds.get("realtime_model")
     model = (
         realtime_per_user

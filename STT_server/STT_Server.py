@@ -1520,6 +1520,44 @@ async def media_stream(ws: WebSocket) -> None:
                     session.agent_tools = _load_agent_tools(session.agent_id, session.user_id)
                     if session.agent_tools:
                         log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
+                    # ponytail: Ticket 3 finalization — guardrail. Tools
+                    # that the model cannot call are silently invisible.
+                    # The most common form of this in production was
+                    # llm_provider=anthropic with a Reception tool: the
+                    # tool got loaded, the dispatcher was never reached
+                    # because the LLM adapter doesn't pass tools to
+                    # Anthropic. The single source of truth lives in
+                    # provider_capabilities; raise loud here so the
+                    # operator sees the misconfiguration before the call
+                    # starts.
+                    if session.agent_tools:
+                        from STT_server.services.provider_capabilities import (
+                            assert_tool_provider_compatible,
+                        )
+                        llm_provider = (
+                            getattr(session, "llm_provider", None) or "openai"
+                        )
+                        try:
+                            assert_tool_provider_compatible(
+                                llm_provider, has_tools=True,
+                            )
+                        except RuntimeError as exc:
+                            log.error(
+                                "[GUARDRAIL] session=%s agent=%s has %d tool(s) "
+                                "but llm_provider=%r does not support tool "
+                                "calling: %s",
+                                session.session_key, session.agent_id,
+                                len(session.agent_tools), llm_provider, exc,
+                            )
+                            # Fail closed: refuse to start the call. The
+                            # operator sees this in the session init log
+                            # and can fix the agent config before the next
+                            # call. We do NOT auto-strip the tools here —
+                            # silent degradation was the original 2026-09-22
+                            # incident. Cleanup_session will record a
+                            # graceful disconnect when the WS dies, which
+                            # the operator can correlate with the log line.
+                            raise
                     # ponytail: master handoff switch (024). Off =
                     # Full-AI: transfer tools never reach the LLM
                     # (tools[] in both adapters is built from this
