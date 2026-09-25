@@ -519,16 +519,35 @@ def build_messages(session: CallSession, user_text: str) -> list[dict]:
             if any(phrase in lowered for phrase in _ORDER_PHRASES):
                 ask_count += 1
     if ask_count >= 2:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    f"WARNING: You have already asked for the order number {ask_count} times in this call. "
-                    "The speech recognition system is having difficulty capturing the digits. "
-                    "Do NOT ask again. Transfer the caller to a live agent immediately using TRANSFER_AGENT."
-                ),
-            }
-        )
+        # ponytail: previously hardcoded "TRANSFER_AGENT" here too.
+        # The operator names the tool whatever they want (e.g.
+        # "Reception"), and ``function_name`` is the OpenAI-safe
+        # sanitised form. The model searches for the literal token we
+        # emit, so a hardcoded name that doesn't match any real tool
+        # left the model with no callable match — it answered with
+        # text only and the transfer never happened. Pick the first
+        # ``call_transfer`` tool we know is available; if none, omit
+        # the directive entirely.
+        from STT_server.domain.tool import AgentTool as _AgentTool2
+        transfer_tool_name = None
+        for t in (getattr(session, "agent_tools", None) or []):
+            if t.get("kind") == "call_transfer":
+                transfer_tool_name = (
+                    t.get("function_name")
+                    or _AgentTool2._sanitize_function_name(t.get("name", ""))
+                )
+                break
+        if transfer_tool_name:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"WARNING: You have already asked for the order number {ask_count} times in this call. "
+                        "The speech recognition system is having difficulty capturing the digits. "
+                        f"Do NOT ask again. Transfer the caller to a live agent immediately using {transfer_tool_name}."
+                    ),
+                }
+            )
 
     # ponytail: anti-loop genérico. gpt-4o-mini a temperature baja
     # tiende a imitar literalmente los diálogos de ejemplo que el

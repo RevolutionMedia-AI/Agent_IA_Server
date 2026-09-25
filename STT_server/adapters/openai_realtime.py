@@ -108,11 +108,29 @@ def _build_instructions(session: CallSession) -> str:
         and any(p in e["content"].lower() for p in _ORDER_PHRASES)
     )
     if ask_count >= 2:
-        parts.append(
-            f"WARNING: You have already asked for the order number {ask_count} times. "
-            "The speech recognition system is having difficulty. "
-            "Do NOT ask again. Transfer the caller to a live agent immediately using TRANSFER_AGENT."
-        )
+        # ponytail: previously hardcoded "TRANSFER_AGENT" here. The
+        # operator names the tool whatever they want (e.g. "Reception"),
+        # and ``function_name`` is the OpenAI-safe sanitised form. The
+        # model searches for the literal token we emit, so a hardcoded
+        # name that doesn't match any real tool left the model with no
+        # callable match — it answered with text only and the transfer
+        # never happened. Pick the first ``call_transfer`` tool we know
+        # is available to this session; if none, omit the directive.
+        from STT_server.domain.tool import TOOL_KIND_CALL_TRANSFER as _TCT_KIND
+        transfer_tool_name = None
+        for t in (getattr(session, "agent_tools", None) or []):
+            if t.get("kind") == _TCT_KIND:
+                transfer_tool_name = (
+                    t.get("function_name")
+                    or _AgentTool._sanitize_function_name(t.get("name", ""))
+                )
+                break
+        if transfer_tool_name:
+            parts.append(
+                f"WARNING: You have already asked for the order number {ask_count} times. "
+                "The speech recognition system is having difficulty. "
+                f"Do NOT ask again. Transfer the caller to a live agent immediately using {transfer_tool_name}."
+            )
 
     return "\n\n".join(parts)
 
