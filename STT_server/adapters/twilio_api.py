@@ -9,6 +9,7 @@ Uses the Twilio SDK to:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -389,4 +390,9 @@ async def hangup_call(
 
     return await _to_thread(_hangup)
 
-    return await _to_thread(_transfer)
+    # ponytail: cap the Twilio API call. Without a timeout, a hung
+    # network call could keep this coroutine alive long after the
+    # operator has hung up — blocking cleanup and wasting memory.
+    # 30s is twice Twilio's default 15s HTTP timeout, which gives the
+    # SDK room to retry once if it wants.
+    return await asyncio.wait_for(_to_thread(_transfer), timeout=30.0)

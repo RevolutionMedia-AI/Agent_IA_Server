@@ -382,6 +382,19 @@ async def call_status(request: Request) -> dict:
 # really ready to handle traffic, not just that the process started.
 # ----------------------------------------------------------------------------
 
+# ponytail: /version proves the deployed instance matches a known commit.
+# The Dockerfile stamps GIT_SHA at build time and start.sh stamps
+# BUILD_STARTED_AT at container start, so a future audit can pin both.
+# No auth — same surface as /health so the operator can curl it from a
+# browser, a Railway CLI shell, or a CI step without a bearer token.
+@api_router.get("/version")
+def version() -> dict:
+    return {
+        "commit": os.environ.get("GIT_SHA", "unknown"),
+        "build_started_at": os.environ.get("BUILD_STARTED_AT", "unknown"),
+    }
+
+
 @api_router.get("/health")
 def health() -> dict:
     out = {

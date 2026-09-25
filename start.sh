@@ -1,7 +1,12 @@
 #!/bin/sh
 # Default to 8080 when PORT is not set
 PORT="${PORT:-8080}"
-echo "Starting app on port $PORT"
+
+# ponytail: stamp the container start time so /version can prove the deployed
+# instance isn't a stale image. UTC ISO-8601 — same shape as the DB columns.
+BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export BUILD_STARTED_AT
+echo "Starting app on port $PORT (commit=${GIT_SHA:-unknown} started=${BUILD_STARTED_AT})"
 
 # ponytail: self-heal the active auth backend + auto-apply migrations
 # + backfill JSON to Postgres. All inline as a single heredoc so we

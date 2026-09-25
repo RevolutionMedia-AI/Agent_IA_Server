@@ -3,6 +3,15 @@
 
 FROM python:3.11-slim
 
+# ponytail: capture the build commit so /version can prove repo == deployed.
+# Railway auto-injects $GIT_COMMIT_SHA via Nixpacks, but nixpacks.toml isn't
+# authoritative here (we use Dockerfile builds) — pass it explicitly via
+#   docker build --build-arg GIT_SHA=$(git rev-parse HEAD) ...
+# or set GIT_SHA in Railway's service Variables. Falls back to "unknown" so a
+# local dev container still boots instead of crashing on an unset env.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
