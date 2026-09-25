@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 
 import websockets
@@ -212,6 +213,21 @@ def _build_session_update_payload(session: CallSession) -> str:
     # JSON stays readable. tool_choice="auto" lets the model decide
     # between a plain reply and a function_call — without it the
     # server defaults to "none" and the agent hallucinates the action.
+    #
+    # The Realtime API receives ``tools`` ONLY when included in
+    # session.update. Previously this payload omitted tools (the
+    # comment claimed "central pipeline handles tool calls"), but
+    # ``process_transcripts`` runs with ``trigger_llm=False`` for the
+    # Realtime source (see line 696), so the central pipeline does
+    # NOT execute tool calls. The Realtime provider IS the only path
+    # that emits function_calls for Realtime sessions. Omitting
+    # tools here left the model without any callable, so when the
+    # user asked for a transfer the model could only speak text and
+    # the dispatcher never saw a function_call. Now we register the
+    # tool list so the model can invoke the canonical call_transfer
+    # executor. If there are no tools, we omit the field entirely
+    # (OpenAI accepts the field omitted; an empty list is also
+    # accepted but produces the same behavior with less payload).
     tools = _build_realtime_tools(session)
     session_dict: dict = {
         # ponytail: OpenAI Realtime API GA schema. The fields
@@ -226,14 +242,9 @@ def _build_session_update_payload(session: CallSession) -> str:
         # unknown_parameter in the WS error event with a clear
         # `param` field — the dispatcher log below captures it.
         "type": "realtime",
-        # ponytail: this session is a STT-only pipe. The LLM lives
-        # in `process_transcripts` / `_stream_llm_with_tools` so we
-        # MUST NOT let Realtime emit text or tool calls — otherwise
-        # the agent speaks twice and tool args leak to TTS. We also
-        # disable tools entirely: every tool path now runs through
-        # the central pipeline against the user's LLM credentials,
-        # which is the single source of truth for the agent's
-        # system prompt + Salesforce integration.
+        # ponytail: Realtime API accepts both the modern GA shape
+        # (output_modalities as a list) and the legacy beta shape
+        # (modalities = "audio"/"text"). The list form is what we send.
         "output_modalities": ["text"],
         "instructions": _build_instructions(session),
         "audio": {
@@ -243,10 +254,10 @@ def _build_session_update_payload(session: CallSession) -> str:
                 "turn_detection": {
                     # ponytail: 1500 ms holds the channel open while
                     # the user pauses to think. The previous 500 ms
-                    # closed the turn after every short breath and
-                    # made the agent speak over the user. 0.5 was
-                    # tuned for keyboard dictation; phones need more
-                    # headroom.
+                    # closed the turn after every short breath and the
+                    # user heard silence even though
+                    # transcripts are coming in. Accept BOTH names so a
+                    # regression to the old shape doesn't break us again.
                     "type": "server_vad",
                     "threshold": 0.5,
                     "prefix_padding_ms": 300,
@@ -255,11 +266,18 @@ def _build_session_update_payload(session: CallSession) -> str:
             },
         },
     }
-    # ponytail: tools intentionally omitted. The Realtime API would
-    # emit function_call events for these, which the central pipeline
-    # already handles when the same transcripts hit
-    # `process_transcripts`. Re-emitting them here produces duplicate
-    # tool invocations and inconsistent responses.
+    # ponytail: only register tools when the agent has any. An empty
+    # list is also accepted by the Realtime API but produces the same
+    # behavior as omitting the field; we send only when we have
+    # something to register, which keeps the payload minimal and the
+    # fallback-reconnect payload identical to the first attempt.
+    if tools:
+        session_dict["tools"] = tools
+        session_dict["tool_choice"] = "auto"
+        log.info(
+            "[REALTIME] session config tools=%d tool_choice=auto session=%s",
+            len(tools), session.session_key,
+        )
     return json.dumps({"type": "session.update", "session": session_dict})
 
 
@@ -869,56 +887,286 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     # Execute every pending tool call and feed the
                     # results back. `record_tool_result` records
                     # observability for the per-tool panel.
-                    from STT_server.services.tool_executor import execute_tool, record_tool_result
+                    from STT_server.services.tool_executor import (
+                        execute_tool, execute_call_transfer, record_tool_result,
+                    )
+                    from STT_server.domain.tool import (
+                        TOOL_KIND_CALL_TRANSFER as _KIND_CT,
+                        TOOL_KIND_WEBHOOK as _KIND_WH,
+                    )
+                    from STT_server.services.transfer_cascade import (
+                        build_transfer_chain, transfer_fallback_url,
+                    )
                     for call_id, tc in pending_tool_calls.items():
                         tool_name = tc["name"]
                         try:
                             args = json.loads(tc["arguments"]) if tc["arguments"] else {}
                         except json.JSONDecodeError:
                             args = {}
-                        # Look up the agent's tool definition so we
-                        # can find the webhook_url + tool_id for the
-                        # observability row.
+                        # Look up the agent's tool definition. The
+                        # dispatcher matches by function_name first
+                        # (OpenAI-safe sanitised token) and falls back
+                        # to display name if they match — pre-fix this
+                        # fell back to webhook_url which is empty for
+                        # call_transfer tools, so a Reception call
+                        # would error "missing webhook_url" without ever
+                        # reaching the canonical transfer executor.
                         tool_def = next(
                             (t for t in (getattr(session, "agent_tools", None) or [])
                              if t.get("function_name") == tool_name
                              or t.get("name") == tool_name),
                             None,
                         )
-                        webhook_url = (tool_def or {}).get("webhook_url", "")
+                        tool_kind = (tool_def or {}).get("kind")
                         tool_id = (tool_def or {}).get("id")
-                        if not webhook_url:
-                            log.warning(
-                                "[OPENAI_REALTIME] tool %s has no webhook_url session=%s",
-                                tool_name, session.session_key,
+                        log.info(
+                            "[TOOL_CALL_RECEIVED] session=%s call_id=%s tool=%s kind=%s",
+                            session.session_key, call_id, tool_name,
+                            tool_kind or "<unknown>",
+                        )
+                        log.info(
+                            "[TOOL_DISPATCH] session=%s tool_id=%s kind=%s",
+                            session.session_key, tool_id, tool_kind or "<unknown>",
+                        )
+
+                        # Branch on tool kind. Call_transfer uses
+                        # the canonical transfer runtime (same chain
+                        # resolution + Twilio Dial as the central
+                        # pipeline); webhook tools use the n8n HTTP
+                        # executor; integration-backed tools are out
+                        # of scope here.
+                        if tool_kind == _KIND_CT:
+                            # ponytail: mirror the central
+                            # turn_manager.py call_transfer branch.
+                            # Pull the same session credentials and
+                            # transfer chain the central pipeline uses
+                            # so the Realtime path and the central path
+                            # produce the same Twilio Dial.
+                            destination = (tool_def or {}).get("destination")
+                            timeout_sec = (tool_def or {}).get(
+                                "ring_timeout_sec"
+                            ) or 20
+                            account_sid = getattr(
+                                session, "twilio_account_sid", None
                             )
-                            output_text = json.dumps({"error": f"tool '{tool_name}' has no webhook_url"})
-                            ok = False
-                            err = "missing webhook_url"
-                        else:
+                            auth_token = getattr(
+                                session, "twilio_auth_token", None
+                            )
+                            call_sid_ws = getattr(session, "call_sid", None)
+                            tools_by_id = {
+                                t.get("id"): t
+                                for t in (getattr(session, "agent_tools", None) or [])
+                                if isinstance(t, dict) and t.get("id")
+                            }
+                            chain_cfg: list = []
                             try:
-                                result = await execute_tool(webhook_url, args, tool_name)
-                                log.info(
-                                    "[OPENAI_REALTIME] tool %s ok session=%s result_len=%d",
-                                    tool_name, session.session_key,
-                                    len(str(result)),
+                                from STT_server.db_agents import get_agent as _ga
+                                _arow = _ga(
+                                    getattr(session, "agent_id", None),
+                                    getattr(session, "user_id", None),
                                 )
-                                output_text = json.dumps(result) if not isinstance(result, str) else result
-                                ok = True
-                                err = None
+                                chain_cfg = (_arow or {}).get("transfer_chain") or []
                             except Exception as exc:
-                                log.exception(
-                                    "[OPENAI_REALTIME] tool %s failed session=%s",
+                                log.warning(
+                                    "[OPENAI_REALTIME] transfer chain lookup failed: %s",
+                                    exc,
+                                )
+                            chain = build_transfer_chain(tool_id, chain_cfg, tools_by_id)
+                            # Ponytail: keep the transfer_enabled master
+                            # switch from the central pipeline. If the
+                            # agent row has the switch off, refuse the
+                            # call so the LLM apologizes instead of
+                            # dialing.
+                            transfer_enabled = getattr(
+                                session, "transfer_enabled", True
+                            )
+                            if transfer_enabled is False:
+                                output_text = (
+                                    f"Tool '{tool_name}' error: human handoff "
+                                    f"is disabled for this agent. Continue helping "
+                                    f"the caller yourself; do not try another transfer."
+                                )
+                                ok = False
+                                err = "transfer_enabled is False for this agent"
+                                log.warning(
+                                    "[OPENAI_REALTIME] call_transfer '%s' refused: "
+                                    "handoff disabled session=%s",
                                     tool_name, session.session_key,
                                 )
-                                output_text = json.dumps({"error": str(exc)[:500]})
+                            elif not (account_sid and auth_token and call_sid_ws and destination):
+                                output_text = json.dumps({
+                                    "error": (
+                                        f"call_transfer not configured for this call "
+                                        f"(missing Twilio auth or destination): "
+                                        f"account_sid={bool(account_sid)} "
+                                        f"auth_token={bool(auth_token)} "
+                                        f"call_sid={bool(call_sid_ws)} "
+                                        f"destination={bool(destination)}"
+                                    )
+                                })
                                 ok = False
-                                err = str(exc)[:200]
-                        if tool_id:
-                            try:
-                                record_tool_result(tool_id, ok, "invocation", error=err)
-                            except Exception:
-                                log.exception("record_tool_result failed for %s", tool_id)
+                                err = "call_transfer not configured"
+                                log.warning(
+                                    "[OPENAI_REALTIME] call_transfer '%s' skipped: "
+                                    "missing creds session=%s",
+                                    tool_name, session.session_key,
+                                )
+                            elif not chain:
+                                output_text = json.dumps({
+                                    "error": "call_transfer has no resolvable chain"
+                                })
+                                ok = False
+                                err = "no chain"
+                                log.warning(
+                                    "[OPENAI_REALTIME] call_transfer '%s' skipped: no chain",
+                                    tool_name,
+                                )
+                            else:
+                                first = chain[0]
+                                rest = chain[1:]
+                                public_url = os.getenv("PUBLIC_URL")
+                                action = None
+                                if public_url:
+                                    action = transfer_fallback_url(
+                                        public_url,
+                                        getattr(session, "agent_id", None),
+                                        [s["id"] for s in rest],
+                                        tenant_id=getattr(
+                                            session, "tenant_id", None
+                                        ),
+                                    )
+                                log.info(
+                                    "[TRANSFER_EXEC] session=%s call_sid=%s tool_id=%s "
+                                    "destination=%s timeout=%s chain_len=%d",
+                                    session.session_key, call_sid_ws, tool_id,
+                                    first["destination"], first["timeout_sec"],
+                                    len(chain),
+                                )
+                                try:
+                                    # Mask destination for the
+                                    # production log line: keep prefix
+                                    # + last 4 digits so the operator
+                                    # can correlate without leaking
+                                    # the full E.164 to logs.
+                                    transfer_result = await execute_call_transfer(
+                                        account_sid, auth_token, call_sid_ws,
+                                        first["destination"], tool_name,
+                                        timeout_sec=first["timeout_sec"],
+                                        action_url=action,
+                                    )
+                                    ok = True
+                                    err = None
+                                    output_text = json.dumps({
+                                        "ok": True,
+                                        "destination": first["destination"],
+                                        "tool_id": tool_id,
+                                        "chain_position": 1,
+                                        "chain_length": len(chain),
+                                    })
+                                    log.info(
+                                        "[TRANSFER_TWILIO_RESULT] session=%s "
+                                        "tool_id=%s ok=%s",
+                                        session.session_key, tool_id, ok,
+                                    )
+                                except Exception as exc:
+                                    log.exception(
+                                        "[TRANSFER_TWILIO_ERROR] session=%s "
+                                        "tool_id=%s exc=%s",
+                                        session.session_key, tool_id, type(exc).__name__,
+                                    )
+                                    ok = False
+                                    err = str(exc)[:200]
+                                    output_text = json.dumps({
+                                        "error": f"call_transfer failed: {err}"
+                                    })
+                            if tool_id:
+                                try:
+                                    record_tool_result(
+                                        tool_id, ok, "invocation", error=err
+                                    )
+                                except Exception:
+                                    log.exception(
+                                        "record_tool_result failed for %s",
+                                        tool_id,
+                                    )
+                        elif tool_kind == _KIND_WH:
+                            # Webhook / n8n-style tool. Mirror the
+                            # original branch: require webhook_url
+                            # and call execute_tool.
+                            webhook_url = (tool_def or {}).get("webhook_url", "")
+                            if not webhook_url:
+                                log.warning(
+                                    "[OPENAI_REALTIME] tool %s has no webhook_url session=%s",
+                                    tool_name, session.session_key,
+                                )
+                                output_text = json.dumps({
+                                    "error": f"tool '{tool_name}' has no webhook_url"
+                                })
+                                ok = False
+                                err = "missing webhook_url"
+                            else:
+                                try:
+                                    result = await execute_tool(
+                                        webhook_url, args, tool_name
+                                    )
+                                    log.info(
+                                        "[OPENAI_REALTIME] tool %s ok session=%s "
+                                        "result_len=%d",
+                                        tool_name, session.session_key,
+                                        len(str(result)),
+                                    )
+                                    output_text = (
+                                        json.dumps(result)
+                                        if not isinstance(result, str)
+                                        else result
+                                    )
+                                    ok = True
+                                    err = None
+                                except Exception as exc:
+                                    log.exception(
+                                        "[OPENAI_REALTIME] tool %s failed session=%s",
+                                        tool_name, session.session_key,
+                                    )
+                                    output_text = json.dumps({
+                                        "error": str(exc)[:500]
+                                    })
+                                    ok = False
+                                    err = str(exc)[:200]
+                            if tool_id:
+                                try:
+                                    record_tool_result(
+                                        tool_id, ok, "invocation", error=err
+                                    )
+                                except Exception:
+                                    log.exception(
+                                        "record_tool_result failed for %s",
+                                        tool_id,
+                                    )
+                        else:
+                            # Unknown kind (or no tool_def match).
+                            output_text = json.dumps({
+                                "error": (
+                                    f"tool '{tool_name}' kind {tool_kind!r} "
+                                    "not supported by Realtime dispatcher"
+                                )
+                            })
+                            ok = False
+                            err = f"unsupported kind {tool_kind!r}"
+                            log.warning(
+                                "[OPENAI_REALTIME] tool %s unsupported kind=%s session=%s",
+                                tool_name, tool_kind, session.session_key,
+                            )
+                            if tool_id:
+                                try:
+                                    record_tool_result(
+                                        tool_id, ok, "invocation", error=err
+                                    )
+                                except Exception:
+                                    log.exception(
+                                        "record_tool_result failed for %s",
+                                        tool_id,
+                                    )
+
                         # Feed the result back to OpenAI. Per the
                         # Realtime API contract: conversation.item.create
                         # with type=function_call_output + the matching
