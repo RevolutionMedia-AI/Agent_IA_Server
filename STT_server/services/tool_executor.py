@@ -541,6 +541,22 @@ async def execute_call_transfer(
         raise ToolExecutionError(
             f"call_transfer '{tool_name}' transport failed: {exc}"
         )
+    # ponytail: defensive against transfer_call returning something
+    # other than a dict (e.g. None on an unexpected Twilio SDK
+    # response). The dispatcher calls ``result.get(...)`` below and a
+    # None there is an AttributeError that swallows the real failure —
+    # exactly the 2026-09-22 production incident where ``result`` came
+    # back as ``None`` for a transferred call. Normalise to a dict here
+    # so the caller always sees ``success=False`` with a diagnostic.
+    if not isinstance(result, dict):
+        log.warning(
+            "[ToolExecutor] call_transfer '%s' returned non-dict %r; "
+            "treating as failure", tool_name, type(result).__name__,
+        )
+        result = {
+            "success": False,
+            "error": f"transfer_call returned non-dict: {type(result).__name__}",
+        }
     if not result.get("success"):
         raise ToolExecutionError(
             f"call_transfer '{tool_name}' rejected by Twilio: "
