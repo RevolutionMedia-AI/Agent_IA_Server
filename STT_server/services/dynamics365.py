@@ -211,7 +211,7 @@ class Dynamics365Client:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 db_integrations.acquire_advisory_xact_lock(cur, integration_id)
-                fresh = db_integrations.get_integration_by_id(integration_id)
+                fresh = db_integrations.get_integration_by_id(integration_id, cur=cur)
                 current = decrypt_credentials(fresh.get("credentials_encrypted")) if fresh else dict(self.credentials)
                 if current.get("access_token") != self.credentials.get("access_token") and not is_token_expiring(current.get("expires_at")):
                     self.credentials = current

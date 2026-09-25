@@ -4789,7 +4789,7 @@ def internal_get_integration_credentials(
                     # latest committed row. The previous lock holder
                     # may have just persisted refreshed tokens.
                     from STT_server.db_integrations import get_integration_by_id as _reload
-                    fresh = _reload(integration_id)
+                    fresh = _reload(integration_id, cur=cur)
                     if fresh and fresh.get("credentials_encrypted"):
                         try:
                             creds_plain = (
@@ -5072,7 +5072,7 @@ def internal_execute_integration_action(
             with _get_conn() as conn:
                 with conn.cursor() as cur:
                     _acquire_advisory_lock(cur, integration_id)
-                    fresh = _db_get_integration_by_id(integration_id)
+                    fresh = _db_get_integration_by_id(integration_id, cur=cur)
                     if fresh and fresh.get("credentials_encrypted"):
                         try:
                             creds_plain = _decrypt_creds(fresh["credentials_encrypted"])

@@ -425,7 +425,7 @@ def get_integration(integration_id: str, user_id: str) -> dict | None:
             return _row_to_integration(row) if row else None
 
 
-def get_integration_by_id(integration_id: str) -> dict | None:
+def get_integration_by_id(integration_id: str, cur=None) -> dict | None:
     """Fetch a single integration by id WITHOUT user ownership scoping.
 
     Used by the internal endpoint /internal/integrations/{id}/credentials
@@ -433,6 +433,11 @@ def get_integration_by_id(integration_id: str) -> dict | None:
     available). The endpoint's caller (n8n) is trusted — the service
     token is the auth. NEVER expose this lookup behind a user-bearer
     guard.
+
+    If `cur` (an open cursor on the caller's connection) is given, the
+    lookup runs on it without touching the pool — pass it when already
+    inside `with get_conn()` so one logical operation never holds two
+    pool slots at once.
     """
     if not is_postgres():
         for rows_owner in _walk_all_integrations_json():
@@ -440,14 +445,16 @@ def get_integration_by_id(integration_id: str) -> dict | None:
                 if r.get("id") == integration_id:
                     return r
         return None
+    if cur is not None:
+        cur.execute(
+            f"SELECT {_integrations_cols()} FROM integrations WHERE id = %s",
+            (integration_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_integration(row) if row else None
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT {_integrations_cols()} FROM integrations WHERE id = %s",
-                (integration_id,),
-            )
-            row = cur.fetchone()
-            return _row_to_integration(row) if row else None
+            return get_integration_by_id(integration_id, cur=cur)
 
 
 def _walk_all_integrations_json():

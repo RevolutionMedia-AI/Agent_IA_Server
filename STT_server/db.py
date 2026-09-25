@@ -98,6 +98,7 @@ def _init_pool():
         _pool = pg_pool.ThreadedConnectionPool(
             minconn=1, maxconn=10, dsn=url, cursor_factory=RealDictCursor,
         )
+        log.warning("[db] pool ready (min=1 max=10)")
         return _pool
 
 
@@ -110,11 +111,26 @@ def get_conn():
     """
     pool = _init_pool()
     import psycopg2
-    conn = pool.getconn()
+    try:
+        conn = pool.getconn()
+    except psycopg2.pool.PoolError:
+        # ponytail: never log the DSN — only safe counters. maxconn is
+        # a plain attribute on the pool; in-use is intentionally not
+        # read here (private internals are audit-only, see tests).
+        log.warning(
+            "[DB_POOL] exhausted max=10 (all slots checked out); "
+            "failing fast instead of queuing"
+        )
+        raise
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except BaseException:
+        # ponytail: BaseException (not just Exception) so CancelledError
+        # / KeyboardInterrupt also roll back. Otherwise the slot goes
+        # back to the pool with an open transaction and the next
+        # borrower inherits idle-in-transaction (plus any advisory
+        # xact lock taken on it).
         conn.rollback()
         raise
     finally:
