@@ -186,11 +186,15 @@ async def lifespan(app: FastAPI):
                 log.info("[oauth.boot] %s: configured (all env vars present)", pid)
                 configured += 1
             else:
+                # ponytail: the hint must name THIS provider's vars.
+                # It used to be hardcoded to Salesforce, so a missing
+                # dynamics365 config told the operator to set
+                # SALESFORCE_* — sending them to the wrong provider.
+                # `missing` already lists the exact names to set.
                 log.warning(
-                    "[oauth.boot] %s: missing env vars %s — "
-                    "operators can configure Salesforce via Setup -> App Manager "
-                    "and set SALESFORCE_CLIENT_ID / SALESFORCE_CLIENT_SECRET / "
-                    "SALESFORCE_REDIRECT_URI on the Railway service, then restart.",
+                    "[oauth.boot] %s: missing env vars %s — register the app "
+                    "with the provider, set these on the Railway service, "
+                    "then restart.",
                     pid, list(missing),
                 )
         total = len(_oauth_boot_diag.known_oauth_providers())
