@@ -2182,21 +2182,39 @@ def _is_real_tool(row: dict) -> bool:
 
 
 @api_router.get("/tools")
-def list_shared_tools(auth: dict = Depends(require_auth)):
-    """List all shared n8n tools owned by the current user.
+def list_shared_tools(
+    include_private: bool = False,
+    auth: dict = Depends(require_auth),
+):
+    """List the callable tools owned by the current user.
 
     Excludes provider-credential rows (Settings → API saves each
     provider's key into the same ``agent_tools`` table with
     ``agent_id='__shared__'``). They have neither ``webhook_url`` nor
     ``destination``, the two fields every real tool carries per
-    ``AgentTool.validate()``. Surfacing them next to actual n8n tools
+    ``AgentTool.validate()``. Surfacing them next to actual tools
     in the agent modal's marketplace was misleading — operators were
     trying to assign OpenAI as a callable tool.
+
+    ponytail: `include_private=true` additionally returns per-agent
+    rows (``agent_id`` set to a real agent id). Needed by the
+    Integrations "By agent" inventory, which is the only surface that
+    shows an operator the private tools an agent owns — they are
+    otherwise reachable solely through
+    ``GET /agents/{agent_id}/tools``, i.e. one request per agent.
+
+    Note the query below ALREADY returns every tool the user owns:
+    ``db_list_tools(user_id, agent_id=None)`` has no agent filter, and
+    the shared-only branch used to be a Python-side discard of rows we
+    had already paid for. So this adds no query, no scan and no N+1 —
+    it only stops throwing the per-agent rows away.
+
+    Default (``include_private`` absent) is byte-identical to before.
     """
-    return [
-        t for t in db_list_tools(auth["user_id"])
-        if t.get("agent_id") == SHARED_TOOL_AGENT_ID and _is_real_tool(t)
-    ]
+    rows = [t for t in db_list_tools(auth["user_id"]) if _is_real_tool(t)]
+    if include_private:
+        return rows
+    return [t for t in rows if t.get("agent_id") == SHARED_TOOL_AGENT_ID]
 
 
 @api_router.post("/tools")
