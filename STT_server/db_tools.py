@@ -296,7 +296,12 @@ def _row_to_tool(row: dict) -> dict:
               "last_invoked_at", "last_invocation_error_at",
               "created_at", "updated_at"):
         if hasattr(out.get(k), "isoformat"):
-            out[k] = out[k].isoformat() + "Z"
+            # ponytail: same double-suffix bug as db_integrations — a
+            # tz-aware isoformat() already carries "+00:00", and the
+            # extra "Z" made JS Date.parse return NaN, so every tool
+            # card read "Tested never". Only add "Z" for naive values.
+            iso = out[k].isoformat()
+            out[k] = iso if iso.endswith("Z") or iso[-6:-5] in ("+", "-") else iso + "Z"
     # ponytail: ring_timeout_sec (023) rides the EXTRA cols — coerce
     # legacy/NULL rows to the default so the executor never defends
     # against None mid-call.

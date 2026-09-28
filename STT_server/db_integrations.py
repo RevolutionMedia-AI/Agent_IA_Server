@@ -253,7 +253,14 @@ def _row_to_integration(row: dict | None) -> dict | None:
         out["configuration"] = {}
     for k in ("last_tested_at", "oauth_state_expires_at", "created_at", "updated_at"):
         if hasattr(out.get(k), "isoformat"):
-            out[k] = out[k].isoformat() + "Z"
+            # ponytail: a tz-aware datetime's isoformat() ALREADY ends in
+            # "+00:00". Appending "Z" on top produced "...+00:00Z", which
+            # JS Date.parse rejects as NaN — so every connection card read
+            # "Never tested" and IntegrationDetail read "Last test · never"
+            # no matter what the real value was. Only add the "Z" when
+            # isoformat left the offset off (naive datetime).
+            iso = out[k].isoformat()
+            out[k] = iso if iso.endswith("Z") or iso[-6:-5] in ("+", "-") else iso + "Z"
     # ponytail: normalize assignments to list for FE assignment UI
     if not isinstance(out.get("assignments"), list):
         if isinstance(out.get("assignments"), str):
