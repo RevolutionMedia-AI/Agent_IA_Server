@@ -531,6 +531,11 @@ async def _stream_llm_with_tools(
                 from STT_server.config import PUBLIC_URL as _PUBLIC_URL
                 from STT_server.services.transfer_cascade import (
                     build_transfer_chain, transfer_fallback_url,
+                    PHASE_POST_AI, ACTION_DIAL, decide_routing, plan_from_steps,
+                    advance_plan, caller_alive_from_call_status,
+                )
+                from STT_server.services.call_plan import (
+                    seal_call_plan, routing_limits as _routing_limits,
                 )
                 destination = tool_def.get("destination")
                 account_sid = getattr(session, "twilio_account_sid", None)
@@ -553,6 +558,45 @@ async def _stream_llm_with_tools(
                 chain = build_transfer_chain(
                     tool_def.get("id"), chain_cfg, tools_by_id,
                 )
+                # ponytail: REAL loop guard. A previous chain returned
+                # the call to us, its counters came back on the
+                # <Stream>, and we hit a cap. Refuse here instead of
+                # trusting the prompt note — the model can and does
+                # ignore that, and an unbounded AI->humans->AI loop burns
+                # real minutes of Twilio billing.
+                _prior = getattr(session, "call_plan", None)
+                _limits = _routing_limits()
+                _rounds = _prior.rounds_used if _prior else 0
+                _attempts = _prior.dial_attempts if _prior else 0
+                _blocked = bool(getattr(session, "handoff_disabled", False))
+                if not _blocked:
+                    if _attempts >= _limits.max_human_dial_attempts:
+                        _blocked = True
+                    elif _rounds >= _limits.max_handoff_rounds:
+                        _blocked = True
+                if _blocked:
+                    log.warning(
+                        "[Tools] call_transfer '%s' REFUSED: handoff budget spent "
+                        "(round=%d/%d attempts=%d/%d disabled=%s) — keeping the AI on the line",
+                        tool_name, _rounds, _limits.max_handoff_rounds,
+                        _attempts, _limits.max_human_dial_attempts,
+                        bool(getattr(session, "handoff_disabled", False)),
+                    )
+                    session.handoff_disabled = True
+                    session.history.append({
+                        "role": "tool",
+                        "content": (
+                            f"Tool '{tool_name}' error: the human-handoff budget for "
+                            "this call is exhausted. Do NOT try another transfer. "
+                            "Tell the caller you could not reach anyone and keep "
+                            "helping them yourself."
+                        ),
+                    })
+                    record_tool_result(
+                        tool_def.get("id"), False, "invocation",
+                        error="handoff budget exhausted for this call",
+                    )
+                    continue
                 if not (account_sid and auth_token and call_sid) or not chain:
                     log.warning(
                         "[Tools] call_transfer '%s' skipped: missing creds "
@@ -574,34 +618,74 @@ async def _stream_llm_with_tools(
                         error="call_transfer not configured (missing Twilio auth or destination)",
                     )
                     continue
-                first, rest = chain[0], chain[1:]
+                # ponytail: Policy A + counters. Freeze the chain this
+                # call will ring, ask the pure core whether the first
+                # dial is allowed, then seal the ADVANCED plan into the
+                # action URL so every later hop reads the plan (and the
+                # running totals) instead of live config.
+                _fresh = plan_from_steps(PHASE_POST_AI, chain, call_sid or "")
+                _decision = decide_routing(
+                    PHASE_POST_AI, None, None, list(_fresh.steps),
+                    rounds_used=_fresh.rounds_used,
+                    dial_attempts=_fresh.dial_attempts,
+                    limits=_limits,
+                )
+                if _decision.action != ACTION_DIAL:
+                    log.warning(
+                        "[Tools] call_transfer '%s' REFUSED by routing core: %s",
+                        tool_name, _decision.reason,
+                    )
+                    session.history.append({
+                        "role": "tool",
+                        "content": (
+                            f"Tool '{tool_name}' error: no human is available to "
+                            "transfer to right now. Keep helping the caller."
+                        ),
+                    })
+                    record_tool_result(
+                        tool_def.get("id"), False, "invocation",
+                        error=f"routing refused: {_decision.reason}",
+                    )
+                    continue
+                first = _decision.destination
+                first_timeout = _decision.timeout_sec
+                _advanced = advance_plan(_fresh, _decision)
+                _rest_ids = [
+                    s.get("id") for s in _advanced.steps
+                    if isinstance(s, dict) and s.get("id")
+                ]
                 action = (
                     transfer_fallback_url(
                         _PUBLIC_URL,
                         getattr(session, "agent_id", None),
-                        [s["id"] for s in rest],
+                        _rest_ids,
                         tenant_id=getattr(session, "tenant_id", None),
+                        plan=seal_call_plan(_advanced),
                     )
                     if _PUBLIC_URL else None
                 )
+                # keep the running totals on the session so a later
+                # transfer in this same call sees them
+                session.call_plan = _advanced
                 try:
                     transfer_result = await execute_call_transfer(
                         account_sid, auth_token, call_sid,
-                        first["destination"], tool_name,
-                        timeout_sec=first["timeout_sec"],
+                        first, tool_name,
+                        timeout_sec=first_timeout,
                         action_url=action,
                     )
                     log.info(
-                        "[Tools] call_transfer '%s' ok -> %s (chain %d of %d)",
-                        tool_name, first["destination"],
-                        1, len(chain),
+                        "[Tools] call_transfer '%s' ok -> %s (round=%d/%d attempts=%d/%d)",
+                        tool_name, first,
+                        _advanced.rounds_used, _limits.max_handoff_rounds,
+                        _advanced.dial_attempts, _limits.max_human_dial_attempts,
                     )
                     record_tool_result(tool_def.get("id"), True, "invocation")
                     session.history.append({
                         "role": "tool",
                         "content": (
                             f"Tool '{tool_name}' result: transferring the call to "
-                            f"{first['destination']}. The system rings it, then "
+                            f"{first}. The system rings it, then "
                             f"continues the chain or returns the call to you. "
                             f"End this turn politely."
                         ),

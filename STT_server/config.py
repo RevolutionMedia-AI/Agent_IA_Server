@@ -69,6 +69,23 @@ FILLER_TTS_ENABLED = os.getenv("FILLER_TTS_ENABLED", "true").strip().lower() in 
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 LOG_TRANSCRIPT_CONTENT = os.getenv("LOG_TRANSCRIPT_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
+# ── Call routing loop guards ───────────────────────────────────────────────
+# The AI can be handed back after a failed human chain, ask for a human
+# again, and ring the whole chain again — nothing counted that, so the
+# only brake was a sentence in the system prompt. These are the hard caps.
+#
+#   MAX_HANDOFF_ROUNDS_PER_CALL       = AI -> human sequences per call.
+#                                       A pre-AI cascade is NOT a round
+#                                       (no AI involved); it only burns
+#                                       dial attempts.
+#   MAX_HUMAN_DIAL_ATTEMPTS_PER_CALL  = every outbound human <Dial>,
+#                                       cascade and chain combined.
+#
+# Counters travel inside the sealed call plan (services/call_plan.py), not
+# in process memory, so a callback on another replica sees the same count.
+MAX_HANDOFF_ROUNDS_PER_CALL = int(os.getenv("MAX_HANDOFF_ROUNDS_PER_CALL", "3"))
+MAX_HUMAN_DIAL_ATTEMPTS_PER_CALL = int(os.getenv("MAX_HUMAN_DIAL_ATTEMPTS_PER_CALL", "20"))
+
 # ponytail: P0 — was 5000ms polling; now event-based via wait_signals.py
 STREAM_SID_WAIT_TIMEOUT_MS = int(os.getenv("STREAM_SID_WAIT_TIMEOUT_MS", "5000"))
 

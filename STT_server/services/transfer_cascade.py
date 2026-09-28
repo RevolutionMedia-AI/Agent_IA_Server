@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+from dataclasses import dataclass
 
 # ponytail: same E.164 shape domain/tool.py enforces for call_transfer
 # destinations. One regex for both features so the operator gets the
@@ -160,15 +161,25 @@ def cascade_action_url(
     agent_id: str,
     step: int,
     tenant_id: str | None = None,
+    plan: str = "",
 ) -> str:
     """Action URL Twilio hits when a Dial step ends. Query params ride
     along so the callback is stateless (no BE-side call state to
     leak across deploys). Twilio signs the full URL including query,
     and /voice/cascade validates that signature the same way /voice
-    does."""
+    does.
+
+    ``plan`` is the sealed, encrypted routing plan (Policy A). It is
+    what makes the in-flight call independent of live config, of the DB
+    and of which process serves the callback. Empty keeps the legacy
+    positional behaviour, so a call that started before this shipped
+    still advances.
+    """
     qs = {"agent_id": agent_id, "step": str(step)}
     if tenant_id:
         qs["tenant_id"] = tenant_id
+    if plan:
+        qs["plan"] = plan
     return f"{public_url.rstrip('/')}/voice/cascade?{urllib.parse.urlencode(qs)}"
 
 
@@ -285,15 +296,452 @@ def transfer_fallback_url(
     agent_id: str,
     remaining_ids: list[str],
     tenant_id: str | None = None,
+    plan: str = "",
 ) -> str:
     """Action URL for a chain <Dial>. Same stateless contract as the
     cascade callback: remaining tool ids ride in the query so
     /voice/transfer-fallback can Dial the next one (or fall back to
-    the AI stream when the chain is exhausted)."""
+    the AI stream when the chain is exhausted).
+
+    ``plan`` is the sealed, encrypted routing plan (Policy A) and is
+    authoritative when present; ``remaining_ids`` stays in the query for
+    the legacy path.
+    """
     qs = {"agent_id": agent_id, "remaining": ",".join(remaining_ids or [])}
     if tenant_id:
         qs["tenant_id"] = tenant_id
+    if plan:
+        qs["plan"] = plan
     return f"{public_url.rstrip('/')}/voice/transfer-fallback?{urllib.parse.urlencode(qs)}"
+
+
+# ── Pure routing core ──────────────────────────────────────────────────────
+# "Ring the next human, or start the AI, or resume the AI, or end the
+# call" is the only part of routing whose bugs the caller experiences as
+# SILENCE rather than as an error. It lives here — free of FastAPI,
+# Twilio, DB and provider SDKs — so the full
+# (dial status x phase x caller aliveness x pending) matrix is testable
+# without booting the app, which pulls openai/inworld/assemblyai/
+# webrtcvad at import.
+#
+# Total by construction: no input shape raises, and a malformed pending
+# entry is skipped rather than dialed.
+
+PHASE_PRE_AI = "pre_ai"    # humans ring BEFORE the AI (transfer_cascade)
+PHASE_POST_AI = "post_ai"  # humans ring AFTER the AI  (transfer_chain)
+
+ACTION_DIAL = "dial"
+ACTION_START_AI = "start_ai"
+ACTION_RESUME_AI = "resume_ai"
+ACTION_END_CALL = "end_call"
+
+DIAL_STATUS_NO_ANSWER = "no-answer"
+DIAL_STATUS_BUSY = "busy"
+DIAL_STATUS_FAILED = "failed"
+DIAL_STATUS_CANCELED = "canceled"
+DIAL_STATUS_COMPLETED = "completed"
+DIAL_STATUS_MISSING = ""          # Twilio sent no DialCallStatus at all
+DIAL_STATUS_UNKNOWN = "unknown"   # sent something we don't recognise
+
+_KNOWN_DIAL_STATUSES = frozenset({
+    DIAL_STATUS_NO_ANSWER, DIAL_STATUS_BUSY, DIAL_STATUS_FAILED,
+    DIAL_STATUS_CANCELED, DIAL_STATUS_COMPLETED,
+})
+
+# CallStatus is the PARENT call's state, a different webhook field from
+# DialCallStatus (the dialed leg). These are the two fields that tell
+# "a human answered then hung up" apart from "the caller gave up".
+PARENT_STATUS_ACTIVE = frozenset({"initiated", "ringing", "in-progress"})
+PARENT_STATUS_TERMINAL = frozenset({
+    "completed", "busy", "failed", "no-answer", "canceled",
+})
+
+
+def caller_alive_from_call_status(raw) -> bool | None:
+    """Map a Twilio ``CallStatus`` to "is the original caller still there?".
+
+    True  -> known-active state (initiated / ringing / in-progress)
+    False -> known-terminal state (completed / busy / failed / no-answer /
+             canceled)
+    None  -> missing, blank or unrecognised.
+
+    ponytail: unrecognised MUST stay None, never collapse to False. A
+    wrong False ends a live call mid-sentence; a None only means "carry
+    on as before". When Twilio adds a status we degrade to the old
+    behaviour, which is the safe direction.
+    """
+    status = str(raw or "").strip().lower()
+    if not status:
+        return None
+    if status in PARENT_STATUS_ACTIVE:
+        return True
+    if status in PARENT_STATUS_TERMINAL:
+        return False
+    return None
+
+
+def normalize_dial_status(raw) -> str:
+    """Canonicalize a Twilio ``DialCallStatus``.
+
+    ponytail: this deliberately does NOT infer whether the caller is
+    still connected. Twilio sends two independent fields in the same
+    action webhook: ``DialCallStatus`` (what happened to the DIALED
+    leg) and ``CallStatus`` (what happened to the parent call).
+    Conflating them is exactly how you end up ringing a fresh number for
+    a caller who already hung up, so caller aliveness arrives as its own
+    ``caller_alive`` argument and is never read off this string.
+    """
+    status = str(raw or "").strip().lower()
+    if not status:
+        return DIAL_STATUS_MISSING
+    return status if status in _KNOWN_DIAL_STATUSES else DIAL_STATUS_UNKNOWN
+
+
+def _clamp_timeout(raw) -> int:
+    try:
+        timeout = int(raw or DEFAULT_STEP_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_STEP_TIMEOUT_SEC
+    return max(MIN_STEP_TIMEOUT_SEC, min(MAX_STEP_TIMEOUT_SEC, timeout))
+
+
+@dataclass(frozen=True)
+class RoutingStep:
+    """One candidate destination. ``tool_id`` is the chain identity that
+    survives into the fallback action URL; the cascade carries a
+    positional index instead and leaves this None."""
+
+    destination: str
+    timeout_sec: int = DEFAULT_STEP_TIMEOUT_SEC
+    tool_id: str | None = None
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    """What the runtime should do with the call right now.
+
+    ``rest`` is the untouched remainder of the caller's pending list, so
+    a route can build the next action URL (positional ``step`` for the
+    cascade, tool ids for the chain) without re-deriving the slicing.
+    ``chosen_index`` is the offset into the input list that was selected,
+    which keeps the cascade's ``step`` arithmetic correct even if a
+    malformed entry was skipped.
+
+    ``handoff_disabled`` is sticky: once a limit is hit the AI must not
+    be able to start another human sequence for the rest of the call.
+    """
+
+    action: str
+    dial_status: str = DIAL_STATUS_MISSING
+    caller_alive: bool | None = None
+    destination: str | None = None
+    timeout_sec: int | None = None
+    label: str = ""
+    rest: tuple = ()
+    chosen_index: int = -1
+    reason: str = ""
+    handoff_disabled: bool = False
+
+
+# ponytail: loop guards. A single pass is already bounded (5 cascade
+# steps, 10 chain tools) but the SYSTEM is not: the AI can be handed
+# back, ask for a human again, and ring the whole chain again. Nothing
+# counted that, so the only brake was a sentence in the system prompt.
+#
+# rounds      = one AI -> human sequence. A pre-AI cascade is NOT a
+#               round (no AI involved); it only burns dial attempts.
+# attempts    = every outbound human <Dial>, cascade and chain combined.
+#
+# Env-configurable via config.py; these are the defaults the pure core
+# is tested against.
+MAX_HANDOFF_ROUNDS_PER_CALL = 3
+MAX_HUMAN_DIAL_ATTEMPTS_PER_CALL = 20
+
+
+@dataclass(frozen=True)
+class RoutingLimits:
+    max_handoff_rounds: int = MAX_HANDOFF_ROUNDS_PER_CALL
+    max_human_dial_attempts: int = MAX_HUMAN_DIAL_ATTEMPTS_PER_CALL
+
+
+@dataclass(frozen=True)
+class CallPlan:
+    """The immutable routing plan for ONE call (Policy A).
+
+    Created once, when the first human is about to be dialed, and
+    carried forward inside the sealed action URL. Everything after that
+    reads the plan instead of live config, so a tool delete, a tool
+    edit, an assignment change or a DB outage cannot move a call that is
+    already in flight. The NEXT call reads the new config.
+
+    ``rounds_used`` / ``dial_attempts`` live here for the same reason:
+    they are correctness-critical and a later callback may land on a
+    different process, so process-local counters are not safe.
+    """
+
+    phase: str = PHASE_POST_AI
+    steps: tuple = ()
+    rounds_used: int = 0
+    dial_attempts: int = 0
+    handoff_disabled: bool = False
+    call_sid: str = ""
+
+
+def _as_step(candidate) -> RoutingStep | None:
+    """Accept a RoutingStep, a chain dict, or junk (returns None).
+
+    The chain builder hands us dicts and the cascade hands us dicts, so
+    normalizing here is what lets both routes share one decision.
+    """
+    if isinstance(candidate, RoutingStep):
+        return candidate
+    if isinstance(candidate, dict):
+        return RoutingStep(
+            destination=str(candidate.get("destination") or "").strip(),
+            timeout_sec=candidate.get("timeout_sec"),
+            tool_id=candidate.get("tool_id") or candidate.get("id") or None,
+            label=str(candidate.get("label") or candidate.get("name") or ""),
+        )
+    return None
+
+
+def decide_routing(
+    phase: str,
+    dial_status,
+    caller_alive: bool | None,
+    pending,
+    *,
+    rounds_used: int = 0,
+    dial_attempts: int = 0,
+    handoff_disabled: bool = False,
+    limits: RoutingLimits | None = None,
+) -> RoutingDecision:
+    """Decide the next hop for a live call. Pure, total, no I/O.
+
+    ``pending`` is the still-untried destinations in ring order — under
+    Policy A that comes from the call's sealed plan, not from live
+    config. ``phase`` only decides which flavour of "no humans left"
+    applies: a cascade that runs out STARTS the AI (the caller has not
+    heard from it yet), a chain that runs out RESUMES it (they have, and
+    the conversation comes back with them).
+
+    ``caller_alive=None`` means "unknown" and preserves the historical
+    behaviour of advancing regardless. Pass False to stop the sequence
+    the moment the caller is gone.
+
+    Precedence, highest first:
+      1. caller gone            -> END_CALL
+      2. nothing left to dial   -> START_AI / RESUME_AI
+      3. a limit is reached     -> START_AI / RESUME_AI, handoff_disabled
+      4. otherwise              -> DIAL
+    A departed caller outranks every other consideration.
+    """
+    status = normalize_dial_status(dial_status)
+    effective_limits = limits if isinstance(limits, RoutingLimits) else RoutingLimits()
+    try:
+        rounds = int(rounds_used or 0)
+    except (TypeError, ValueError):
+        rounds = 0
+    try:
+        attempts = int(dial_attempts or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+
+    # The caller hung up. There is nobody to bridge to: never ring
+    # another number, never open a stream that talks to dead air.
+    if caller_alive is False:
+        return RoutingDecision(
+            action=ACTION_END_CALL,
+            dial_status=status,
+            caller_alive=False,
+            reason="caller_gone",
+            handoff_disabled=True,
+        )
+
+    def _to_ai(reason: str) -> RoutingDecision:
+        return RoutingDecision(
+            action=ACTION_RESUME_AI if phase == PHASE_POST_AI else ACTION_START_AI,
+            dial_status=status,
+            caller_alive=caller_alive,
+            reason=reason,
+            handoff_disabled=blocked,
+        )
+
+    # Loop guards. `blocked` is sticky: once set it stays set for the
+    # rest of the call, so the AI cannot re-enter a human sequence.
+    blocked = bool(handoff_disabled)
+    if not blocked:
+        if attempts >= effective_limits.max_human_dial_attempts:
+            blocked = True
+        elif phase == PHASE_POST_AI and rounds >= effective_limits.max_handoff_rounds:
+            blocked = True
+
+    chosen = None
+    chosen_index = -1
+    for index, candidate in enumerate(pending or ()):
+        step = _as_step(candidate)
+        if step is None:
+            continue
+        destination = str(step.destination or "").strip()
+        if not E164_PATTERN.match(destination):
+            # Malformed / deleted-and-unresolvable. Skip it; never dial
+            # garbage, never abort the rest of the sequence.
+            continue
+        chosen = step
+        chosen_index = index
+        break
+
+    if chosen is None:
+        return _to_ai("sequence_exhausted")
+    if blocked:
+        return _to_ai("limit_reached")
+
+    return RoutingDecision(
+        action=ACTION_DIAL,
+        dial_status=status,
+        caller_alive=caller_alive,
+        destination=str(chosen.destination).strip(),
+        timeout_sec=_clamp_timeout(chosen.timeout_sec),
+        label=chosen.label,
+        rest=tuple(pending[chosen_index + 1:]),
+        chosen_index=chosen_index,
+        reason="advance",
+        handoff_disabled=False,
+    )
+
+
+# ── Call plan: build, advance, serialize (pure) ───────────────────────────
+
+def plan_from_steps(phase: str, steps, call_sid: str = "") -> CallPlan:
+    """Freeze the destinations this call will ring, in ring order.
+
+    This is the Policy A moment: whatever config says right now becomes
+    the plan, and the plan is what the rest of the call uses.
+    """
+    frozen: list[RoutingStep] = []
+    for candidate in steps or ():
+        step = _as_step(candidate)
+        if step is None:
+            continue
+        destination = str(step.destination or "").strip()
+        if not E164_PATTERN.match(destination):
+            continue
+        frozen.append(RoutingStep(
+            destination=destination,
+            timeout_sec=_clamp_timeout(step.timeout_sec),
+            tool_id=step.tool_id,
+            label=step.label,
+        ))
+    return CallPlan(phase=phase, steps=tuple(frozen), call_sid=call_sid or "")
+
+
+def advance_plan(plan: CallPlan, decision: RoutingDecision) -> CallPlan:
+    """Fold one decision back into the plan for the next hop.
+
+    A DIAL consumes one human attempt; a post-AI DIAL also consumes one
+    handoff round. Any non-DIAL outcome ends the human phase, so the
+    remaining steps are dropped and the counters freeze.
+    """
+    if not isinstance(plan, CallPlan):
+        return plan
+    if decision.action != ACTION_DIAL:
+        return CallPlan(
+            phase=plan.phase,
+            steps=(),
+            rounds_used=plan.rounds_used,
+            dial_attempts=plan.dial_attempts,
+            handoff_disabled=bool(plan.handoff_disabled or decision.handoff_disabled),
+            call_sid=plan.call_sid,
+        )
+    rest = tuple(decision.rest)
+    return CallPlan(
+        phase=plan.phase,
+        steps=rest,
+        rounds_used=plan.rounds_used + (1 if plan.phase == PHASE_POST_AI else 0),
+        dial_attempts=plan.dial_attempts + 1,
+        handoff_disabled=bool(plan.handoff_disabled),
+        call_sid=plan.call_sid,
+    )
+
+
+def _step_to_json(step: RoutingStep) -> dict:
+    out = {"d": step.destination, "t": _clamp_timeout(step.timeout_sec)}
+    if step.tool_id:
+        out["i"] = step.tool_id
+    if step.label:
+        out["n"] = step.label
+    return out
+
+
+def encode_plan_payload(plan: CallPlan) -> str:
+    """Serialize a plan to a compact, URL-safe blob. PURE — no crypto.
+
+    The caller seals this with Fernet (see services/call_plan.py) so the
+    E.164 destinations never appear in an access log, in a trace or in
+    Twilio's own request log. The Twilio signature additionally
+    authenticates the whole query string.
+    """
+    if not isinstance(plan, CallPlan):
+        return ""
+    import base64
+    import json
+    payload = {
+        "v": 1,
+        "p": plan.phase,
+        "s": [_step_to_json(s) for s in plan.steps],
+        "r": plan.rounds_used,
+        "a": plan.dial_attempts,
+        "h": 1 if plan.handoff_disabled else 0,
+        "c": plan.call_sid or "",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_plan_payload(token) -> CallPlan | None:
+    """Inverse of encode_plan_payload. Tolerant: any failure -> None.
+
+    None means "no usable plan" and the caller must fall back to the
+    legacy live-config path. That is the safe direction: a corrupted or
+    truncated blob degrades to today's behaviour rather than dropping
+    the caller into silence.
+    """
+    if not token or not isinstance(token, str):
+        return None
+    import base64
+    import binascii
+    import json
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        steps = []
+        for entry in payload.get("s") or []:
+            if not isinstance(entry, dict):
+                continue
+            steps.append(RoutingStep(
+                destination=str(entry.get("d") or "").strip(),
+                timeout_sec=entry.get("t") or DEFAULT_STEP_TIMEOUT_SEC,
+                tool_id=entry.get("i") or None,
+                label=str(entry.get("n") or ""),
+            ))
+        return CallPlan(
+            phase=str(payload.get("p") or PHASE_POST_AI),
+            steps=tuple(steps),
+            rounds_used=int(payload.get("r") or 0),
+            dial_attempts=int(payload.get("a") or 0),
+            handoff_disabled=bool(payload.get("h")),
+            call_sid=str(payload.get("c") or ""),
+        )
+    except (ValueError, TypeError, KeyError, binascii.Error, UnicodeDecodeError):
+        return None
+    except Exception:
+        # ponytail: never let a malformed blob escape as an exception
+        # from a live call path.
+        return None
 
 
 # ── Unified handoff order (canonical config representation) ──────────

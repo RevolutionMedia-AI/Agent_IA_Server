@@ -39,6 +39,16 @@ class CallSession:
     # filtered from tools[] and invoking one returns a tool error
     # instead of dialing. Default True (legacy rows predate it).
     transfer_enabled: bool = True
+    # ponytail: loop-guard state for this call. `call_plan` is the sealed
+    # CallPlan (services/transfer_cascade.py) that arrived on the
+    # <Stream> when a transfer chain handed the call back to the AI. It
+    # carries the running rounds/attempts so the tool executor can refuse
+    # a further human handoff as a REAL guard rather than trusting a
+    # sentence in the system prompt. `handoff_disabled` is sticky: once
+    # set, no further handoff happens for the rest of the call.
+    # None/absent = no prior chain on this call, counters start at zero.
+    call_plan: object | None = None
+    handoff_disabled: bool = False
     # Per-session custom system prompt (overrides default if set)
     custom_prompt: str | None = None
     # ponytail: the agent's welcome message, set on the session at

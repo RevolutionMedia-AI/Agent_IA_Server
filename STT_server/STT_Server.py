@@ -696,6 +696,11 @@ async def voice(
     from STT_server.services.transfer_cascade import (
         parse_cascade_with_ids, resolve_cascade_steps,
         dial_twiml, connect_stream_twiml, cascade_action_url,
+        PHASE_PRE_AI, PHASE_POST_AI, ACTION_DIAL, decide_routing,
+        plan_from_steps, advance_plan, caller_alive_from_call_status,
+    )
+    from STT_server.services.call_plan import (
+        seal_call_plan, open_call_plan, routing_limits as _routing_limits,
     )
 
     # ponytail: pre-AI transfer cascade (021). When the agent owns a
@@ -738,9 +743,21 @@ async def voice(
             _steps = []
         if _steps:
             first = _steps[0]
+            # ponytail: Policy A. Freeze what THIS call will ring, then
+            # seal it into the action URL. From here the call reads the
+            # plan, not live config: a tool delete, a tool edit, a
+            # re-assignment or a DB outage cannot move this call. The
+            # next call reads the new config. Sealed (Fernet) so the
+            # E.164s never land in an access log or a trace.
+            _plan = plan_from_steps(
+                PHASE_PRE_AI, _steps,
+                (form_dict.get("CallSid") or form_dict.get("callSid") or "").strip(),
+            )
+            _sealed = seal_call_plan(_plan)
             log.warning(
-                "[VOICE] agent %s has %d-step cascade, dialing %s first",
-                agent_id, len(_steps), first["destination"],
+                "[VOICE] agent %s has %d-step cascade, dialing %s first "
+                "(plan_sealed=%s)",
+                agent_id, len(_steps), first["destination"], bool(_sealed),
             )
             return Response(
                 content=dial_twiml(
@@ -749,6 +766,7 @@ async def voice(
                     cascade_action_url(
                         PUBLIC_URL, agent_id, 1,
                         tenant_id=tenant_id,
+                        plan=_sealed,
                     ),
                 ),
                 media_type="application/xml",
@@ -764,6 +782,7 @@ async def voice_cascade(
     agent_id: str = Query(default=None),
     step: int = Query(default=0),
     tenant_id: str = Query(default=None),
+    plan: str = Query(default=""),
     request: Request = None,
 ) -> Response:
     """Next step of a pre-AI transfer cascade. Twilio POSTs here when a
@@ -773,8 +792,16 @@ async def voice_cascade(
     Same signature model as /voice (per-number token from the `To`
     field). Missing agent/step or an empty cascade falls through to
     the AI stream so a misconfigured callback never dead-airs the
-    caller. completed = a human picked up → <Hangup>, the call was
-    already handled.
+    caller.
+
+    NOTE on ``completed``: it does NOT mean the caller hung up — it is
+    the DIALED leg's status, and completed there means the human
+    answered and then the leg ended. The caller is typically still
+    connected, so this route keeps them and advances to the next step
+    rather than hanging up. The webhook's separate CallStatus field is
+    what would reveal a departed caller; this route does not read it yet
+    (decide_routing receives caller_alive=None). See also
+    decide_routing's docstring.
     """
     form_dict: dict = {}
     if request is not None:
@@ -821,6 +848,10 @@ async def voice_cascade(
         return Response(content="invalid signature", status_code=403)
 
     call_sid_log = (form_dict.get("CallSid") or form_dict.get("callSid") or "")[:20]
+    # ponytail: the FULL CallSid, for binding the sealed plan to this
+    # call. call_sid_log is truncated to 20 chars for logging, and a
+    # Twilio CallSid is ~34, so it cannot be used for an equality check.
+    caller_sid = (form_dict.get("CallSid") or form_dict.get("callSid") or "").strip()
     # ponytail: completed = human answered then Dial leg completed. Keep
     # the caller — advance to next destination instead of Hangup. The
     # wording avoids claiming who hung up (Twilio only says completed).
@@ -833,6 +864,7 @@ async def voice_cascade(
     from STT_server.services.transfer_cascade import (
         parse_cascade_with_ids, resolve_cascade_steps,
         dial_twiml, connect_stream_twiml, cascade_action_url,
+        PHASE_PRE_AI, ACTION_DIAL, decide_routing,
     )
     from STT_server.db_agents import get_agent as _get_agent
     try:
@@ -884,31 +916,62 @@ async def voice_cascade(
         idx = int(step)
     except (TypeError, ValueError):
         idx = len(steps)
-    if 0 <= idx < len(steps):
-        nxt = steps[idx]
-        # ponytail: detailed routing log per spec 9 — pos, dest type,
-        # Dial result, reason, next. Remaining humans after this Dial
-        # are steps[idx+1:]; AI is the fallback after exhaust.
-        next_dest = steps[idx + 1]["destination"] if idx + 1 < len(steps) else "AI"
+    # ponytail: Policy A. A sealed plan on the action URL is AUTHORITATIVE:
+    # this call rings what /voice froze, so a tool delete/edit or a DB
+    # outage cannot move it. No plan means the call started before this
+    # shipped (mid-deploy) or sealing failed, and we fall back to live
+    # config — today's behaviour, never silence.
+    _plan = open_call_plan(plan, caller_sid)
+    if _plan is not None:
+        _pending = list(_plan.steps)
+    else:
+        _pending = steps[idx:] if 0 <= idx < len(steps) else []
+    # ponytail: real caller liveness. CallStatus is the PARENT call's
+    # state, distinct from DialCallStatus (the dialed leg). A terminal
+    # parent means the caller is gone: never ring another number.
+    _alive = caller_alive_from_call_status(form_dict.get("CallStatus"))
+    _decision = decide_routing(
+        PHASE_PRE_AI, status, _alive, _pending,
+        rounds_used=_plan.rounds_used if _plan else 0,
+        dial_attempts=_plan.dial_attempts if _plan else 0,
+        handoff_disabled=_plan.handoff_disabled if _plan else False,
+        limits=_routing_limits(),
+    )
+    if _decision.action == ACTION_DIAL:
+        # Remaining humans after this Dial are _decision.rest; the AI is
+        # the fallback once they run out. chosen_index keeps the `step`
+        # arithmetic correct even if a malformed entry was skipped.
+        _next_step = idx + _decision.chosen_index + 1
+        _next_dest = (
+            _pending[_decision.chosen_index + 1].destination
+            if _decision.chosen_index + 1 < len(_pending) else "AI"
+        )
+        _next_plan = advance_plan(
+            _plan or plan_from_steps(PHASE_PRE_AI, _pending), _decision,
+        )
         log.warning(
-            "[VOICE] routing next human for CallSid=%s pos=%d/%d agent=%s dest=%s type=human timeout=%s prev_status=%s reason=advance next=%s",
-            call_sid_log or "?", idx, len(steps), agent_id, nxt["destination"], nxt["timeout_sec"], status or "?", next_dest,
+            "[VOICE] routing next human for CallSid=%s pos=%d/%d agent=%s dest=%s type=human timeout=%s prev_status=%s caller_alive=%s reason=%s next=%s attempts=%d",
+            call_sid_log or "?", _next_step, len(_pending), agent_id,
+            _decision.destination, _decision.timeout_sec,
+            _decision.dial_status or "?", _alive, _decision.reason,
+            _next_dest, _next_plan.dial_attempts,
         )
         return Response(
             content=dial_twiml(
-                nxt["destination"],
-                nxt["timeout_sec"],
+                _decision.destination,
+                _decision.timeout_sec,
                 cascade_action_url(
-                    PUBLIC_URL, agent_id, idx + 1,
+                    PUBLIC_URL, agent_id, _next_step,
                     tenant_id=tenant_id,
+                    plan=seal_call_plan(_next_plan),
                 ),
             ),
             media_type="application/xml",
         )
     log.warning(
-        "[VOICE] routing cascade exhausted for CallSid=%s agent=%s pos=%d DialStatus=%s — falling through to AI (type=ai) reason=sequence_exhausted next=ai",
-        call_sid_log or "?", agent_id, idx, status or "?",
-        agent_id, status or "?",
+        "[VOICE] routing cascade ended for CallSid=%s agent=%s pos=%d DialStatus=%s caller_alive=%s — falling through to AI (type=ai) reason=%s next=ai",
+        call_sid_log or "?", agent_id, idx, status or "?", _alive,
+        _decision.reason,
     )
     return Response(
         content=connect_stream_twiml(ws_url, ''.join(stream_params)),
@@ -921,17 +984,29 @@ async def voice_transfer_fallback(
     agent_id: str = Query(default=None),
     remaining: str = Query(default=""),
     tenant_id: str = Query(default=None),
+    plan: str = Query(default=""),
     request: Request = None,
 ) -> Response:
     """Next link of an ordered transfer chain. Twilio POSTs here when a
     chain <Dial> ends (no-answer / busy / failed / cancel / completed).
 
     Same signature model as /voice/cascade (per-number token from the
-    `To` field, fail-closed 503/403). completed = a human picked up →
-    <Hangup>, the call was handled. Otherwise Dial the next remaining
-    tool id; when none remain, fall back to <Connect><Stream> so the
-    AI resumes the call (transfer_resume=1 tells the stream setup to
-    skip the greeting and note the failed handoff in history).
+    `To` field, fail-closed 503/403).
+
+    NOTE on ``completed``: it does NOT mean the caller hung up. Twilio
+    reports DialCallStatus (what happened to the DIALED leg) and
+    CallStatus (what happened to the parent call) as two independent
+    fields; ``completed`` on the dialed leg means the human answered and
+    then the leg ended, with the caller typically still connected. This
+    route keeps the caller and advances to the next link. It does NOT
+    read CallStatus, so it cannot yet tell A (leg ended, caller alive)
+    from B (caller gone) — see decide_routing's caller_alive, which
+    currently receives None here.
+
+    Otherwise Dial the next remaining tool id; when none remain, fall
+    back to <Connect><Stream> so the AI resumes the call
+    (transfer_resume=1 tells the stream setup to skip the greeting and
+    carry the pre-transfer conversation back in).
 
     Stateless: remaining ids ride the query; destinations/timeouts are
     re-resolved from the tool rows so an edited tool applies to
@@ -978,6 +1053,9 @@ async def voice_transfer_fallback(
         return Response(content="invalid signature", status_code=403)
 
     call_sid_log2 = (form_dict.get("CallSid") or form_dict.get("callSid") or "")[:20]
+    # ponytail: FULL CallSid for binding the sealed plan to this call;
+    # call_sid_log2 is truncated for logging only.
+    caller_sid2 = (form_dict.get("CallSid") or form_dict.get("callSid") or "").strip()
     # ponytail: completed = Dial leg completed after answer. Keep caller.
     if status == "completed":
         log.warning(
@@ -988,6 +1066,11 @@ async def voice_transfer_fallback(
     from STT_server.services.transfer_cascade import (
         dial_twiml, connect_stream_twiml, transfer_fallback_url,
         build_transfer_chain,
+        PHASE_POST_AI, ACTION_DIAL, decide_routing,
+        plan_from_steps, advance_plan, caller_alive_from_call_status,
+    )
+    from STT_server.services.call_plan import (
+        seal_call_plan, open_call_plan, routing_limits as _routing_limits,
     )
     from STT_server.db_agents import get_agent as _get_agent
     from STT_server.db_tools import list_tools as _list_tools
@@ -1022,35 +1105,75 @@ async def voice_transfer_fallback(
     # suffix from the invoked position, so an explicit "Recruiting" skips
     # earlier "Cafeteria" and remaining is suffix[1:] — never restart.
     chain = build_transfer_chain(ids[0] if ids else "", ids, tools_by_id)
-    if chain:
-        nxt = chain[0]
-        after = [s["id"] for s in chain[1:]]
-        next_label = after[0] if after else "AI"
+    # ponytail: Policy A. The sealed plan is AUTHORITATIVE — it is what
+    # turn_manager froze for this call, so a tool delete/edit or a DB
+    # outage cannot move it. Absent plan = the call predates this feature
+    # or sealing failed, and we resolve from live config as before.
+    _plan = open_call_plan(plan, caller_sid2)
+    _pending = list(_plan.steps) if _plan is not None else chain
+    # ponytail: real caller liveness from the PARENT call status, which
+    # is a different field from DialCallStatus (the dialed leg).
+    _alive = caller_alive_from_call_status(form_dict.get("CallStatus"))
+    _decision = decide_routing(
+        PHASE_POST_AI, status, _alive, _pending,
+        rounds_used=_plan.rounds_used if _plan else 0,
+        dial_attempts=_plan.dial_attempts if _plan else 0,
+        handoff_disabled=_plan.handoff_disabled if _plan else False,
+        limits=_routing_limits(),
+    )
+    if _decision.action == ACTION_DIAL:
+        _rest = _decision.rest
+        _after = [
+            s.get("tool_id") or s.get("id") for s in _rest
+            if getattr(s, "tool_id", None) or (isinstance(s, dict) and s.get("id"))
+        ]
+        _next_label = _after[0] if _after else "AI"
+        _next_plan = advance_plan(
+            _plan or plan_from_steps(PHASE_POST_AI, _pending), _decision,
+        )
         log.warning(
-            "[VOICE] routing next human for CallSid=%s agent=%s dest=%s (%s) type=human timeout=%s prev_status=%s reason=advance next=%s remaining=%d",
-            call_sid_log2 or "?", agent_id, nxt["destination"], nxt["name"], nxt["timeout_sec"], status or "?", next_label, len(after),
+            "[VOICE] routing next human for CallSid=%s agent=%s dest=%s (%s) type=human timeout=%s prev_status=%s caller_alive=%s reason=%s next=%s remaining=%d round=%d/%d attempts=%d",
+            call_sid_log2 or "?", agent_id, _decision.destination,
+            _decision.label or "-", _decision.timeout_sec,
+            _decision.dial_status or "?", _alive, _decision.reason,
+            _next_label, len(_after), _next_plan.rounds_used,
+            _routing_limits().max_handoff_rounds, _next_plan.dial_attempts,
         )
         return Response(
             content=dial_twiml(
-                nxt["destination"],
-                nxt["timeout_sec"],
+                _decision.destination,
+                _decision.timeout_sec,
                 transfer_fallback_url(
-                    PUBLIC_URL, agent_id, after,
+                    PUBLIC_URL, agent_id, _after,
                     tenant_id=tenant_id,
+                    plan=seal_call_plan(_next_plan),
                 ),
             ),
             media_type="application/xml",
         )
     log.warning(
-        "[VOICE] routing exhausted for CallSid=%s agent=%s DialStatus=%s — returning to AI (type=ai) reason=sequence_exhausted next=ai",
-        call_sid_log2 or "?", agent_id, status or "?",
+        "[VOICE] routing ended for CallSid=%s agent=%s DialStatus=%s caller_alive=%s — returning to AI (type=ai) reason=%s next=ai handoff_disabled=%s",
+        call_sid_log2 or "?", agent_id, status or "?", _alive,
+        _decision.reason, _decision.handoff_disabled,
     )
     stream_params.append('<Parameter name="transfer_resume" value="1" />')
+    # ponytail: hand the loop counters to the AI session so the tool
+    # executor can refuse a 4th handoff as a REAL guard, not a sentence
+    # in the prompt. Also the sticky disabled flag when a limit was hit.
+    _final = advance_plan(
+        _plan or plan_from_steps(PHASE_POST_AI, _pending), _decision,
+    )
+    _sealed_final = seal_call_plan(_final)
+    if _sealed_final:
+        stream_params.append(
+            f'<Parameter name="call_plan" value="{_sealed_final}" />'
+        )
+    if _final.handoff_disabled:
+        stream_params.append('<Parameter name="handoff_disabled" value="1" />')
     return Response(
         content=connect_stream_twiml(ws_url, ''.join(stream_params)),
         media_type="application/xml",
     )
-
 
 async def _watchdog_assistant_speaking(session: CallSession) -> None:
     """H5 from the call-flow audit: force-reset assistant_speaking if
@@ -1623,15 +1746,40 @@ async def media_stream(ws: WebSocket) -> None:
                                 "Díselo brevemente al cliente y sigue ayudando. "
                                 "NO invoques de inmediato otra herramienta de transferencia."
                             )
-                        _carried = pop_handoff_history(session.call_sid)
-                        session.history = _carried + [
-                            {"role": "system", "content": _note}
-                        ]
+                    _carried = pop_handoff_history(session.call_sid)
+                    session.history = _carried + [
+                        {"role": "system", "content": _note}
+                    ]
+                    # ponytail: the loop counters and the sticky disabled
+                    # flag come back on the <Stream> so the tool executor
+                    # can refuse a further handoff as a real guard. The
+                    # prompt note above is a courtesy, not the guard.
+                    from STT_server.services.call_plan import open_call_plan
+                    _sealed_plan = (
+                        custom_params.get("call_plan")
+                        if isinstance(custom_params, dict) else None
+                    )
+                    session.call_plan = open_call_plan(
+                        _sealed_plan, session.call_sid or "",
+                    )
+                    session.handoff_disabled = bool(
+                        (custom_params.get("handoff_disabled")
+                         if isinstance(custom_params, dict) else None)
+                    ) or bool(getattr(session.call_plan, "handoff_disabled", False))
+                    if session.call_plan is not None or session.handoff_disabled:
                         log.info(
-                            "[TRANSFER] resume session %s (agent=%s): carried %d prior "
-                            "message(s), greeting overridden, history seeded",
-                            session.session_key, session.agent_id, len(_carried),
+                            "[TRANSFER] resume %s: plan=%s rounds=%s attempts=%s disabled=%s",
+                            session.session_key,
+                            session.call_plan is not None,
+                            getattr(session.call_plan, "rounds_used", None),
+                            getattr(session.call_plan, "dial_attempts", None),
+                            session.handoff_disabled,
                         )
+                    log.info(
+                        "[TRANSFER] resume session %s (agent=%s): carried %d prior "
+                        "message(s), greeting overridden, history seeded",
+                        session.session_key, session.agent_id, len(_carried),
+                    )
                 # ponytail: helper that closes over `session` so the
                 # caller can `await _enqueue_transcript(item)` instead
                 # of `await lambda item: enqueue_transcript_event(session, item)`.
