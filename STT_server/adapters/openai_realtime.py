@@ -38,6 +38,32 @@ log = logging.getLogger("stt_server")
 
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
 
+# ponytail: the Realtime ids OpenAI still serves, and the ones the
+# operator is allowed to pick. Single source of truth: the agent-row
+# validation, the 4004 fallback chain and the STT catalog test all read
+# this.
+#
+# Membership means "we know this id", so an id that is NOT here is
+# treated as unknown and the adapter falls back immediately rather than
+# round-tripping a 4004. That is deliberate: the two
+# `gpt-4o*-realtime-preview` ids used to live here AFTER OpenAI shut
+# them down, so every agent pointing at one connected, got closed
+# instantly with model_not_found, and the caller heard the greeting
+# followed by silence. Keeping retired ids out is what turns that
+# outage into a one-line self-heal.
+#
+# Only tool-capable models belong here. This product's call transfer is
+# an LLM tool, so a Realtime model without tool support is a silently
+# dead feature. `gpt-realtime-1.5` and `gpt-live-1` are live but are
+# NOT listed until tool support is verified for them.
+_REALTIME_MODEL_CATALOG = frozenset({
+    "gpt-realtime-2.1-mini",
+    "gpt-realtime-2.1",
+    "gpt-realtime-2",
+    # Works today, retires 2027-01-20 in favour of gpt-realtime-2.1.
+    "gpt-realtime",
+})
+
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -301,10 +327,17 @@ async def run_realtime_session(session: CallSession) -> None:
         return
 
     # ponytail: per-agent model only. The agent row's stt_model is the
-    # single source of truth — the FE dropdown now lists exactly the
-    # three Realtime-capable IDs (gpt-realtime, gpt-4o-realtime-preview,
-    # gpt-4o-mini-realtime-preview). If the agent picked something else,
-    # fail loud here so the operator sees which row is misconfigured.
+    # single source of truth — the FE dropdown lists the Realtime-capable
+    # IDs OpenAI still serves. If the agent picked something else, fail
+    # loud here so the operator sees which row is misconfigured.
+    #
+    # This set is ALSO the self-heal switch: an id that is not in it is
+    # treated as unknown, so the code falls back immediately instead of
+    # round-tripping a 4004 to OpenAI. That is what rescues agent rows
+    # still pointing at the retired `gpt-4o*-realtime-preview` ids — they
+    # were here when OpenAI shut those models down, which left every
+    # such call with a working WebSocket that closed instantly and no AI
+    # behind it.
     #
     # Ponytail (Ticket 3 finalization): the single source of truth for
     # provider capabilities lives in
@@ -333,8 +366,8 @@ async def run_realtime_session(session: CallSession) -> None:
     if not model:
         log.error(
             "[REALTIME] session %s has no realtime model. agent.stt_model "
-            "must be one of gpt-realtime / gpt-4o-realtime-preview / "
-            "gpt-4o-mini-realtime-preview (set when editing the agent).",
+            "must be one of gpt-realtime-2.1-mini / gpt-realtime-2.1 / "
+            "gpt-realtime-2 / gpt-realtime (set when editing the agent).",
             session.session_key,
         )
         return
@@ -345,12 +378,14 @@ async def run_realtime_session(session: CallSession) -> None:
     # Validate against the known Realtime catalog. If the agent picked
     # something invalid (legacy field, typo), we don't auto-substitute;
     # we let OpenAI 4004 it and the operator sees the model id in the log.
-    _VALID_REALTIME_MODELS = {
-        "gpt-realtime",
-        "gpt-4o-realtime-preview",
-        "gpt-4o-mini-realtime-preview",
-    }
-    if model not in _VALID_REALTIME_MODELS:
+    #
+    # ponytail: an id that is NOT in the catalog is treated as unknown,
+    # so the chain falls back immediately instead of round-tripping a
+    # 4004. That is what rescues agent rows still pointing at the retired
+    # `gpt-4o*-realtime-preview` ids: they were in this set when OpenAI
+    # shut those models down, which left every such call with a working
+    # WebSocket that closed instantly and no AI behind it.
+    if model not in _REALTIME_MODEL_CATALOG:
         log.warning(
             "[REALTIME] session %s using non-catalog model=%r — OpenAI "
             "will likely reject it. Update the agent's stt_model or the "
@@ -367,7 +402,7 @@ async def run_realtime_session(session: CallSession) -> None:
     # future OpenAI re-release of the same id will resume using it.
     _FALLBACK_MODEL = "gpt-realtime"
     _attempt_chain = [model]
-    if model != _FALLBACK_MODEL and model not in _VALID_REALTIME_MODELS:
+    if model != _FALLBACK_MODEL and model not in _REALTIME_MODEL_CATALOG:
         # Unknown id — fall back immediately instead of round-tripping
         # an error to OpenAI.
         _attempt_chain = [_FALLBACK_MODEL]

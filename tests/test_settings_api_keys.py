@@ -680,13 +680,28 @@ async def test_get_settings_llm_options_route_with_saved_model(client, data_dir)
 
 def _fake_openai_models_response():
     """Mirror what GET https://api.openai.com/v1/models actually returns.
-    Includes a mix of valid realtime IDs and batch transcribe IDs
-    that the previous filter accidentally let through.
+
+    Includes the live realtime family, the two retired
+    `gpt-4o*-realtime-preview` ids OpenAI used to serve, the
+    realtime-named ids that are NOT usable as a voice agent, and the
+    batch transcribe ids the filter has always had to reject.
     """
     return {
         "data": [
             # realtime family — works with /v1/realtime
+            {"id": "gpt-realtime-2.1-mini",        "owned_by": "openai"},
+            {"id": "gpt-realtime-2.1",             "owned_by": "openai"},
+            {"id": "gpt-realtime-2",               "owned_by": "openai"},
+            {"id": "gpt-realtime-1.5",             "owned_by": "openai"},
             {"id": "gpt-realtime",                 "owned_by": "openai"},
+            # "realtime" in the name but NOT a voice agent: translation
+            # and streaming-stt only, no STT->LLM->TTS turn loop, so they
+            # cannot invoke the call-transfer tools this product relies on.
+            {"id": "gpt-realtime-translate",       "owned_by": "openai"},
+            {"id": "gpt-realtime-whisper",         "owned_by": "openai"},
+            {"id": "gpt-live-transcribe",          "owned_by": "openai"},
+            # retired — shut down by OpenAI; kept here so the test
+            # proves they are not offered as if they still worked
             {"id": "gpt-4o-realtime-preview",     "owned_by": "openai"},
             {"id": "gpt-4o-mini-realtime-preview", "owned_by": "openai"},
             # batch transcribe family — would 400 from /v1/realtime
@@ -701,6 +716,48 @@ def _fake_openai_models_response():
     }
 
 
+def test_retired_openai_realtime_models_are_nowhere_in_the_stt_catalog():
+    """Pin the failure that took the voice offline.
+
+    OpenAI retired these Realtime ids (2025-09 and 2026-05). While they
+    were still in the dropdown, picking one produced a call whose
+    WebSocket connected and then closed with model_not_found: the caller
+    heard the greeting and then nothing. The operator had no correct
+    option available.
+
+    Guard all three places an id can reach an operator, so a future
+    catalog refresh cannot reintroduce a dead model.
+    """
+    import pathlib
+
+    import STT_server.services.credentials_resolver as cr
+    from STT_server.adapters import openai_realtime
+
+    retired = ("gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview")
+
+    # 1. the dynamic filter's exclusion set
+    src = pathlib.Path(cr.__file__).read_text(encoding="utf-8")
+    for dead in retired:
+        assert dead in src, f"{dead} must be explicitly excluded by the STT filter"
+
+    # 2. the hardcoded fallback catalog
+    hardcoded = {m["id"] for m in cr._HARDCODED_STT_MODELS["openai"]}
+    for dead in retired:
+        assert dead not in hardcoded, f"{dead} is retired but still in the fallback catalog"
+    assert hardcoded, "the fallback catalog must not be empty"
+
+    # 3. the adapter's valid-model set
+    #    This one is also the self-heal switch: an id that is not in it
+    #    makes the adapter fall back immediately instead of 4004-ing.
+    assert not (set(openai_realtime._REALTIME_MODEL_CATALOG) & set(retired)), (
+        "a retired id in the adapter catalog would keep an agent row "
+        "pointing at a dead model instead of self-healing to the fallback"
+    )
+
+    # and the catalog is not accidentally empty either
+    assert openai_realtime._REALTIME_MODEL_CATALOG & {"gpt-realtime"}
+
+
 def test_list_openai_stt_filters_out_batch_transcribe_models():
     """Regression: the previous filter accepted any model with
     "transcribe" in its name, which let batch-only models
@@ -709,8 +766,8 @@ def test_list_openai_stt_filters_out_batch_transcribe_models():
     rejected it, and the BE silently fell back to gpt-realtime.
 
     Ponytail: the fix is to require "realtime" in the name AND
-    exclude "transcribe". Realtime-compatible = gpt-realtime,
-    gpt-4o-realtime-preview, gpt-4o-mini-realtime-preview.
+    exclude "transcribe" AND exclude the realtime-named ids that are not
+    voice agents (translate / streaming-stt only).
     """
     import urllib.request
     from unittest.mock import patch
@@ -728,10 +785,21 @@ def test_list_openai_stt_filters_out_batch_transcribe_models():
         out = list_provider_models("stt", "openai", api_key="sk-test1234567890abcdefABCDEF")
 
     ids = [m["id"] for m in out["models"]]
-    # Realtime family present.
+    # Live Realtime family present.
+    assert "gpt-realtime-2.1-mini" in ids
+    assert "gpt-realtime-2.1" in ids
+    assert "gpt-realtime-2" in ids
+    assert "gpt-realtime-1.5" in ids
     assert "gpt-realtime" in ids
-    assert "gpt-4o-realtime-preview" in ids
-    assert "gpt-4o-mini-realtime-preview" in ids
+    # "realtime"-named but NOT a voice agent: offering these configures
+    # an agent that cannot hold a conversation or call the transfer
+    # tools, which is a silent feature death.
+    assert "gpt-realtime-translate" not in ids
+    assert "gpt-realtime-whisper" not in ids
+    assert "gpt-live-transcribe" not in ids
+    # Retired models must never be offered as if they still worked.
+    assert "gpt-4o-realtime-preview" not in ids
+    assert "gpt-4o-mini-realtime-preview" not in ids
     # Batch transcribe family excluded.
     assert "gpt-4o-transcribe" not in ids
     assert "gpt-4o-mini-transcribe" not in ids

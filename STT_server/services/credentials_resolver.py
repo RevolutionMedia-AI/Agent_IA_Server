@@ -775,10 +775,22 @@ _HARDCODED_STT_MODELS = {
     # via WebSockets or HTTP chunked" rule in the realtime spec, so
     # they were removed. The agent's stt_model must be one of these
     # Realtime IDs for the openai_realtime adapter to work.
+    # ponytail: fallback used only when the OpenAI /models call fails.
+    # Kept in sync with the live Realtime catalog; the two `*-preview`
+    # ids that used to be here were shut down by OpenAI (the 4o pair in
+    # 2025-09 and 2026-05), so an agent row pointing at one now
+    # reconnects with a dead model and the caller hears silence.
+    #
+    # Only ids OpenAI documents as tool-capable Realtime models are
+    # listed, because this product's call transfer is an LLM tool: if the
+    # model cannot call tools, the handoff feature is silently dead.
+    # `gpt-realtime-1.5` and `gpt-live-1` are live but are NOT listed
+    # until someone verifies tool support for them.
     "openai": [
-        {"id": "gpt-realtime",                 "name": "GPT Realtime",                  "description": "OpenAI's latest GA realtime model (audio + text, low latency)"},
-        {"id": "gpt-4o-realtime-preview",     "name": "GPT-4o Realtime Preview",       "description": "gpt-4o class audio + text Realtime API (preview)"},
-        {"id": "gpt-4o-mini-realtime-preview", "name": "GPT-4o-mini Realtime Preview", "description": "Smaller / cheaper Realtime preview"},
+        {"id": "gpt-realtime-2.1-mini", "name": "GPT Realtime 2.1 Mini", "description": "Current Realtime with tool use, cheapest of the 2.1 family"},
+        {"id": "gpt-realtime-2.1",      "name": "GPT Realtime 2.1",      "description": "Current Realtime flagship with tool use"},
+        {"id": "gpt-realtime-2",        "name": "GPT Realtime 2",        "description": "Realtime 2 with tool use"},
+        {"id": "gpt-realtime",          "name": "GPT Realtime",          "description": "Previous GA Realtime. Works today, retires 2027-01-20"},
     ],
     # ponytail: Rime STT removed entirely. Out of spec.
     "inworld": [
@@ -1490,12 +1502,41 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 # tightened this to drop batch transcribe; see its
                 # message. The matching LLM / TTS filters for OpenAI
                 # live in their own `if service == ...` blocks above.
+                #
+                # ponytail: the "realtime in the name" heuristic is too
+                # loose in two different ways, both fixed here by id.
+                #
+                # (a) Live but not a VOICE AGENT. These cannot run the
+                #     STT->LLM->TTS turn loop, so an agent pointed at one
+                #     cannot hold a conversation or invoke the
+                #     call-transfer tools this product depends on.
+                # (b) RETIRED. OpenAI shuts Realtime models down without
+                #     warning and keeps answering /v1/models from stale
+                #     caches, so "the provider didn't list it" is not a
+                #     guarantee we can rely on. Offering a dead id is
+                #     what produced a call with a working WebSocket
+                #     that closed instantly and no AI behind it: the
+                #     greeting played, then silence.
+                #
+                # Listed explicitly so the next catalog refresh cannot
+                # quietly reintroduce either group.
+                _NOT_OFFERED_AS_STT = (
+                    # (a) realtime-named, not a voice agent
+                    "gpt-realtime-translate",
+                    "gpt-realtime-whisper",
+                    "gpt-live-transcribe",
+                    "gpt-live-transcribe-mini",
+                    # (b) retired by OpenAI
+                    "gpt-4o-realtime-preview",
+                    "gpt-4o-mini-realtime-preview",
+                )
                 if creds:
                     try:
                         models = _fetch_openai_models(creds)
                         stt = [m for m in models
                                if "realtime" in m["id"].lower()
-                               and "transcribe" not in m["id"].lower()]
+                               and "transcribe" not in m["id"].lower()
+                               and m["id"].lower() not in _NOT_OFFERED_AS_STT]
                         if stt:
                             return {"models": stt}
                     except Exception:
