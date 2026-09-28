@@ -1780,40 +1780,49 @@ async def media_stream(ws: WebSocket) -> None:
                                 "Díselo brevemente al cliente y sigue ayudando. "
                                 "NO invoques de inmediato otra herramienta de transferencia."
                             )
-                    _carried = pop_handoff_history(session.call_sid)
-                    session.history = _carried + [
-                        {"role": "system", "content": _note}
-                    ]
-                    # ponytail: the loop counters and the sticky disabled
-                    # flag come back on the <Stream> so the tool executor
-                    # can refuse a further handoff as a real guard. The
-                    # prompt note above is a courtesy, not the guard.
-                    from STT_server.services.call_plan import open_call_plan
-                    _sealed_plan = (
-                        custom_params.get("call_plan")
-                        if isinstance(custom_params, dict) else None
-                    )
-                    session.call_plan = open_call_plan(
-                        _sealed_plan, session.call_sid or "",
-                    )
-                    session.handoff_disabled = bool(
-                        (custom_params.get("handoff_disabled")
-                         if isinstance(custom_params, dict) else None)
-                    ) or bool(getattr(session.call_plan, "handoff_disabled", False))
-                    if session.call_plan is not None or session.handoff_disabled:
-                        log.info(
-                            "[TRANSFER] resume %s: plan=%s rounds=%s attempts=%s disabled=%s",
-                            session.session_key,
-                            session.call_plan is not None,
-                            getattr(session.call_plan, "rounds_used", None),
-                            getattr(session.call_plan, "dial_attempts", None),
-                            session.handoff_disabled,
+                        # ponytail: this MUST stay inside `if _resume:`. An
+                        # earlier revision dedented it by one level, so a
+                        # NORMAL call (no transfer_resume) fell straight
+                        # through to it and raised UnboundLocalError on
+                        # `_note` — which killed every inbound call in
+                        # production with "hubo un problema de
+                        # configuracion". No test caught it because the
+                        # failure needs the real start handler.
+                        _carried = pop_handoff_history(session.call_sid)
+                        session.history = _carried + [
+                            {"role": "system", "content": _note}
+                        ]
+                        # ponytail: the loop counters and the sticky
+                        # disabled flag come back on the <Stream> so the
+                        # tool executor can refuse a further handoff as a
+                        # real guard. The prompt note above is a
+                        # courtesy, not the guard.
+                        from STT_server.services.call_plan import open_call_plan
+                        _sealed_plan = (
+                            custom_params.get("call_plan")
+                            if isinstance(custom_params, dict) else None
                         )
-                    log.info(
-                        "[TRANSFER] resume session %s (agent=%s): carried %d prior "
-                        "message(s), greeting overridden, history seeded",
-                        session.session_key, session.agent_id, len(_carried),
-                    )
+                        session.call_plan = open_call_plan(
+                            _sealed_plan, session.call_sid or "",
+                        )
+                        session.handoff_disabled = bool(
+                            (custom_params.get("handoff_disabled")
+                             if isinstance(custom_params, dict) else None)
+                        ) or bool(getattr(session.call_plan, "handoff_disabled", False))
+                        if session.call_plan is not None or session.handoff_disabled:
+                            log.info(
+                                "[TRANSFER] resume %s: plan=%s rounds=%s attempts=%s disabled=%s",
+                                session.session_key,
+                                session.call_plan is not None,
+                                getattr(session.call_plan, "rounds_used", None),
+                                getattr(session.call_plan, "dial_attempts", None),
+                                session.handoff_disabled,
+                            )
+                        log.info(
+                            "[TRANSFER] resume session %s (agent=%s): carried %d prior "
+                            "message(s), greeting overridden, history seeded",
+                            session.session_key, session.agent_id, len(_carried),
+                        )
                 # ponytail: helper that closes over `session` so the
                 # caller can `await _enqueue_transcript(item)` instead
                 # of `await lambda item: enqueue_transcript_event(session, item)`.

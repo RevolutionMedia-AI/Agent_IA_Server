@@ -843,6 +843,81 @@ def test_max_plan_url_stays_inside_the_internal_budget():
     )
 
 
+def test_start_handler_resume_block_is_guarded_by_if_resume():
+    """Regression guard for a bug that killed EVERY inbound call in
+    production.
+
+    The media-stream start handler builds a `transfer_resume` branch: a
+    failure note, the carried pre-transfer history, and the sealed plan
+    read off the <Stream>. All of it is meaningless — and was crashing —
+    on a NORMAL call that has no transfer_resume.
+
+    A previous revision dedented the body one level, so a plain call fell
+    through to it and raised UnboundLocalError on `_note`. The caller got
+    "hubo un problema de configuracion" and the AI never ran.
+
+    Asserted structurally, because reproducing it needs the whole
+    WebSocket handshake: every name the resume branch introduces must be
+    first bound INSIDE the `if _resume:` block, never used after it.
+    """
+    import ast
+    import pathlib
+
+    import STT_server.STT_Server as server_mod
+
+    path = pathlib.Path(server_mod.__file__).resolve()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    handler = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "media_stream":
+            handler = node
+            break
+    assert handler is not None, "media_stream handler not found"
+
+    # find the `if _resume:` statement
+    resume_if = None
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (isinstance(test, ast.Name) and test.id == "_resume"):
+            resume_if = node
+            break
+    assert resume_if is not None, "the if _resume: branch is gone"
+    lo = resume_if.lineno
+    hi = resume_if.end_lineno or resume_if.lineno
+
+    # every name the branch introduces must be bound inside it
+    bound_inside = set()
+    for stmt in resume_if.body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound_inside.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    bound_inside.add(a.asname or a.name)
+    assert {"_note", "_carried"} <= bound_inside, (
+        "the failure note and the carried history must be created inside "
+        f"the branch; found {sorted(bound_inside)}"
+    )
+
+    # and none of them may be READ outside it. This is the exact
+    # production failure: the read sat one dedent too high, so every
+    # normal call hit it with `_note` unbound.
+    for name in ("_note", "_carried"):
+        escaped = sorted({
+            n.lineno for n in ast.walk(handler)
+            if isinstance(n, ast.Name) and n.id == name
+            and isinstance(n.ctx, ast.Load)
+            and not (lo <= n.lineno <= hi)
+        })
+        assert not escaped, (
+            f"{name} is read at line(s) {escaped}, OUTSIDE `if _resume:` "
+            f"(lines {lo}-{hi}). On a normal call that name is unbound and "
+            "the call dies with UnboundLocalError."
+        )
+
+
 if __name__ == "__main__":
     print("run with: python -m pytest tests/test_routing_http.py")
     for _name, _fn in sorted(globals().items()):
