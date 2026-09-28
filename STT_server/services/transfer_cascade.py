@@ -156,6 +156,20 @@ def connect_stream_twiml(
     """
 
 
+def hangup_twiml() -> str:
+    """Terminate the call: the original caller is gone.
+
+    ponytail: this exists because the AI stream is the WRONG answer for
+    a departed caller. Both callback routes used to branch only on
+    "dial vs anything else", so an END_CALL decision fell through to
+    <Connect><Stream> — opening a WebSocket and talking to dead air,
+    billing the call until the idle monitor noticed. Emitting an empty
+    or malformed body is not an option either: Twilio retries.
+    <Hangup/> is the explicit, correct terminal TwiML.
+    """
+    return "<Response><Hangup/></Response>"
+
+
 def cascade_action_url(
     public_url: str,
     agent_id: str,

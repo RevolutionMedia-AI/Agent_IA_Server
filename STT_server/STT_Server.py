@@ -695,8 +695,9 @@ async def voice(
     # purpose; use it.
     from STT_server.services.transfer_cascade import (
         parse_cascade_with_ids, resolve_cascade_steps,
-        dial_twiml, connect_stream_twiml, cascade_action_url,
-        PHASE_PRE_AI, PHASE_POST_AI, ACTION_DIAL, decide_routing,
+        dial_twiml, connect_stream_twiml, cascade_action_url, hangup_twiml,
+        PHASE_PRE_AI, PHASE_POST_AI, ACTION_DIAL, ACTION_END_CALL,
+        decide_routing,
         plan_from_steps, advance_plan, caller_alive_from_call_status,
     )
     from STT_server.services.call_plan import (
@@ -863,8 +864,13 @@ async def voice_cascade(
 
     from STT_server.services.transfer_cascade import (
         parse_cascade_with_ids, resolve_cascade_steps,
-        dial_twiml, connect_stream_twiml, cascade_action_url,
-        PHASE_PRE_AI, ACTION_DIAL, decide_routing,
+        dial_twiml, connect_stream_twiml, cascade_action_url, hangup_twiml,
+        PHASE_PRE_AI, PHASE_POST_AI, ACTION_DIAL, ACTION_END_CALL,
+        decide_routing, plan_from_steps, advance_plan,
+        caller_alive_from_call_status,
+    )
+    from STT_server.services.call_plan import (
+        seal_call_plan, open_call_plan, routing_limits as _routing_limits,
     )
     from STT_server.db_agents import get_agent as _get_agent
     try:
@@ -937,15 +943,34 @@ async def voice_cascade(
         handoff_disabled=_plan.handoff_disabled if _plan else False,
         limits=_routing_limits(),
     )
-    if _decision.action == ACTION_DIAL:
-        # Remaining humans after this Dial are _decision.rest; the AI is
-        # the fallback once they run out. chosen_index keeps the `step`
-        # arithmetic correct even if a malformed entry was skipped.
-        _next_step = idx + _decision.chosen_index + 1
-        _next_dest = (
-            _pending[_decision.chosen_index + 1].destination
-            if _decision.chosen_index + 1 < len(_pending) else "AI"
+    if _decision.action == ACTION_END_CALL:
+        # ponytail: the caller is gone (terminal CallStatus). Do NOT open
+        # a stream — that bills a WebSocket talking to dead air until the
+        # idle monitor fires. Explicit <Hangup/>.
+        log.warning(
+            "[VOICE] cascade ended for CallSid=%s agent=%s DialStatus=%s "
+            "caller_alive=False reason=%s — hanging up",
+            call_sid_log or "?", agent_id, status or "?", _decision.reason,
         )
+        return Response(content=hangup_twiml(), media_type="application/xml")
+    if _decision.action == ACTION_DIAL:
+        _next_step = idx + _decision.chosen_index + 1
+        # ponytail: _pending is RoutingStep objects when it came from the
+        # sealed plan, and plain dicts on the legacy live-config path.
+        # Read the destination without caring which, or the legacy path
+        # dies on AttributeError and takes the call with it.
+        _nxt_raw = (
+            _pending[_decision.chosen_index + 1]
+            if _decision.chosen_index + 1 < len(_pending) else None
+        )
+        if _nxt_raw is None:
+            _next_dest = "AI"
+        else:
+            _next_dest = (
+                getattr(_nxt_raw, "destination", None)
+                or (_nxt_raw.get("destination") if isinstance(_nxt_raw, dict) else None)
+                or "AI"
+            )
         _next_plan = advance_plan(
             _plan or plan_from_steps(PHASE_PRE_AI, _pending), _decision,
         )
@@ -1065,8 +1090,8 @@ async def voice_transfer_fallback(
 
     from STT_server.services.transfer_cascade import (
         dial_twiml, connect_stream_twiml, transfer_fallback_url,
-        build_transfer_chain,
-        PHASE_POST_AI, ACTION_DIAL, decide_routing,
+        build_transfer_chain, hangup_twiml,
+        PHASE_POST_AI, ACTION_DIAL, ACTION_END_CALL, decide_routing,
         plan_from_steps, advance_plan, caller_alive_from_call_status,
     )
     from STT_server.services.call_plan import (
@@ -1121,6 +1146,15 @@ async def voice_transfer_fallback(
         handoff_disabled=_plan.handoff_disabled if _plan else False,
         limits=_routing_limits(),
     )
+    if _decision.action == ACTION_END_CALL:
+        # ponytail: same reason as the cascade — a departed caller must
+        # not get a <Connect><Stream>. See hangup_twiml().
+        log.warning(
+            "[VOICE] transfer ended for CallSid=%s agent=%s DialStatus=%s "
+            "caller_alive=False reason=%s — hanging up",
+            call_sid_log2 or "?", agent_id, status or "?", _decision.reason,
+        )
+        return Response(content=hangup_twiml(), media_type="application/xml")
     if _decision.action == ACTION_DIAL:
         _rest = _decision.rest
         _after = [
