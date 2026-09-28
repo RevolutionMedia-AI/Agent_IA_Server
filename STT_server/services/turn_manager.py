@@ -57,6 +57,7 @@ from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
 from STT_server.services.tool_executor import execute_tool, execute_call_transfer, record_tool_result
+from STT_server.services.session_runtime import stash_handoff_history
 from STT_server.domain.tool import TOOL_KIND_CALL_TRANSFER
 from STT_server.services._instrumentation import Stages
 from STT_server.services.wait_signals import mark_stage as _mark_stage
@@ -605,6 +606,15 @@ async def _stream_llm_with_tools(
                             f"End this turn politely."
                         ),
                     })
+                    # ponytail: preserve the conversation across the
+                    # handoff. Our WS dies the moment Twilio starts the
+                    # <Dial> and cleanup_session() pops this session
+                    # along with its history. If the whole chain goes
+                    # unanswered the call comes BACK to the AI, which
+                    # must not greet a caller who already gave their
+                    # name and order as a stranger. Stashed here, popped
+                    # in the media-stream start handler on transfer_resume.
+                    stash_handoff_history(call_sid, session.history)
                     # ponytail: do NOT mark the session closed (the old
                     # code did). Twilio tears down our WebSocket when
                     # the Dial starts; either a human answers (call

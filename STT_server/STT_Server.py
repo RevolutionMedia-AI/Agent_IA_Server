@@ -47,7 +47,7 @@ from STT_server.services.common import require_debug_endpoints
 from STT_server.services._instrumentation import Stages
 from STT_server.services.reconnect import BackoffPolicy, with_backoff
 from STT_server.services.playback_service import playback_loop
-from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, monitor_max_call_duration, register_session, track_task
+from STT_server.services.session_runtime import cleanup_session, monitor_idle_silence, monitor_max_call_duration, pop_handoff_history, register_session, track_task
 from STT_server.services.turn_manager import announce_stt_failure_once, enqueue_transcript_event, process_transcripts
 from STT_server.services.wait_signals import set_stream_ready
 
@@ -1590,12 +1590,14 @@ async def media_stream(ws: WebSocket) -> None:
                     # ponytail: transfer-chain resume. This stream is the
                     # fallback tail of a transfer chain (nobody answered
                     # the Dialed numbers). Same callSid as the dead
-                    # session, so sessions[call_sid] is simply
-                    # overwritten on register — no surgery. Override the
-                    # greeting (replaying "hello" mid-call is absurd)
-                    # and seed a history note so the LLM knows the
-                    # handoff failed and keeps helping instead of
-                    # re-transferring in a loop.
+                    # session — which cleanup_session() already popped, so
+                    # the pre-transfer conversation lives in the handoff
+                    # stash, NOT in `sessions`. Pull it back in before the
+                    # failure note: the AI must know what the caller
+                    # already said, not merely that a transfer failed.
+                    # Then override the greeting (replaying "hello"
+                    # mid-call is absurd) and seed the note so the LLM
+                    # keeps helping instead of re-transferring in a loop.
                     _resume = (custom_params.get("transfer_resume") if isinstance(custom_params, dict) else None)
                     if _resume:
                         _lang = (session.preferred_language or "es").strip().lower()
@@ -1621,13 +1623,14 @@ async def media_stream(ws: WebSocket) -> None:
                                 "Díselo brevemente al cliente y sigue ayudando. "
                                 "NO invoques de inmediato otra herramienta de transferencia."
                             )
-                        try:
-                            session.history.append({"role": "system", "content": _note})
-                        except Exception:
-                            session.history = [{"role": "system", "content": _note}]
+                        _carried = pop_handoff_history(session.call_sid)
+                        session.history = _carried + [
+                            {"role": "system", "content": _note}
+                        ]
                         log.info(
-                            "[TRANSFER] resume session %s (agent=%s): greeting overridden, history seeded",
-                            session.session_key, session.agent_id,
+                            "[TRANSFER] resume session %s (agent=%s): carried %d prior "
+                            "message(s), greeting overridden, history seeded",
+                            session.session_key, session.agent_id, len(_carried),
                         )
                 # ponytail: helper that closes over `session` so the
                 # caller can `await _enqueue_transcript(item)` instead

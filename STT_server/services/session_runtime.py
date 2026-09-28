@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from collections import OrderedDict
 
 from fastapi import WebSocket
 
@@ -17,6 +18,62 @@ from STT_server.services.usage_store import has_user_stored_key, record_call
 log = logging.getLogger("stt_server")
 
 sessions: dict[str, CallSession] = {}
+
+
+# ponytail: transfer-chain handoff memory.
+#
+# When the AI hands the call to a <Dial> action, our WebSocket dies and
+# cleanup_session() pops the session from `sessions` — taking the
+# conversation history with it. If the whole chain goes unanswered,
+# Twilio re-opens a stream for the SAME call_sid and the returning AI
+# starts from zero: it greets a caller who already gave their name and
+# order number, knowing only "a transfer failed".
+#
+# Stash the history at handoff time, pop it when the chain returns.
+# Bounded + TTL because a human who DOES answer never resumes, so
+# nothing ever pops that entry — without a cap, one orphaned
+# conversation accumulates per successful transfer.
+#
+# No lock: every caller is same-loop async code (turn_manager and the
+# media-stream start handler), so dict ops never interleave mid-statement.
+HANDOFF_MEMORY_MAX = 64
+HANDOFF_MEMORY_TTL_SEC = 300.0
+_handoff_memory: "OrderedDict[str, tuple[float, list]]" = OrderedDict()
+
+
+def _expire_handoff_memory(now: float) -> None:
+    """Drop entries past the TTL. Keys collected first: deleting while
+    iterating an OrderedDict raises RuntimeError."""
+    cutoff = now - HANDOFF_MEMORY_TTL_SEC
+    for key in [k for k, (ts, _) in _handoff_memory.items() if ts < cutoff]:
+        del _handoff_memory[key]
+
+
+def stash_handoff_history(call_sid: str | None, history: list | None) -> None:
+    """Preserve the conversation across a transfer-chain handoff.
+
+    Called from turn_manager right after a call_transfer tool hands the
+    call to Twilio's <Dial>. A no-op without a call_sid (nothing to key
+    the resume by) or without history (nothing worth keeping).
+    """
+    if not call_sid or not history:
+        return
+    now = time.monotonic()
+    _expire_handoff_memory(now)
+    _handoff_memory[call_sid] = (now, list(history))
+    _handoff_memory.move_to_end(call_sid)
+    while len(_handoff_memory) > HANDOFF_MEMORY_MAX:
+        _handoff_memory.popitem(last=False)
+
+
+def pop_handoff_history(call_sid: str | None) -> list[dict]:
+    """Recover the stashed conversation, or [] when there is none."""
+    if not call_sid:
+        return []
+    now = time.monotonic()
+    _expire_handoff_memory(now)
+    entry = _handoff_memory.pop(call_sid, None)
+    return list(entry[1]) if entry else []
 
 
 async def _hangup_twilio_call(session: CallSession) -> None:
