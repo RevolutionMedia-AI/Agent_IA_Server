@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+
+from STT_server.utils.iso import iso_utc
 from pathlib import Path
 from typing import Optional
 
@@ -55,22 +57,10 @@ def _row_to_dict(row: dict, *, include_secrets: bool = False) -> dict:
         "name": row.get("name") or "",
         "account_sid_last4": row.get("account_sid_last4") or "",
         "status": row.get("status") or "unknown",
-        "last_tested_at": (
-            row["last_tested_at"].isoformat() + "Z"
-            if hasattr(row.get("last_tested_at"), "isoformat")
-            else row.get("last_tested_at")
-        ),
+        "last_tested_at": iso_utc(row.get("last_tested_at")),
         "last_test_message": row.get("last_test_message") or "",
-        "created_at": (
-            row["created_at"].isoformat() + "Z"
-            if hasattr(row.get("created_at"), "isoformat")
-            else row.get("created_at")
-        ),
-        "updated_at": (
-            row["updated_at"].isoformat() + "Z"
-            if hasattr(row.get("updated_at"), "isoformat")
-            else row.get("updated_at")
-        ),
+        "created_at": iso_utc(row.get("created_at")),
+        "updated_at": iso_utc(row.get("updated_at")),
     }
     if include_secrets:
         out["account_sid"] = decrypt_value(row["account_sid_encrypted"]) if row.get("account_sid_encrypted") else ""

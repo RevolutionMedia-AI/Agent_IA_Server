@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from STT_server.db import get_conn, is_postgres
+from STT_server.utils.iso import iso_utc
 from STT_server.utils.safe_path import UnsafePathError, sanitize_id
 
 log = logging.getLogger("stt_server.db_settings")
@@ -36,9 +37,7 @@ def _row_to_settings(row: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             out["notifications"] = {}
     for k in ("updated_at",):
-        v = out.get(k)
-        if hasattr(v, "isoformat"):
-            out[k] = v.isoformat() + "Z"
+        out[k] = iso_utc(out.get(k))
     return out
 
 

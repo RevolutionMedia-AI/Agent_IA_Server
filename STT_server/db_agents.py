@@ -58,6 +58,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+from STT_server.utils.iso import iso_utc
 import uuid
 from pathlib import Path
 
@@ -108,9 +110,7 @@ def _row_to_agent(row: dict) -> dict:
     # ponytail: the FE reads "created_at" as ISO string. psycopg2 hands
     # us a datetime; convert so the FE doesn't choke.
     for k in ("created_at", "updated_at"):
-        v = out.get(k)
-        if hasattr(v, "isoformat"):
-            out[k] = v.isoformat() + "Z"
+        out[k] = iso_utc(out.get(k))
     # ponytail: transfer_cascade (021) is JSONB. psycopg2+RealDictCursor
     # already parses it to a list; the JSON-file backend stores
     # whatever the FE sent. Normalize both to a plain list so the

@@ -31,6 +31,7 @@ import uuid
 from pathlib import Path
 
 from STT_server.db import get_conn, is_postgres
+from STT_server.utils.iso import iso_utc
 
 log = logging.getLogger("stt_server.db_tools")
 
@@ -295,13 +296,9 @@ def _row_to_tool(row: dict) -> dict:
     for k in ("last_tested_at", "last_test_error_at",
               "last_invoked_at", "last_invocation_error_at",
               "created_at", "updated_at"):
-        if hasattr(out.get(k), "isoformat"):
-            # ponytail: same double-suffix bug as db_integrations — a
-            # tz-aware isoformat() already carries "+00:00", and the
-            # extra "Z" made JS Date.parse return NaN, so every tool
-            # card read "Tested never". Only add "Z" for naive values.
-            iso = out[k].isoformat()
-            out[k] = iso if iso.endswith("Z") or iso[-6:-5] in ("+", "-") else iso + "Z"
+        # ponytail: same double-suffix bug as db_integrations, now fixed
+        # once for every row mapper via utils.iso.iso_utc.
+        out[k] = iso_utc(out.get(k))
     # ponytail: ring_timeout_sec (023) rides the EXTRA cols — coerce
     # legacy/NULL rows to the default so the executor never defends
     # against None mid-call.

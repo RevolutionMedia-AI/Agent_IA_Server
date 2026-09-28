@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+
+from STT_server.utils.iso import iso_utc
 import uuid
 from pathlib import Path
 
@@ -57,9 +59,7 @@ def _row_to_number(row: dict) -> dict:
         return None
     out = dict(row)
     for k in ("created_at", "updated_at"):
-        v = out.get(k)
-        if hasattr(v, "isoformat"):
-            out[k] = v.isoformat() + "Z"
+        out[k] = iso_utc(out.get(k))
     return out
 
 

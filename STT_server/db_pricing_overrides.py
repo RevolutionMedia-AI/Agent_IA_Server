@@ -15,6 +15,8 @@ import json
 import logging
 from typing import Optional
 
+from STT_server.utils.iso import iso_utc
+
 from STT_server.db import get_conn
 
 log = logging.getLogger("stt_server.db_pricing_overrides")
@@ -24,8 +26,7 @@ def _row_to_override(row: dict) -> dict:
     if row is None:
         return None
     out = dict(row)
-    if hasattr(out.get("updated_at"), "isoformat"):
-        out["updated_at"] = out["updated_at"].isoformat() + "Z"
+    out["updated_at"] = iso_utc(out.get("updated_at"))
     return out
 
 
