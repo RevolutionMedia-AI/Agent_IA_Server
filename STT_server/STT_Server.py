@@ -186,7 +186,7 @@ def _resolve_twilio_credential(called_to, account_sid=None):
     return token, sid, source, row_id
 
 
-def _resume_copy(language):
+def _resume_copy(language, custom=None):
     """What the agent says when a handoff chain ends with nobody home.
 
     Returns (welcome_message, system_note). Extracted from the media-stream
@@ -196,12 +196,37 @@ def _resume_copy(language):
     one 25-line block, and the whole complaint was that a fully Spanish
     agent got the English one.
 
+    `custom` is agents.transfer_unavailable_message. It matters that this
+    goes into the NOTE, not only into welcome_message: on the resume path
+    the model is already connected and it is the model's own reply the
+    caller hears, so a greeting that is never played cannot be the control
+    surface. Production heard "Sorry we cant connect your call, i can help
+    u?" — the model paraphrasing an English note in a Spanish voice.
+
     Spanish is the default: the platform default is `es` (config
     DEFAULT_CALL_LANGUAGE, tenants, sessions), so an unset language must
     not resolve to English here.
     """
     from STT_server.domain.language import normalize_supported_language
     lang = normalize_supported_language(language)
+    if custom and custom.strip():
+        line = custom.strip()
+        if lang == "en":
+            note = (
+                "System note: you just tried to transfer this call, but nobody "
+                "answered and the call returned to you. Tell the caller "
+                f"exactly this, word for word, and nothing else: {line} Then "
+                "continue helping. Do NOT immediately re-invoke a transfer tool."
+            )
+        else:
+            note = (
+                "Nota del sistema: acabas de intentar transferir esta llamada, "
+                "pero nadie contestó y la llamada volvió contigo. Dile al "
+                f"cliente exactamente esto, palabra por palabra y nada más: "
+                f"{line} Después sigue ayudándolo. NO invoques de inmediato "
+                "otra herramienta de transferencia."
+            )
+        return line, note
     if lang == "en":
         return (
             "Sorry, nobody answered the transfer. How else can I help you?",
@@ -1821,7 +1846,12 @@ async def media_stream(ws: WebSocket) -> None:
                     _resume = (custom_params.get("transfer_resume") if isinstance(custom_params, dict) else None)
                     if _resume:
                         session.welcome_message, _note = _resume_copy(
-                            session.preferred_language
+                            session.preferred_language,
+                            # ponytail: the operator's own sentence, if set
+                            # (migration 025). agent_cfg is bound to None
+                            # before the lookup above and never reassigned
+                            # after, so this is a safe closure read.
+                            (agent_cfg or {}).get("transfer_unavailable_message"),
                         )
                         # ponytail: this MUST stay inside `if _resume:`. An
                         # earlier revision dedented it by one level, so a

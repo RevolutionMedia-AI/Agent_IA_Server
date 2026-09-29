@@ -89,5 +89,43 @@ def test_legacy_display_word_normalizes_to_a_code():
     assert normalize_supported_language("Spanish") == "es"
 
 
+# ── the operator's own sentence (migration 025) ─────────────────────────────
+
+def test_operator_message_is_spoken_verbatim():
+    """The whole point of the field: the operator's words, unchanged."""
+    line = "Perdón, ya no hay nadie en la oficina. ¿Le dejo su mensaje?"
+    welcome, note = srv._resume_copy("es", line)
+    assert welcome == line
+    assert line in note
+
+
+def test_operator_message_reaches_the_note_in_the_right_language():
+    """The note is what the live model actually acts on — welcome_message
+    is not spoken on this path. An English note with a Spanish sentence
+    makes the model paraphrase back into English."""
+    line = "Perdón, ya no hay nadie en la oficina."
+    _, note_es = srv._resume_copy("es", line)
+    _, note_en = srv._resume_copy("en", line)
+    assert "exactamente esto" in note_es
+    assert "word for word" in note_en
+    # both still forbid the re-transfer loop
+    assert "NO invoques" in note_es
+    assert "Do NOT" in note_en
+
+
+@pytest.mark.parametrize("blank", [None, "", "   ", "\n\t "])
+def test_blank_operator_message_falls_back_to_the_built_in_copy(blank):
+    """Empty means 'use the default in my language', not 'say nothing'."""
+    assert srv._resume_copy("es", blank)[0].startswith("Disculpa")
+    assert srv._resume_copy("en", blank)[0].startswith("Sorry")
+
+
+def test_the_field_accepts_and_caps_the_message():
+    assert AgentCreate(name="a", transfer_unavailable_message="hola").transfer_unavailable_message == "hola"
+    assert AgentUpdate(transfer_unavailable_message="hola").transfer_unavailable_message == "hola"
+    with pytest.raises(Exception):
+        AgentCreate(name="a", transfer_unavailable_message="x" * 1001)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -91,6 +91,7 @@ _AGENT_COLS = (
     "transfer_cascade, "
     "transfer_chain, "
     "transfer_enabled, "
+    "transfer_unavailable_message, "
     "calls, perf, created_at, updated_at"
 )
 
@@ -224,7 +225,8 @@ def create_agent(user_id: str, payload: dict) -> dict:
             "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
             "idle_subsequent_timeout_sec", "idle_final_message",
             "idle_disconnect_timeout_sec", "idle_max_attempts",
-            "transfer_cascade", "transfer_chain", "transfer_enabled"]
+            "transfer_cascade", "transfer_chain", "transfer_enabled",
+            "transfer_unavailable_message"]
     # ponytail: transfer_cascade + transfer_chain are the JSONB columns
     # on this table — both need an explicit ::jsonb cast, the rest
     # stay plain %s.
@@ -258,7 +260,8 @@ def create_agent(user_id: str, payload: dict) -> dict:
               json.dumps(payload.get("transfer_chain") or []),
               # ponytail: None (FE didn't send) = default on. Only an
               # explicit false disables handoff.
-              True if payload.get("transfer_enabled") is None else bool(payload.get("transfer_enabled"))]
+              True if payload.get("transfer_enabled") is None else bool(payload.get("transfer_enabled")),
+              payload.get("transfer_unavailable_message")]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -307,7 +310,8 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                      "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
                      "idle_subsequent_timeout_sec", "idle_final_message",
                       "idle_disconnect_timeout_sec", "idle_max_attempts",
-                      "transfer_cascade", "transfer_chain", "transfer_enabled"}:
+                     "transfer_cascade", "transfer_chain", "transfer_enabled",
+                     "transfer_unavailable_message"}:
             continue
         if k in ("transfer_cascade", "transfer_chain"):
             # ponytail: same ::jsonb cast as the INSERT above. Accept

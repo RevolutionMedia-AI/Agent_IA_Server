@@ -548,9 +548,17 @@ class AgentCreate(BaseModel):
     # None = default on. Explicit false = Full-AI: no transfer
     # tools reach the LLM, no chain runs.
     transfer_enabled: Optional[bool] = None
+    # ponytail: what the agent says when a handoff chain runs out of
+    # answers. The AI is live at that moment, so the caller hears the
+    # model's reply and not a played greeting — this text is injected
+    # into the system note as "say exactly this". None = built-in copy in
+    # agents.language. See migration 025.
+    transfer_unavailable_message: Optional[str] = Field(
+        None, max_length=1000
+    )
     # ponytail: unified handoff order (canonical config). List of nodes:
     # {"type":"ai"} | {"type":"transfer_tool","tool_id":...} |
-    # {"type":"phone_destination","destination":...,"timeout_sec":...}.
+    # {"type":"phone_destination","destination":..., "timeout_sec":...}.
     # The handler splits it into transfer_cascade + transfer_chain
     # atomically. Send this XOR the two halves, never both.
     handoff_order: Optional[list] = None
@@ -622,6 +630,10 @@ class AgentUpdate(BaseModel):
     transfer_chain: Optional[list] = None
     # ponytail: master handoff switch — see AgentCreate above.
     transfer_enabled: Optional[bool] = None
+    # ponytail: see AgentCreate. None = built-in copy in agents.language.
+    transfer_unavailable_message: Optional[str] = Field(
+        None, max_length=1000
+    )
     # ponytail: unified handoff order — see AgentCreate above.
     handoff_order: Optional[list] = None
 
