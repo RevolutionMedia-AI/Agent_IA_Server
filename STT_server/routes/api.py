@@ -433,30 +433,47 @@ def health() -> dict:
 
 # ---------- Pydantic schemas ----------
 
-# ponytail: the agent's `language` column shipped with DEFAULT 'English'
-# and the create schema defaulted to the same, while the rest of the
-# platform defaults to Spanish (config.DEFAULT_CALL_LANGUAGE, tenants,
-# sessions). The two words — not the value — are what broke: the column
-# stored "English"/"Spanish" display strings while every consumer expects
-# a canonical "en"/"es" code, and nothing ever normalized between them.
-# Production symptom: an agent whose prompt, greeting and TTS voice were
-# all Spanish came back from a failed handoff chain speaking English,
-# because the resume copy picks its language from this one field.
+# ponytail: agents.language is a DISPLAY enum, not a code. 001_schema.sql
+# declares
+#     language TEXT NOT NULL DEFAULT 'English'
+#               CHECK (language IN ('English', 'Spanish', 'Bilingual'))
+# while tenants.preferred_language and call_sessions.preferred_language are
+# CODES: CHECK (preferred_language IN ('en', 'es')). Two contracts, one
+# schema. A previous revision of this file "canonicalized" every write to
+# 'en'/'es' and the next PUT /agents/{id} died in production with
+#     psycopg2.errors.CheckViolation: new row for relation "agents"
+#     violates check constraint "agents_language_check"
+# The local suite could not see it: db_agents falls back to a JSON file when
+# DATABASE_URL is unset, so there is no CHECK locally. tests/
+# test_agent_language_column_contract.py now parses the DDL and asserts
+# every value this function can emit is inside the CHECK, so the two files
+# cannot drift again.
 #
-# `Bilingual` was offered in the create wizard but is not implementable:
-# one call has one TTS language and the resume copy has exactly two
-# branches. It is gone from the toggle rather than left as a silent lie.
+# So: accept codes AND words on the way in (the FE sends 'en'/'es', older
+# clients send 'English'/'Spanish'), store the word the constraint allows,
+# and normalize to a code on the way out — see the read path in
+# STT_Server, which is what actually fixed the English resume copy.
+#
+# 'Bilingual' stays a legal STORED value because the CHECK demands it, but
+# it has no code: normalize_supported_language falls back to the platform
+# default for it, and the resume copy has only two branches. One call has
+# one TTS language. It is gone from the UI toggle, but a legacy row that
+# still holds it keeps loading instead of failing the whole agent.
 _AGENT_LANGUAGE_ALIASES = {
-    "en": "en", "eng": "en", "english": "en", "en-us": "en", "en-gb": "en",
-    "es": "es", "spa": "es", "spanish": "es", "castellano": "es",
-    "es-es": "es", "es-419": "es", "es-mx": "es",
+    "en": "English", "eng": "English", "english": "English",
+    "en-us": "English", "en-gb": "English",
+    "es": "Spanish", "spa": "Spanish", "spanish": "Spanish",
+    "castellano": "Spanish", "es-es": "Spanish", "es-419": "Spanish",
+    "es-mx": "Spanish",
+    "bilingual": "Bilingual",
 }
 
 
 def _canonical_agent_language(value):
     """None/blank -> None (leave the caller's default alone). A known
-    alias -> its canonical code. Anything else -> ValueError, so a typo
-    cannot silently become Spanish at 3am."""
+    alias -> the exact word the agents_language_check CHECK allows.
+    Anything else -> ValueError, so a typo cannot silently become Spanish
+    at 3am."""
     if value is None:
         return None
     key = str(value).strip().lower()
@@ -480,7 +497,9 @@ class AgentCreate(BaseModel):
     # field on the schema, Pydantic drops it and the runtime falls
     # back to the provider's hardcoded default on every save.
     voice_id: Optional[str] = None
-    language: Optional[str] = "en"
+    # 'English' is the column's own DEFAULT in 001_schema.sql and the only
+    # value the agents_language_check CHECK accepts as a written default.
+    language: Optional[str] = "English"
     campaign: Optional[str] = None
     status: Optional[str] = "Active"
     description: Optional[str] = None

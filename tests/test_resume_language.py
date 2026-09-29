@@ -50,33 +50,45 @@ def test_resume_copy_pair_is_consistent():
 
 
 # ── the write path: the API validator ──────────────────────────────────────
+#
+# These expectations are DISPLAY WORDS, not codes, and that is the whole
+# lesson: agents.language is a word enum guarded by agents_language_check
+# (see test_agent_language_column_contract.py). A first attempt asserted
+# 'en' / 'es' here and every PUT /agents/{id} 500'd in production. The codes
+# are still accepted on input; the column gets the word.
 
 @pytest.mark.parametrize("raw,expected", [
-    ("en", "en"), ("English", "en"), ("ENGLISH", "en"), ("en-US", "en"),
-    ("es", "es"), ("Spanish", "es"), ("es-MX", "es"), ("es-419", "es"),
-    ("  Spanish  ", "es"),
+    ("en", "English"), ("English", "English"), ("ENGLISH", "English"),
+    ("en-US", "English"), ("en-GB", "English"),
+    ("es", "Spanish"), ("Spanish", "Spanish"), ("es-MX", "Spanish"),
+    ("es-419", "Spanish"), ("  Spanish  ", "Spanish"),
     (None, None), ("", None),
 ])
 def test_agent_language_is_canonicalized_on_write(raw, expected):
-    """Both schemas. The old wizard wrote 'English' / 'Spanish' verbatim."""
+    """Both schemas. Codes and display words both go in; the CHECK's word
+    comes out."""
     assert AgentCreate(name="a", language=raw).language == expected
     assert AgentUpdate(language=raw).language == expected
 
 
-@pytest.mark.parametrize("bad", ["Bilingual", "fr", "klingon", "e"])
+@pytest.mark.parametrize("bad", ["fr", "klingon", "e", "english please"])
 def test_agent_language_rejects_junk_on_write(bad):
-    """'Bilingual' was offered in the create wizard but is not implementable:
-    one call has one TTS language and this copy has two branches. Silently
-    behaving as one of them is worse than refusing."""
+    """A typo cannot silently become Spanish at 3am."""
     with pytest.raises(ValueError):
         AgentCreate(name="a", language=bad)
     with pytest.raises(ValueError):
         AgentUpdate(language=bad)
 
 
-def test_agent_create_default_is_a_canonical_code():
-    """The default used to be the literal 'English'."""
-    assert AgentCreate(name="a").language == "en"
+def test_bilingual_still_loads_because_the_check_requires_it():
+    """Not offered in the UI — one call has one TTS language and the resume
+    copy has two branches. But agents_language_check lists it, so a legacy
+    row holding it must still save instead of 500ing the whole agent."""
+    assert AgentUpdate(language="Bilingual").language == "Bilingual"
+
+
+def test_agent_create_default_is_a_value_the_check_allows():
+    assert AgentCreate(name="a").language == "English"
 
 
 # ── the read path: normalization onto the session ──────────────────────────
