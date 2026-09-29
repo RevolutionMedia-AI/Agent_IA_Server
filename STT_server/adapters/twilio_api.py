@@ -20,6 +20,14 @@ from STT_server.services.thread_pool import to_thread as _to_thread
 
 log = logging.getLogger("stt_server")
 
+# ponytail: cap on the Twilio REST call that redirects a live call.
+# Without it, a hung HTTP request could keep the coroutine alive long
+# after the operator hung up — blocking cleanup and leaking memory.
+# 30s is twice Twilio's default 15s HTTP timeout, which gives the SDK
+# room to retry once if it wants. Module-level so the test can shrink
+# it instead of sleeping for half a minute.
+TRANSFER_CALL_TIMEOUT_SEC = 30.0
+
 
 def validate_twilio_signature(
     auth_token: str,
@@ -355,9 +363,21 @@ async def transfer_call(
         except Exception as exc:
             log.exception(
                 "[TRANSFER] call_sid=%s destination=%s failed",
-                call_sid,
+                call_sid, destination,
             )
             return {"success": False, "error": str(exc)}
+
+    # Cap the Twilio API call (see TRANSFER_CALL_TIMEOUT_SEC). This
+    # return is also the whole function: it was missing, so the
+    # coroutine fell off the end and every caller got None:
+    #   "call_transfer 'Recepcion' rejected by Twilio: transfer_call
+    #    returned non-dict: NoneType"
+    # which failed 100% of human transfers while the AI apologised to
+    # the caller. It was previously mistaken for a Twilio SDK quirk
+    # because every test mocked transfer_call out instead of calling it.
+    return await asyncio.wait_for(
+        _to_thread(_transfer), timeout=TRANSFER_CALL_TIMEOUT_SEC,
+    )
 
 
 async def hangup_call(
@@ -389,10 +409,3 @@ async def hangup_call(
             return {"success": False, "error": str(exc)}
 
     return await _to_thread(_hangup)
-
-    # ponytail: cap the Twilio API call. Without a timeout, a hung
-    # network call could keep this coroutine alive long after the
-    # operator has hung up — blocking cleanup and wasting memory.
-    # 30s is twice Twilio's default 15s HTTP timeout, which gives the
-    # SDK room to retry once if it wants.
-    return await asyncio.wait_for(_to_thread(_transfer), timeout=30.0)

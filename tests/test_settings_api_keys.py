@@ -359,16 +359,29 @@ def test_classify_openai_model():
     assert _classify_openai_model("o1") == "llm"
     assert _classify_openai_model("o3-mini") == "llm"
     assert _classify_openai_model("o4-mini") == "llm"
-    # STT family
-    assert _classify_openai_model("gpt-4o-transcribe") == "stt"
-    assert _classify_openai_model("gpt-4o-mini-transcribe") == "stt"
-    assert _classify_openai_model("whisper-1") == "stt"
+    # STT family: the Realtime voice models this product can run.
+    # NOTE: this assertion CHANGED. The previous expectation was that
+    # gpt-4o-transcribe / gpt-4o-mini-transcribe / whisper-1 were STT,
+    # and that gpt-realtime was excluded from every bucket. Both were
+    # wrong for a voice agent: the transcribe family cannot hold a
+    # conversation or call the transfer tools, and excluding every
+    # Realtime model left the operator's dropdown with nothing usable.
+    assert _classify_openai_model("gpt-realtime") == "stt"
+    assert _classify_openai_model("gpt-realtime-2") == "stt"
+    assert _classify_openai_model("gpt-realtime-2.1") == "stt"
+    assert _classify_openai_model("gpt-realtime-2.1-mini") == "stt"
+    # transcription-only and translation ids are not voice agents
+    assert _classify_openai_model("gpt-4o-transcribe") is None
+    assert _classify_openai_model("gpt-4o-mini-transcribe") is None
+    assert _classify_openai_model("whisper-1") is None
+    assert _classify_openai_model("gpt-live-transcribe") is None
+    assert _classify_openai_model("gpt-realtime-whisper") is None
+    assert _classify_openai_model("gpt-realtime-translate") is None
     # TTS family
     assert _classify_openai_model("tts-1") == "tts"
     assert _classify_openai_model("tts-1-hd") == "tts"
     assert _classify_openai_model("gpt-4o-mini-tts") == "tts"
-    # Excluded from LLM (realtime, embedding, etc.)
-    assert _classify_openai_model("gpt-realtime") is None
+    # Excluded from LLM (embedding, image, moderation, ...)
     assert _classify_openai_model("gpt-4o-realtime-preview") is None
     assert _classify_openai_model("text-embedding-3-small") is None
     assert _classify_openai_model("dall-e-3") is None
@@ -434,7 +447,9 @@ def test_build_categorized_models_openai():
         "gpt-4.1-mini", "gpt-4o", "o3-mini",
     }
     assert {m["id"] for m in out["models"]["stt"]} == {
-        "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1",
+        # CHANGED: was the transcribe/whisper family, which cannot drive
+        # a call. The STT bucket is now the Realtime voice models.
+        "gpt-realtime",
     }
     assert {m["id"] for m in out["models"]["tts"]} == {
         "tts-1", "tts-1-hd", "gpt-4o-mini-tts",
@@ -446,15 +461,18 @@ def test_build_categorized_models_openai():
             # Spot-check labels.
             if m["id"] == "gpt-4.1-mini":
                 assert m["label"] == "GPT-4.1 Mini"
-            if m["id"] == "gpt-4o-mini-transcribe":
-                assert m["label"] == "GPT-4o Mini Transcribe"
+            if m["id"] == "gpt-realtime":
+                assert m["label"] == "GPT-Realtime"
             if m["id"] == "gpt-4o-mini-tts":
                 assert m["label"] == "GPT-4o Mini Tts"
-    # The 6 excluded models (realtime * 2, dall-e, embedding,
-    # moderation, gpt-3.5-turbo, gpt-4, gpt-4o-2024-05-13,
-    # o1-2024-12-17) are NOT in any bucket.
+    # Models that fit no bucket are in none of them. CHANGED: gpt-realtime
+    # used to be here too; it is now the STT bucket, because it is the
+    # model the runtime actually runs.
     all_ids = {m["id"] for b in ("llm", "stt", "tts") for m in out["models"][b]}
-    assert "gpt-realtime" not in all_ids
+    # transcription-only models are not a voice agent, so not offered
+    assert "gpt-4o-transcribe" not in all_ids
+    assert "gpt-4o-mini-transcribe" not in all_ids
+    assert "whisper-1" not in all_ids
     assert "gpt-4o-realtime-preview" not in all_ids
     assert "dall-e-3" not in all_ids
     assert "text-embedding-3-small" not in all_ids
@@ -561,7 +579,10 @@ async def test_categorized_models_route(client, data_dir):
     assert body["provider"] == "openai"
     assert {m["id"] for m in body["models"]["llm"]} == {"gpt-4.1-mini"}
     assert {m["id"] for m in body["models"]["tts"]} == {"tts-1"}
-    assert body["models"]["stt"] == []
+    # CHANGED: was []. The operator's OpenAI STT dropdown was empty of
+    # usable models because the classifier had no bucket for Realtime,
+    # which is the only family that can drive a call.
+    assert {m["id"] for m in body["models"]["stt"]} == {"gpt-realtime"}
 
 
 # ── LLM picker helper + route ───────────────────────────────────────────
@@ -756,6 +777,51 @@ def test_retired_openai_realtime_models_are_nowhere_in_the_stt_catalog():
 
     # and the catalog is not accidentally empty either
     assert openai_realtime._REALTIME_MODEL_CATALOG & {"gpt-realtime"}
+
+
+def test_openai_stt_bucket_holds_only_voice_agents():
+    """The agent picker's OpenAI STT dropdown showed exactly two options,
+    gpt-live-transcribe and gpt-realtime-whisper, and neither could hold a
+    conversation or invoke the call-transfer tools. Meanwhile no Realtime
+    voice model appeared at all.
+
+    Cause: the categorized picker classifies with _classify_openai_model,
+    not the filter used by /providers/models, and that classifier defined
+    STT as "id contains transcribe or whisper" with no bucket at all for
+    Realtime models.
+    """
+    from STT_server.adapters.openai_realtime import _REALTIME_MODEL_CATALOG
+    from STT_server.services.credentials_resolver import _classify_openai_model
+
+    # every model the product can actually run must be offered as STT
+    for model in _REALTIME_MODEL_CATALOG:
+        assert _classify_openai_model(model) == "stt", (
+            f"{model} drives a live call and must be in the STT bucket"
+        )
+
+    # transcription-only / translation models are not voice agents
+    for dead_end in (
+        "gpt-live-transcribe",
+        "gpt-realtime-whisper",
+        "gpt-realtime-translate",
+        "gpt-4o-transcribe",
+        "gpt-4o-mini-transcribe",
+        "whisper-1",
+    ):
+        assert _classify_openai_model(dead_end) != "stt", (
+            f"{dead_end} cannot drive a call; it must not be offered as STT"
+        )
+
+    # retired voice models are not offered either
+    for retired in ("gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"):
+        assert _classify_openai_model(retired) != "stt"
+
+    # and the other buckets still work
+    assert _classify_openai_model("gpt-4o") == "llm"
+    assert _classify_openai_model("gpt-4o-mini") == "llm"
+    assert _classify_openai_model("gpt-4o-mini-tts") == "tts"
+    assert _classify_openai_model("tts-1") == "tts"
+    assert _classify_openai_model("") is None
 
 
 def test_list_openai_stt_filters_out_batch_transcribe_models():

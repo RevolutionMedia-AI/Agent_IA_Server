@@ -2031,26 +2031,53 @@ def _classify_openai_model(model_id: str) -> str | None:
     """Return "llm" / "stt" / "tts" for an OpenAI model id, or None
     if the id doesn't fit a service.
 
-    Mirrors the operator-supplied classifier (commit message):
-      llm: gpt-4*, gpt-5*, o1*, o3*, o4* — and not in the
-           excludedLLMTerms set (realtime, audio, transcribe, tts,
-           image, embedding, whisper, moderation, search,
-           computer-use, deep-research, codex).
-      stt: id contains "transcribe" or "whisper".
-      tts: id contains "tts" or "speech".
+    STT here means "can drive a live call", not "can transcribe a
+    file". This product's STT slot feeds a Realtime WebSocket that does
+    STT + LLM + TTS in one session, so only the tool-capable Realtime
+    voice models belong in the STT bucket.
+
+    ponytail: the previous version classified STT as "id contains
+    transcribe or whisper". That put gpt-live-transcribe and
+    gpt-realtime-whisper in the operator's dropdown — neither can hold a
+    conversation or invoke the call-transfer tools — while classifying
+    NO Realtime voice model at all, because they contain neither
+    "transcribe" nor "whisper" and do not start with a chat-family
+    prefix. Net effect: the OpenAI STT dropdown offered exactly two
+    models, and both were unusable for a voice agent.
+
+    The Realtime list is read from the adapter's catalog rather than
+    duplicated here, so the picker and the runtime can never disagree
+    about what this product can actually run.
     """
     mid = model_id.lower()
+    if not mid:
+        return None
+
+    # STT, part 1: the Realtime voice models this product can run.
+    # Function-local import: adapters.openai_realtime is heavy and this
+    # module is imported by the credentials path, so a module-level
+    # import would both slow it down and risk a cycle.
+    try:
+        from STT_server.adapters.openai_realtime import (
+            _REALTIME_MODEL_CATALOG as _REALTIME_STT,
+        )
+    except Exception:
+        _REALTIME_STT = frozenset()
+    if mid in _REALTIME_STT:
+        return "stt"
+
     excluded = (
         "realtime", "audio", "transcribe", "tts", "image",
         "embedding", "whisper", "moderation", "search",
         "computer-use", "deep-research", "codex",
     )
-    # STT: anything with transcribe or whisper in the name. Apply
-    # this check first because some LLM-prefixed models also include
-    # the word "transcribe" (e.g. gpt-4o-transcribe) and we want
-    # them in the STT bucket, not LLM.
-    if "transcribe" in mid or "whisper" in mid:
-        return "stt"
+    # STT, part 2: a Realtime model we do not know how to run, or a
+    # translate/whisper/transcribe-only model. Both are dead ends for a
+    # live call, so they return None and simply do not appear.
+    # (An unknown future Realtime id is deliberately not offered rather
+    # than offered and 4004-ing the first call.)
+    if "realtime" in mid or "transcribe" in mid or "whisper" in mid:
+        return None
     if "tts" in mid or "speech" in mid:
         return "tts"
     if mid.startswith(("gpt-4", "gpt-5", "o1", "o3", "o4")):
