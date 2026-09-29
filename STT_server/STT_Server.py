@@ -129,6 +129,63 @@ def _safe_int(v) -> int | None:
         return None
 
 
+def _resolve_twilio_credential(called_to, account_sid=None):
+    """Resolve the Twilio auth token that can verify a webhook for `called_to`.
+
+    Returns (token, account_sid, source, row_id). Settings is the source of
+    truth: when the phone row carries no inline token we fall back to
+    twilio_credentials, preferring the row's explicit FK, then the account
+    SID Twilio signed with, then the user's most recent credential.
+
+    All three Twilio entry points (/voice, /voice/cascade,
+    /voice/transfer-fallback) MUST go through here. They previously each
+    had their own copy, and the two callback routes had a weaker one that
+    only read the inline column — so any number whose credential lives in
+    Settings authenticated on the inbound leg and then failed closed with
+    503 on every cascade/chain callback. See commit 592f552's follow-up.
+    """
+    token = sid = None
+    source = "per-number"
+    row_id = None
+    if not called_to:
+        return None, None, source, None
+    try:
+        from STT_server.db_phone_numbers import find_by_number
+        row = find_by_number(called_to)
+    except Exception as exc:
+        log.warning("[TWILIO] could not look up phone row for To=%s: %s", called_to, exc)
+        return None, None, source, None
+    if not row:
+        return None, None, source, None
+    row_id = row.get("id")
+    token = row.get("twilio_auth_token") or None
+    sid = row.get("twilio_account_sid") or None
+    user_id = row.get("user_id")
+    if token:
+        return token, sid, source, row_id
+    if not user_id:
+        return None, sid, source, row_id
+    try:
+        from STT_server import db_twilio_credentials as _twcreds
+        cred = None
+        cred_id = row.get("twilio_credential_id")
+        if cred_id:
+            cred = _twcreds.find_for_phone_number(cred_id, user_id)
+            if cred and cred.get("auth_token"):
+                source = f"settings:{cred_id}"
+        if not (cred and cred.get("auth_token")):
+            cred = _twcreds.resolve_for_user(user_id, account_sid)
+            if cred and cred.get("auth_token"):
+                source = f"settings:{cred.get('id')}"
+        if cred and cred.get("auth_token"):
+            token = cred.get("auth_token")
+            if not sid and cred.get("account_sid"):
+                sid = cred.get("account_sid")
+    except Exception as exc:
+        log.warning("[TWILIO] settings credential fallback failed: %s", exc)
+    return token, sid, source, row_id
+
+
 # ponytail: startup hook. On Postgres deployments, backfill any tenants
 # that exist in the local JSON file but not yet in the DB (the in-memory
 # tenant_store was ephemeral, so on a greenfield this is a no-op; the
@@ -487,48 +544,12 @@ async def voice(
     # number that's calling. The user enters that token via
     # ModalConnectNumber; if missing, REJECT the call — there's no
     # fallback to a global credential (removed per the spec).
-    per_number_token = None
-    per_number_row_id = None
-    per_number_sid = None
-    token_source = "per-number"
+    per_number_token, per_number_sid, token_source, per_number_row_id = _resolve_twilio_credential(
+        form_dict.get("To") or form_dict.get("to"),
+        form_dict.get("AccountSid") or form_dict.get("accountsid"),
+    )
     from STT_server.adapters.twilio_api import validate_twilio_signature
-    from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
-    try:
-        called_to = form_dict.get("To") or form_dict.get("to")
-        if called_to:
-            row = _find_num_for_sig(called_to)
-            if row:
-                per_number_row_id = row.get("id")
-                per_number_token = row.get("twilio_auth_token") or None
-                per_number_sid = row.get("twilio_account_sid") or None
-                per_number_user_id = row.get("user_id")
-                per_number_cred_id = row.get("twilio_credential_id")
-                # ponytail: Settings is source of truth. When the row has
-                # no inline token, resolve from twilio_credentials:
-                # explicit FK first, then SID match / most recent.
-                if not per_number_token and per_number_user_id:
-                    try:
-                        from STT_server import db_twilio_credentials as _twcreds
-                        cred = None
-                        if per_number_cred_id:
-                            cred = _twcreds.find_for_phone_number(per_number_cred_id, per_number_user_id)
-                            if cred and cred.get("auth_token"):
-                                token_source = f"settings:{per_number_cred_id}"
-                        if not (cred and cred.get("auth_token")):
-                            cred = _twcreds.resolve_for_user(
-                                per_number_user_id,
-                                form_dict.get("AccountSid") or form_dict.get("accountsid"),
-                            )
-                            if cred and cred.get("auth_token"):
-                                token_source = f"settings:{cred.get('id')}"
-                        if cred and cred.get("auth_token"):
-                            per_number_token = cred.get("auth_token")
-                            if not per_number_sid and cred.get("account_sid"):
-                                per_number_sid = cred.get("account_sid")
-                    except Exception as exc:
-                        log.warning("[VOICE] settings credential fallback failed: %s", exc)
-    except Exception as exc:
-        log.warning("[VOICE] could not look up per-number auth token: %s", exc)
+    called_to = form_dict.get("To") or form_dict.get("to")
     token_to_check = per_number_token
     # ponytail: refuse only when neither the row nor Settings has a
     # token. Settings (twilio_credentials) is the source of truth, so a
@@ -814,13 +835,10 @@ async def voice_cascade(
     status = (form_dict.get("DialCallStatus") or "").strip().lower()
 
     from STT_server.adapters.twilio_api import validate_twilio_signature
-    from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
-    try:
-        called_to = form_dict.get("To") or form_dict.get("to")
-        row = _find_num_for_sig(called_to) if called_to else None
-        token_to_check = (row or {}).get("twilio_auth_token") or None
-    except Exception:
-        token_to_check = None
+    called_to = form_dict.get("To") or form_dict.get("to")
+    token_to_check, _cascade_sid, _cascade_src, _cascade_row = _resolve_twilio_credential(
+        called_to, form_dict.get("AccountSid") or form_dict.get("accountsid"),
+    )
     if not token_to_check:
         # ponytail: same fail-closed rule as /voice — a cascade step
         # without a resolvable credential never dials. Without this a
@@ -1047,13 +1065,10 @@ async def voice_transfer_fallback(
     status = (form_dict.get("DialCallStatus") or "").strip().lower()
 
     from STT_server.adapters.twilio_api import validate_twilio_signature
-    from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
-    try:
-        called_to = form_dict.get("To") or form_dict.get("to")
-        row = _find_num_for_sig(called_to) if called_to else None
-        token_to_check = (row or {}).get("twilio_auth_token") or None
-    except Exception:
-        token_to_check = None
+    called_to2 = form_dict.get("To") or form_dict.get("to")
+    token_to_check, _fb_sid, _fb_src, _fb_row = _resolve_twilio_credential(
+        called_to2, form_dict.get("AccountSid") or form_dict.get("accountsid"),
+    )
     if not token_to_check:
         log.warning(
             "[VOICE] transfer-fallback without resolvable credential "

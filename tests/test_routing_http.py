@@ -56,6 +56,7 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 import STT_server.STT_Server as srv  # noqa: E402  (the REAL app)
 import STT_server.db_agents as db_agents  # noqa: E402
 import STT_server.db_phone_numbers as db_phone_numbers  # noqa: E402
+import STT_server.db_twilio_credentials as db_twilio_credentials  # noqa: E402
 import STT_server.db_tools as db_tools  # noqa: E402
 from STT_server.services.call_plan import open_call_plan, seal_call_plan  # noqa: E402
 from STT_server.services.transfer_cascade import (  # noqa: E402
@@ -300,6 +301,69 @@ async def test_empty_form_body_fails_closed_503(client, routing_env):
     cannot be authenticated."""
     set_cascade(routing_env, [H1, H2])
     r = await post(client, CASCADE_PATH, {"agent_id": "agent-1", "step": 1}, {})
+    assert r.status_code == 503
+    assert "Dial" not in r.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,params", [
+    (CASCADE_PATH, {"agent_id": "agent-1", "step": 1}),
+    (FALLBACK_PATH, {"agent_id": "agent-1", "remaining": "t2"}),
+])
+async def test_credential_from_settings_authenticates_callbacks(
+    client, routing_env, path, params
+):
+    """The regression that took the whole chain down in production.
+
+    A phone row may carry no inline twilio_auth_token; the credential
+    then lives in Settings (twilio_credentials), reached by the row's FK.
+    /voice resolved that correctly, but the two callback routes each had
+    a weaker private copy that only read the inline column, so they
+    answered 503 and the call died. The fixture above hands every test a
+    row WITH an inline token, so no test could have seen it.
+    """
+    routing_env.setattr(db_phone_numbers, "find_by_number", lambda _to: {
+        "id": "pn-1", "twilio_auth_token": None, "twilio_account_sid": None,
+        "user_id": "u1", "twilio_credential_id": "twcred-1",
+    })
+    routing_env.setattr(
+        db_twilio_credentials, "find_for_phone_number",
+        lambda cred_id, user_id: (
+            {"id": cred_id, "auth_token": TOKEN, "account_sid": ACCOUNT_SID}
+            if (cred_id, user_id) == ("twcred-1", "u1") else None
+        ),
+    )
+    set_cascade(routing_env, [H1, H2])
+    form = twilio_form()
+    sig = sign(build_url(path, params), form)
+    r = await post(client, path, params, form, signature=sig)
+    assert r.status_code == 200, r.text
+    assert "no Twilio auth token" not in r.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,params", [
+    (CASCADE_PATH, {"agent_id": "agent-1", "step": 1}),
+    (FALLBACK_PATH, {"agent_id": "agent-1", "remaining": "t2"}),
+])
+async def test_callback_with_broken_settings_lookup_still_fails_closed(
+    client, routing_env, path, params
+):
+    """The Settings fallback must not swallow a DB error into an
+    authenticated route — a lookup that raises resolves to no token, so
+    the callback still 503s."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("postgres down")
+
+    routing_env.setattr(db_phone_numbers, "find_by_number", lambda _to: {
+        "id": "pn-1", "twilio_auth_token": None, "twilio_account_sid": None,
+        "user_id": "u1", "twilio_credential_id": "twcred-1",
+    })
+    routing_env.setattr(
+        db_twilio_credentials, "find_for_phone_number", _boom
+    )
+    set_cascade(routing_env, [H1, H2])
+    r = await post(client, path, params, twilio_form())
     assert r.status_code == 503
     assert "Dial" not in r.text
 
