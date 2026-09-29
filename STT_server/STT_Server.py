@@ -186,6 +186,38 @@ def _resolve_twilio_credential(called_to, account_sid=None):
     return token, sid, source, row_id
 
 
+def _resume_copy(language):
+    """What the agent says when a handoff chain ends with nobody home.
+
+    Returns (welcome_message, system_note). Extracted from the media-stream
+    start handler so the language branch is testable without standing up a
+    websocket, and so the caller-facing sentence and the LLM instruction can
+    never drift apart — they used to be two copies of the same if/else in
+    one 25-line block, and the whole complaint was that a fully Spanish
+    agent got the English one.
+
+    Spanish is the default: the platform default is `es` (config
+    DEFAULT_CALL_LANGUAGE, tenants, sessions), so an unset language must
+    not resolve to English here.
+    """
+    from STT_server.domain.language import normalize_supported_language
+    lang = normalize_supported_language(language)
+    if lang == "en":
+        return (
+            "Sorry, nobody answered the transfer. How else can I help you?",
+            "System note: you just tried to transfer this call, but nobody "
+            "answered and the call returned to you. Tell the caller briefly "
+            "and continue helping. Do NOT immediately re-invoke a transfer tool.",
+        )
+    return (
+        "Disculpa, nadie contestó la transferencia. ¿En qué más te puedo ayudar?",
+        "Nota del sistema: acabas de intentar transferir esta llamada, pero "
+        "nadie contestó y la llamada volvió contigo. Díselo brevemente al "
+        "cliente y sigue ayudando. NO invoques de inmediato otra herramienta "
+        "de transferencia.",
+    )
+
+
 # ponytail: startup hook. On Postgres deployments, backfill any tenants
 # that exist in the local JSON file but not yet in the DB (the in-memory
 # tenant_store was ephemeral, so on a greenfield this is a no-op; the
@@ -1487,13 +1519,29 @@ async def media_stream(ws: WebSocket) -> None:
                     # The agent row wins; the tenant value is the
                     # fallback for calls without an agent.
                     if agent_cfg.get('language'):
-                        session.preferred_language = (
-                            agent_cfg['language'].strip().lower()
+                        # ponytail: normalize, don't just lowercase. Rows
+                        # written before the API validator carry display
+                        # words ('English', 'Spanish'); consumers want a
+                        # canonical 'en'/'es'. Without this the session
+                        # language was 'english', which is not a valid
+                        # Inworld/OpenRealtime language code, and the
+                        # post-handoff resume copy took its English
+                        # branch for a fully Spanish agent.
+                        from STT_server.domain.language import (
+                            normalize_supported_language as _norm_lang,
                         )
-                        log.info(
-                            "[AGENT] Set preferred_language from agent %s: %s",
-                            agent_id_from_params, session.preferred_language,
-                        )
+                        _agent_lang = _norm_lang(agent_cfg['language'])
+                        session.preferred_language = _agent_lang
+                        if _agent_lang != str(agent_cfg['language']).strip().lower():
+                            log.info(
+                                "[AGENT] Normalized language for %s: %r -> %s",
+                                agent_id_from_params, agent_cfg['language'], _agent_lang,
+                            )
+                        else:
+                            log.info(
+                                "[AGENT] Set preferred_language from agent %s: %s",
+                                agent_id_from_params, session.preferred_language,
+                            )
                     # ponytail: usage record needs to know which agent
                     # took this call so the per-agent totals are right.
                     session.agent_id = agent_cfg.get('id') or agent_id_from_params
@@ -1772,29 +1820,9 @@ async def media_stream(ws: WebSocket) -> None:
                     # keeps helping instead of re-transferring in a loop.
                     _resume = (custom_params.get("transfer_resume") if isinstance(custom_params, dict) else None)
                     if _resume:
-                        _lang = (session.preferred_language or "es").strip().lower()
-                        if _lang.startswith("en"):
-                            session.welcome_message = (
-                                "Sorry, nobody answered the transfer. "
-                                "How else can I help you?"
-                            )
-                            _note = (
-                                "System note: you just tried to transfer this call, "
-                                "but nobody answered and the call returned to you. "
-                                "Tell the caller briefly and continue helping. "
-                                "Do NOT immediately re-invoke a transfer tool."
-                            )
-                        else:
-                            session.welcome_message = (
-                                "Disculpa, nadie contestó la transferencia. "
-                                "¿En qué más te puedo ayudar?"
-                            )
-                            _note = (
-                                "Nota del sistema: acabas de intentar transferir esta "
-                                "llamada, pero nadie contestó y la llamada volvió contigo. "
-                                "Díselo brevemente al cliente y sigue ayudando. "
-                                "NO invoques de inmediato otra herramienta de transferencia."
-                            )
+                        session.welcome_message, _note = _resume_copy(
+                            session.preferred_language
+                        )
                         # ponytail: this MUST stay inside `if _resume:`. An
                         # earlier revision dedented it by one level, so a
                         # NORMAL call (no transfer_resume) fell straight

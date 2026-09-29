@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ponytail: log was referenced in 8 places (lines 223, 228, 610, 615, 793,
 # 1001, 1021, ...) but never defined. Every endpoint that touched
@@ -433,6 +433,43 @@ def health() -> dict:
 
 # ---------- Pydantic schemas ----------
 
+# ponytail: the agent's `language` column shipped with DEFAULT 'English'
+# and the create schema defaulted to the same, while the rest of the
+# platform defaults to Spanish (config.DEFAULT_CALL_LANGUAGE, tenants,
+# sessions). The two words — not the value — are what broke: the column
+# stored "English"/"Spanish" display strings while every consumer expects
+# a canonical "en"/"es" code, and nothing ever normalized between them.
+# Production symptom: an agent whose prompt, greeting and TTS voice were
+# all Spanish came back from a failed handoff chain speaking English,
+# because the resume copy picks its language from this one field.
+#
+# `Bilingual` was offered in the create wizard but is not implementable:
+# one call has one TTS language and the resume copy has exactly two
+# branches. It is gone from the toggle rather than left as a silent lie.
+_AGENT_LANGUAGE_ALIASES = {
+    "en": "en", "eng": "en", "english": "en", "en-us": "en", "en-gb": "en",
+    "es": "es", "spa": "es", "spanish": "es", "castellano": "es",
+    "es-es": "es", "es-419": "es", "es-mx": "es",
+}
+
+
+def _canonical_agent_language(value):
+    """None/blank -> None (leave the caller's default alone). A known
+    alias -> its canonical code. Anything else -> ValueError, so a typo
+    cannot silently become Spanish at 3am."""
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if not key:
+        return None
+    if key not in _AGENT_LANGUAGE_ALIASES:
+        raise ValueError(
+            f"Unsupported language {value!r}. Valid: en, es "
+            "(English and Spanish aliases are accepted)"
+        )
+    return _AGENT_LANGUAGE_ALIASES[key]
+
+
 class AgentCreate(BaseModel):
     name: str = Field(..., min_length=1)
     voice: Optional[str] = None
@@ -443,7 +480,7 @@ class AgentCreate(BaseModel):
     # field on the schema, Pydantic drops it and the runtime falls
     # back to the provider's hardcoded default on every save.
     voice_id: Optional[str] = None
-    language: Optional[str] = "English"
+    language: Optional[str] = "en"
     campaign: Optional[str] = None
     status: Optional[str] = "Active"
     description: Optional[str] = None
@@ -518,6 +555,11 @@ class AgentCreate(BaseModel):
     # atomically. Send this XOR the two halves, never both.
     handoff_order: Optional[list] = None
 
+    @field_validator("language")
+    @classmethod
+    def _check_language(cls, v):
+        return _canonical_agent_language(v)
+
 
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
@@ -582,6 +624,15 @@ class AgentUpdate(BaseModel):
     transfer_enabled: Optional[bool] = None
     # ponytail: unified handoff order — see AgentCreate above.
     handoff_order: Optional[list] = None
+
+    # ponytail: the edit modal had no language control at all, so the
+    # only way this field was ever set was the create wizard. Existing
+    # rows keep whatever the create wizard sent. Declared + validated
+    # here so the FE can finally change it.
+    @field_validator("language")
+    @classmethod
+    def _check_language(cls, v):
+        return _canonical_agent_language(v)
 
 
 class PhoneNumberCreate(BaseModel):
