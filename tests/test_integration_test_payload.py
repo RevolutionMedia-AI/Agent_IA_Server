@@ -40,8 +40,9 @@ class _FakeHTTPError(urllib.error.HTTPError):
         super().__init__("https://x", code, "err", {}, None)
 
 
-def _patched(monkeypatch, code=None, ok_code=None):
-    """Replace urlopen. `code` raises an HTTPError; `ok_code` returns 200."""
+def _patched(monkeypatch, code=None, ok_code=None, body=b""):
+    """Replace urlopen. `code` raises an HTTPError; `ok_code` returns
+    a 2xx carrying `body`."""
     sent: list[dict] = []
 
     def fake_urlopen(req, timeout=None):
@@ -52,21 +53,34 @@ def _patched(monkeypatch, code=None, ok_code=None):
         })
         if code is not None:
             raise _FakeHTTPError(code)
-        return _FakeResp(ok_code or 200)
+        resp = _FakeResp(ok_code or 200, body)
+        _LAST_RESPONSE.append(resp)
+        return resp
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    _LAST_RESPONSE.clear()
     return sent
 
 
 class _FakeResp:
-    def __init__(self, status: int):
+    def __init__(self, status: int, body: bytes = b""):
         self.status = status
+        self._body = body
+        # how much the caller asked for, so the cap is observable
+        self.read_limit: int | None = None
+
+    def read(self, limit: int = -1) -> bytes:
+        self.read_limit = limit
+        return self._body if limit < 0 else self._body[:limit]
 
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
         return False
+
+
+_LAST_RESPONSE: list[_FakeResp] = []
 
 
 # ── 1. the body is the tool's real arguments ────────────────────────────────
@@ -231,6 +245,121 @@ def test_blank_tools_are_skipped_not_rendered_as_action() -> None:
         bound_tools=[{"id": "", "action": "", "name": "  ", "parameters": {}}],
     )
     assert actions == []
+
+
+# ── 5. a 2xx that carries success:false is still a failure ────────────────
+
+def test_apps_script_rejecting_the_payload_is_not_connected(monkeypatch) -> None:
+    # The real incident: a Google Apps Script doPost that found its
+    # required fields missing returned {"success": false, ...} and STILL
+    # answered 200. Reported as "POST 200 / connected", no row written.
+    body = json.dumps({
+        "success": False,
+        "message": "Missing required fields",
+        "missing_fields": ["full_name", "phone_number", "position", "email"],
+    }).encode()
+    _patched(monkeypatch, ok_code=200, body=body)
+
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"tool_name": "t"})
+    assert valid is False, "a business-level rejection is not a connection"
+    assert "POST 200" in msg          # the status is still reported
+    assert "Missing required fields" in msg
+    # The single most actionable detail: WHICH fields.
+    for field in ("full_name", "phone_number", "position", "email"):
+        assert field in msg
+
+
+def test_success_false_without_a_message_still_fails(monkeypatch) -> None:
+    _patched(monkeypatch, ok_code=200, body=b'{"success": false}')
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is False
+    assert "success: false" in msg
+
+
+def test_ok_false_is_honoured_too(monkeypatch) -> None:
+    _patched(monkeypatch, ok_code=200, body=b'{"ok": false, "error": "nope"}')
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is False
+    assert "nope" in msg
+
+
+def test_nested_error_object_is_unwrapped(monkeypatch) -> None:
+    body = json.dumps({"success": False, "error": {"message": "bad field"}}).encode()
+    _patched(monkeypatch, ok_code=200, body=body)
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is False
+    assert "bad field" in msg
+
+
+def test_success_true_is_a_clean_pass(monkeypatch) -> None:
+    _patched(monkeypatch, ok_code=200, body=b'{"success": true, "message": "ok"}')
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is True
+    assert msg == "POST 200"
+
+
+def test_plain_text_body_is_not_second_guessed(monkeypatch) -> None:
+    # Apps Script can also return bare text, and a webhook returning an
+    # HTML page is not a business verdict. The status is the contract.
+    _patched(monkeypatch, ok_code=200, body=b"Success")
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is True
+    assert msg == "POST 200"
+
+
+def test_html_body_is_not_second_guessed(monkeypatch) -> None:
+    _patched(monkeypatch, ok_code=200, body=b"<html><body>hi</body></html>")
+    valid, _msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is True
+
+
+def test_empty_body_is_not_second_guessed(monkeypatch) -> None:
+    _patched(monkeypatch, ok_code=200, body=b"")
+    valid, _msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is True
+
+
+def test_body_read_is_capped(monkeypatch) -> None:
+    # A chatty endpoint must not make the test button pull megabytes.
+    from STT_server.services.integrations_tester import _BODY_INSPECT_BYTES
+
+    huge = json.dumps({"success": False, "message": "x" * 50000}).encode()
+    _patched(monkeypatch, ok_code=200, body=huge)
+    _test_webhook_reachable(CONFIG, {}, {"a": 1})
+
+    assert _LAST_RESPONSE, "no response captured"
+    asked = _LAST_RESPONSE[0].read_limit
+    assert asked is not None and asked <= _BODY_INSPECT_BYTES, (
+        f"read {asked} bytes; cap is {_BODY_INSPECT_BYTES}"
+    )
+
+
+def test_a_truncated_body_degrades_to_the_status_code(monkeypatch) -> None:
+    # Past the cap the JSON no longer parses, so there is no verdict and
+    # we fall back to the status code. That is the documented direction:
+    # a pathological 50 kB error body is not a reason to block an
+    # otherwise-working integration.
+    huge = json.dumps({"success": False, "message": "x" * 50000}).encode()
+    _patched(monkeypatch, ok_code=200, body=huge)
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is True
+    assert msg == "POST 200"
+
+
+def test_a_rejection_that_fits_the_cap_is_still_caught(monkeypatch) -> None:
+    # The cap must not be small enough to lose a normal error object.
+    from STT_server.services.integrations_tester import _BODY_INSPECT_BYTES
+
+    body = json.dumps({
+        "success": False,
+        "message": "y" * (_BODY_INSPECT_BYTES - 400),
+        "missing_fields": ["full_name"],
+    }).encode()
+    assert len(body) <= _BODY_INSPECT_BYTES
+    _patched(monkeypatch, ok_code=200, body=body)
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is False
+    assert "full_name" in msg
 
 
 if __name__ == "__main__":

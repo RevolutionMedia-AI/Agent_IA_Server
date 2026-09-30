@@ -26,6 +26,11 @@ import urllib.request
 
 log = logging.getLogger("stt_server.services.integrations_tester")
 
+# How much of a 2xx body to read for the success/false verdict. Enough
+# for a JSON error object, small enough that a chatty endpoint cannot
+# make the test button pull megabytes.
+_BODY_INSPECT_BYTES = 8192
+
 
 # ponytail: same credential sanitization used by credentials_resolver.
 # If the test function raises (timeout, bad JSON, auth wall) we don't
@@ -85,6 +90,57 @@ def _test_zendesk(configuration: dict, credentials: dict) -> tuple[bool, str]:
         return False, _sanitize_error(str(exc))
 
 
+def _verdict_from_body(method: str, status: int, raw: bytes) -> tuple[bool, str] | None:
+    """Second opinion on a 2xx: does the endpoint say the WORK succeeded?
+
+    HTTP 200 only proves the request was delivered and the handler ran.
+    A Google Apps Script `doPost` that finds its required fields missing
+    returns `{"success": false, "missing_fields": [...]}` and STILL
+    answers 200, because ContentService always does. Reporting that as
+    connected is the worst kind of false green: the operator sees a pass
+    and no row was ever written.
+
+    Conventions accepted, so this stays generic and does not assume n8n:
+      {"success": false} / {"ok": false}  → failure, message forwarded
+      {"success": true}  / {"ok": true}   → confirmed success
+      anything else, or a non-JSON body   → no opinion, the status code
+                                            is the only contract available
+
+    `missing_fields` is quoted when present because "which fields?" is
+    the one thing the operator needs to act, and it is the whole answer
+    for a schema/argument mismatch.
+    """
+    if not raw:
+        return None
+    import json as _json
+    try:
+        parsed = _json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, TypeError):
+        # Plain text, an HTML page, an empty 204 body. No business-level
+        # verdict available — do not invent one.
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    failed = parsed.get("success") is False or parsed.get("ok") is False
+    if not failed:
+        return None
+
+    detail = str(
+        parsed.get("message") or parsed.get("error") or ""
+    ).strip()
+    if isinstance(parsed.get("error"), dict):
+        detail = str(parsed["error"].get("message") or parsed["error"]).strip()
+    missing = parsed.get("missing_fields") or parsed.get("missing") or []
+    if isinstance(missing, (list, tuple)) and missing:
+        detail = (detail + " — missing: " + ", ".join(str(m) for m in missing)).strip()
+    elif not detail:
+        detail = "the endpoint reported success: false"
+    return False, (
+        f"{method} {status} but the endpoint reported failure — {detail}"
+    )
+
+
 def _test_webhook_reachable(
     configuration: dict,
     credentials: dict,
@@ -130,7 +186,16 @@ def _test_webhook_reachable(
             req = urllib.request.Request(url, **kwargs)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 ok = 200 <= resp.status < 400
-                return (True, f"{method} {resp.status}") if ok else (True, f"{method} {resp.status} — webhook reachable")
+                if not ok:
+                    return True, f"{method} {resp.status} — webhook reachable"
+                # 2xx is not the last word. A handler that rejected the
+                # payload at the business level still answers 200.
+                if method in ("POST", "PUT", "PATCH"):
+                    raw = resp.read(_BODY_INSPECT_BYTES)
+                    verdict = _verdict_from_body(method, resp.status, raw)
+                    if verdict is not None:
+                        return verdict
+                return True, f"{method} {resp.status}"
         except urllib.error.HTTPError as exc:
             # A 404/405 means "wrong verb, host is fine" — reachable. A
             # 401/403 means the endpoint refused us outright, which is
