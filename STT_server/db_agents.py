@@ -92,6 +92,7 @@ _AGENT_COLS = (
     "transfer_chain, "
     "transfer_enabled, "
     "transfer_unavailable_message, "
+    "ai_first_dates, "
     "calls, perf, created_at, updated_at"
 )
 
@@ -132,6 +133,16 @@ def _row_to_agent(row: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             ch = []
     out["transfer_chain"] = [c for c in ch] if isinstance(ch, list) else []
+    # ponytail: ai_first_dates (026) — JSONB list of "YYYY-MM-DD" strings on
+    # which the AI answers before any human. Same normalize as the cascade.
+    # A JSON legacy row (pre-migration) has no key at all → [].
+    afd = out.get("ai_first_dates")
+    if isinstance(afd, str):
+        try:
+            afd = json.loads(afd)
+        except (json.JSONDecodeError, TypeError):
+            afd = []
+    out["ai_first_dates"] = [d for d in afd if isinstance(d, str)] if isinstance(afd, list) else []
     # ponytail: transfer_enabled (024) — BOOL NOT NULL DEFAULT TRUE.
     # None (JSON legacy row) means "never set" → default on.
     if out.get("transfer_enabled") is None:
@@ -226,12 +237,13 @@ def create_agent(user_id: str, payload: dict) -> dict:
             "idle_subsequent_timeout_sec", "idle_final_message",
             "idle_disconnect_timeout_sec", "idle_max_attempts",
             "transfer_cascade", "transfer_chain", "transfer_enabled",
-            "transfer_unavailable_message"]
-    # ponytail: transfer_cascade + transfer_chain are the JSONB columns
-    # on this table — both need an explicit ::jsonb cast, the rest
-    # stay plain %s.
+            "transfer_unavailable_message", "ai_first_dates"]
+    # ponytail: transfer_cascade + transfer_chain + ai_first_dates are the
+    # JSONB columns on this table — all need an explicit ::jsonb cast,
+    # the rest stay plain %s.
     placeholders = ", ".join(
-        "%s::jsonb" if c in ("transfer_cascade", "transfer_chain") else "%s" for c in cols
+        "%s::jsonb" if c in ("transfer_cascade", "transfer_chain", "ai_first_dates") else "%s"
+        for c in cols
     )
     insert_cols = ", ".join(cols)
     values = [agent_id, user_id, payload.get("name", "Untitled"),
@@ -261,7 +273,8 @@ def create_agent(user_id: str, payload: dict) -> dict:
               # ponytail: None (FE didn't send) = default on. Only an
               # explicit false disables handoff.
               True if payload.get("transfer_enabled") is None else bool(payload.get("transfer_enabled")),
-              payload.get("transfer_unavailable_message")]
+              payload.get("transfer_unavailable_message"),
+              json.dumps(payload.get("ai_first_dates") or [])]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -311,9 +324,9 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
                      "idle_subsequent_timeout_sec", "idle_final_message",
                       "idle_disconnect_timeout_sec", "idle_max_attempts",
                      "transfer_cascade", "transfer_chain", "transfer_enabled",
-                     "transfer_unavailable_message"}:
+                     "transfer_unavailable_message", "ai_first_dates"}:
             continue
-        if k in ("transfer_cascade", "transfer_chain"):
+        if k in ("transfer_cascade", "transfer_chain", "ai_first_dates"):
             # ponytail: same ::jsonb cast as the INSERT above. Accept
             # list (normal) or pre-serialized str (defensive).
             v = v if isinstance(v, str) else json.dumps(v or [])

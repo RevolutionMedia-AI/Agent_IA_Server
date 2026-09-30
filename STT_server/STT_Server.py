@@ -820,7 +820,37 @@ async def voice(
         except Exception as exc:
             log.warning("[VOICE] cascade lookup failed for agent %s: %s", agent_id, exc)
             _steps = []
-        if _steps:
+
+        # ponytail: 026 · AI-first dates. On a date the operator flagged
+        # (company holiday, special closure) the pre-AI cascade must not
+        # ring anybody — the AI answers on the first ring and the humans
+        # become the post-AI chain instead. Falling through to the
+        # connect_stream_twiml below is the whole feature: the chain is
+        # still there, turn_manager resolves it from live config the
+        # moment the AI hands off, so nothing is lost but the initial
+        # ringing. Checked AFTER the cascade is resolved so the flag and
+        # the cascade are read from the same agent row.
+        _ai_first = False
+        if _agent_row and _agent_row.get("ai_first_dates"):
+            try:
+                from STT_server.services.ai_first_dates import agent_answers_ai_first
+
+                _tz_name = None
+                if _agent_row.get("user_id"):
+                    from STT_server.db_settings import get_settings as _get_settings
+                    _tz_name = (_get_settings(_agent_row["user_id"]) or {}).get("timezone")
+                _ai_first = agent_answers_ai_first(_agent_row, _tz_name)
+            except Exception as exc:
+                # A holiday lookup must never cost us the call: degrade to
+                # the configured handoff order, which is today's behaviour.
+                log.error(
+                    "[VOICE] ai_first_dates check failed for agent %s (%s) — "
+                    "falling back to the normal handoff order",
+                    agent_id, exc,
+                )
+                _ai_first = False
+
+        if _steps and not _ai_first:
             first = _steps[0]
             # ponytail: Policy A. Freeze what THIS call will ring, then
             # seal it into the action URL. From here the call reads the
@@ -849,6 +879,16 @@ async def voice(
                     ),
                 ),
                 media_type="application/xml",
+            )
+
+        if _ai_first and _steps:
+            # Loud on purpose: the operator needs to see in the logs that
+            # a flagged date swallowed the cascade, otherwise a holiday
+            # that silently routes every call to the AI looks identical
+            # to a misconfigured cascade.
+            log.warning(
+                "[VOICE] agent %s is on an AI-first date — skipping the "
+                "%d-step cascade, the AI answers first", agent_id, len(_steps),
             )
 
     twiml = connect_stream_twiml(ws_url, stream_params_str, play_section)

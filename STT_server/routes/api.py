@@ -487,6 +487,37 @@ def _canonical_agent_language(value):
     return _AGENT_LANGUAGE_ALIASES[key]
 
 
+def _validate_ai_first_dates(value):
+    """None -> None (don't touch). Otherwise a sorted, de-duped ISO list.
+
+    ponytail: this rejects a bad date with a 422 instead of letting the
+    service layer drop it. Silently dropping is the wrong trade here: the
+    operator would still SEE the date in the modal, save successfully, and
+    the holiday would quietly not apply — a failure with no symptom. Fail
+    loud at the boundary and name the offending value.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("ai_first_dates must be a list of 'YYYY-MM-DD' strings")
+    from STT_server.services.ai_first_dates import MAX_DATES, normalize_dates
+
+    cleaned = normalize_dates(value)
+    valid = set(cleaned)
+    bad = [
+        str(v) for v in value
+        if not (isinstance(v, str) and str(v).strip() in valid)
+    ]
+    if bad:
+        raise ValueError(
+            f"Invalid date(s) in ai_first_dates: {', '.join(bad)}. "
+            "Use YYYY-MM-DD, e.g. 2026-12-25."
+        )
+    if len(value) > MAX_DATES:
+        raise ValueError(f"ai_first_dates accepts at most {MAX_DATES} dates")
+    return cleaned
+
+
 class AgentCreate(BaseModel):
     name: str = Field(..., min_length=1)
     voice: Optional[str] = None
@@ -581,11 +612,20 @@ class AgentCreate(BaseModel):
     # The handler splits it into transfer_cascade + transfer_chain
     # atomically. Send this XOR the two halves, never both.
     handoff_order: Optional[list] = None
+    # ponytail: 026 — calendar dates ("YYYY-MM-DD") on which the AI answers
+    # BEFORE any human, overriding the handoff order for that day. The
+    # humans become the post-AI chain instead. [] = the order always wins.
+    ai_first_dates: Optional[list] = None
 
     @field_validator("language")
     @classmethod
     def _check_language(cls, v):
         return _canonical_agent_language(v)
+
+    @field_validator("ai_first_dates")
+    @classmethod
+    def _check_ai_first_dates(cls, v):
+        return _validate_ai_first_dates(v)
 
 
 class AgentUpdate(BaseModel):
@@ -655,6 +695,9 @@ class AgentUpdate(BaseModel):
     )
     # ponytail: unified handoff order — see AgentCreate above.
     handoff_order: Optional[list] = None
+    # ponytail: 026 — see AgentCreate. Validated the same way; the
+    # service-layer normalize is defense-in-depth for a hand-edited row.
+    ai_first_dates: Optional[list] = None
 
     # ponytail: the edit modal had no language control at all, so the
     # only way this field was ever set was the create wizard. Existing
@@ -664,6 +707,11 @@ class AgentUpdate(BaseModel):
     @classmethod
     def _check_language(cls, v):
         return _canonical_agent_language(v)
+
+    @field_validator("ai_first_dates")
+    @classmethod
+    def _check_ai_first_dates(cls, v):
+        return _validate_ai_first_dates(v)
 
 
 class PhoneNumberCreate(BaseModel):
