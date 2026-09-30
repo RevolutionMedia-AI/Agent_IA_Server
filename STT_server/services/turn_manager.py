@@ -56,7 +56,9 @@ from STT_server.domain.language import (
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_nowait_with_drop, enqueue_with_drop
 from STT_server.services.playback_service import emit_playback_item, interrupt_current_turn
-from STT_server.services.tool_executor import execute_tool, execute_call_transfer, record_tool_result
+from STT_server.services.tool_executor import (
+    execute_tool, execute_tool_call, execute_call_transfer, record_tool_result,
+)
 from STT_server.services.session_runtime import stash_handoff_history
 from STT_server.domain.tool import TOOL_KIND_CALL_TRANSFER
 from STT_server.services._instrumentation import Stages
@@ -719,21 +721,20 @@ async def _stream_llm_with_tools(
                         "content": f"Tool '{tool_name}' error: {str(exc)}",
                     })
                 continue
-            # Default: webhook tool. Run the HTTP call as before.
-            webhook_url = tool_def.get("webhook_url", "")
-            if not webhook_url:
-                log.warning("[Tools] webhook tool '%s' has no webhook_url", tool_name)
-                session.history.append({
-                    "role": "tool",
-                    "content": f"Tool '{tool_name}' error: missing webhook_url",
-                })
-                record_tool_result(
-                    tool_def.get("id"), False, "invocation",
-                    error="missing webhook_url",
-                )
-                continue
+            # Default: webhook tool. execute_tool_call is the ONE
+            # integration-aware executor — it resolves the URL from the
+            # tool row OR from the bound integration, strips
+            # LLM-controlled forbidden keys and injects the server-owned
+            # fields. This branch used to read tool_def["webhook_url"] and
+            # bail when empty, which made every integration-bound tool
+            # permanently dead: a generic_webhook keeps its URL in
+            # integrations.configuration.webhook_url, never on the tool
+            # row, so the call raised "missing webhook_url" and the
+            # caller was told the data could not be saved.
             try:
-                tool_result = await execute_tool(webhook_url, tool_args, tool_name)
+                tool_result = await execute_tool_call(
+                    tool_def, session.user_id, tool_args,
+                )
                 log.info(
                     "[Tools] Tool '%s' executed ok result_len=%d",
                     tool_name, len(str(tool_result)),

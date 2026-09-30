@@ -257,32 +257,27 @@ def _resume_copy(language, custom=None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db_tenants.backfill_from_json()
-    # ponytail: nullify stale agent_tools.integration_id on every boot.
-    # The prompt-persistence refactor (commit 623d4e8) made the
-    # `integration_id` column vestigial — tools dispatch from their own
-    # webhook_url + name + parameters, and the prompt sections in
-    # agents.prompt carry the LLM-facing instructions. Pre-refactor
-    # rows still have a non-null `integration_id`; the dependent-tools
-    # delete gate was removed in the same commit as this backfill,
-    # so leaving the stale pointer would have only one effect: it
-    # counts toward `count(agent_tools WHERE integration_id = ?)` for
-    # reporting purposes (the dashboard counter, future
-    # `is_integration_used` health checks, etc.). Wiping the column
-    # on every boot keeps the data shape consistent. Idempotent —
-    # the WHERE clause filters on `integration_id IS NOT NULL`, so
-    # the second boot after a clean migration is a no-op.
-    try:
-        from STT_server.db_integrations import (
-            nullify_stale_tool_integration_pointers as _backfill_tools,
-        )
-        cleared = _backfill_tools()
-        if cleared:
-            log.info(
-                "[lifespan] nullified stale integration_id on %d agent_tools row(s)",
-                cleared,
-            )
-    except Exception as exc:
-        log.warning("[lifespan] stale-integration_id backfill failed: %s", exc)
+    # ponytail: the `nullify_stale_tool_integration_pointers()` boot
+    # backfill is GONE. It ran
+    #   UPDATE agent_tools SET integration_id = NULL WHERE integration_id IS NOT NULL
+    # on every start, on the premise (commit 623d4e8) that the column was
+    # vestigial because "tools dispatch from their own webhook_url".
+    #
+    # That premise is false, and the backfill silently broke the product:
+    # a generic_webhook keeps its URL in
+    # integrations.configuration.webhook_url and NEVER on the tool row,
+    # so nullifying the pointer left the tool with no way to resolve an
+    # endpoint. Both dispatchers then raised "missing webhook_url" and
+    # the agent told the caller it could not save their data. It recurred
+    # on every restart, and the Test Connection button kept reporting
+    # green because that path reads the URL off the integration row.
+    #
+    # The dispatchers now resolve the URL through the integration (see
+    # tool_executor.execute_tool_call), so the pointer is load-bearing and
+    # must survive restarts. Deleting an integration that still has tools
+    # bound returns 409 with the count and a "View tools" link — the FE
+    # already surfaces both — which is the honest outcome: delete the tool
+    # first instead of orphaning it behind a wiped foreign key.
 
     # ponyy: log OAuth provider status at boot so the operator
     # can see in the Railway deploy log whether Salesforce (or

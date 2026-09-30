@@ -947,7 +947,8 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     # results back. `record_tool_result` records
                     # observability for the per-tool panel.
                     from STT_server.services.tool_executor import (
-                        execute_tool, execute_call_transfer, record_tool_result,
+                        execute_tool, execute_tool_call,
+                        execute_call_transfer, record_tool_result,
                     )
                     from STT_server.domain.tool import (
                         TOOL_KIND_CALL_TRANSFER as _KIND_CT,
@@ -1149,48 +1150,55 @@ async def _event_receiver(ws, session: CallSession) -> None:
                                         tool_id,
                                     )
                         elif tool_kind == _KIND_WH:
-                            # Webhook / n8n-style tool. Mirror the
-                            # original branch: require webhook_url
-                            # and call execute_tool.
-                            webhook_url = (tool_def or {}).get("webhook_url", "")
-                            if not webhook_url:
-                                log.warning(
-                                    "[OPENAI_REALTIME] tool %s has no webhook_url session=%s",
+                            # Webhook tool. Goes through execute_tool_call,
+                            # the ONE integration-aware executor: it reads
+                            # the URL from the tool row OR from the
+                            # integration the tool is bound to, strips
+                            # LLM-controlled forbidden keys, and injects
+                            # the server-owned fields (action,
+                            # integration_id, provider).
+                            #
+                            # This branch used to read
+                            # `tool_def["webhook_url"]` and bail when
+                            # empty. That made every integration-bound
+                            # tool permanently dead: a generic_webhook
+                            # keeps its URL in
+                            # integrations.configuration.webhook_url and
+                            # never on the tool row, so the call raised
+                            # "missing webhook_url" and the agent told the
+                            # caller it could not save the data. The
+                            # integration-aware executor existed the
+                            # whole time but nothing in production called
+                            # it.
+                            try:
+                                result = await execute_tool_call(
+                                    tool_def or {},
+                                    getattr(session, "user_id", None),
+                                    args,
+                                )
+                                log.info(
+                                    "[OPENAI_REALTIME] tool %s ok session=%s "
+                                    "result_len=%d",
+                                    tool_name, session.session_key,
+                                    len(str(result)),
+                                )
+                                output_text = (
+                                    json.dumps(result)
+                                    if not isinstance(result, str)
+                                    else result
+                                )
+                                ok = True
+                                err = None
+                            except Exception as exc:
+                                log.exception(
+                                    "[OPENAI_REALTIME] tool %s failed session=%s",
                                     tool_name, session.session_key,
                                 )
                                 output_text = json.dumps({
-                                    "error": f"tool '{tool_name}' has no webhook_url"
+                                    "error": str(exc)[:500]
                                 })
                                 ok = False
-                                err = "missing webhook_url"
-                            else:
-                                try:
-                                    result = await execute_tool(
-                                        webhook_url, args, tool_name
-                                    )
-                                    log.info(
-                                        "[OPENAI_REALTIME] tool %s ok session=%s "
-                                        "result_len=%d",
-                                        tool_name, session.session_key,
-                                        len(str(result)),
-                                    )
-                                    output_text = (
-                                        json.dumps(result)
-                                        if not isinstance(result, str)
-                                        else result
-                                    )
-                                    ok = True
-                                    err = None
-                                except Exception as exc:
-                                    log.exception(
-                                        "[OPENAI_REALTIME] tool %s failed session=%s",
-                                        tool_name, session.session_key,
-                                    )
-                                    output_text = json.dumps({
-                                        "error": str(exc)[:500]
-                                    })
-                                    ok = False
-                                    err = str(exc)[:200]
+                                err = str(exc)[:200]
                             if tool_id:
                                 try:
                                     record_tool_result(

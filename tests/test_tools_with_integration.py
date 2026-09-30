@@ -17,12 +17,21 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_execute_tool_call_injects_server_fields(monkeypatch):
-    """Stub the executor and verify the body shape."""
+    """Stub the executor and verify the body shape.
+
+    The executor builds the {tool_name, arguments} envelope itself, so
+    the fake receives the ARGUMENTS and the server-owned top-level
+    fields via `extra` — and the assertions below reconstruct the wire
+    payload the same way, which is what a webhook actually receives.
+    """
     captured: list[dict] = []
 
     class FakeExecutor:
-        async def execute(self, url, arguments, tool_name):
-            captured.append({"url": url, "arguments": arguments, "tool_name": tool_name})
+        async def execute(self, url, arguments, tool_name, method="POST", extra=None):
+            captured.append({
+                "url": url, "arguments": arguments, "tool_name": tool_name,
+                "method": method, "extra": dict(extra or {}),
+            })
             return {"ok": True}
 
     # Patch the singleton factory so execute_tool_call uses our fake.
@@ -65,7 +74,13 @@ async def test_execute_tool_call_injects_server_fields(monkeypatch):
     )
     assert result == {"ok": True}
     assert len(captured) == 1
-    payload = captured[0]["arguments"]
+    call = captured[0]
+    # The envelope is flat: the arguments are NOT nested under a second
+    # "arguments" key. `execute_tool_call` used to hand execute() a
+    # pre-built body, which produced
+    # body.arguments.arguments.<field> on the wire.
+    payload = {"tool_name": call["tool_name"], "arguments": call["arguments"]}
+    payload.update(call["extra"])
     # Server-injected
     assert payload["integration_id"] == "int-abc12345"
     assert payload["provider"] == "zendesk"
@@ -74,6 +89,8 @@ async def test_execute_tool_call_injects_server_fields(monkeypatch):
     # LLM-provided value — NOT the LLM's injected "action" key
     assert payload["arguments"] == {"email": "caller@example.com"}
     assert "action" not in payload["arguments"]
+    # Exactly one level of nesting. The whole point.
+    assert "arguments" not in payload["arguments"]
 
 
 @pytest.mark.asyncio
@@ -81,8 +98,11 @@ async def test_execute_tool_call_legacy_path_without_integration(monkeypatch):
     captured: list[dict] = []
 
     class FakeExecutor:
-        async def execute(self, url, arguments, tool_name):
-            captured.append({"url": url, "arguments": arguments})
+        async def execute(self, url, arguments, tool_name, method="POST", extra=None):
+            captured.append({
+                "url": url, "arguments": arguments, "tool_name": tool_name,
+                "extra": dict(extra or {}),
+            })
             return {"ok": True}
 
     from STT_server.services import tool_executor as te
@@ -98,7 +118,9 @@ async def test_execute_tool_call_legacy_path_without_integration(monkeypatch):
     result = await te.execute_tool_call(
         tool=tool, user_id="u", llm_arguments={"x": 1},
     )
-    payload = captured[0]["arguments"]
+    call = captured[0]
+    payload = {"tool_name": call["tool_name"], "arguments": call["arguments"]}
+    payload.update(call["extra"])
     # No server-injected integration fields
     assert "integration_id" not in payload
     assert "provider" not in payload
@@ -112,8 +134,8 @@ async def test_execute_tool_call_strips_all_forbidden_keys(monkeypatch):
     captured: list[dict] = []
 
     class FakeExecutor:
-        async def execute(self, url, arguments, tool_name):
-            captured.append({"arguments": arguments})
+        async def execute(self, url, arguments, tool_name, method="POST", extra=None):
+            captured.append({"arguments": arguments, "extra": dict(extra or {})})
             return {}
 
     from STT_server.services import tool_executor as te
@@ -135,7 +157,9 @@ async def test_execute_tool_call_strips_all_forbidden_keys(monkeypatch):
             "credentials": {"DROP": "ME"},
         },
     )
-    payload = captured[0]["arguments"]
+    call = captured[0]
+    payload = {"arguments": call["arguments"]}
+    payload.update(call["extra"])
     assert payload["arguments"] == {"legit_key": "ok"}
     for forbidden in ("action", "provider", "integration_id", "webhook_url", "credentials"):
         assert forbidden not in payload["arguments"]

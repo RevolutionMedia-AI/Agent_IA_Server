@@ -4023,21 +4023,35 @@ def update_integration_endpoint(
 def delete_integration_endpoint(integration_id: str, auth: dict = Depends(require_auth)):
     """Delete an integration.
 
-    ponytail: the previous version gated deletion on the count of
-    agent_tools pointing at the integration (409 if any). That gate
-    predated the prompt-persistence refactor — see the long docstring
-    on `STT_server.db_integrations.delete_integration` for why. The
-    gate is gone: tools don't need the integration row to be callable
-    after the refactor (they carry their own webhook_url + name +
-    parameters; the integration only injected OAuth-only metadata).
+    409 when tools are still bound to it. The gate was removed on the
+    same (wrong) premise as the boot backfill — that a tool row is
+    self-sufficient. It is not: a generic_webhook keeps its URL in
+    `integrations.configuration.webhook_url` and never on the tool row,
+    so deleting the connection turns every bound tool into a tool that
+    can no longer resolve an endpoint. It fails at CALL time with
+    "Integration missing or revoked", i.e. the operator finds out with a
+    candidate on the line.
+
+    409 is the honest outcome: delete the tool first. `count_dependent_tools`
+    is already the right primitive and the FE already surfaces the count
+    plus a "View tools" link.
     """
+    from STT_server.db_integrations import count_dependent_tools
+    dependents = count_dependent_tools(integration_id, auth["user_id"])
+    if dependents:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{dependents} tool(s) still use this integration. "
+                "Delete or reassign them first."
+            ),
+        )
     from STT_server.db_integrations import delete_integration as db_delete_integration
     ok, err = db_delete_integration(integration_id, auth["user_id"])
     if err:
         # ponytail: 404 for "not found" still comes through this path;
         # we keep the same shape so the FE's 404 handler doesn't need
-        # a new branch. A real "blocked by dependent tools" never
-        # reaches here post-refactor.
+        # a new branch.
         raise HTTPException(status_code=404, detail="Integration not found")
     if not ok:
         raise HTTPException(status_code=404, detail="Integration not found")

@@ -268,6 +268,7 @@ class ToolExecutor:
         arguments: dict,
         tool_name: str,
         method: str = "POST",
+        extra: Optional[dict] = None,
     ) -> dict:
         """Execute a tool by calling its n8n webhook.
 
@@ -276,6 +277,11 @@ class ToolExecutor:
             arguments: The arguments collected by the LLM to send to the tool.
             tool_name: Name of the tool being executed (for logging).
             method: HTTP method (GET, POST, PUT, PATCH, DELETE). Defaults to POST.
+            extra: Server-owned top-level fields merged into the envelope
+                (action, integration_id, provider, calendar_id...). Pass
+                the ARGUMENTS here, not a pre-built envelope: this method
+                builds the `{tool_name, arguments}` envelope itself, and
+                handing it a body wraps the envelope a second time.
 
         Returns:
             The JSON response from n8n as a dict.
@@ -287,14 +293,23 @@ class ToolExecutor:
         # ponytail: 016 — strip LLM-controlled forbidden keys before
         # the body leaves our process. The execution body itself
         # (server-injected action / provider / integration_id) is
-        # built by the route layer that calls execute() with the
-        # already-resolved integration context; here we just defend
-        # against stray arguments leaking through.
+        # built by the route layer and handed to `extra`, which is
+        # merged at the TOP level; here we just defend against stray
+        # arguments leaking through.
         sanitized_args = _strip_forbidden_args(arguments)
         payload = {
             "tool_name": tool_name,
             "arguments": sanitized_args,
         }
+        # ponytail: server-owned top-level fields (action, integration_id,
+        # provider, calendar_id, ...). Merged AFTER the envelope is built
+        # so an integration-bound tool can inject them without wrapping
+        # the whole envelope a second time. `extra` can never overwrite
+        # tool_name/arguments — those are the contract, and the LLM must
+        # not be able to forge them.
+        for k, v in (extra or {}).items():
+            if k not in ("tool_name", "arguments"):
+                payload.setdefault(k, v)
 
         # ponytail: SSRF guard. Run BEFORE any DNS / network call so a
         # blocked URL never reaches the resolver. _validate_webhook_url
@@ -435,10 +450,15 @@ async def execute_tool_call(
     if not url:
         raise ToolExecutionError(f"Tool '{tool.get('id')}' has no webhook URL")
     sanitized_args = _strip_forbidden_args(llm_arguments)
-    body: dict = {
-        "tool_name": tool.get("function_name") or tool.get("name") or "",
-        "arguments": sanitized_args,
-    }
+    # ponytail: server-owned TOP-LEVEL fields. The LLM controls none of
+    # these — they come from the BE lookup of the tool row + its
+    # integration. The n8n Switch node keys off `action`. They travel
+    # as `extra` because ToolExecutor.execute builds the
+    # {tool_name, arguments} envelope itself; passing this dict as the
+    # `arguments` argument used to nest the whole envelope a second
+    # time, so a script reading `body.arguments.full_name` found
+    # nothing (the value sat at `body.arguments.arguments.full_name`).
+    body: dict = {}
     # ponytail: server-injected fields. The LLM doesn't control any
     # of these — they come from the BE lookup of the tool row + its
     # integration. The n8n Switch node keys off `action`.
@@ -481,9 +501,17 @@ async def execute_tool_call(
     executor = get_tool_executor()
     method = _resolve_integration_method(integration)
     # We pass the resolved URL directly to .execute(), which strips
-    # a second time (defense in depth) and posts the body.
+    # a second time (defense in depth) and posts the body. The
+    # ARGUMENTS go in as `arguments`; `body` carries only the
+    # server-owned top-level fields.
     try:
-        return await executor.execute(url, body, body["tool_name"], method=method)
+        return await executor.execute(
+            url,
+            sanitized_args,
+            tool.get("function_name") or tool.get("name") or "",
+            method=method,
+            extra=body,
+        )
     except ToolExecutionError as exc:
         # Redact the URL in the message so the FE / logs don't leak
         # a tokenized generic_webhook path. The class allows us to

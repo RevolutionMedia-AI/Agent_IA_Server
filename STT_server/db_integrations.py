@@ -1,4 +1,4 @@
-"""Postgres-backed CRUD for the integrations table.
+﻿"""Postgres-backed CRUD for the integrations table.
 
 Mirror of db_tools.py: the JSON file under STT_server/data/ is only
 used as a one-time backfill source on first boot (this file does NOT
@@ -629,43 +629,23 @@ def update_integration(
 def delete_integration(integration_id: str, user_id: str) -> tuple[bool, str | None]:
     """Delete an integration. Returns (success, error_message).
 
-    ponytail: the previous version gated deletion on
-    `count(agent_tools WHERE integration_id = ?) > 0` and returned a
-    409 with "N tools depend on this integration". That gate predates
-    the prompt-persistence refactor (commit 623d4e8) — at the time
-    the integration row was the only place the BE could resolve the
-    webhook URL, the OAuth credentials, and the action the LLM needed
-    to invoke, so a dangling tool pointed at a deleted integration
-    would have crashed at runtime.
+    ponytail: this function does NOT gate on dependent tools; the route
+    layer does, via `count_dependent_tools`, so the 409 can carry the
+    count and a "View tools" link.
 
-    Since the refactor:
-      * tool dispatch reads the LLM-bound schema + name from
-        `agent_tools.parameters` + `agent_tools.name` (rows are
-        self-sufficient — they don't need the integration to call
-        the n8n webhook, they only need `webhook_url` on the row).
-      * the integration row is now only consulted to inject
-        `calendar_id` / `timezone` / `credentials_endpoint` for
-        OAuth providers — useful but not required for the call to
-        happen at all.
-      * tool rows persist their own System Prompt section via
-        `agents.prompt`, so a deleted integration never leaves an
-        orphan instruction.
+    The gate used to be removed here on the premise that tool rows are
+    self-sufficient after the prompt-persistence refactor (commit
+    623d4e8) — "they carry their own webhook_url, the integration only
+    injects OAuth-only metadata". That premise was wrong for
+    generic_webhook: the URL lives in
+    `integrations.configuration.webhook_url` and NEVER on the tool row.
+    A bound tool with its integration deleted cannot resolve an endpoint
+    at all, so the gate is back: refusing the delete up front beats
+    leaving a tool that only discovers it is dead during a live call.
 
-    Net: there is no longer any reason to refuse a delete because
-    tools still point at it. The old 409 was a footgun that left
-    operators stuck — they couldn't delete the integration, and
-    there was no UI to bulk-detach the stale tool rows. This commit
-    drops the gate; if there ARE stale tool rows, the integration
-    just deletes cleanly and the tools fall back to whatever's on
-    their own row (their `webhook_url` plus the now-empty
-    `integration_id`, which the executor tolerates as "no oauth
-    metadata to inject").
-
-    Ponytail: the index on agent_tools.integration_id (migration 016)
-    stays — we still need it for the post-connect hook
-    (`/internal/integrations/{id}/credentials`) and for the
-    integrations-tester preflight. We just stop using it to BLOCK
-    deletes.
+    The index on agent_tools.integration_id (migration 016) stays — the
+    dispatchers, the post-connect credentials hook and the integrations
+    tester all resolve through it.
     """
     if not is_postgres():
         rows = _read_integrations_file()
@@ -1431,86 +1411,24 @@ def acquire_advisory_xact_lock(cur, lock_key: str) -> None:
     )
 
 
-# ponytail: one-shot backfill that nulls `integration_id` on every
-# agent_tools row that still has one. Pre-prompt-persistence rows
-# stored the integration link on the tool; the refactor moved the
-# relationship to `agents.prompt` and the executor tolerates a null
-# `integration_id` (it just skips the OAuth-metadata injection). The
-# 409 guard on integration delete was removed in the same commit
-# (see delete_integration docstring for the rationale), so we can
-# clean up the stale pointer rows without leaving any operator
-# stuck.
+# ponytail: REMOVED `nullify_stale_tool_integration_pointers()`.
 #
-# Idempotent: the UPDATE filters on `integration_id IS NOT NULL`,
-# so running it twice is a no-op the second time. Safe to call on
-# every boot — it's an UPDATE-with-WHERE that touches at most
-# `count(agent_tools WHERE integration_id IS NOT NULL)` rows
-# (typically zero post-refactor, but the production data shipped
-# with the prompt-persistence refactor had ~115 stale rows per
-# tenant).
-def nullify_stale_tool_integration_pointers() -> int:
-    """NULL out `agent_tools.integration_id` on every row that still
-    has one set. Returns the number of rows touched.
+# It ran `UPDATE agent_tools SET integration_id = NULL WHERE
+# integration_id IS NOT NULL` on every boot, on the premise that the
+# column was vestigial after the prompt-persistence refactor. That
+# premise was wrong and the backfill silently broke live calls: a
+# generic_webhook stores its URL in
+# integrations.configuration.webhook_url and never on the tool row,
+# so wiping the pointer left the tool with no resolvable endpoint.
+# Both dispatchers raised "missing webhook_url", the agent told the
+# caller it could not save their data, and the Test Connection button
+# still showed green because it reads the URL off the integration.
+#
+# The dispatchers now go through tool_executor.execute_tool_call,
+# which resolves the URL from the tool row OR the bound integration.
+# The pointer is load-bearing and must survive restarts. Deleting an
+# integration that still has tools bound returns 409 with the count
+# and a "View tools" link, which the FE already surfaces.
 
-    ponytail: rationale for the surgical UPDATE. The refactor
-    (commit 623d4e8) replaced the "tool holds the integration
-    pointer" model with a "system prompt section holds the
-    instruction" model. Tools persisted before the refactor kept
-    their `integration_id` populated even though the runtime no
-    longer reads it for LLM dispatch — the value lingered in the
-    table as a historical artifact. Until we wipe those pointers,
-    `count(agent_tools WHERE integration_id = ?)` returns >0 for the
-    production tenants that upgraded, blocking DELETE /integrations
-    with a 409 that the operator cannot resolve (no FE surface
-    exists to bulk-detach a tool). The fix is a single UPDATE
-    because the prompt sections in `agents.prompt` already carry
-    the LLM-facing instructions; the table pointer is purely
-    vestigial.
-
-    Called once on first boot after deploy via STT_Server.py
-    lifespan. Safe to call repeatedly — the WHERE clause filters
-    on `integration_id IS NOT NULL` and we report rowcount.
-    """
-    if not is_postgres():
-        tools_file = _DATA_DIR / "agent_tools.json"
-        if not tools_file.exists():
-            return 0
-        try:
-            with open(tools_file, "r", encoding="utf-8") as f:
-                rows = json.load(f) or []
-        except (json.JSONDecodeError, IOError, OSError):
-            return 0
-        # ponytail: count the rows that have a stale pointer BEFORE
-        # the in-place mutation, otherwise the second pass of an
-        # idempotent call would see zero rows that match `IS NOT
-        # NULL` and incorrectly report 0. We report the rowcount
-        # for the same logical reason the Postgres path uses
-        # `cur.rowcount`: number of rows that needed fixing.
-        to_clear = [
-            r for r in rows
-            if isinstance(r, dict) and r.get("integration_id")
-        ]
-        changed = len(to_clear)
-        for r in to_clear:
-            r["integration_id"] = None
-        if changed:
-            _write_agent_tools_file(rows)
-            log.info(
-                "[backfill] nullified stale integration_id on %d agent_tools row(s) (JSON)",
-                changed,
-            )
-        return changed
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE agent_tools SET integration_id = NULL "
-                "WHERE integration_id IS NOT NULL"
-            )
-            touched = cur.rowcount
-            conn.commit()
-    if touched:
-        log.info(
-            "[backfill] nullified stale integration_id on %d agent_tools row(s)",
-            touched,
-        )
-    return touched
+# Do not reintroduce this as a "one-shot" migration either: the rows it
+# would clear are live bindings, not leftovers.

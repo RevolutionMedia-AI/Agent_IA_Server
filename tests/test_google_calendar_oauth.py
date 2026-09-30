@@ -162,13 +162,26 @@ def test_tool_executor_body_includes_calendar_id_and_timezone(monkeypatch):
     captured = {}
 
     class _FakeExecutor:
-        async def execute(self, url, body, tool_name, method="POST"):
+        async def execute(self, url, arguments, tool_name, method="POST", extra=None):
             captured["url"] = url
-            captured["body"] = body
+            captured["arguments"] = arguments
+            captured["tool_name"] = tool_name
+            # Server-owned top-level fields arrive via `extra`; the
+            # executor builds the envelope itself, so passing a
+            # pre-built body here would double-nest it.
+            captured["body"] = dict(extra or {})
             return {"ok": True}
 
-    tool_executor.get_tool_executor = lambda: _FakeExecutor()
-    tool_executor._resolve_integration_webhook = lambda integ: "https://n8n.example.com/webhook/calendar"
+    # ponytail: these two used to be bare assignments
+    # (`tool_executor.get_tool_executor = ...`), which leaked into every
+    # later test in the session — a downstream test resolving a
+    # generic_webhook URL got this file's n8n calendar URL instead of
+    # its own. monkeypatch restores them at teardown.
+    monkeypatch.setattr(tool_executor, "get_tool_executor", lambda: _FakeExecutor())
+    monkeypatch.setattr(
+        tool_executor, "_resolve_integration_webhook",
+        lambda integ: "https://n8n.example.com/webhook/calendar",
+    )
 
     # ponytail: execute_tool_call resolves the integration row by
     # `from STT_server.db_integrations import get_integration` inside
@@ -212,7 +225,9 @@ def test_tool_executor_body_includes_calendar_id_and_timezone(monkeypatch):
         )
 
     out = asyncio.run(_run())
-    body = captured["body"]
+    # Rebuild the wire payload the same way the real executor does.
+    body = {"tool_name": captured["tool_name"], "arguments": captured["arguments"]}
+    body.update(captured["body"])
     assert body["integration_id"] == "int-1"
     assert body["provider"] == "google_calendar"
     assert body["action"] == "create_appointment"
