@@ -343,6 +343,98 @@ def build_call_transfer_section(
     return "\n".join(parts)
 
 
+def _spec_attr(obj, name, default=""):
+    """Read an attribute off a catalog spec.
+
+    Accepts both dataclass specs (production — the catalog returns
+    ActionSpec objects) and dict specs (tests inject simpler stubs).
+    """
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _bound_tools_for_integration(integration_row: dict) -> list[dict]:
+    """Tools bound to this integration, from the user's tool rows."""
+    user_id = integration_row.get("user_id")
+    integration_id = integration_row.get("id")
+    if not user_id or not integration_id:
+        return []
+    try:
+        from STT_server.db_tools import list_tools as _list_tools
+        return [
+            t for t in (_list_tools(user_id) or [])
+            if isinstance(t, dict) and t.get("integration_id") == integration_id
+        ]
+    except Exception as exc:
+        log.warning(
+            "[agent_prompt_tools] bound tools lookup failed integration=%s: %s",
+            integration_id, exc,
+        )
+        return []
+
+
+def integration_actions_for_prompt(
+    integration_row: dict,
+    spec,
+    bound_tools: list[dict] | None = None,
+) -> list[dict]:
+    """The action list to render in the prompt block for one integration.
+
+    Official providers take it straight from the catalog. A
+    `generic_webhook` has an EMPTY catalog on purpose — the operator
+    names the action per tool — so the real callable shape of that
+    connection is the set of tools bound to it. Each tool carries its own
+    `parameters` schema, which is exactly the JSON the model has to send.
+
+    Without this fallback, assigning a webhook integration to an agent
+    wrote "This integration has no actions configured yet" into the
+    System Prompt while a tool with a complete schema sat bound to the
+    same row: the model was told there was nothing to call.
+
+    `bound_tools` is injectable so tests don't need a database.
+    """
+    catalog_actions = [
+        {
+            "id": _spec_attr(a, "id"),
+            "name": _spec_attr(a, "name"),
+            "description": _spec_attr(a, "description"),
+            # Catalog is the source of truth for the bilingual copy; the
+            # integration row never overrides it.
+            "when_to_use_en": _spec_attr(a, "when_to_use_en", "") or "",
+            "when_to_use_es": _spec_attr(a, "when_to_use_es", "") or "",
+            "parameters_schema": _spec_attr(
+                a, "parameters_schema",
+                {"type": "object", "properties": {}, "required": []},
+            ),
+        }
+        for a in (getattr(spec, "actions", None) or _spec_attr(spec, "actions", None) or [])
+    ]
+    if catalog_actions:
+        return catalog_actions
+
+    tools = bound_tools if bound_tools is not None else _bound_tools_for_integration(integration_row)
+    out: list[dict] = []
+    for t in tools:
+        # A tool with neither an action nor a name would render as
+        # "Action: action" — skip it rather than teach the model a blank.
+        act_id = (t.get("action") or t.get("id") or "").strip()
+        act_name = (t.get("name") or "").strip()
+        if not act_id and not act_name:
+            continue
+        out.append({
+            "id": act_id or act_name,
+            "name": act_name or act_id,
+            "description": (t.get("description") or "").strip(),
+            # No bilingual "when to use" on a tool row; the renderer
+            # falls back to wrapping the description in both languages.
+            "when_to_use_en": "",
+            "when_to_use_es": "",
+            "parameters_schema": t.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return out
+
+
 def build_integration_section(
     integration_id: str,
     provider_name: str,
@@ -622,30 +714,12 @@ def reconcile_agent_prompt(
         spec = get_integration_provider_spec_fn(integ.get("provider"))
         if not spec:
             continue
-        # ponytail: accept both dataclass specs (production — the
-        # catalog returns ActionSpec) and dict specs (tests can
-        # inject a simpler stub). `_get_attr` normalizes both.
-        def _get_attr(obj, name, default=""):
-            if isinstance(obj, dict):
-                return obj.get(name, default)
-            return getattr(obj, name, default)
-
-        actions = [
-            {
-                "id": _get_attr(a, "id"),
-                "name": _get_attr(a, "name"),
-                "description": _get_attr(a, "description"),
-                # Catalog is the source of truth for the bilingual
-                # copy; the integration row never overrides it.
-                "when_to_use_en": _get_attr(a, "when_to_use_en", "") or "",
-                "when_to_use_es": _get_attr(a, "when_to_use_es", "") or "",
-                "parameters_schema": _get_attr(
-                    a, "parameters_schema",
-                    {"type": "object", "properties": {}, "required": []},
-                ),
-            }
-            for a in spec.actions
-        ]
+        # ponytail: a provider with no catalog actions (generic_webhook)
+        # gets its action list from the tools bound to the integration,
+        # so the block carries each tool's parameter schema instead of
+        # saying there is nothing to call. Same renderer, same JSON
+        # example, different source for the list.
+        actions = integration_actions_for_prompt(integ, spec)
         expected_sections[(KIND_INTEGRATION, integ["id"])] = {
             "kind": KIND_INTEGRATION,
             "integration": integ,

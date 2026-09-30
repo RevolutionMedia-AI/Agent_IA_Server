@@ -2202,18 +2202,15 @@ def assign_shared_integration(agent_id: str, integration_id: str, auth: dict = D
             add_or_update_section,
             KIND_INTEGRATION,
             build_integration_section,
+            integration_actions_for_prompt,
         )
-        actions = [
-            {
-                "id": a.id,
-                "name": a.name,
-                "description": a.description,
-                "when_to_use_en": getattr(a, "when_to_use_en", "") or "",
-                "when_to_use_es": getattr(a, "when_to_use_es", "") or "",
-                "parameters_schema": a.parameters_schema,
-            }
-            for a in spec.actions
-        ]
+        # ponytail: the action list comes from the catalog for official
+        # providers, and from the tools bound to this integration for a
+        # generic_webhook (whose catalog is empty by design). Without the
+        # fallback the assign wrote "no actions configured yet" into the
+        # prompt while a tool with a real parameter schema was bound to
+        # the same row.
+        actions = integration_actions_for_prompt(integ, spec)
         body = build_integration_section(integration_id, integ.get("name") or integration_id, actions)
         new_prompt = add_or_update_section(
             agent.get("prompt") or "",
@@ -4070,6 +4067,82 @@ def delete_integration_endpoint(integration_id: str, auth: dict = Depends(requir
     return {"success": True, "change_log": change_log}
 
 
+def _webhook_body_for_tool(
+    integration_id: str,
+    user_id: str,
+    action: str | None,
+    model: str | None,
+) -> tuple[dict | None, dict | None]:
+    """Build the request body Test Connection should POST, from a bound tool.
+
+    Returns (body, tool_row). (None, None) when the integration has no
+    tool bound, or when the LLM that invents the sample args is
+    unavailable — in both cases the caller falls back to the historical
+    behaviour and the probe sends `{}`.
+
+    The tool's `parameters` schema is the contract n8n/the script
+    actually receives, so the sample args come from THAT schema and not
+    from the integration's configuration fields. `action` picks the tool
+    when the operator selected one on the FE; otherwise the first bound
+    tool is used, which is the one the FE shows first anyway.
+    """
+    from STT_server.db_tools import list_tools as _list_tools
+    from STT_server.services.test_data_generator import (
+        TestDataUnavailable,
+        generate_test_payload,
+    )
+
+    try:
+        bound = [
+            t for t in (_list_tools(user_id) or [])
+            if isinstance(t, dict) and t.get("integration_id") == integration_id
+        ]
+    except Exception as exc:
+        log.warning(
+            "[integrations.test] tool lookup failed integration_id=%s: %s",
+            integration_id, exc,
+        )
+        return None, None
+    if not bound:
+        return None, None
+
+    tool = None
+    if action:
+        for t in bound:
+            if (t.get("action") or "") == action:
+                tool = t
+                break
+    if tool is None:
+        tool = bound[0]
+
+    try:
+        args = generate_test_payload(tool, user_id, model=model)
+    except TestDataUnavailable as exc:
+        log.warning(
+            "[integrations.test] no sample args for integration_id=%s tool=%s: %s",
+            integration_id, tool.get("id"), exc,
+        )
+        return None, None
+    except Exception as exc:
+        log.warning(
+            "[integrations.test] sample args failed integration_id=%s tool=%s: %s",
+            integration_id, tool.get("id"), exc,
+        )
+        return None, None
+
+    # Same envelope integrations_executor posts on a live call. The
+    # integration id lets the receiver tell which connection this is
+    # without us shipping the URL back to it.
+    body: dict[str, Any] = {
+        "tool_name": tool.get("name") or "",
+        "arguments": args if isinstance(args, dict) else {},
+    }
+    if tool.get("action"):
+        body["action"] = tool["action"]
+    body["integration_id"] = integration_id
+    return body, tool
+
+
 @api_router.post("/integrations/{integration_id}/test")
 def test_integration_endpoint(
     integration_id: str,
@@ -4143,6 +4216,11 @@ def test_integration_endpoint(
             integration_id, exc,
         )
 
+    # ponytail: initialised before the branch so the response can name
+    # what went on the wire even when the provider has no test_fn.
+    sent_payload: dict[str, Any] = {}
+    sent_tool: dict | None = None
+
     if not spec.test_fn:
         valid, message = False, f"Test not yet implemented for {row['provider']}"
     else:
@@ -4167,10 +4245,29 @@ def test_integration_endpoint(
         for k, v in (llm_payload or {}).items():
             if k not in merged_cfg or merged_cfg.get(k) in (None, ""):
                 merged_cfg[k] = v
+
+        # ponytail: when a tool is bound to this integration, test with
+        # the tool's OWN arguments. Previously the webhook probe POSTed
+        # `{}`, which proved the host answered but nothing about whether
+        # the script could handle a real request — a script that reads
+        # e.postData.contents.name got an empty object every time. The
+        # envelope mirrors what integrations_executor sends on a live
+        # call, so the test is a rehearsal instead of a ping.
+        request_body, sent_tool = _webhook_body_for_tool(
+            integration_id, auth["user_id"], test_action, test_model,
+        )
+        sent_payload = request_body or {}
         from STT_server.services.integrations_tester import run_integration_test
         valid, message = run_integration_test(
-            spec.test_fn, merged_cfg, creds_plain,
+            spec.test_fn, merged_cfg, creds_plain, request_body=request_body,
         )
+        if sent_tool:
+            log.info(
+                "[integrations.test] integration_id=%s probed with tool=%r "
+                "action=%s body_keys=%s",
+                integration_id, sent_tool.get("name"), sent_tool.get("action") or "-",
+                sorted(request_body or {}),
+            )
 
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     db_update_integration(
@@ -4190,6 +4287,13 @@ def test_integration_endpoint(
         # status. Empty dict when the LLM is unavailable.
         "preview_payload": llm_payload or {},
         "preview_model": test_model or "gpt-4o-mini",
+        # ponytail: what actually went on the wire. Empty dict when the
+        # integration has no tool bound (the probe sent `{}`). With a tool
+        # bound this is the same envelope a live call sends, so the
+        # operator can confirm the arguments are the right shape without
+        # making a call.
+        "sent_payload": sent_payload or {},
+        "tested_tool": (sent_tool or {}).get("name") or None,
     }
 
 

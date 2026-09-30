@@ -40,6 +40,28 @@ def _stub(provider_id: str) -> tuple[bool, str]:
     return False, f"Test not yet implemented for {provider_id}"
 
 
+def _wants_request_body(fn) -> bool:
+    """True when `fn` declared a `request_body` parameter.
+
+    ponytail: only _test_webhook_reachable has one. Rather than adding a
+    third parameter to all eight providers (seven of which would ignore
+    it and one of which is a stub), the dispatcher checks the signature.
+    A test that does not exist in a coverage report is not a test, and a
+    try/except TypeError here would swallow a genuine TypeError raised
+    inside the function.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "request_body" in params:
+        return True
+    # A **kwargs catch-all can take it too.
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _test_zendesk(configuration: dict, credentials: dict) -> tuple[bool, str]:
     """Hit Zendesk's /api/v2/users/me.json — auth-protected, free."""
     subdomain = (configuration.get("subdomain") or "").strip()
@@ -63,13 +85,24 @@ def _test_zendesk(configuration: dict, credentials: dict) -> tuple[bool, str]:
         return False, _sanitize_error(str(exc))
 
 
-def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[bool, str]:
+def _test_webhook_reachable(
+    configuration: dict,
+    credentials: dict,
+    request_body: dict | None = None,
+) -> tuple[bool, str]:
     """Test the generic_webhook URL. Times out at 10s.
 
     ponytail: n8n/Make webhooks are often POST-only and return 404 on HEAD/GET.
     Respects configuration.webhook_method (GET/POST/PUT/PATCH/DELETE); defaults
     to POST. Any HTTP response (including 404/405) proves DNS/TLS works.
     Only network errors/timeouts are failures.
+
+    `request_body` is what the caller wants on the wire. When the
+    integration has a tool bound, the route passes the real
+    {tool_name, arguments} envelope generated from that tool's parameter
+    schema, so the test exercises the same shape a live call sends. An
+    empty `{}` proved nothing: a script that reads
+    e.postData.contents.name never saw a field.
     """
     url = (configuration.get("webhook_url") or "").strip()
     if not url:
@@ -81,6 +114,8 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
     configured = (configuration.get("webhook_method") or "POST").strip().upper()
     if configured not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
         configured = "POST"
+    import json as _json
+    body_bytes = _json.dumps(request_body or {}).encode("utf-8")
     # Probe order: configured method first, then fallbacks for POST-only webhooks.
     probe_order = [configured]
     for m in ("HEAD", "GET", "POST"):
@@ -90,14 +125,26 @@ def _test_webhook_reachable(configuration: dict, credentials: dict) -> tuple[boo
         try:
             kwargs = {"method": method}
             if method in ("POST", "PUT", "PATCH"):
-                kwargs["data"] = b"{}"
+                kwargs["data"] = body_bytes
                 kwargs["headers"] = {"Content-Type": "application/json"}
             req = urllib.request.Request(url, **kwargs)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 ok = 200 <= resp.status < 400
                 return (True, f"{method} {resp.status}") if ok else (True, f"{method} {resp.status} — webhook reachable")
         except urllib.error.HTTPError as exc:
-            # Any 4xx proves the host responded - for webhooks 404/405 is expected on wrong method
+            # A 404/405 means "wrong verb, host is fine" — reachable. A
+            # 401/403 means the endpoint refused us outright, which is
+            # exactly how an Apps Script deployed as "Only myself" answers
+            # an anonymous POST. Reporting that as "connected" marked the
+            # integration green and then failed on the first live call, so
+            # it is a failure with a message that names the cause.
+            if exc.code in (401, 403):
+                return False, (
+                    f"HTTP {exc.code} — the endpoint rejected the request. "
+                    "If this is a Google Apps Script, redeploy it with "
+                    "access set to 'Anyone' (Deploy → Manage deployments → "
+                    "Edit → Who has access). The URL changes on redeploy."
+                )
             if 400 <= exc.code < 500:
                 return True, f"HTTP {exc.code} — webhook reachable ({configured} expected)"
             continue
@@ -215,10 +262,21 @@ def _test_nice_cxone(configuration: dict, credentials: dict) -> tuple[bool, str]
     return _stub("nice_cxone")
 
 
-def run_integration_test(test_fn_path: str, configuration: dict, credentials: dict) -> tuple[bool, str]:
+def run_integration_test(
+    test_fn_path: str,
+    configuration: dict,
+    credentials: dict,
+    request_body: dict | None = None,
+) -> tuple[bool, str]:
     """Resolve `test_fn_path` (dotted, e.g. "_test_zendesk" — caller
     prepends the module) and invoke. Returns (False, "...") if the
-    path doesn't resolve — never raises."""
+    path doesn't resolve — never raises.
+
+    `request_body` is forwarded ONLY to a test_fn that declares it. The
+    signature check keeps the eight other providers on their original
+    two-argument contract instead of every one of them growing a
+    parameter they would ignore.
+    """
     if not test_fn_path:
         return False, "Test not yet implemented for this provider"
     # ponytail: dotted path of the form "module.symbol". We get the
@@ -230,6 +288,8 @@ def run_integration_test(test_fn_path: str, configuration: dict, credentials: di
         log.warning("[integrations_tester] unknown test_fn=%s", test_fn_path)
         return False, f"Test not yet implemented ({test_fn_path})"
     try:
+        if request_body is not None and _wants_request_body(fn):
+            return fn(configuration, credentials, request_body)
         return fn(configuration, credentials)
     except Exception as exc:
         log.exception("[integrations_tester] %s raised", test_fn_path)
