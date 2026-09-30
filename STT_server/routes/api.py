@@ -2252,15 +2252,30 @@ def _is_real_tool(row: dict) -> bool:
 
     Provider credentials (Settings → API keys) also live in the same
     table with ``agent_id='__shared__'`` but they have an empty
-    ``webhook_url`` AND a null ``destination`` — real tools always
-    have one or the other (enforced by ``AgentTool.validate()``). The
-    modal filters "Assigned shared" / "Available shared" on this
-    predicate so credential rows don't show up next to the operator's
-    n8n tools.
+    ``webhook_url``, a null ``destination`` AND a null ``integration_id``
+    — a real tool always has at least one of the three. The modal filters
+    "Assigned shared" / "Available shared" on this predicate so credential
+    rows don't show up next to the operator's n8n tools.
+
+    ponytail: the ``integration_id`` branch is the bug this predicate used
+    to miss. ``AgentTool.validate()`` has required, since migration 016,
+    that an integration-bound webhook tool carries ``integration_id`` +
+    ``action`` and NO ``webhook_url`` — the URL lives on the integration
+    row. Checking only ``webhook_url or destination`` therefore filtered
+    out every integration-bound tool from ``GET /tools``, while the create
+    call still returned the row, so the operator watched it save and then
+    saw nothing: the connection detail filtered
+    ``t.integration_id === integration.id`` over a list that had already
+    had the row removed. Keep all three shapes — an independent webhook
+    tool (webhook_url, no integration) is still a real tool.
     """
     if not row:
         return False
-    return bool(row.get("webhook_url") or row.get("destination"))
+    return bool(
+        row.get("webhook_url")
+        or row.get("destination")
+        or (row.get("integration_id") and row.get("action"))
+    )
 
 
 @api_router.get("/tools")
