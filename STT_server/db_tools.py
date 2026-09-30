@@ -240,6 +240,27 @@ def _ensure_tool_columns() -> None:
             raise
 
 
+def _extra_cols() -> list[str]:
+    """`_TOOL_COLS_EXTRA`, with the self-heal guaranteed to have run.
+
+    ponytail: `create_tool` and `update_tool` branch on which OPTIONAL
+    columns to write (integration_id, action, ring_timeout_sec). They
+    used to read the module global directly, which is `[]` until
+    `_ensure_tool_columns()` has run — and nothing called it before the
+    INSERT. So the FIRST tool created after a process start silently
+    wrote a row with no `integration_id` at all: the tool saved, appeared
+    in the list, and was permanently unbound. The self-heal then ran from
+    the `RETURNING _tool_cols()` on that very statement, so every
+    SUBSEQUENT create worked, which is what made this look intermittent.
+
+    One helper so there is a single place that guarantees the check
+    before anyone branches on the column list.
+    """
+    if not _columns_check_done:
+        _ensure_tool_columns()
+    return _TOOL_COLS_EXTRA
+
+
 def _tool_cols() -> str:
     """Returns the SELECT column list for the agent_tools table.
 
@@ -565,15 +586,19 @@ def create_tool(
     extra_cols_sql = ""
     extra_vals_sql = ""
     extra_params: list = []
-    if "integration_id" in _TOOL_COLS_EXTRA:
+    # Read the optional-column list THROUGH _extra_cols() so the self-heal
+    # has run. Reading the global here dropped integration_id/action on the
+    # first create after every deploy.
+    _extra = _extra_cols()
+    if "integration_id" in _extra:
         extra_cols_sql += ", integration_id"
         extra_vals_sql += ", %s"
         extra_params.append(integration_id)
-    if "action" in _TOOL_COLS_EXTRA:
+    if "action" in _extra:
         extra_cols_sql += ", action"
         extra_vals_sql += ", %s"
         extra_params.append(action)
-    if "ring_timeout_sec" in _TOOL_COLS_EXTRA:
+    if "ring_timeout_sec" in _extra:
         extra_cols_sql += ", ring_timeout_sec"
         extra_vals_sql += ", %s"
         try:
@@ -662,7 +687,7 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
     # caller didn't touch the integration binding and we shouldn't
     # blank it out by writing NULL.
     optional_text_keys = [k for k in ("integration_id", "action")
-                          if k in _TOOL_COLS_EXTRA]
+                          if k in _extra_cols()]
     set_clauses = []
     values: list = []
     for k, v in payload.items():
