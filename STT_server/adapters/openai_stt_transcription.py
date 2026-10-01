@@ -640,17 +640,23 @@ async def run_realtime_stt(
                     if _metrics is None:
                         _metrics = getattr(session, "metrics", None)
                     if _metrics is not None:
-                        _since_vad = (
-                            (_now - session.stt_turn_end_at) * 1000.0
-                            if getattr(session, "stt_turn_end_at", None)
-                            else None
+                        # ponytail: 2026-10-01 — partials and finals have
+                        # DIFFERENT t0. A partial arrives during speech, so
+                        # it is measured from the voice-start stamp; a final
+                        # arrives after end-of-speech, so it is measured
+                        # from the end stamp. Measuring both from the end
+                        # produced 12-18 s "partial latencies" that were the
+                        # time since the previous turn, not a number.
+                        _t0 = (
+                            getattr(session, "stt_turn_start_at", None)
+                            if not is_done else
+                            getattr(session, "stt_turn_end_at", None)
                         )
-                        if _since_vad is not None and _since_vad >= 0:
-                            # Distinct series per kind: merging them is what
-                            # would make a later p50/p95/p99 useless.
+                        _since = ((_now - _t0) * 1000.0) if _t0 else None
+                        if _since is not None and _since >= 0:
                             _metrics.observe_ms(
                                 "stt_final_ms" if is_done else "stt_partial_ms",
-                                _since_vad,
+                                _since,
                             )
                             if not is_done:
                                 # record the dial once per turn, on the

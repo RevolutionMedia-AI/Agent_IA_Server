@@ -355,6 +355,12 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                     session.speech_frames.extend(session.pre_speech_frames)
                     session.speech_frame_count = session.voice_streak
                     session.silence_frames = 0
+                    # ponytail: 2026-10-01 — the t0 that partial latency is
+                    # measured against. Partials arrive DURING speech, so
+                    # measuring them from stt_turn_end_at (which is stamped
+                    # at FIN DE VOZ) produced 12-18 s numbers that were the
+                    # time since the PREVIOUS turn ended, not a latency.
+                    session.stt_turn_start_at = time.monotonic()
                     log.info(f"[VAD] INICIO DE VOZ: streak={session.voice_streak}, speech_frame_count={session.speech_frame_count}")
                     barge_in_gap = (
                         f" barge_in_gap={(time.monotonic() - session.barge_in_at):.2f}s"

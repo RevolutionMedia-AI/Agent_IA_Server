@@ -183,6 +183,13 @@ class CallSession:
     # measurements rather than the static estimates in the UI. These are
     # what will eventually replace the estimated table.
     stt_turn_end_at: float | None = None
+    # ponytail: 2026-10-01 — monotonic timestamp of the VOICE START that
+    # opened the turn. Partials arrive while the caller is still talking,
+    # so their latency is measured from here. Finals are measured from
+    # stt_turn_end_at. Measuring a partial from the END stamp produced
+    # 12-18 s figures that were the time since the previous turn ended,
+    # not a latency at all.
+    stt_turn_start_at: float | None = None
     # 027_agent_stt_latency_mode.sql. The agent's OpenAI latency/accuracy
     # dial. None for models that have no dial (gpt-transcribe) and for
     # legacy rows, where the adapter substitutes the platform default.
