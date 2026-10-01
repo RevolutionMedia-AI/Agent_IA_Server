@@ -159,6 +159,15 @@ class CallSession:
     speech_frame_count: int = 0
     voice_streak: int = 0
     silence_frames: int = 0
+    # ponytail: adaptive noise floor for THIS line. Measured 2026-10-01:
+    # webrtcvad flags lowpassed noise as speech from ~2% full scale upward
+    # at every aggressiveness mode (0..3), so WEBRTC_VAD_MODE is a no-op
+    # for line hiss and MIN_VOICE_RMS is the only real gate. On a noisy
+    # PSTN line that fixed gate is either too low (hiss opens phantom
+    # turns) or too high (quiet speech gets dropped). Seeded at 0 and
+    # treated as "not yet estimated" so the first frames still use
+    # MIN_VOICE_RMS.
+    noise_floor_rms: int = 0
     active_generation: int = 0
     # ponytail: every generation <= this is invalid; producers abort when
     # their gen <= cancelled_through. Set by interrupt_current_turn after

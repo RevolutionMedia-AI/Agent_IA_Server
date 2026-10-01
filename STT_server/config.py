@@ -47,12 +47,15 @@ TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
 # even allocate the decoded buffer.
 MAX_MEDIA_PAYLOAD_BYTES = int(os.getenv("MAX_MEDIA_PAYLOAD_BYTES", "8192"))
 
-# webrtc VAD mode: 0..3 (0 less aggressive, 3 most aggressive).
-# ponytail: P0 follow-up — bumped default 1 -> 2 per operator feedback.
-# Mode 1 fires on noise bursts (clicks, line hiss) reaching BARGE_IN_MIN_RMS
-# sustained for MIN_BARGE_IN_FRAMES; mode 2 rejects more non-speech while
-# still triggering on real human speech (which has distinctive formant
-# transitions that VAD mode 2 catches reliably).
+# webrtc VAD mode: 0..3 (0 least aggressive, 3 most aggressive).
+# ponytail: 2026-10-01 — MEASURED, do not "tune" this expecting it to
+# help with line noise. Fed lowpassed white noise through the real
+# G.711 mu-law path at 0.5%..50% full scale, webrtcvad flagged it as
+# speech 100% of the time at ALL FOUR modes (0 included) once the level
+# passed ~2% full scale. Only below ~1% did any mode reject it. So this
+# knob does not discriminate telephony hiss at all, and the earlier
+# "mode 1 fires on noise bursts" note did not survive measurement.
+# Hiss rejection is MIN_VOICE_RMS + the adaptive noise floor instead.
 WEBRTC_VAD_MODE = int(os.getenv("WEBRTC_VAD_MODE", "2"))
 
 # Default call language — per-call override comes from agent row
@@ -270,10 +273,12 @@ SPEECH_START_FRAMES = int(os.getenv("SPEECH_START_FRAMES", "6"))
 # sustained voice — well below a real-word duration but well above
 # anything a click / echo burst can sustain.
 MIN_UTTERANCE_VOICE_FRAMES = int(os.getenv("MIN_UTTERANCE_VOICE_FRAMES", "25"))
-# ponytail: P0 follow-up — bumped default 12 -> 16 (~320ms of consecutive
-# VAD-positive frames required). Real human speech sustains voice
-# activity for 320ms easily; click/noise bursts typically don't.
-MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "16"))
+# ponytail: 2026-10-01 — 16 -> 20 (~400ms). Paired with the shorter
+# ASSISTANT_ECHO_IGNORE_MS: barge-in is now reachable early in the
+# assistant's turn, so the streak has to do the echo rejection that the
+# old 5 s blind window used to do. 400 ms of sustained voice is still
+# far below any deliberate interjection and well above an echo onset.
+MIN_BARGE_IN_FRAMES = int(os.getenv("MIN_BARGE_IN_FRAMES", "20"))
 PRE_SPEECH_FRAMES = int(os.getenv("PRE_SPEECH_FRAMES", "5"))
 # AUDIO-005: hard cap on the per-utterance PCM buffer (audio_ingest).
 # 20 ms @ 8 kHz PCM16 = 320 bytes/frame. 3000 frames = 60 s ≈ 960 KB.
@@ -290,18 +295,38 @@ VAD_BUFFER_MAX_BYTES = int(os.getenv("VAD_BUFFER_MAX_BYTES", "65536"))  # 64 KB 
 # ponytail: P0 follow-up — bumped 260 -> 800. The RMS threshold is the
 # PRIMARY filter for non-speech noise. Telephony line noise + clicks
 # typically peak well below 800; real human voice easily clears 1000+.
+# ponytail: 2026-10-01 — the "clicks peak well below 800" note above was
+# WRONG and is the reason hissy lines slipped through. Measured: this
+# synthetic noise only reaches RMS 800 at ~25% full scale, so any real
+# hiss louder than that passes a bare 800 gate and opens phantom turns.
+# 800 stays as the floor for CLEAN lines; noisy lines are handled by
+# NOISE_FLOOR_MULTIPLIER above, not by inflating this number.
 MIN_VOICE_RMS = int(os.getenv("MIN_VOICE_RMS", "800"))
-# ponytail: P0 follow-up — bumped 900 -> 2500. The pre-barge-in RMS
-# check uses pre_speech_frames[-MIN_BARGE_IN_FRAMES:] averaged, so the
-# absolute RMS must be loud AND sustained for barge-in to fire.
-BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "2500"))
+# ponytail: 2026-10-01 — the voice gate is now relative to the line's own
+# noise floor, not just this absolute value. A caller on a clean line keeps
+# MIN_VOICE_RMS; a caller on a hissy PSTN line has its threshold raised to
+# NOISE_FLOOR_MULTIPLIER x whatever the floor settles at, so hiss stops
+# opening phantom turns. 2.0 measured against real speech: the synthetic
+# speech fixture sits ~4x above the floor, so 2.0 keeps a clear margin
+# without blinding the VAD on a noisy line.
+NOISE_FLOOR_MULTIPLIER = float(os.getenv("NOISE_FLOOR_MULTIPLIER", "2.0"))
+# ponytail: 2026-10-01 — 2500 -> 1500. The pre-barge-in check averages
+# pre_speech_frames[-MIN_BARGE_IN_FRAMES:] and compares against this
+# absolute level, so at 2500 a caller who simply talks at a normal
+# shouting-free volume could not interrupt the agent at all. 1500 is
+# ~2x the 800 voice gate: clearly above the line, still clearly a person.
+BARGE_IN_MIN_RMS = int(os.getenv("BARGE_IN_MIN_RMS", "1500"))
 ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").strip().lower() in {"1", "true", "yes", "on"}
-# ponytail: P0 follow-up — bumped 3000 -> 5000ms. The echo of the AI's
-# own voice reaching the user's phone mic can sustain VAD-trigger
-# levels past the previous 3s window. 5s covers any reasonable
-# greeting reply (the welcome is ~12s of speech; we accept barge-in
-# risk on the tail of the reply rather than mid-greeting).
-ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "5000"))
+# ponytail: 2026-10-01 — 5000 -> 1500. The welcome message is ~9 s, so a
+# 5 s blind window made the first half of every greeting physically
+# uninterruptible; the operator reported the agent "no se calla para
+# nada" and could not cut it off. 1500 ms only covers the onset transient
+# of the assistant's own audio leaking into the mic. Echo DURING the turn
+# is now handled by the relative thresholds (NOISE_FLOOR_MULTIPLIER for
+# the voice gate, lower BARGE_IN_MIN_RMS) rather than by a long timer.
+# ponytail: if the agent starts interrupting ITSELF, raise this back
+# toward 3000 — that is the knob for self-echo, not BARGE_IN_MIN_RMS.
+ASSISTANT_ECHO_IGNORE_MS = float(os.getenv("ASSISTANT_ECHO_IGNORE_MS", "1500"))
 
 # LLM context window and response length — runtime tunables.
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))

@@ -6,21 +6,66 @@ import time
 
 import pytest
 
+from STT_server.config import SPEECH_START_FRAMES
 from STT_server.domain.session import CallSession
 from STT_server.services import audio_ingest, session_runtime, turn_manager
 
 
-@pytest.mark.asyncio
-async def test_voice_refreshes_idle_activity_before_turn_is_final(monkeypatch) -> None:
-    async def voice(_frame: bytes) -> tuple[bool, int]:
-        return True, 1000
+def _one_frame() -> str:
+    """base64 of 160 bytes mu-law == exactly one 20 ms frame after ulaw2lin."""
+    return base64.b64encode(b"\xff" * 160).decode("ascii")
+
+
+def _voice_stub(monkeypatch, *, is_voice: bool, rms: int) -> None:
+    async def voice(_frame: bytes, _min_rms: int) -> tuple[bool, int]:
+        return is_voice, rms
 
     monkeypatch.setattr(audio_ingest, "is_probable_voice", voice)
+
+
+@pytest.mark.asyncio
+async def test_sustained_voice_refreshes_idle_activity(monkeypatch) -> None:
+    # 2026-10-01: the clock now requires SPEECH_START_FRAMES of sustained
+    # voice instead of moving on any single voice-positive frame. The +1
+    # is real: audio_ingest reads voice_streak BEFORE incrementing it for
+    # the current frame, so the gate opens one frame (20 ms) late. On a
+    # timer whose resolution is seconds that lag is free; asserting it
+    # here keeps the behaviour pinned.
+    _voice_stub(monkeypatch, is_voice=True, rms=1000)
     session = CallSession(session_key="voice-activity")
     session.last_activity_at = 0
 
-    payload = base64.b64encode(b"\xff" * 160).decode("ascii")
-    await audio_ingest.handle_incoming_media(session, payload)
+    for _ in range(SPEECH_START_FRAMES + 1):
+        await audio_ingest.handle_incoming_media(session, _one_frame())
+
+    assert session.last_activity_at > 0
+
+
+@pytest.mark.asyncio
+async def test_single_voice_frame_does_not_refresh_idle_activity(monkeypatch) -> None:
+    # 2026-10-01: the regression that kept dead calls alive forever — a
+    # lone hiss burst used to reset the idle clock, so the line never
+    # looked silent and the call never hung up.
+    _voice_stub(monkeypatch, is_voice=True, rms=1000)
+    session = CallSession(session_key="hiss-activity")
+    session.last_activity_at = 0
+
+    await audio_ingest.handle_incoming_media(session, _one_frame())
+
+    assert session.last_activity_at == 0
+
+
+@pytest.mark.asyncio
+async def test_assistant_playback_advances_idle_clock(monkeypatch) -> None:
+    # 2026-10-01: the clock was frozen while the assistant spoke, so the
+    # whole assistant turn later counted as caller silence and the bot
+    # hung up mid-conversation. The assistant's own turn must move it.
+    _voice_stub(monkeypatch, is_voice=False, rms=100)
+    session = CallSession(session_key="assistant-activity")
+    session.assistant_speaking = True
+    session.last_activity_at = 0
+
+    await audio_ingest.handle_incoming_media(session, _one_frame())
 
     assert session.last_activity_at > 0
 

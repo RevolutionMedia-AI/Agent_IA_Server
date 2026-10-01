@@ -16,6 +16,7 @@ from STT_server.config import (
     MIN_BARGE_IN_FRAMES,
     MIN_UTTERANCE_VOICE_FRAMES,
     MIN_VOICE_RMS,
+    NOISE_FLOOR_MULTIPLIER,
     PRE_SPEECH_FRAMES,
     SPEECH_FRAMES_MAX,
     SPEECH_START_FRAMES,
@@ -40,9 +41,9 @@ def get_frame_rms(frame: bytes) -> int:
     return audio_codec.rms(frame, 2)
 
 
-def _is_probable_voice_sync(frame: bytes) -> tuple[bool, int]:
+def _is_probable_voice_sync(frame: bytes, min_rms: int) -> tuple[bool, int]:
     rms = get_frame_rms(frame)
-    return vad.is_speech(frame, TWILIO_SR) and rms >= MIN_VOICE_RMS, rms
+    return vad.is_speech(frame, TWILIO_SR) and rms >= min_rms, rms
 
 
 # ponytail: AUDIO-005 — cap gate for speech_frames. A runaway
@@ -66,13 +67,50 @@ def _append_speech_frame(session: CallSession, frame: bytes) -> None:
     session.speech_frames.append(frame)
 
 
-async def is_probable_voice(frame: bytes) -> tuple[bool, int]:
+def _voice_threshold(session: CallSession) -> int:
+    """Voice gate for this call: the higher of the fixed floor and
+    NOISE_FLOOR_MULTIPLIER x the line's measured noise floor.
+
+    webrtcvad does not discriminate telephony hiss at any aggressiveness
+    mode (measured — see WEBRTC_VAD_MODE in config.py), so a caller on a
+    noisy PSTN line otherwise gets phantom turns from sustained hiss. The
+    floor is only ever fed by frames that already failed the gate, so it
+    cannot chase real speech upward.
+    """
+    floor = session.noise_floor_rms
+    if floor <= 0:
+        return MIN_VOICE_RMS
+    return max(MIN_VOICE_RMS, int(floor * NOISE_FLOOR_MULTIPLIER))
+
+
+def _update_noise_floor(session: CallSession, rms: int, was_voice: bool) -> None:
+    """Track the caller's line noise from NON-voice frames only.
+
+    Rises immediately (a sudden hiss must raise the gate before the next
+    frame) and decays slowly (a one-off loud frame must not deafen the
+    caller for the rest of the call). ponytail: the decay rate is tuned
+    for 20 ms frames; a slower floor (0.999) tracks gain drift but takes
+    ~5 s to notice, a faster one (0.98) chases transients.
+    """
+    if was_voice or rms <= 0:
+        return
+    prev = session.noise_floor_rms
+    if prev <= 0 or rms > prev:
+        session.noise_floor_rms = rms
+    else:
+        session.noise_floor_rms = max(MIN_VOICE_RMS // 2, int(prev * 0.98))
+
+
+async def is_probable_voice(frame: bytes, min_rms: int) -> tuple[bool, int]:
     """M4: VAD + RMS are CPU-bound (audio_codec + webrtcvad). At 50 fps per call
     and 10 concurrent calls that's ~1.5 ms of CPU per frame x 500 fps = 750 ms
-    of CPU per second on one core, blocking the event loop. Offload to
-    the default thread pool so the WebSocket handler stays responsive.
+    of CPU per second on one core, blocking the event loop. Offload to the
+    default thread pool so the WebSocket handler stays responsive.
+
+    *min_rms* is the caller-adaptive voice threshold (see
+    ``_voice_threshold``), not the raw config value.
     """
-    return await _to_thread(_is_probable_voice_sync, frame)
+    return await _to_thread(_is_probable_voice_sync, frame, min_rms)
 
 
 async def handle_incoming_media(session: CallSession, media_payload: str) -> None:
@@ -211,11 +249,23 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
         frame = bytes(buf[offset:offset + FRAME_BYTES])
         offset += FRAME_BYTES
 
-        is_voice, rms = await is_probable_voice(frame)
-        log.debug(f"[VAD] Frame: offset={offset}, rms={rms}, is_voice={is_voice}")
+        is_voice, rms = await is_probable_voice(frame, _voice_threshold(session))
+        _update_noise_floor(session, rms, is_voice)
+        log.debug(f"[VAD] Frame: offset={offset}, rms={rms}, is_voice={is_voice} floor={session.noise_floor_rms}")
         session.pre_speech_frames.append(frame)
 
-        if is_voice and not session.assistant_speaking:
+        # ponytail: 2026-10-01 — the idle clock belongs to the HUMAN, and
+        # this one line was wrong in both directions:
+        # (a) it moved on ANY single voice-positive frame, so line hiss
+        #     kept a dead call alive forever;
+        # (b) it was skipped entirely while the assistant spoke, so the
+        #     whole assistant turn later counted as caller silence and
+        #     the bot hung up mid-conversation.
+        # So: sustained voice only, and the assistant's own turn moves the
+        # clock too so its duration is never charged to the caller.
+        if session.assistant_speaking or (
+            is_voice and session.voice_streak >= SPEECH_START_FRAMES
+        ):
             session.last_activity_at = time.monotonic()
 
         assistant_recently_started = (
