@@ -88,29 +88,41 @@ REALTIME_WS_URL = (
 )
 
 # ponytail: 2026-10-01 — 24000 is a HARD MINIMUM, not a documentation
-# example. OpenAI rejected 8000 outright:
-#   invalid_request_error.integer_below_min_value
-#   "Invalid 'session.audio.input.format.rate': integer below minimum
-#    value. Expected a value >= 24000, but got 8000 instead."
-# So there is no "skip the resample" escape hatch: the 8 kHz mu-law Twilio
-# hands us must always be converted. I previously suggested 8000 here as a
-# first thing to try; that was wrong and it cost a deploy.
-#
-# The knob is kept only because the API accepts anything >= 24000 and
-# 48000 is a legitimate higher-fidelity choice, which costs 2x the CPU.
-TARGET_SAMPLE_RATE = int(
-    os.getenv("OPENAI_TRANSCRIPTION_RATE_HZ", "24000")
-)
+# example. OpenAI rejected 8000 outright. A stale invalid value once
+# crash-looped production at import, so it now falls back to 24000 with a
+# loud error log; transcription can safely proceed at the documented
+# default. The knob is kept because values >= 24000 are accepted.
 SOURCE_SAMPLE_RATE = 8000
-if TARGET_SAMPLE_RATE % SOURCE_SAMPLE_RATE or TARGET_SAMPLE_RATE < 24000:
-    # Fail at import, not on the first call: a bad value would otherwise
-    # cost every call in the container a dead transcription session.
-    raise ValueError(
-        f"OPENAI_TRANSCRIPTION_RATE_HZ={TARGET_SAMPLE_RATE} is invalid. "
-        f"OpenAI's transcription session requires a rate >= 24000 that is a "
-        f"multiple of {SOURCE_SAMPLE_RATE} (Twilio's native rate); "
-        f"8000 is rejected by the API."
-    )
+DEFAULT_TRANSCRIPTION_RATE_HZ = 24000
+
+
+def _resolve_target_sample_rate(raw: str | None) -> int:
+    """Return the transcription-session audio rate.
+
+    OpenAI's hard minimum is 24000, and it must be a multiple of Twilio's
+    native 8000. An invalid OPENAI_TRANSCRIPTION_RATE_HZ falls back to
+    24000 with a loud error log instead of crashing the module: failing
+    the import crash-loops the whole container, while transcription can
+    safely proceed at the documented default.
+    """
+    try:
+        rate = int((raw or "").strip() or DEFAULT_TRANSCRIPTION_RATE_HZ)
+    except (TypeError, ValueError):
+        rate = DEFAULT_TRANSCRIPTION_RATE_HZ
+    if rate % SOURCE_SAMPLE_RATE or rate < 24000:
+        log.error(
+            "OPENAI_TRANSCRIPTION_RATE_HZ=%r is invalid. OpenAI requires "
+            "a rate >= 24000 that is a multiple of %d; using %d instead. "
+            "Remove the bad variable from the deployment environment.",
+            raw, SOURCE_SAMPLE_RATE, DEFAULT_TRANSCRIPTION_RATE_HZ,
+        )
+        return DEFAULT_TRANSCRIPTION_RATE_HZ
+    return rate
+
+
+TARGET_SAMPLE_RATE = _resolve_target_sample_rate(
+    os.getenv("OPENAI_TRANSCRIPTION_RATE_HZ")
+)
 UPSAMPLE = TARGET_SAMPLE_RATE // SOURCE_SAMPLE_RATE
 
 DEFAULT_MODEL_ID = meta.DEFAULT_OPENAI_STT_MODEL

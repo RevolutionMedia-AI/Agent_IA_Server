@@ -413,33 +413,24 @@ def test_connect_headers_carry_no_beta_flag():
     )
 
 
-def test_transcription_rate_rejects_the_value_openai_rejects():
-    """8000 is not a usable escape hatch — OpenAI rejects it.
+def test_transcription_rate_falls_back_instead_of_crash_looping():
+    """8000 must not crash the server.
 
-    Production: setting OPENAI_TRANSCRIPTION_RATE_HZ=8000 closed the
-    session with
-      invalid_request_error.integer_below_min_value
-      "Expected a value >= 24000, but got 8000 instead."
-
-    The point of the guard is to fail at import, in the container, once —
-    instead of silently accepting a value that kills every transcription
-    session on the first call.
+    Production: a stale OPENAI_TRANSCRIPTION_RATE_HZ=8000 first killed
+    transcription sessions, then — after the guard was added as a
+    module-level raise — crash-looped the entire container at import.
+    An invalid value now falls back to 24000 with a loud log while
+    transcription safely proceeds at OpenAI's documented default.
     """
-    import importlib
-    import pathlib
-
-    src = pathlib.Path(
-        importlib.import_module(
-            "STT_server.adapters.openai_stt_transcription"
-        ).__file__
-    ).read_text(encoding="utf-8")
-    assert ">= 24000" in src, (
-        "the rate guard must state OpenAI's documented minimum so the "
-        "next reader does not try 8000 again"
-    )
-
-    # And the guard is live: 24000 (the default) is accepted, 8000 is not.
     from STT_server.adapters import openai_stt_transcription as mod
+
+    assert mod._resolve_target_sample_rate(None) == 24000
+    assert mod._resolve_target_sample_rate("") == 24000
+    assert mod._resolve_target_sample_rate("24000") == 24000
+    assert mod._resolve_target_sample_rate("48000") == 48000
+    assert mod._resolve_target_sample_rate("8000") == 24000
+    assert mod._resolve_target_sample_rate("24001") == 24000
+    assert mod._resolve_target_sample_rate("not-a-rate") == 24000
     assert mod.TARGET_SAMPLE_RATE >= 24000
     assert mod.UPSAMPLE >= 3
 
