@@ -37,6 +37,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import struct
 import time
 
@@ -48,6 +49,12 @@ try:
     HAVE_NUMPY = True
 except ImportError:  # pragma: no cover - numpy is a hard dep in practice
     HAVE_NUMPY = False
+
+try:
+    from scipy.signal import resample_poly
+    _HAVE_SCIPY = True
+except ImportError:  # pragma: no cover
+    _HAVE_SCIPY = False
 
 from STT_server.config import (
     DEFAULT_CALL_LANGUAGE,
@@ -79,9 +86,24 @@ log = logging.getLogger("stt_server")
 REALTIME_WS_URL = (
     "wss://api.openai.com/v1/realtime?intent=transcription"
 )
-TARGET_SAMPLE_RATE = 24000
+
+# ponytail: 2026-10-01 — OpenAI's own example uses 24000, which forces a
+# 3x resample of the 8 kHz mu-law Twilio hands us. Setting
+# OPENAI_TRANSCRIPTION_RATE_HZ=8000 removes that conversion entirely: the
+# pipeline already holds 8 kHz, so there is nothing to resample, no filter
+# state, and no CPU. Try this FIRST if recognition is still poor — it is
+# one env var and no redeploy of code. Unverified against the live model
+# (no API key here), which is why it is opt-in rather than the default.
+TARGET_SAMPLE_RATE = int(
+    os.getenv("OPENAI_TRANSCRIPTION_RATE_HZ", "24000")
+)
 SOURCE_SAMPLE_RATE = 8000
-UPSAMPLE = TARGET_SAMPLE_RATE // SOURCE_SAMPLE_RATE  # 3
+if TARGET_SAMPLE_RATE % SOURCE_SAMPLE_RATE:
+    raise ValueError(
+        f"OPENAI_TRANSCRIPTION_RATE_HZ={TARGET_SAMPLE_RATE} must be a "
+        f"multiple of {SOURCE_SAMPLE_RATE} (Twilio's native rate)"
+    )
+UPSAMPLE = TARGET_SAMPLE_RATE // SOURCE_SAMPLE_RATE
 
 DEFAULT_MODEL_ID = meta.DEFAULT_OPENAI_STT_MODEL
 
@@ -102,34 +124,116 @@ TRANSCRIPTION_MODELS = tuple(meta.OPENAI_STT_MODELS)
 STT_INACTIVITY_TIMEOUT_S = 60
 
 
-def _mulaw_8k_to_pcm16_24k(mulaw: bytes) -> bytes:
-    """mu-law 8 kHz mono -> LINEAR16 PCM 24 kHz mono (int16 little-endian).
+class _StreamingResampler:
+    """mu-law 8k -> PCM16 24k across chunk boundaries, without seams.
 
-    Same shape as the Inworld adapter's 8k->16k helper: original samples
-    land on every Nth output slot and the slots between are filled by
-    linear interpolation, so the rate is right without inventing
-    high-frequency content that was never in the source.
+    resample_poly is a finite-impulse-response filter, so the first
+    `half_len` output samples of any call depend on samples that were
+    filtered away in the previous call. Resampling 20 ms chunks in
+    isolation therefore puts an audible step at every 20 ms seam.
+
+    Keeping the input history and dropping the output samples that
+    correspond to it makes the stream equivalent to one resample_poly over
+    the whole signal — which is what the test asserts.
+
+    ponytail: half_len mirrors resample_poly's default filter length
+    (10 * max(up, down) + 1). If that default ever changes, the seam
+    assertion in the test is what catches it.
     """
-    pcm_8k = ulaw2lin(mulaw, 2)
+
+    def __init__(self) -> None:
+        # resample_poly's default filter is 10 * max(up, down) + 1 taps,
+        # so it reaches HALF that many taps either side of a boundary.
+        # 30 is a multiple of UPSAMPLE, which the phase math needs.
+        self._half = 10 * UPSAMPLE
+        self._hist = b""      # last _half input samples (left filter context)
+        self._carry = b""     # 0..UPSAMPLE-1 samples held for a whole group
+        self._in_seen = 0     # input samples consumed, including _hist
+        self._emitted = 0     # output samples yielded so far
+
+    def feed(self, mulaw: bytes) -> bytes:
+        if not mulaw:
+            return b""
+        if UPSAMPLE == 1 or not _HAVE_SCIPY:
+            return _mulaw_8k_to_pcm16_24k(mulaw)
+
+        pcm_8k = ulaw2lin(mulaw, 2)
+        if not pcm_8k:
+            return b""
+
+        # ponytail: 2026-10-01 — the phase correction. resample_poly puts
+        # block-output k at block-input k/up, so its phase grid depends on
+        # the block length. _half (30) + a 20 ms chunk (160) = 190, which
+        # is NOT a multiple of 3, so the grid slid a third of a sample
+        # every chunk. Over a second of speech that is a full cycle of
+        # drift and the waveform stops matching its input. Consuming only
+        # whole groups of UPSAMPLE samples keeps every block length a
+        # multiple of 3 and the grid fixed.
+        buf = self._carry + pcm_8k
+        n_avail = len(buf) // 2
+        use = (n_avail // UPSAMPLE) * UPSAMPLE
+        if use == 0:
+            self._carry = buf
+            return b""
+        self._carry = buf[use * 2:]
+        self._in_seen += use
+
+        block = self._hist + buf[:use * 2]
+        n_block = len(block) // 2
+
+        out = resample_poly(
+            np.frombuffer(block, dtype="<i2"), up=UPSAMPLE, down=1
+        )
+        out = np.clip(out, -32768, 32767).astype("<i2")
+
+        # Block output k corresponds to GLOBAL output S*UPSAMPLE + k, so
+        # tracking _emitted in global terms is what makes "which of these
+        # are new" answerable. Dropping `len(_hist)//2 * UPSAMPLE` from
+        # the head every call instead removes the samples the previous
+        # call HELD, and the stream runs at 2.43x instead of 3x.
+        S = self._in_seen - n_block
+        start_k = self._emitted - S * UPSAMPLE
+        if start_k < 0:
+            start_k = 0
+        # Emit only outputs whose filter support ends at or before the last
+        # input sample we hold; the rest are recomputed next call.
+        limit_k = (n_block - 1 - self._half) * UPSAMPLE
+        if limit_k < start_k:
+            return b""
+
+        self._emitted = S * UPSAMPLE + limit_k + 1
+        self._hist = block[-self._half * 2:]
+        return out[start_k:limit_k + 1].tobytes()
+
+
+def _mulaw_8k_to_pcm16_24k(mulaw: bytes) -> bytes:
+    """mu-law 8 kHz mono -> LINEAR16 PCM at TARGET_SAMPLE_RATE.
+
+    ponytail: 2026-10-01 — this used to zero-stuff and linearly
+    interpolate. That is NOT band-limited resampling: it leaves spectral
+    images between 8 kHz and 24 kHz, and production heard the result as
+    garbage transcripts ("One of the" from a Spanish caller, then a
+    hallucination-rejected "No no no no"). scipy is already a dependency
+    (requirements.txt), so use resample_poly's proper polyphase FIR with
+    an anti-aliasing filter.
+
+    At UPSAMPLE == 1 there is nothing to convert and the bytes pass
+    through untouched, which is the point of the env-var escape hatch.
+
+    Falls back to the naive path only if scipy is somehow missing, so a
+    broken deploy degrades instead of dropping every call.
+    """
+    if UPSAMPLE == 1:
+        return ulaw2lin(mulaw, 2)
+    pcm_8k = ulaw2lin(mulaw, 2)  # PCM16 @ 8 kHz mono
     n_8k = len(pcm_8k) // 2
     if n_8k == 0:
         return b""
-
-    if HAVE_NUMPY:
-        src = np.frombuffer(pcm_8k, dtype="<i2")
-        n_out = UPSAMPLE * n_8k
-        out = np.zeros(n_out, dtype="<i2")
-        out[0::UPSAMPLE] = src
-        if n_8k > 1:
-            pair = src.astype(np.int32)
-            a = pair[:-1]
-            b = pair[1:]
-            for k in range(1, UPSAMPLE):
-                # linear ramp from a to b across the intermediate slots
-                out[k::UPSAMPLE][: n_8k - 1] = (
-                    a + ((b - a) * k) // UPSAMPLE
-                ).astype("<i2")
-        return out.tobytes()
+    if _HAVE_SCIPY:
+        out = resample_poly(
+            np.frombuffer(pcm_8k, dtype="<i2"), up=UPSAMPLE, down=1
+        )
+        return np.clip(out, -32768, 32767).astype("<i2").tobytes()
 
     src = struct.unpack(f"<{n_8k}h", pcm_8k)
     out = [0] * (UPSAMPLE * n_8k)
@@ -246,6 +350,13 @@ async def _audio_sender(ws, session: CallSession) -> None:
     """
     last_committed_seq = session.stt_turn_end_seq
     queue = session.stt_audio_queue
+    # ponytail: 2026-10-01 — the resampler is stateful. resample_poly's
+    # anti-aliasing FIR reaches 10*max(up,down) taps either side, so
+    # resampling each 20 ms chunk in isolation left an unfiltered edge at
+    # every boundary: audible clicks, and the transcribe model sees
+    # discontinuities. Carry the filter history across chunks so the
+    # concatenation is identical to resampling the whole stream at once.
+    resampler = _StreamingResampler()
 
     while not session.closed:
         # ponytail: the seq is checked on a short poll, not only when
@@ -263,7 +374,7 @@ async def _audio_sender(ws, session: CallSession) -> None:
             if chunk is None:
                 # Cleanup sentinel from the session teardown path.
                 return
-            pcm = _mulaw_8k_to_pcm16_24k(chunk)
+            pcm = resampler.feed(chunk)
             if pcm:
                 await ws.send(json.dumps({
                     "type": "input_audio_buffer.append",

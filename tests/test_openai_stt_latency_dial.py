@@ -476,21 +476,24 @@ def test_fe_mirror_matches_backend_table():
 
 
 def test_resampler_is_3x_and_stays_in_int16_range():
-    from STT_server.services.audio_codec import lin2ulaw, ulaw2lin
+    """Length and int16 range only.
+
+    Sample-exact equality at the 3x stride was a property of the old
+    zero-stuffing resampler. A band-limited resample filters every output,
+    so those positions legitimately differ. Waveform fidelity is asserted
+    in test_openai_stt_resampler.py.
+    """
+    from STT_server.services.audio_codec import lin2ulaw
 
     n = 40
     src = [(i * 500) - 10000 for i in range(n)]
     pcm = b"".join(int(s).to_bytes(2, "little", signed=True) for s in src)
-    decoded = ulaw2lin(lin2ulaw(pcm, 2), 2)
-    expect = [int.from_bytes(decoded[i:i + 2], "little", signed=True)
-              for i in range(0, len(decoded), 2)]
     out = _mulaw_8k_to_pcm16_24k(lin2ulaw(pcm, 2))
     got = [int.from_bytes(out[i:i + 2], "little", signed=True)
            for i in range(0, len(out), 2)]
     assert len(got) == n * 3
     assert all(-32768 <= v <= 32767 for v in got)
-    for i, s in enumerate(expect):
-        assert got[3 * i] == s
+    assert max(got) > 0
 
 
 def test_estimated_table_matches_the_spec_numbers():

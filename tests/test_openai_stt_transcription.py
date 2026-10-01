@@ -84,6 +84,13 @@ def test_live_transcribe_sends_plural_languages_not_language():
 def test_resampler_triples_the_sample_count_and_stays_in_range():
     """8 kHz -> 24 kHz is 3x. Also guards int16 overflow, which would
     wrap to full-scale negative and sound like loud static.
+
+    Sample-exact equality at the stride positions is deliberately NOT
+    asserted. That was a property of the old zero-stuffing code, which
+    copied input samples into every 3rd output slot verbatim. A
+    band-limited resample (resample_poly plus an anti-aliasing FIR) filters
+    every output sample, so those positions are legitimately different.
+    That the waveform survives is covered in test_openai_stt_resampler.py.
     """
     from STT_server.services.audio_codec import lin2ulaw
 
@@ -91,20 +98,13 @@ def test_resampler_triples_the_sample_count_and_stays_in_range():
     samples = [(i * 500) - 10000 for i in range(n_8k)]
     pcm_8k = struct.pack(f"<{n_8k}h", *samples)
 
-    # Round-trip through mu-law first so the values we assert on are the
-    # ones the function actually receives — G.711 is lossy, so comparing
-    # against the pre-encoded ints would fail on quantisation, not bugs.
-    decoded = struct.unpack(
-        f"<{n_8k}h", audio_codec.ulaw2lin(lin2ulaw(pcm_8k, 2), 2)
-    )
     out = _mulaw_8k_to_pcm16_24k(lin2ulaw(pcm_8k, 2))
 
     got = struct.unpack(f"<{len(out) // 2}h", out)
     assert len(got) == n_8k * 3
     assert all(-32768 <= v <= 32767 for v in got)
-    # every original sample survives at its 3x-stride position
-    for i, s in enumerate(decoded):
-        assert got[3 * i] == s
+    # the signal is still the caller's, not noise and not silence
+    assert max(got) > 0
 
 
 def test_resampler_handles_empty_and_odd_length_input():
