@@ -182,11 +182,16 @@ INITIAL_GREETING_TEXT_ES = os.getenv(
 # after the call connects. Root cause was a 236-char welcome_message
 # in Spanish that took ~18 s to play at speakingRate=1.15; plus
 # the user's reaction time + barge-in detection + LLM TTFB added
-# another ~10 s before the first non-greeting agent message. The
-# 28 s was real and avoidable without changing the welcome text:
-# cap the greeting to a length that plays in < ~10 s, regardless
-# of what the agent row has stored. Default 200 chars (~10 s of
-# speech at 1.15x). Set via env var.
+# another ~10 s before the first non-greeting agent message.
+# ponytail: 2026-10-01 — the "cap to ~10 s / 200 chars" note that used
+# to sit here was STALE. The cap was later raised to 500 on purpose to
+# allow a personalised opener (~30 s at speakingRate=1.0), and 500 is
+# what the frontend enforces (WELCOME_MAX_CHARS in
+# src/components/common/agentModalCopy.js, rendered as a live counter in
+# both agent modals). Dropping this to 200 would silently truncate
+# every greeting the operator is allowed to type, so 500 stays.
+# The real fix for "the agent talks too long" is barge-in
+# (ASSISTANT_ECHO_IGNORE_MS), not a shorter cap.
 INITIAL_GREETING_MAX_CHARS = int(os.getenv("INITIAL_GREETING_MAX_CHARS", "500"))
 # ponytail: 2026-08-14 — opt-in TwiML ``<Play>`` of a pre-generated
 # static greeting. The operator reported that the previous default

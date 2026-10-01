@@ -71,15 +71,19 @@ def test_min_utterance_voice_frames_default_is_25(monkeypatch) -> None:
     assert cfg.MIN_UTTERANCE_VOICE_FRAMES == 25
 
 
-def test_initial_greeting_max_chars_default_is_200(monkeypatch) -> None:
-    """Pin INITIAL_GREETING_MAX_CHARS at 200. Default chosen so the
-    full greeting plays in ~10 s at speakingRate=1.15; any longer
-    greeting truncates at the nearest sentence boundary.
+def test_initial_greeting_max_chars_default_is_500(monkeypatch) -> None:
+    """Pin INITIAL_GREETING_MAX_CHARS at 500.
+
+    2026-10-01: this test pinned 200 and had been failing since the cap
+    was raised. 500 is correct — it matches WELCOME_MAX_CHARS in the
+    frontend (src/components/common/agentModalCopy.js), which both agent
+    modals render as a live counter, so 200 would silently truncate every
+    greeting the operator was allowed to type.
     """
     monkeypatch.delenv("INITIAL_GREETING_MAX_CHARS", raising=False)
     _reload_config(monkeypatch)
     import STT_server.config as cfg
-    assert cfg.INITIAL_GREETING_MAX_CHARS == 200
+    assert cfg.INITIAL_GREETING_MAX_CHARS == 500
 
 
 # ── Greeting truncation logic ────────────────────────────────────────────

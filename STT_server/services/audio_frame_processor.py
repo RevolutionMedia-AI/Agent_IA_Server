@@ -5,7 +5,14 @@ callers (sync producers or async consumers via ``aiter_frames``) get completed
 ``frame_size``-byte slices. ``flush`` handles the trailing partial frame at EOF.
 """
 import asyncio
+from collections import deque
 from typing import AsyncIterator
+
+# ponytail: frames held for a consumer that has not started yet. 1500
+# frames = 30 s of audio. Bounded because inworld_tts feeds from a worker
+# thread and a consumer that never appears must not grow this forever.
+# Drop-oldest is right: those frames are the stalest by definition.
+_PENDING_MAX_FRAMES = 1500
 
 
 class AudioFrameProcessor:
@@ -21,6 +28,13 @@ class AudioFrameProcessor:
             "dropped_tail_bytes": 0,
         }
         self._queue: asyncio.Queue | None = None
+        # 2026-10-01: frames and the EOF sentinel published before any
+        # consumer existed were silently DROPPED (the queue is lazy), so
+        # aiter_frames() then blocked on an empty queue with no EOF and
+        # the call hung forever. These carry the unpublished state across
+        # queue creation instead.
+        self._pending: deque[bytes] = deque(maxlen=_PENDING_MAX_FRAMES)
+        self._eof_pending = False
 
     # ── sync API ─────────────────────────────────────────────────────────
     def feed(self, data: bytes) -> list[bytes]:
@@ -80,17 +94,29 @@ class AudioFrameProcessor:
     def _get_or_make_queue(self) -> asyncio.Queue:
         if self._queue is None:
             self._queue = asyncio.Queue()
+            # Replay whatever was published before this consumer existed,
+            # EOF last. Skipping this is what hung the call: the consumer
+            # waited on a queue that could never receive an EOF.
+            for f in self._pending:
+                self._queue.put_nowait(f)
+            self._pending.clear()
+            if self._eof_pending:
+                self._queue.put_nowait(None)
+                self._eof_pending = False
         return self._queue
 
     def _publish(self, frames: list[bytes]) -> None:
         if self._queue is None:
+            self._pending.extend(frames)
             return
         for f in frames:
             self._queue.put_nowait(f)
 
     def _publish_eof(self) -> None:
-        if self._queue is not None:
-            self._queue.put_nowait(None)
+        if self._queue is None:
+            self._eof_pending = True
+            return
+        self._queue.put_nowait(None)
 
 
 # ── self-test ────────────────────────────────────────────────────────────

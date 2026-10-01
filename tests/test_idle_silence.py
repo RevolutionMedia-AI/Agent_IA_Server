@@ -70,10 +70,10 @@ async def test_assistant_playback_advances_idle_clock(monkeypatch) -> None:
     assert session.last_activity_at > 0
 
 
-def idle_session() -> CallSession:
+def idle_session(*, first_timeout: float = 0.04) -> CallSession:
     session = CallSession(session_key="idle-monitor")
     session.idle_enabled = True
-    session.idle_first_timeout_sec = 0.04
+    session.idle_first_timeout_sec = first_timeout
     session.idle_subsequent_timeout_sec = 1
     session.idle_disconnect_timeout_sec = 1
     session.idle_max_attempts = 1
@@ -82,6 +82,13 @@ def idle_session() -> CallSession:
 
 @pytest.mark.asyncio
 async def test_idle_clock_starts_after_assistant_playback(monkeypatch) -> None:
+    # 2026-10-01: this was flaky (failed ~1 in 3 on the clean tree). The
+    # deadline was 0.04 s and the test slept 0.02 s before asserting the
+    # prompt had NOT fired — a 2x margin that asyncio.sleep blows through
+    # whenever the loop is loaded. The production logic is fine; the
+    # observation window was too close to the deadline. Give the "not
+    # yet" assertion a 10x margin and let the prompt land on the event
+    # with a 4x margin instead of a second fixed sleep.
     prompted = asyncio.Event()
 
     async def fake_tts(_session, _text, _generation):
@@ -89,17 +96,20 @@ async def test_idle_clock_starts_after_assistant_playback(monkeypatch) -> None:
 
     monkeypatch.setattr(turn_manager, "run_tts_with_retries", fake_tts)
     monkeypatch.setattr(session_runtime, "IDLE_MONITOR_POLL_SEC", 0.005)
-    session = idle_session()
+    session = idle_session(first_timeout=0.5)
     session.last_activity_at = time.monotonic() - 10
     session.assistant_speaking = True
 
     task = asyncio.create_task(session_runtime.monitor_idle_silence(session, object()))
     try:
-        await asyncio.sleep(0.02)
-        session.assistant_speaking = False
-        await asyncio.sleep(0.02)
+        # Assistant is mid-utterance: the clock must not be running, and
+        # last_activity_at is already 10 s stale, so anything less than a
+        # real 0.5 s wait proves the clock was correctly not started.
+        await asyncio.sleep(0.05)
         assert not prompted.is_set()
-        await asyncio.wait_for(prompted.wait(), timeout=0.2)
+
+        session.assistant_speaking = False
+        await asyncio.wait_for(prompted.wait(), timeout=3.0)
     finally:
         task.cancel()
         await task
