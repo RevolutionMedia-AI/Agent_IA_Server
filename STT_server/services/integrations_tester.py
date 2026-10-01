@@ -109,6 +109,16 @@ def _verdict_from_body(method: str, status: int, raw: bytes) -> tuple[bool, str]
     `missing_fields` is quoted when present because "which fields?" is
     the one thing the operator needs to act, and it is the whole answer
     for a schema/argument mismatch.
+
+    `message` AND `error` are both surfaced when both are present. An
+    Apps Script catch block is the canonical shape:
+
+        {success: false, message: "Internal error", error: "Exception: ..."}
+
+    `message` is the generic label the handler chose; `error` is the
+    exception it actually threw. Preferring `message` alone showed
+    "Internal error" and threw away the only actionable line in the
+    body.
     """
     if not raw:
         return None
@@ -126,11 +136,21 @@ def _verdict_from_body(method: str, status: int, raw: bytes) -> tuple[bool, str]
     if not failed:
         return None
 
-    detail = str(
-        parsed.get("message") or parsed.get("error") or ""
-    ).strip()
-    if isinstance(parsed.get("error"), dict):
-        detail = str(parsed["error"].get("message") or parsed["error"]).strip()
+    def _flatten(value) -> str:
+        if isinstance(value, dict):
+            return str(value.get("message") or value.get("detail") or value).strip()
+        return str(value or "").strip()
+
+    parts: list[str] = []
+    label = _flatten(parsed.get("message"))
+    err = _flatten(parsed.get("error"))
+    if label:
+        parts.append(label)
+    if err and err != label:
+        # The exception, not the handler's label for it.
+        parts.append(err)
+    detail = " — ".join(parts)
+
     missing = parsed.get("missing_fields") or parsed.get("missing") or []
     if isinstance(missing, (list, tuple)) and missing:
         detail = (detail + " — missing: " + ", ".join(str(m) for m in missing)).strip()

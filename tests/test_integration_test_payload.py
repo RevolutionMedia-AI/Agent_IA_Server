@@ -283,6 +283,24 @@ def test_ok_false_is_honoured_too(monkeypatch) -> None:
     assert "nope" in msg
 
 
+def test_apps_script_internal_error_surfaces_the_exception(monkeypatch) -> None:
+    # The real shape from a doPost catch block. `message` is the generic
+    # label the handler chose; `error` is the exception it threw. Reporting
+    # only "Internal error" throws away the one line the operator can act
+    # on.
+    body = json.dumps({
+        "success": False,
+        "message": "Internal error",
+        "error": "Exception: Sheet \"Candidatos\" not found",
+    }).encode()
+    _patched(monkeypatch, ok_code=200, body=body)
+
+    valid, msg = _test_webhook_reachable(CONFIG, {}, {"a": 1})
+    assert valid is False
+    assert "Internal error" in msg
+    assert "Candidatos" in msg, "the actual exception was dropped"
+
+
 def test_nested_error_object_is_unwrapped(monkeypatch) -> None:
     body = json.dumps({"success": False, "error": {"message": "bad field"}}).encode()
     _patched(monkeypatch, ok_code=200, body=body)
