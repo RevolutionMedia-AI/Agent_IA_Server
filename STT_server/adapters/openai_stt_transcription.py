@@ -87,21 +87,29 @@ REALTIME_WS_URL = (
     "wss://api.openai.com/v1/realtime?intent=transcription"
 )
 
-# ponytail: 2026-10-01 — OpenAI's own example uses 24000, which forces a
-# 3x resample of the 8 kHz mu-law Twilio hands us. Setting
-# OPENAI_TRANSCRIPTION_RATE_HZ=8000 removes that conversion entirely: the
-# pipeline already holds 8 kHz, so there is nothing to resample, no filter
-# state, and no CPU. Try this FIRST if recognition is still poor — it is
-# one env var and no redeploy of code. Unverified against the live model
-# (no API key here), which is why it is opt-in rather than the default.
+# ponytail: 2026-10-01 — 24000 is a HARD MINIMUM, not a documentation
+# example. OpenAI rejected 8000 outright:
+#   invalid_request_error.integer_below_min_value
+#   "Invalid 'session.audio.input.format.rate': integer below minimum
+#    value. Expected a value >= 24000, but got 8000 instead."
+# So there is no "skip the resample" escape hatch: the 8 kHz mu-law Twilio
+# hands us must always be converted. I previously suggested 8000 here as a
+# first thing to try; that was wrong and it cost a deploy.
+#
+# The knob is kept only because the API accepts anything >= 24000 and
+# 48000 is a legitimate higher-fidelity choice, which costs 2x the CPU.
 TARGET_SAMPLE_RATE = int(
     os.getenv("OPENAI_TRANSCRIPTION_RATE_HZ", "24000")
 )
 SOURCE_SAMPLE_RATE = 8000
-if TARGET_SAMPLE_RATE % SOURCE_SAMPLE_RATE:
+if TARGET_SAMPLE_RATE % SOURCE_SAMPLE_RATE or TARGET_SAMPLE_RATE < 24000:
+    # Fail at import, not on the first call: a bad value would otherwise
+    # cost every call in the container a dead transcription session.
     raise ValueError(
-        f"OPENAI_TRANSCRIPTION_RATE_HZ={TARGET_SAMPLE_RATE} must be a "
-        f"multiple of {SOURCE_SAMPLE_RATE} (Twilio's native rate)"
+        f"OPENAI_TRANSCRIPTION_RATE_HZ={TARGET_SAMPLE_RATE} is invalid. "
+        f"OpenAI's transcription session requires a rate >= 24000 that is a "
+        f"multiple of {SOURCE_SAMPLE_RATE} (Twilio's native rate); "
+        f"8000 is rejected by the API."
     )
 UPSAMPLE = TARGET_SAMPLE_RATE // SOURCE_SAMPLE_RATE
 
@@ -489,8 +497,16 @@ async def run_realtime_stt(
                     model_id, language, latency_mode=latency_mode,
                 )))
                 sender_task = asyncio.create_task(_audio_sender(ws, session))
+                # ponytail: 2026-10-01 — this says "sent", not "open".
+                # The previous wording logged the session as open
+                # immediately after ws.send(), before the server had
+                # accepted anything, so a rejected session.update still
+                # printed "transcription session open". Reading that line
+                # in production is how a hard rejection got mistaken for a
+                # success twice. `session.updated` from the server is the
+                # real confirmation and is logged when it arrives.
                 log.info(
-                    "[OPENAI_STT] transcription session open for %s "
+                    "[OPENAI_STT] session.update sent for %s "
                     "(model=%s latency_mode=%s lang=%s rate=%d)",
                     session.session_key, model_id,
                     latency_mode or "n/a", language, TARGET_SAMPLE_RATE,
@@ -565,14 +581,24 @@ async def run_realtime_stt(
                         "transcription.completed"
                     )
                     if not (is_delta or is_done):
+                        # session.updated is the server confirming it
+                        # accepted the config — the first hard evidence the
+                        # session is actually transcribing.
+                        if etype in (
+                            "session.updated", "transcription_session.updated",
+                        ):
+                            log.info(
+                                "[OPENAI_STT] session confirmed for %s "
+                                "(model=%s rate=%d)",
+                                session.session_key, model_id,
+                                TARGET_SAMPLE_RATE,
+                            )
                         # session.created/updated and keepalives carry
                         # nothing we act on. Log the rest so a contract
                         # change is visible instead of silent.
-                        if etype not in (
+                        elif etype not in (
                             "session.created",
-                            "session.updated",
                             "transcription_session.created",
-                            "transcription_session.updated",
                             "ping",
                             "pong",
                         ):

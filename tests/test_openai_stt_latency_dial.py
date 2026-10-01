@@ -413,6 +413,37 @@ def test_connect_headers_carry_no_beta_flag():
     )
 
 
+def test_transcription_rate_rejects_the_value_openai_rejects():
+    """8000 is not a usable escape hatch — OpenAI rejects it.
+
+    Production: setting OPENAI_TRANSCRIPTION_RATE_HZ=8000 closed the
+    session with
+      invalid_request_error.integer_below_min_value
+      "Expected a value >= 24000, but got 8000 instead."
+
+    The point of the guard is to fail at import, in the container, once —
+    instead of silently accepting a value that kills every transcription
+    session on the first call.
+    """
+    import importlib
+    import pathlib
+
+    src = pathlib.Path(
+        importlib.import_module(
+            "STT_server.adapters.openai_stt_transcription"
+        ).__file__
+    ).read_text(encoding="utf-8")
+    assert ">= 24000" in src, (
+        "the rate guard must state OpenAI's documented minimum so the "
+        "next reader does not try 8000 again"
+    )
+
+    # And the guard is live: 24000 (the default) is accepted, 8000 is not.
+    from STT_server.adapters import openai_stt_transcription as mod
+    assert mod.TARGET_SAMPLE_RATE >= 24000
+    assert mod.UPSAMPLE >= 3
+
+
 def test_unknown_model_raises():
     """A model outside the lineup must fail at the boundary. Silently
     substituting one would make the dropdown lie about what is running."""
