@@ -23,6 +23,18 @@ from STT_server.adapters.inworld_stt_realtime import run_realtime_stt as run_inw
 from STT_server.adapters.assemblyai_stt_realtime import run_realtime_stt as run_assemblyai_realtime_stt
 from STT_server.adapters.openai_llm import call_llm, list_models
 from STT_server.adapters.openai_realtime import run_realtime_session
+# ponytail: 2026-10-01 — imported at module scope, like every other STT
+# adapter, on purpose. A lazy import meant a bad
+# OPENAI_TRANSCRIPTION_RATE_HZ only raised inside media_stream, so the
+# container booted healthy, served the greeting, and then killed the call
+# with a generic "configuration problem" hangup. At module scope the same
+# misconfiguration stops the deploy at boot, where Railway says exactly
+# which variable is wrong instead of an operator discovering it on a live
+# phone call.
+from STT_server.adapters.openai_stt_transcription import (
+    TRANSCRIPTION_MODELS,
+    run_realtime_stt as run_openai_transcription_stt,
+)
 # ponytail: M8 from the call-flow audit. Fail fast on missing critical
 # env vars BEFORE any heavy import. Without this, if a downstream import
 # (FastAPI, pydantic, etc.) fails, the operator sees a confusing
@@ -1963,10 +1975,6 @@ async def media_stream(ws: WebSocket) -> None:
                     # The previous TODO here ("a real OpenAI batch STT
                     # path ... doesn't exist yet") is now adapters/
                     # openai_stt_transcription.py.
-                    from STT_server.adapters.openai_stt_transcription import (
-                        TRANSCRIPTION_MODELS,
-                        run_realtime_stt as run_openai_transcription_stt,
-                    )
                     _openai_stt_model = (
                         getattr(session, "stt_model", "") or ""
                     ).strip()
