@@ -63,7 +63,22 @@ from STT_server.services.credentials_resolver import resolve_for_session
 
 log = logging.getLogger("stt_server")
 
-REALTIME_WS_URL = "wss://api.openai.com/v1/realtime"
+# ponytail: 2026-10-01 — `intent=transcription`, NOT `?model=`.
+# The GA Realtime endpoint answers a bare /v1/realtime with
+# `invalid_request_error.missing_model`, which reads like "pass the
+# transcription model on the URL". It does not:
+#   ?model=gpt-4o-transcribe -> "is a transcription model and cannot be
+#                               used as the realtime session model"
+#   ?intent=transcription&model=... -> also rejected
+#   ?model=<realtime model> + a `type: transcription` session.update ->
+#       "Passing a transcription session update to a realtime session is
+#        not allowed"
+# `intent=transcription` alone is the supported form: OpenAI picks the
+# transcription model from session.update -> audio.input.transcription.model,
+# which is exactly where build_session_update() puts it.
+REALTIME_WS_URL = (
+    "wss://api.openai.com/v1/realtime?intent=transcription"
+)
 TARGET_SAMPLE_RATE = 24000
 SOURCE_SAMPLE_RATE = 8000
 UPSAMPLE = TARGET_SAMPLE_RATE // SOURCE_SAMPLE_RATE  # 3

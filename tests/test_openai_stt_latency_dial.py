@@ -355,6 +355,39 @@ def test_session_update_shape_is_a_24k_transcription_session():
     )
 
 
+def test_ws_url_uses_intent_and_never_a_model_param():
+    """Regression: `?model=` on the upgrade URL is wrong for transcription.
+
+    Production burned two deploys on this. First a beta header (fixed
+    separately), then `missing_model` on a bare /v1/realtime, which reads
+    like "pass the transcription model on the URL". Passing it gets:
+
+      ?model=gpt-4o-transcribe  -> "is a transcription model and cannot be
+                                   used as the realtime session model"
+      ?model=<realtime id>      -> "Passing a transcription session update
+                                   to a realtime session is not allowed"
+
+    `intent=transcription` alone is the supported form; the model travels
+    in session.update -> audio.input.transcription.model.
+    """
+    from STT_server.adapters import openai_stt_transcription as mod
+    from urllib.parse import urlparse, parse_qs
+
+    parsed = urlparse(mod.REALTIME_WS_URL)
+    assert parsed.scheme == "wss"
+    assert parsed.netloc == "api.openai.com"
+    assert parsed.path == "/v1/realtime"
+
+    q = parse_qs(parsed.query)
+    assert q.get("intent") == ["transcription"], (
+        f"the URL must declare transcription intent: {mod.REALTIME_WS_URL}"
+    )
+    assert "model" not in q, (
+        "a model param selects a conversation session and makes OpenAI "
+        "reject the transcription session.update"
+    )
+
+
 def test_connect_headers_carry_no_beta_flag():
     """Regression: the adapter shipped with `OpenAI-Beta: realtime=v1`.
 
