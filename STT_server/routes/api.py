@@ -1461,12 +1461,33 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
     # so an explicit clear-to-null is not expressible over this endpoint;
     # the adapter treats a stale value for a dial-less model as None
     # anyway, so the observable behaviour is right either way.
-    if "stt_latency_mode" in payload:
-        payload["stt_latency_mode"] = _validate_stt_latency(
-            payload.get("stt_provider") or _agent_stt_provider(agent_id, auth["user_id"]),
-            payload.get("stt_model") or _agent_stt_model(agent_id, auth["user_id"]),
-            payload.get("stt_latency_mode"),
+    # The dial only makes sense while the agent's model has one. Switching
+    # to a dial-less model (gpt-transcribe) or off OpenAI has to CLEAR the
+    # stored value, not leave it: db_update_agent treats None as "don't
+    # touch", so without clear_fields the old mode would sit on the row
+    # forever. Harmless to the adapter (it re-derives per call) but it is a
+    # stale column, and the next model switch back would resurrect it.
+    clear_fields: set[str] = set()
+    _latency_touched = (
+        "stt_latency_mode" in payload
+        or "stt_model" in payload
+        or "stt_provider" in payload
+    )
+    if _latency_touched:
+        _p = (
+            payload.get("stt_provider")
+            or _agent_stt_provider(agent_id, auth["user_id"])
         )
+        _m = (
+            payload.get("stt_model")
+            or _agent_stt_model(agent_id, auth["user_id"])
+        )
+        _resolved = _validate_stt_latency(_p, _m, payload.get("stt_latency_mode"))
+        payload.pop("stt_latency_mode", None)
+        if _resolved is not None:
+            payload["stt_latency_mode"] = _resolved
+        else:
+            clear_fields.add("stt_latency_mode")
     # ponytail: unified handoff validation. handoff_order (canonical) is
     # split into transfer_cascade + transfer_chain atomically; the halves
     # sent directly (legacy callers) get the same membership guarantees.
@@ -1500,13 +1521,21 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
                 if a["id"] == agent_id and a.get("user_id") == auth["user_id"]:
                     for k, v in payload.items():
                         a[k] = v
+                    # 2026-10-01 — explicit clears (see the latency-dial
+                    # block above). The JSON path writes nulls directly,
+                    # which is why it does not need db_update_agent's
+                    # None-means-don't-touch rule.
+                    for k in clear_fields:
+                        a[k] = None
                     _save(AGENTS_FILE, agents)
                     return {
                         "agent": a,
                         "change_log": reconcile_log,
                     }
         raise HTTPException(status_code=404, detail="Agent not found")
-    updated = db_update_agent(agent_id, auth["user_id"], payload)
+    updated = db_update_agent(
+        agent_id, auth["user_id"], payload, clear_fields=clear_fields,
+    )
     if not updated:
         raise HTTPException(status_code=404, detail="Agent not found")
     return {

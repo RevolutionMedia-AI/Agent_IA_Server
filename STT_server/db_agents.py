@@ -110,6 +110,25 @@ _AGENT_COLS = (
 DATA_DIR = Path(__file__).resolve().parent / "data"
 AGENTS_FILE = DATA_DIR / "agents.json"
 
+# Columns update_agent is allowed to SET. Extracted from the old inline set
+# so the payload loop and the clear_fields loop validate against the same
+# list — previously a new column had to be added in two places and forgetting
+# the second one silently dropped every clear for that column.
+_UPDATABLE_COLS = frozenset({
+    "name", "voice", "voice_id", "language", "campaign", "status",
+    "description", "tone", "prompt", "welcome_message",
+    "stt_provider", "stt_model", "stt_latency_mode",
+    "tts_provider", "tts_model",
+    "llm_provider", "llm_model",
+    "llm_temperature", "llm_max_tokens", "tts_speed",
+    "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
+    "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
+    "idle_subsequent_timeout_sec", "idle_final_message",
+    "idle_disconnect_timeout_sec", "idle_max_attempts",
+    "transfer_cascade", "transfer_chain", "transfer_enabled",
+    "transfer_unavailable_message", "ai_first_dates",
+})
+
 
 def _row_to_agent(row: dict) -> dict:
     """Map a DB row to the JSON shape the FE expects."""
@@ -295,8 +314,25 @@ def create_agent(user_id: str, payload: dict) -> dict:
     return _row_to_agent(row)
 
 
-def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
-    if not payload:
+def update_agent(
+    agent_id: str,
+    user_id: str,
+    payload: dict,
+    clear_fields: set[str] | None = None,
+) -> dict | None:
+    """Patch an agent row.
+
+    *clear_fields* names columns to set to NULL explicitly. Needed because
+    None already means "don't touch" everywhere else in this function
+    (the FE sends a partial PUT), so clearing a column is otherwise
+    inexpressible: switching an agent from a model that has a latency dial
+    to one that does not would leave the old value stored forever.
+
+    Kept separate from payload rather than overloading a sentinel value so
+    a caller cannot accidentally blank a column by sending null.
+    """
+    clear_fields = clear_fields or set()
+    if not payload and not clear_fields:
         return get_agent(agent_id, user_id)
     if not is_postgres():
         if not AGENTS_FILE.exists():
@@ -309,32 +345,26 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
         for a in data:
             if a.get("id") == agent_id and a.get("user_id") == user_id:
                 a.update({k: v for k, v in payload.items() if v is not None})
+                for k in clear_fields:
+                    a[k] = None
                 with open(AGENTS_FILE, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 return a
         return None
     # ponytail: only update fields the caller passed (exclude_none), so a
-    # PUT with {"name": "X"} doesn't blank out tts_provider. The set
-    # below also matches columns added in 006_agent_runtime_params.sql +
-    # 008_agent_idle_settings.sql so the FE can PATCH temperature /
-    # max_tokens / tts_speed / idle_* without the BE silently dropping them.
+    # PUT with {"name": "X"} doesn't blank out tts_provider. Columns added
+    # by 006 / 008 / 027 are in _UPDATABLE_COLS so the FE can PATCH them
+    # without the BE silently dropping them.
     set_clauses = []
     values = []
+    # A column in clear_fields is emitted as a bare NULL and its value from
+    # payload is DISCARDED, not appended as a second clause: two assignments
+    # to one column in a single UPDATE is a Postgres syntax error, so a
+    # caller passing both would have taken the whole save down.
     for k, v in payload.items():
-        if v is None:
+        if v is None or k in clear_fields:
             continue
-        if k not in {"name", "voice", "voice_id", "language", "campaign", "status",
-                     "description", "tone", "prompt", "welcome_message",
-                     "stt_provider", "stt_model", "stt_latency_mode",
-                     "tts_provider", "tts_model",
-                     "llm_provider", "llm_model",
-                     "llm_temperature", "llm_max_tokens", "tts_speed",
-                     "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
-                     "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
-                     "idle_subsequent_timeout_sec", "idle_final_message",
-                      "idle_disconnect_timeout_sec", "idle_max_attempts",
-                     "transfer_cascade", "transfer_chain", "transfer_enabled",
-                     "transfer_unavailable_message", "ai_first_dates"}:
+        if k not in _UPDATABLE_COLS:
             continue
         if k in ("transfer_cascade", "transfer_chain", "ai_first_dates"):
             # ponytail: same ::jsonb cast as the INSERT above. Accept
@@ -344,6 +374,12 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
         else:
             set_clauses.append(f"{k} = %s")
         values.append(v)
+
+    for k in clear_fields:
+        if k not in _UPDATABLE_COLS:
+            continue
+        set_clauses.append(f"{k} = NULL")
+
     if not set_clauses:
         return get_agent(agent_id, user_id)
     set_clauses.append("updated_at = NOW()")
