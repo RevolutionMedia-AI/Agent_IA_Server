@@ -546,6 +546,14 @@ class AgentCreate(BaseModel):
     # default provider config at call time.
     stt_provider: Optional[str] = None
     stt_model: Optional[str] = None
+    # ponytail: 027_agent_stt_latency_mode.sql. The OpenAI transcription
+    # latency/accuracy dial (minimal/low/medium/high/xhigh). Optional with
+    # None = "platform default for that model", which is also exactly what
+    # a pre-027 agent row looks like, so old clients keep working.
+    # Validated against the model in _validate_stt_latency, because a
+    # value legal for one model is invalid for another and OpenAI rejects
+    # the entire session.update if we send the wrong one.
+    stt_latency_mode: Optional[str] = None
     tts_provider: Optional[str] = None
     tts_model: Optional[str] = None
     llm_provider: Optional[str] = None
@@ -652,6 +660,11 @@ class AgentUpdate(BaseModel):
     # Per-service provider/model selection (New Agent flow)
     stt_provider: Optional[str] = None
     stt_model: Optional[str] = None
+    # ponytail: 027_agent_stt_latency_mode.sql. Same semantics as
+    # AgentCreate, but note the update route uses exclude_none, so
+    # omitting this leaves the stored value untouched and the modal must
+    # send an explicit value to change it.
+    stt_latency_mode: Optional[str] = None
     tts_provider: Optional[str] = None
     tts_model: Optional[str] = None
     llm_provider: Optional[str] = None
@@ -1337,6 +1350,71 @@ def _apply_handoff_payload(payload: dict, user_id: str, agent_id: str | None) ->
         payload["transfer_cascade"] = new_cascade
 
 
+def _agent_stt_provider(agent_id: str, user_id: str) -> str:
+    """Current stored stt_provider, so a partial update that only sends
+    stt_latency_mode is validated against the model the agent really has.
+    """
+    try:
+        from STT_server.db_agents import get_agent
+        row = get_agent(agent_id, user_id) or {}
+    except Exception:
+        return ""
+    return (row.get("stt_provider") or "").strip().lower()
+
+
+def _agent_stt_model(agent_id: str, user_id: str) -> str:
+    try:
+        from STT_server.db_agents import get_agent
+        row = get_agent(agent_id, user_id) or {}
+    except Exception:
+        return ""
+    return (row.get("stt_model") or "").strip()
+
+
+def _validate_stt_latency(provider, model, latency_mode) -> Optional[str]:
+    """Normalize and validate the STT latency dial before it hits disk.
+
+    Returns the value to persist, or None. Rules:
+      - non-OpenAI provider, or no model -> the dial is meaningless, store NULL
+      - supported model + no value -> store NULL and let the adapter apply
+        the platform default. This is what a legacy row looks like.
+      - supported model + a value that is not legal for THAT model -> 400,
+        because OpenAI rejects the whole session.update and the call would
+        open a socket and then never transcribe.
+      - committed-turn model (gpt-transcribe) + a value -> 400 when the
+        client explicitly sent one, so the operator learns their wizard is
+        posting a field this model cannot take. Storing NULL instead would
+        hide a real client bug behind a silently-ignored field. Nothing is
+        persisted either way, so the B9 requirement holds.
+    """
+    if not provider or provider not in ("openai", "openai_realtime"):
+        return None
+    from STT_server.services import openai_stt_models as _meta
+    if not _meta.is_supported(model):
+        return None
+    spec = _meta.OPENAI_STT_MODELS[model]
+    if not latency_mode:
+        return None
+    if not spec.get("supports_latency_mode"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model}' is committed-turn and has no "
+                f"latency/accuracy dial; omit stt_latency_mode"
+            ),
+        )
+    if latency_mode not in spec["latency"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid stt_latency_mode '{latency_mode}' for model "
+                f"'{model}'; expected one of "
+                + ", ".join(spec["latency"])
+            ),
+        )
+    return latency_mode
+
+
 @api_router.post("/agents")
 def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
     # ponytail: validate provider ids BEFORE the agent hits disk so a
@@ -1346,6 +1424,10 @@ def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
         if v and not get_provider_spec(v):
             raise HTTPException(status_code=400, detail=f"Unknown provider '{v}'")
     payload = data.dict()
+    payload["stt_latency_mode"] = _validate_stt_latency(
+        payload.get("stt_provider"), payload.get("stt_model"),
+        data.stt_latency_mode,
+    )
     # ponytail: handoff routing validation (fail-fast). On create no tools
     # can be assigned yet, so membership checks run against an empty set —
     # any transfer_tool reference 400s; post-create assigns append to chain.
@@ -1368,6 +1450,23 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
                 detail=f"Unknown provider '{v}'",
             )
     payload = data.dict(exclude_none=True)
+    # ponytail: 027 — validate the latency dial the same way create does,
+    # but ONLY when the caller sent it. exclude_none above already dropped
+    # the field when it was absent or null, so a legacy client that never
+    # sends it leaves the stored value untouched.
+    #
+    # A committed-turn model (gpt-transcribe) resolves to None here, which
+    # means it is simply not written — correct, since NULL and "absent" are
+    # the same thing to this column. Note db_update_agent skips None values,
+    # so an explicit clear-to-null is not expressible over this endpoint;
+    # the adapter treats a stale value for a dial-less model as None
+    # anyway, so the observable behaviour is right either way.
+    if "stt_latency_mode" in payload:
+        payload["stt_latency_mode"] = _validate_stt_latency(
+            payload.get("stt_provider") or _agent_stt_provider(agent_id, auth["user_id"]),
+            payload.get("stt_model") or _agent_stt_model(agent_id, auth["user_id"]),
+            payload.get("stt_latency_mode"),
+        )
     # ponytail: unified handoff validation. handoff_order (canonical) is
     # split into transfer_cascade + transfer_chain atomically; the halves
     # sent directly (legacy callers) get the same membership guarantees.

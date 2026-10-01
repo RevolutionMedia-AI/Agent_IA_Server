@@ -769,28 +769,23 @@ _HARDCODED_STT_MODELS = {
         {"id": "universal-streaming-multilingual",   "name": "Universal-Streaming Multilingual",   "description": "Multilingual streaming"},
         {"id": "universal-3.5-pro-realtime",         "name": "Universal-3.5 Pro Realtime",         "description": "Highest accuracy, realtime"},
     ],
-    # ponytail: STT catalog now strictly streaming-only. OpenAI's
-    # Whisper / gpt-4o-transcribe / gpt-4o-mini-transcribe are
-    # batch REST endpoints — they don't satisfy the "low-latency
-    # via WebSockets or HTTP chunked" rule in the realtime spec, so
-    # they were removed. The agent's stt_model must be one of these
-    # Realtime IDs for the openai_realtime adapter to work.
-    # ponytail: fallback used only when the OpenAI /models call fails.
-    # Kept in sync with the live Realtime catalog; the two `*-preview`
-    # ids that used to be here were shut down by OpenAI (the 4o pair in
-    # 2025-09 and 2026-05), so an agent row pointing at one now
-    # reconnects with a dead model and the caller hears silence.
+    # ponytail: 2026-10-01 — REPLACED. This used to be the four
+    # speech-to-speech Realtime ids (gpt-realtime-2.1-mini / -2.1 / -2 /
+    # gpt-realtime), and the transcribe-only models were on an explicit
+    # deny list because a previous fix concluded they "cannot hold a
+    # conversation or invoke the call-transfer tools". That reasoning
+    # conflated two different jobs. Those tools are the LLM's: with a
+    # cascade transcription session the LLM turn, the tool calls and the
+    # TTS all live in turn_manager, exactly as they already do for
+    # Deepgram, Inworld and AssemblyAI. A transcribe-only STT model is
+    # therefore the CORRECT shape for this product, not a dead end.
     #
-    # Only ids OpenAI documents as tool-capable Realtime models are
-    # listed, because this product's call transfer is an LLM tool: if the
-    # model cannot call tools, the handoff feature is silently dead.
-    # `gpt-realtime-1.5` and `gpt-live-1` are live but are NOT listed
-    # until someone verifies tool support for them.
+    # Driver is adapters/openai_stt_transcription.py; the ids are imported
+    # from there so the picker and the router can never disagree.
     "openai": [
-        {"id": "gpt-realtime-2.1-mini", "name": "GPT Realtime 2.1 Mini", "description": "Current Realtime with tool use, cheapest of the 2.1 family"},
-        {"id": "gpt-realtime-2.1",      "name": "GPT Realtime 2.1",      "description": "Current Realtime flagship with tool use"},
-        {"id": "gpt-realtime-2",        "name": "GPT Realtime 2",        "description": "Realtime 2 with tool use"},
-        {"id": "gpt-realtime",          "name": "GPT Realtime",          "description": "Previous GA Realtime. Works today, retires 2027-01-20"},
+        {"id": "gpt-live-transcribe",  "name": "GPT Live Transcribe",  "description": "Live streaming transcription for phone agents. Recommended default."},
+        {"id": "gpt-realtime-whisper", "name": "GPT Realtime Whisper", "description": "Streaming transcription. Legacy realtime model."},
+        {"id": "gpt-transcribe",       "name": "GPT Transcribe",       "description": "Committed-turn STT. Lowest cost, high accuracy."},
     ],
     # ponytail: Rime STT removed entirely. Out of spec.
     "inworld": [
@@ -1518,30 +1513,66 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 #     that closed instantly and no AI behind it: the
                 #     greeting played, then silence.
                 #
-                # Listed explicitly so the next catalog refresh cannot
-                # quietly reintroduce either group.
-                _NOT_OFFERED_AS_STT = (
-                    # (a) realtime-named, not a voice agent
-                    "gpt-realtime-translate",
-                    "gpt-realtime-whisper",
-                    "gpt-live-transcribe",
-                    "gpt-live-transcribe-mini",
-                    # (b) retired by OpenAI
-                    "gpt-4o-realtime-preview",
-                    "gpt-4o-mini-realtime-preview",
+                # ponytail: 2026-10-01 — allowlist, not denylist. The
+                # picker must offer EXACTLY the transcription ids the
+                # adapter in openai_stt_transcription.py can drive, so
+                # the filter is now "is this id in TRANSCRIPTION_MODELS".
+                # The old heuristic ("realtime" in id AND "transcribe"
+                # NOT in id) had become the opposite of correct: it
+                # excluded all three ids we want, and it could not
+                # exclude a future id that neither matched.
+                #
+                # The live /models call still runs, but only to pick up
+                # display metadata; if the provider omits one of our
+                # ids, the hardcoded catalog below fills the gap so the
+                # dropdown never shows a model the adapter can't run.
+                from STT_server.services.openai_stt_models import (
+                    DEFAULT_LATENCY_MODE as _DEFAULT_LATENCY_MODE,
+                    OPENAI_STT_MODELS as _OPENAI_STT_META,
                 )
+                _OPENAI_STT_IDS = tuple(_OPENAI_STT_META)
+                _OPENAI_STT_META_DEFAULTS = {
+                    k: _DEFAULT_LATENCY_MODE
+                    for k, v in _OPENAI_STT_META.items()
+                    if v.get("supports_latency_mode")
+                }
+                allowed = {i.lower() for i in _OPENAI_STT_IDS}
+                live: dict[str, dict] = {}
                 if creds:
                     try:
-                        models = _fetch_openai_models(creds)
-                        stt = [m for m in models
-                               if "realtime" in m["id"].lower()
-                               and "transcribe" not in m["id"].lower()
-                               and m["id"].lower() not in _NOT_OFFERED_AS_STT]
-                        if stt:
-                            return {"models": stt}
+                        for m in _fetch_openai_models(creds):
+                            mid = str(m.get("id") or "").lower()
+                            if mid in allowed:
+                                live[mid] = m
                     except Exception:
                         pass
-                return {"models": _HARDCODED_STT_MODELS.get("openai", [])}
+
+                # The FE needs the latency dial's shape to render the
+                # selector, so each entry carries supports_latency_mode and
+                # latency_options. This is metadata for the UI only — the
+                # adapter re-derives every value from
+                # services/openai_stt_models.py and never trusts the client.
+                merged = []
+                for entry in _HARDCODED_STT_MODELS.get("openai", []):
+                    eid = str(entry.get("id") or "").lower()
+                    spec = _OPENAI_STT_META.get(eid) or {}
+                    from_live = live.get(eid)
+                    merged.append({
+                        **entry,
+                        "name": (from_live or {}).get("name")
+                        or entry.get("name") or eid,
+                        "supports_latency_mode": bool(
+                            spec.get("supports_latency_mode")
+                        ),
+                        "latency_options": sorted(spec.get("latency", {})),
+                        "default_latency_mode": (
+                            _OPENAI_STT_META_DEFAULTS.get(eid)
+                            if spec.get("supports_latency_mode") else None
+                        ),
+                        "cost_per_minute_usd": spec.get("cost_per_minute_usd"),
+                        "kind": spec.get("kind"),
+                    })
+                return {"models": merged}
             if provider_id == "inworld":
                 return {"models": _HARDCODED_STT_MODELS["inworld"]}
             return {"models": []}
@@ -2031,39 +2062,51 @@ def _classify_openai_model(model_id: str) -> str | None:
     """Return "llm" / "stt" / "tts" for an OpenAI model id, or None
     if the id doesn't fit a service.
 
-    STT here means "can drive a live call", not "can transcribe a
-    file". This product's STT slot feeds a Realtime WebSocket that does
-    STT + LLM + TTS in one session, so only the tool-capable Realtime
-    voice models belong in the STT bucket.
+    STT here means "a transcription model this product can run as the
+    STT stage of a call".
 
-    ponytail: the previous version classified STT as "id contains
-    transcribe or whisper". That put gpt-live-transcribe and
-    gpt-realtime-whisper in the operator's dropdown — neither can hold a
-    conversation or invoke the call-transfer tools — while classifying
-    NO Realtime voice model at all, because they contain neither
-    "transcribe" nor "whisper" and do not start with a chat-family
-    prefix. Net effect: the OpenAI STT dropdown offered exactly two
-    models, and both were unusable for a voice agent.
+    ponytail: 2026-10-01 — this used to define STT as "can drive a live
+    call", on the reasoning that the STT slot fed a Realtime WebSocket
+    doing STT + LLM + TTS in one session, so only tool-capable Realtime
+    voice models belonged. That was wrong about where the LLM and the
+    tool calls live. They live in turn_manager. A transcription session
+    (adapters/openai_stt_transcription.py) feeds the same queue the
+    Deepgram, Inworld and AssemblyAI adapters feed, so the LLM turn and
+    every call-transfer tool run identically regardless of which STT model
+    produced the text. Transcribe-only models are therefore the correct
+    shape here, not a dead end.
 
-    The Realtime list is read from the adapter's catalog rather than
-    duplicated here, so the picker and the runtime can never disagree
-    about what this product can actually run.
+    The id set is read from that adapter rather than duplicated, so the
+    picker and the runtime cannot disagree about what we can run.
     """
     mid = model_id.lower()
     if not mid:
         return None
 
-    # STT, part 1: the Realtime voice models this product can run.
-    # Function-local import: adapters.openai_realtime is heavy and this
-    # module is imported by the credentials path, so a module-level
-    # import would both slow it down and risk a cycle.
+    # STT: the transcription ids the adapter can actually drive.
+    # Function-local import: the adapters are heavy and this module is on
+    # the credentials path, so a module-level import would slow it down
+    # and risk a cycle.
+    try:
+        from STT_server.adapters.openai_stt_transcription import (
+            TRANSCRIPTION_MODELS as _CASCADE_STT,
+        )
+    except Exception:
+        _CASCADE_STT = frozenset()
+    if mid in {i.lower() for i in _CASCADE_STT}:
+        return "stt"
+
+    # A speech-to-speech Realtime id is still runnable (STT_Server routes
+    # it to openai_realtime), so keep it in the bucket for agent rows
+    # that already point at one — but the PICKER only offers the
+    # transcription ids above, per the current catalog.
     try:
         from STT_server.adapters.openai_realtime import (
             _REALTIME_MODEL_CATALOG as _REALTIME_STT,
         )
     except Exception:
         _REALTIME_STT = frozenset()
-    if mid in _REALTIME_STT:
+    if mid in {i.lower() for i in _REALTIME_STT}:
         return "stt"
 
     excluded = (
@@ -2071,11 +2114,11 @@ def _classify_openai_model(model_id: str) -> str | None:
         "embedding", "whisper", "moderation", "search",
         "computer-use", "deep-research", "codex",
     )
-    # STT, part 2: a Realtime model we do not know how to run, or a
-    # translate/whisper/transcribe-only model. Both are dead ends for a
-    # live call, so they return None and simply do not appear.
-    # (An unknown future Realtime id is deliberately not offered rather
-    # than offered and 4004-ing the first call.)
+    # Anything else that merely LOOKS like transcription (gpt-4o-transcribe,
+    # gpt-realtime-translate, whisper-1, gpt-live-transcribe-mini) is not
+    # in the adapter's id set, so it returns None and does not appear.
+    # An unknown future id is deliberately not offered rather than
+    # offered and failing the first call.
     if "realtime" in mid or "transcribe" in mid or "whisper" in mid:
         return None
     if "tts" in mid or "speech" in mid:

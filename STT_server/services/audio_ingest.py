@@ -162,7 +162,23 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
     # response → caller heard silence after the greeting. The fix is
     # to mirror the dispatch check verbatim.
     stt_provider = getattr(session, "stt_provider", "")
+    # ponytail: 2026-10-01 — an Openai TRANSCRIPTION model (cascade) has to
+    # land on stt_audio_queue, not realtime_audio_queue. Only the
+    # speech-to-speech Realtime models consume the realtime queue; the
+    # transcription adapter in openai_stt_transcription.py reads
+    # stt_audio_queue like Deepgram/Inworld do. Routing by provider alone
+    # sent cascade agents' audio to a queue nobody was reading, so the
+    # transcription session opened and never transcribed.
+    _is_transcription = False
     if stt_provider in ("openai_realtime", "openai"):
+        from STT_server.adapters.openai_stt_transcription import (
+            TRANSCRIPTION_MODELS,
+        )
+        _is_transcription = (
+            getattr(session, "stt_model", "") or ""
+        ).strip() in TRANSCRIPTION_MODELS
+
+    if stt_provider in ("openai_realtime", "openai") and not _is_transcription:
         target_queue = session.realtime_audio_queue
         queue_name = "realtime_audio_queue"
     else:
@@ -396,6 +412,19 @@ async def handle_incoming_media(session: CallSession, media_payload: str) -> Non
                 session._speech_frames_cap_warned = False
                 continue
             log.info(f"[VAD] FIN DE VOZ: speech_frame_count={session.speech_frame_count}, silence_frames={session.silence_frames}")
+            # ponytail: 2026-10-01 — signal the end of a caller turn to
+            # cascade STT adapters. The OpenAI transcription session has
+            # no server_vad, so it must send input_audio_buffer.commit
+            # itself and needs a "the caller stopped talking" edge that
+            # lives next to the VAD decision rather than in a second
+            # detector inside the adapter.
+            #
+            # stt_turn_end_at is the t0 the transcription adapter measures
+            # real STT latency against; keeping it here means the
+            # measurement starts at the same instant the commit fires, so
+            # the number cannot disagree with the audio that was sent.
+            session.stt_turn_end_seq += 1
+            session.stt_turn_end_at = time.monotonic()
             session.speech_frames.clear()
             session.pre_speech_frames.clear()
             session.silence_frames = 0

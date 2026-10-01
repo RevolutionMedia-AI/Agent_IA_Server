@@ -168,6 +168,25 @@ class CallSession:
     # treated as "not yet estimated" so the first frames still use
     # MIN_VOICE_RMS.
     noise_floor_rms: int = 0
+    # ponytail: 2026-10-01 — bumped once per end-of-speech in
+    # audio_ingest. The OpenAI transcription session (adapters/
+    # openai_stt_transcription.py) has no server_vad, so it has to send
+    # `input_audio_buffer.commit` itself; watching this counter lets it
+    # reuse THIS VAD (and the adaptive floor above) instead of running a
+    # second energy detector that would disagree on exactly the noisy
+    # lines that motivated the floor.
+    stt_turn_end_seq: int = 0
+    # ponytail: 2026-10-01 — monotonic timestamp of that same
+    # end-of-speech bump. The transcription adapter subtracts it from the
+    # arrival of the first partial / the final so the recorded
+    # stt_partial_ms / stt_final_ms are REAL end-of-speech-to-transcript
+    # measurements rather than the static estimates in the UI. These are
+    # what will eventually replace the estimated table.
+    stt_turn_end_at: float | None = None
+    # 027_agent_stt_latency_mode.sql. The agent's OpenAI latency/accuracy
+    # dial. None for models that have no dial (gpt-transcribe) and for
+    # legacy rows, where the adapter substitutes the platform default.
+    stt_latency_mode: str | None = None
     active_generation: int = 0
     # ponytail: every generation <= this is invalid; producers abort when
     # their gen <= cancelled_through. Set by interrupt_current_turn after

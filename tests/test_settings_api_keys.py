@@ -374,8 +374,15 @@ def test_classify_openai_model():
     assert _classify_openai_model("gpt-4o-transcribe") is None
     assert _classify_openai_model("gpt-4o-mini-transcribe") is None
     assert _classify_openai_model("whisper-1") is None
-    assert _classify_openai_model("gpt-live-transcribe") is None
-    assert _classify_openai_model("gpt-realtime-whisper") is None
+    # 2026-10-01: INVERTED. These three used to assert None on the theory
+    # that a transcribe-only model "cannot drive a call". That conflated
+    # two jobs: the call's LLM turn, tool calls and TTS live in
+    # turn_manager, so a cascade transcription session drives the call just
+    # as well as a speech-to-speech socket does. They are now the STT bucket.
+    assert _classify_openai_model("gpt-live-transcribe") == "stt"
+    assert _classify_openai_model("gpt-realtime-whisper") == "stt"
+    assert _classify_openai_model("gpt-transcribe") == "stt"
+    # translation is still not a transcription model
     assert _classify_openai_model("gpt-realtime-translate") is None
     # TTS family
     assert _classify_openai_model("tts-1") == "tts"
@@ -702,30 +709,32 @@ async def test_get_settings_llm_options_route_with_saved_model(client, data_dir)
 def _fake_openai_models_response():
     """Mirror what GET https://api.openai.com/v1/models actually returns.
 
-    Includes the live realtime family, the two retired
-    `gpt-4o*-realtime-preview` ids OpenAI used to serve, the
-    realtime-named ids that are NOT usable as a voice agent, and the
-    batch transcribe ids the filter has always had to reject.
+    2026-10-01: the three ids the STT picker now offers are
+    transcribe-only, so the fixture now includes them. Their presence
+    here is what proves the allowlist filter keeps them, and the
+    presence of every other id is what proves it drops the rest.
     """
     return {
         "data": [
-            # realtime family — works with /v1/realtime
+            # the cascade transcription lineup — the ONLY ids offered as STT
+            {"id": "gpt-live-transcribe",          "owned_by": "openai"},
+            {"id": "gpt-transcribe",               "owned_by": "openai"},
+            {"id": "gpt-realtime-whisper",         "owned_by": "openai"},
+            # speech-to-speech realtime family — still runnable
+            # (openai_realtime adapter) but not offered in the picker
             {"id": "gpt-realtime-2.1-mini",        "owned_by": "openai"},
             {"id": "gpt-realtime-2.1",             "owned_by": "openai"},
             {"id": "gpt-realtime-2",               "owned_by": "openai"},
             {"id": "gpt-realtime-1.5",             "owned_by": "openai"},
             {"id": "gpt-realtime",                 "owned_by": "openai"},
-            # "realtime" in the name but NOT a voice agent: translation
-            # and streaming-stt only, no STT->LLM->TTS turn loop, so they
-            # cannot invoke the call-transfer tools this product relies on.
+            # "realtime"-named but not transcription either
             {"id": "gpt-realtime-translate",       "owned_by": "openai"},
-            {"id": "gpt-realtime-whisper",         "owned_by": "openai"},
-            {"id": "gpt-live-transcribe",          "owned_by": "openai"},
             # retired — shut down by OpenAI; kept here so the test
             # proves they are not offered as if they still worked
             {"id": "gpt-4o-realtime-preview",     "owned_by": "openai"},
             {"id": "gpt-4o-mini-realtime-preview", "owned_by": "openai"},
-            # batch transcribe family — would 400 from /v1/realtime
+            # batch transcribe family — the transcription SESSION does not
+            # accept these; they are file-transcription ids
             {"id": "gpt-4o-transcribe",             "owned_by": "openai"},
             {"id": "gpt-4o-mini-transcribe",       "owned_by": "openai"},
             {"id": "gpt-4o-transcribe-diarize",    "owned_by": "openai"},
@@ -746,6 +755,10 @@ def test_retired_openai_realtime_models_are_nowhere_in_the_stt_catalog():
     heard the greeting and then nothing. The operator had no correct
     option available.
 
+    Still worth guarding after the 2026-10-01 catalog change: the picker
+    moved to the three transcription ids, and a retired id must not come
+    back through a future catalog refresh.
+
     Guard all three places an id can reach an operator, so a future
     catalog refresh cannot reintroduce a dead model.
     """
@@ -756,10 +769,17 @@ def test_retired_openai_realtime_models_are_nowhere_in_the_stt_catalog():
 
     retired = ("gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview")
 
-    # 1. the dynamic filter's exclusion set
-    src = pathlib.Path(cr.__file__).read_text(encoding="utf-8")
+    # 1. the dynamic filter is now an ALLOWLIST over the transcription ids
+    #    (2026-10-01), so the retired ids cannot appear even if OpenAI's
+    #    stale /v1/models cache still serves them. Assert behaviour, not
+    #    the presence of a string in the source: the old check was a
+    #    grep for the id in a denylist, which passed as long as the id
+    #    appeared anywhere in the file.
+    from STT_server.services import openai_stt_models as _meta
     for dead in retired:
-        assert dead in src, f"{dead} must be explicitly excluded by the STT filter"
+        assert dead not in _meta.OPENAI_STT_MODELS, (
+            f"{dead} is retired and must not be an offered STT model"
+        )
 
     # 2. the hardcoded fallback catalog
     hardcoded = {m["id"] for m in cr._HARDCODED_STT_MODELS["openai"]}
@@ -789,27 +809,48 @@ def test_openai_stt_bucket_holds_only_voice_agents():
     not the filter used by /providers/models, and that classifier defined
     STT as "id contains transcribe or whisper" with no bucket at all for
     Realtime models.
+
+    2026-10-01: this test is INVERTED. The premise was wrong — that a
+    transcribe-only model "cannot drive a call" because the STT slot fed
+    a Realtime socket doing STT+LLM+TTS together. With a cascade
+    transcription session the LLM turn, the tool calls and the TTS live in
+    turn_manager, so a transcribe-only STT model is the correct shape for
+    this product. The three transcription ids are now the offer list, and
+    the ids that genuinely cannot run are the file-transcription ones and
+    the retired family.
     """
     from STT_server.adapters.openai_realtime import _REALTIME_MODEL_CATALOG
+    from STT_server.adapters.openai_stt_transcription import (
+        TRANSCRIPTION_MODELS,
+    )
     from STT_server.services.credentials_resolver import _classify_openai_model
 
-    # every model the product can actually run must be offered as STT
+    # the transcription ids the cascade adapter drives are all STT
+    for model in TRANSCRIPTION_MODELS:
+        assert _classify_openai_model(model) == "stt", (
+            f"{model} is driven by the transcription adapter and must be "
+            f"in the STT bucket"
+        )
+
+    # speech-to-speech realtime ids stay classified as STT so agent rows
+    # already pointing at one keep routing to openai_realtime
     for model in _REALTIME_MODEL_CATALOG:
         assert _classify_openai_model(model) == "stt", (
             f"{model} drives a live call and must be in the STT bucket"
         )
 
-    # transcription-only / translation models are not voice agents
+    # file-transcription ids are NOT what a transcription session accepts,
+    # and neither is a translate model
     for dead_end in (
-        "gpt-live-transcribe",
-        "gpt-realtime-whisper",
         "gpt-realtime-translate",
         "gpt-4o-transcribe",
         "gpt-4o-mini-transcribe",
+        "gpt-4o-transcribe-diarize",
         "whisper-1",
     ):
         assert _classify_openai_model(dead_end) != "stt", (
-            f"{dead_end} cannot drive a call; it must not be offered as STT"
+            f"{dead_end} is not a transcription-session id; it must not be "
+            f"offered as STT"
         )
 
     # retired voice models are not offered either
@@ -825,15 +866,20 @@ def test_openai_stt_bucket_holds_only_voice_agents():
 
 
 def test_list_openai_stt_filters_out_batch_transcribe_models():
-    """Regression: the previous filter accepted any model with
-    "transcribe" in its name, which let batch-only models
-    (gpt-4o-transcribe, gpt-4o-transcribe-diarize, ...) into the
-    STT dropdown. The agent then picked one, the Realtime API
-    rejected it, and the BE silently fell back to gpt-realtime.
+    """Regression guard, still true after the 2026-10-01 catalog change.
 
-    Ponytail: the fix is to require "realtime" in the name AND
-    exclude "transcribe" AND exclude the realtime-named ids that are not
-    voice agents (translate / streaming-stt only).
+    The ORIGINAL bug: the filter accepted any model with "transcribe" in
+    its name, letting batch-only models (gpt-4o-transcribe,
+    gpt-4o-transcribe-diarize) into the dropdown. The agent picked one,
+    the API rejected it, and the BE silently fell back.
+
+    The 2026-10-01 change replaced the name heuristic with an allowlist of
+    the transcription ids a transcription SESSION accepts, because the
+    heuristic had become the opposite of correct: it rejected all three
+    ids we actually want, all of which contain "transcribe".
+
+    Batch-only ids must still be excluded, and the substring coincidence
+    is exactly why the allowlist exists.
     """
     import urllib.request
     from unittest.mock import patch
@@ -851,22 +897,29 @@ def test_list_openai_stt_filters_out_batch_transcribe_models():
         out = list_provider_models("stt", "openai", api_key="sk-test1234567890abcdefABCDEF")
 
     ids = [m["id"] for m in out["models"]]
-    # Live Realtime family present.
-    assert "gpt-realtime-2.1-mini" in ids
-    assert "gpt-realtime-2.1" in ids
-    assert "gpt-realtime-2" in ids
-    assert "gpt-realtime-1.5" in ids
-    assert "gpt-realtime" in ids
-    # "realtime"-named but NOT a voice agent: offering these configures
-    # an agent that cannot hold a conversation or call the transfer
-    # tools, which is a silent feature death.
-    assert "gpt-realtime-translate" not in ids
-    assert "gpt-realtime-whisper" not in ids
-    assert "gpt-live-transcribe" not in ids
+
+    # 2026-10-01: the offer-list is the three transcription ids, and it is
+    # an ALLOWLIST, so the SET is the whole contract. Assert as a set (order
+    # is a display concern) so a harmless reorder does not fail the suite,
+    # while a missing or extra id still does.
+    assert set(ids) == {
+        "gpt-live-transcribe",
+        "gpt-realtime-whisper",
+        "gpt-transcribe",
+    }, f"unexpected STT offer list: {ids}"
+    assert len(ids) == 3, f"the offer list must not contain duplicates: {ids}"
+
     # Retired models must never be offered as if they still worked.
     assert "gpt-4o-realtime-preview" not in ids
     assert "gpt-4o-mini-realtime-preview" not in ids
-    # Batch transcribe family excluded.
+    # Speech-to-speech realtime ids are still runnable but the picker
+    # does not offer them; see _classify_openai_model for why the
+    # bucket is not the same thing as the offer list.
+    assert "gpt-realtime" not in ids
+    assert "gpt-realtime-2.1" not in ids
+    assert "gpt-realtime-translate" not in ids
+    # Batch transcribe family excluded — a transcription SESSION does not
+    # accept file-transcription ids.
     assert "gpt-4o-transcribe" not in ids
     assert "gpt-4o-mini-transcribe" not in ids
     assert "gpt-4o-transcribe-diarize" not in ids

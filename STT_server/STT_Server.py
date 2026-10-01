@@ -1625,6 +1625,13 @@ async def media_stream(ws: WebSocket) -> None:
                     session.tts_provider = _cfg_tts or find_first_configured_provider(session.user_id, 'tts') or ''
                     session.llm_provider = _cfg_llm or find_first_configured_provider(session.user_id, 'llm') or 'openai'
                     session.stt_model = (agent_cfg.get('stt_model') or None)
+                    # ponytail: 027 — the STT latency/accuracy dial. Kept
+                    # as the RAW stored value here; the transcription
+                    # adapter normalizes it (a value that is not legal for
+                    # the chosen model resolves to the platform default,
+                    # and a committed-turn model always resolves to None
+                    # so `delay` is never sent to gpt-transcribe).
+                    session.stt_latency_mode = (agent_cfg.get('stt_latency_mode') or None)
                     session.tts_model = (agent_cfg.get('tts_model') or None)
                     session.llm_model = (agent_cfg.get('llm_model') or None)
                     session.voice_id = agent_cfg.get('voice_id') or None
@@ -1941,35 +1948,82 @@ async def media_stream(ws: WebSocket) -> None:
                 async def _enqueue_transcript(item: dict) -> None:
                     await enqueue_transcript_event(session, item)
                 if session.stt_provider in ('openai_realtime', 'openai'):
-                    # ponytail: 'openai' is the user-facing name in the
-                    # FE dropdown (matches the OpenAI STT option the FE
-                    # shows); 'openai_realtime' is the historical path
-                    # name. They route to the same adapter — the
-                    # agent's stt_model field (gpt-4o-transcribe, etc.)
-                    # is what tells the OpenAI Realtime API which model
-                    # to use. If you want a real OpenAI batch STT path
-                    # (REST /v1/audio/transcriptions), that's a separate
-                    # adapter that doesn't exist yet — TODO.
-                    if session.stt_provider == 'openai':
-                        log.info(
-                            "[STT] session %s using 'openai' alias for 'openai_realtime'",
-                            session.session_key,
-                        )
-                    track_task(
-                        session,
-                        asyncio.create_task(run_realtime_session(session)),
+                    # ponytail: 2026-10-01 — one provider id, two very
+                    # different OpenAI STT paths, told apart by the
+                    # agent's stt_model because the provider cannot:
+                    #  - transcription ids (gpt-live-transcribe,
+                    #    gpt-transcribe, gpt-realtime-whisper) are
+                    #    CASCADE. Text only; the LLM turn, the tool calls
+                    #    and TTS stay in turn_manager exactly like
+                    #    Deepgram / Inworld / AssemblyAI.
+                    #  - realtime ids (gpt-realtime*) are SPEECH-TO-SPEECH.
+                    #    One model does STT+LLM+TTS on the same socket and
+                    #    is what carries the tools. Kept so agent rows
+                    #    already pointing at them keep working.
+                    # The previous TODO here ("a real OpenAI batch STT
+                    # path ... doesn't exist yet") is now adapters/
+                    # openai_stt_transcription.py.
+                    from STT_server.adapters.openai_stt_transcription import (
+                        TRANSCRIPTION_MODELS,
+                        run_realtime_stt as run_openai_transcription_stt,
                     )
-                    # ponytail: P3 — start the relay pump so realtime
-                    # transcripts flow through process_transcripts
-                    # (memory / anti-loop / replace-current / order
-                    # escalation). Belt-and-suspenders: existing
-                    # realtime dispatch path is untouched.
-                    pump_task = asyncio.create_task(_pump_realtime_transcripts_to_central_queue(session))
-                    session.tasks.add(pump_task)
-                    # ponytail: do NOT launch process_transcripts here.
-                    # The pump already forwards realtime finals into the
-                    # central pipeline; adding a second consumer races on
-                    # transcript_queue and double-fires TTS turns.
+                    _openai_stt_model = (
+                        getattr(session, "stt_model", "") or ""
+                    ).strip()
+                    if _openai_stt_model in TRANSCRIPTION_MODELS:
+                        log.info(
+                            "[STT] session %s using OpenAI transcription "
+                            "session (cascade) model=%s",
+                            session.session_key, _openai_stt_model,
+                        )
+                        track_task(
+                            session,
+                            asyncio.create_task(
+                                run_openai_transcription_stt(
+                                    session,
+                                    _enqueue_transcript,
+                                    announce_stt_failure_once,
+                                )
+                            ),
+                        )
+                        track_task(
+                            session,
+                            asyncio.create_task(
+                                process_transcripts(session)
+                            ),
+                        )
+                    else:
+                        # ponytail: 'openai' is the user-facing name in the
+                        # FE dropdown (matches the OpenAI STT option the FE
+                        # shows); 'openai_realtime' is the historical path
+                        # name. They route to the same speech-to-speech
+                        # adapter. The agent's stt_model field is what
+                        # tells the OpenAI Realtime API which model to use.
+                        if session.stt_provider == 'openai':
+                            log.info(
+                                "[STT] session %s using 'openai' alias for "
+                                "'openai_realtime' (speech-to-speech)",
+                                session.session_key,
+                            )
+                        track_task(
+                            session,
+                            asyncio.create_task(
+                                run_realtime_session(session)
+                            ),
+                        )
+                        # ponytail: P3 — start the relay pump so realtime
+                        # transcripts flow through process_transcripts
+                        # (memory / anti-loop / replace-current / order
+                        # escalation). Belt-and-suspenders: existing
+                        # realtime dispatch path is untouched.
+                        pump_task = asyncio.create_task(
+                            _pump_realtime_transcripts_to_central_queue(session)
+                        )
+                        session.tasks.add(pump_task)
+                        # ponytail: do NOT launch process_transcripts here.
+                        # The pump already forwards realtime finals into the
+                        # central pipeline; adding a second consumer races on
+                        # transcript_queue and double-fires TTS turns.
                 elif session.stt_provider == 'inworld':
                     track_task(
                         session,

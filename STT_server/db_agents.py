@@ -19,6 +19,12 @@ Schema (001_schema.sql + 006_agent_runtime_params.sql):
     welcome_message TEXT,
     stt_provider TEXT,
     stt_model TEXT,
+    -- 027_agent_stt_latency_mode.sql. OpenAI transcription latency dial
+    -- (minimal/low/medium/high/xhigh). NULL = platform default for the
+    -- model, and is the ONLY valid stored value for gpt-transcribe, which
+    -- is committed-turn and has no dial. Intentionally no DEFAULT: a
+    -- default would push an invalid value into committed-turn rows.
+    stt_latency_mode TEXT,
     tts_provider TEXT,
     tts_model TEXT,
     llm_provider TEXT,
@@ -83,7 +89,8 @@ _IDLE_COLS = (
 _AGENT_COLS = (
     "id, user_id, name, voice, voice_id, language, campaign, status, "
     "description, tone, prompt, welcome_message, "
-    "stt_provider, stt_model, tts_provider, tts_model, "
+    "stt_provider, stt_model, stt_latency_mode, "
+    "tts_provider, tts_model, "
     "llm_provider, llm_model, "
     "llm_temperature, llm_max_tokens, tts_speed, "
     "stt_use_own_key, llm_use_own_key, tts_use_own_key, "
@@ -229,7 +236,8 @@ def create_agent(user_id: str, payload: dict) -> dict:
         return new_agent
     cols = ["id", "user_id", "name", "calls", "perf", "voice", "voice_id", "language",
             "campaign", "status", "description", "tone", "prompt", "welcome_message",
-            "stt_provider", "stt_model", "tts_provider", "tts_model",
+            "stt_provider", "stt_model", "stt_latency_mode",
+            "tts_provider", "tts_model",
             "llm_provider", "llm_model",
             "llm_temperature", "llm_max_tokens", "tts_speed",
             "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
@@ -254,6 +262,7 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("tone"), payload.get("prompt"),
               payload.get("welcome_message"),
               payload.get("stt_provider"), payload.get("stt_model"),
+              payload.get("stt_latency_mode"),
               payload.get("tts_provider"), payload.get("tts_model"),
               payload.get("llm_provider"), payload.get("llm_model"),
               payload.get("llm_temperature"), payload.get("llm_max_tokens"),
@@ -316,7 +325,8 @@ def update_agent(agent_id: str, user_id: str, payload: dict) -> dict | None:
             continue
         if k not in {"name", "voice", "voice_id", "language", "campaign", "status",
                      "description", "tone", "prompt", "welcome_message",
-                     "stt_provider", "stt_model", "tts_provider", "tts_model",
+                     "stt_provider", "stt_model", "stt_latency_mode",
+                     "tts_provider", "tts_model",
                      "llm_provider", "llm_model",
                      "llm_temperature", "llm_max_tokens", "tts_speed",
                      "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
