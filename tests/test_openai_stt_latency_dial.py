@@ -355,6 +355,31 @@ def test_session_update_shape_is_a_24k_transcription_session():
     )
 
 
+def test_connect_headers_carry_no_beta_flag():
+    """Regression: the adapter shipped with `OpenAI-Beta: realtime=v1`.
+
+    OpenAI graduated the Realtime API to GA, so the beta header flips the
+    server onto a disabled beta path and the socket closes 4000 with
+    `invalid_request_error.beta_api_shape_disabled` before a single
+    session.update is accepted. Production saw exactly that: every call
+    died on the first send and the caller heard the STT-failure prompt.
+
+    openai_realtime.py had already removed this header for the same
+    reason, and this adapter reintroduced it. Assert the header set so a
+    copy from an outdated doc snippet cannot bring it back.
+    """
+    from STT_server.adapters import openai_stt_transcription as mod
+
+    mod._ACTIVE_API_KEY[0] = "sk-test-not-a-real-key"
+    headers = mod._connect_kwargs()
+    flat = next(v for v in headers.values() if isinstance(v, dict))
+    assert "Authorization" in flat
+    assert flat["Authorization"] == "Bearer sk-test-not-a-real-key"
+    assert not [k for k in flat if k.lower().startswith("openai-beta")], (
+        f"the GA Realtime endpoint must be called with no beta header: {list(flat)}"
+    )
+
+
 def test_unknown_model_raises():
     """A model outside the lineup must fail at the boundary. Silently
     substituting one would make the dropdown lie about what is running."""

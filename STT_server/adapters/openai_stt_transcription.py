@@ -286,10 +286,17 @@ def _connect_kwargs() -> dict:
         )
     except (TypeError, ValueError):  # pragma: no cover
         name = "additional_headers"
+    # ponytail: 2026-10-01 — DO NOT add `OpenAI-Beta: realtime=v1` here.
+    # It was removed from openai_realtime.py because OpenAI graduated the
+    # Realtime API to GA; the beta header now flips the server onto a
+    # disabled beta path and the socket closes 4000 with
+    # `invalid_request_error.beta_api_shape_disabled`. This adapter shipped
+    # with the header (copied from an outdated docs snippet) and every call
+    # failed on the first session.update. The GA endpoint accepts the exact
+    # same session.update payload with no beta header at all.
     return {
         name: {
             "Authorization": "Bearer " + _ACTIVE_API_KEY[0],
-            "OpenAI-Beta": "realtime=v1",
         },
         "ping_interval": 20,
         "ping_timeout": 20,
