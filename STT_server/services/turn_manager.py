@@ -973,9 +973,17 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
     if not text or session.closed:
         return
 
-    # If the text still looks incomplete, allow ONE extra short wait
+    # If the text still needs deferring, allow ONE extra short wait
     # (half grace) to accumulate more text.
-    if looks_like_incomplete_utterance(text):
+    # ponytail: 2026-10-02 — was `looks_like_incomplete_utterance(text)`.
+    # That is NOT the predicate that caused the deferral: process_transcripts
+    # defers on `should_defer_final_transcript`, which also covers short
+    # unpunctuated utterances (<= SHORT_FINAL_MAX_WORDS). So every short
+    # fragment ("en varias", "a las dos") was deferred and then given ZERO
+    # extra grace, and went to the LLM verbatim as if it were the whole
+    # turn -- producing paraphrases of the previous answer ("varias
+    # vacantes" out of the fragment "en varias"). Same question, same answer.
+    if should_defer_final_transcript(text):
         ext_ms = (
             DIGIT_DICTATION_GRACE_MS / 2
             if looks_like_digit_dictation(text)
@@ -987,6 +995,27 @@ async def flush_deferred_final_after_grace(session: CallSession) -> None:
             return
         text = session.deferred_final_text.strip()
         if not text or session.closed:
+            return
+        # Still a fragment after the extra wait. Answering it would
+        # paraphrase whatever the previous turn already said, which is the
+        # "the agent repeats itself / mixes turns" report. Hold it instead:
+        # the next real final merges with it (process_transcripts), and a
+        # caller who really did stop mid-sentence gets handled by the idle
+        # monitor, not by a hallucinated reply.
+        if should_defer_final_transcript(text):
+            if LOG_TRANSCRIPT_CONTENT:
+                log.info(
+                    "Reteniendo final diferido (aun fragmento) en %s: %s",
+                    session.session_key, text,
+                )
+            else:
+                log.info(
+                    "Reteniendo final diferido (aun fragmento) en %s len=%d",
+                    session.session_key, len(text),
+                )
+            # Keep deferred_final_text/_language for the next merge; only
+            # drop the flush task so a new final can schedule a new one.
+            session.deferred_final_flush_task = None
             return
 
     # If the assistant is still speaking, wait briefly for playback to
