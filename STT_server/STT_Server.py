@@ -70,7 +70,15 @@ from STT_server.services.wait_signals import set_stream_ready
 # at INFO; the third-party noise is still quieted below.
 logging.basicConfig(level=logging.INFO)
 # Reduce verbosity of commonly noisy third-party loggers (uvicorn/access, websockets)
-for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error", "websockets", "asyncio"):
+# ponytail: 2026-10-02 — added httpx/httpcore/urllib3. httpx logs one
+# "HTTP Request: POST <url> HTTP/1.1 200 OK" line per request at INFO, so
+# every LLM turn and every STT turn printed a line carrying no information
+# we don't already log (turn durations, mark RTTs, error bodies). Their
+# errors still surface — we only raise the floor for INFO chatter.
+for noisy in (
+    "uvicorn", "uvicorn.access", "uvicorn.error", "websockets", "asyncio",
+    "httpx", "httpcore", "urllib3",
+):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("stt_server")
 _WS_BACKOFF = BackoffPolicy(base_ms=250, max_ms=8000, factor=2.0)
@@ -396,7 +404,11 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(60)
             counter["n"] += 1
             try:
-                log.info("[heartbeat] container alive t+%ds", counter["n"] * 60)
+                # ponytail: 2026-10-02 — INFO→DEBUG. One line per minute
+                # per container forever, i.e. pure noise once the call
+                # lifecycle itself is being logged. Railway's own
+                # healthcheck covers liveness.
+                log.debug("[heartbeat] container alive t+%ds", counter["n"] * 60)
             except Exception:
                 # Log handler itself blew up — don't let the heartbeat
                 # itself crash the worker.
@@ -1838,7 +1850,7 @@ async def media_stream(ws: WebSocket) -> None:
                                 # first 200 chars, the prepend didn't run
                                 # (likely tts_provider != 'inworld' or
                                 # has_tts_hint() detected a double-prepend).
-                                log.info(
+                                log.debug(
                                     "[AGENT] custom_prompt HEAD session=%s len=%d preview=%r",
                                     session.session_key,
                                     len(session.custom_prompt),
@@ -1864,7 +1876,9 @@ async def media_stream(ws: WebSocket) -> None:
                     # "__shared__" in the same JSON file).
                     session.agent_tools = _load_agent_tools(session.agent_id, session.user_id)
                     if session.agent_tools:
-                        log.info("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
+                        # ponytail: 2026-10-02 — INFO→DEBUG. Tool count
+                        # only changes when an operator edits the agent.
+                        log.debug("[TOOLS] Loaded %d tools for agent %s", len(session.agent_tools), session.agent_id)
                     # ponytail: Ticket 3 finalization — guardrail. Tools
                     # that the model cannot call are silently invisible.
                     # The most common form of this in production was

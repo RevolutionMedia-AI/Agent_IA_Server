@@ -70,7 +70,9 @@ async def stream_tts_segment(
     log sites.
     """
     provider = _resolve_provider(session)
-    log.info(
+    # ponytail: 2026-10-02 — INFO→DEBUG. One line per segment; the
+    # provider is a per-agent constant, so this repeated a known value.
+    log.debug(
         "[TTS] Dispatching to provider='%s' session=%s gen=%s seg=%d text_len=%d",
         provider, session.session_key, generation, seg_idx, len(text),
     )

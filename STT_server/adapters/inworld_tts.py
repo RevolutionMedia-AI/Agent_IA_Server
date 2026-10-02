@@ -139,7 +139,10 @@ async def stream_tts_segment(
     # real Inworld voice name. Logged here so the next time this
     # happens, the operator sees the exact values without having
     # to add a breakpoint.
-    log.info(
+    # ponytail: 2026-10-02 — INFO→DEBUG. Fires once per segment and the
+    # values are fixed per agent, so a production call re-printed the same
+    # voice/model/key-present triplet on every segment.
+    log.debug(
         "[INWORLD_TTS] session=%s voice_id=%r model_id=%r key_present=%s",
         getattr(session, "session_key", "?"),
         voice_id, model_id, bool(api_key),
@@ -206,24 +209,15 @@ async def stream_tts_segment(
             "speakingRate": speaking_rate,
         },
     }).encode("utf-8")
-    # ponytail: TTS_INWORLD_BODY observability log. Truncated to
-    # 500 chars so PII doesn't blow up the pipeline. Carries the
-    # same session + generation + seg_idx the upstream
-    # TTS_RAW_SEGMENT and TTS_SANITIZED_SEGMENT logs use, so an
-    # operator can join the three (now four with FORMATTED) lines
-    # with a single grep on session + gen + seg.
-    log.info(
-        "[TTS_INWORLD_BODY] session=%s gen=%d seg=%d text_len=%d voice=%r model=%r speakingRate=%.2f deliveryMode=%s body=%r",
-        getattr(session, "session_key", "?"),
-        generation,
-        seg_idx,
-        len(text),
-        voice_id,
-        model_id,
-        speaking_rate,
-        "BALANCED",
-        body.decode("utf-8")[:500],
-    )
+    # ponytail: 2026-10-02 — removed the [TTS_INWORLD_BODY] log here. It
+    # dumped the whole request body (including the spoken text) at INFO on
+    # every segment of every call, and it was the only link in the
+    # observability chain that ignored TTS_DEBUG_LOG. The body is fully
+    # determined by (voice, model, speakingRate, deliveryMode) — all fixed
+    # per agent — so per-segment repetition carried no information the
+    # RAW/SANITIZED/FORMATTED chain doesn't already give under
+    # TTS_DEBUG_LOG=1. Restore behind that flag if a body-shape bug
+    # ever needs it again.
 
     url = "https://api.inworld.ai/tts/v1/voice:stream"
     headers = {

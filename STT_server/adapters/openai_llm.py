@@ -500,7 +500,10 @@ def build_messages(session: CallSession, user_text: str) -> list[dict]:
     # in STT_Server.py didn't run and the LLM will produce flat
     # prose without steering tags.
     _hint_marker = "[TTS Steering"
-    log.info(
+    # ponytail: 2026-10-02 — INFO→DEBUG. Dumped 160 chars of the 28 KB
+    # system prompt on EVERY turn, so a 5-minute call reprinted the same
+    # prefix ~10 times.
+    log.debug(
         "[LLM] custom_prompt HEAD session=%s tts_hint_present=%s preview=%r",
         session.session_key,
         _hint_marker in custom_prompt,

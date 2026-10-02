@@ -211,20 +211,27 @@ async def play_tts_from_text_queue(
         # three capped at 200 chars (truncated) so PII doesn't blow
         # up the log pipeline. The full text is in `session.history`
         # if anyone needs the raw output.
-        log.info(
-            "[TTS_RAW_SEGMENT] session=%s gen=%d seg=%d text=%r",
-            session.session_key, generation, seg_idx,
-            text[:TTS_DEBUG_TEXT_CHARS],
-        )
+        # ponytail: 2026-10-02 — all three (plus TTS_INWORLD_BODY in
+        # inworld_tts.py) were log.info with NO gate, so they dumped
+        # transcript text on every segment of every production call even
+        # though TTS_DEBUG_LOG exists precisely to turn them off. Wrapped
+        # the chain in the flag it was always documented to respect.
+        if TTS_DEBUG_LOG:
+            log.info(
+                "[TTS_RAW_SEGMENT] session=%s gen=%d seg=%d text=%r",
+                session.session_key, generation, seg_idx,
+                text[:TTS_DEBUG_TEXT_CHARS],
+            )
         try:
             safe_text = sanitize_tts_text(text)
         except Exception:
             safe_text = text
-        log.info(
-            "[TTS_SANITIZED_SEGMENT] session=%s gen=%d seg=%d text=%r",
-            session.session_key, generation, seg_idx,
-            safe_text[:TTS_DEBUG_TEXT_CHARS],
-        )
+        if TTS_DEBUG_LOG:
+            log.info(
+                "[TTS_SANITIZED_SEGMENT] session=%s gen=%d seg=%d text=%r",
+                session.session_key, generation, seg_idx,
+                safe_text[:TTS_DEBUG_TEXT_CHARS],
+            )
         # ponytail: deterministic break insertion. The LLM is no
         # longer asked to emit <break> (it doesn't do it reliably —
         # 0 occurrences in the last production call). Pauses are
@@ -241,11 +248,12 @@ async def play_tts_from_text_queue(
         except Exception:
             formatted = safe_text
         if formatted != safe_text:
-            log.info(
-                "[TTS_FORMATTED_SEGMENT] session=%s gen=%d seg=%d text=%r",
-                session.session_key, generation, seg_idx,
-                formatted[:TTS_DEBUG_TEXT_CHARS],
-            )
+            if TTS_DEBUG_LOG:
+                log.info(
+                    "[TTS_FORMATTED_SEGMENT] session=%s gen=%d seg=%d text=%r",
+                    session.session_key, generation, seg_idx,
+                    formatted[:TTS_DEBUG_TEXT_CHARS],
+                )
             safe_text = formatted
 
         if not safe_text:
@@ -362,7 +370,9 @@ async def stream_llm_reply_with_tts(
                     "parameters": t.get("parameters", {"type": "object", "properties": {}}),
                 },
             })
-        log.info("[TOOLS] Passing %d tools to LLM for session %s", len(tools), session.session_key)
+        # ponytail: 2026-10-02 — INFO→DEBUG. Fires once per turn; the
+        # tool count only changes when an operator edits the agent.
+        log.debug("[TOOLS] Passing %d tools to LLM for session %s", len(tools), session.session_key)
     else:
         tools = None
     return await _stream_llm_with_tools(session, user_text, generation, tools=tools)
@@ -1116,9 +1126,9 @@ async def handle_agent_reply(
     # gated on LOG_TRANSCRIPT_CONTENT (default off). Production logs
     # get a length summary + session_key, never the raw text.
     if LOG_TRANSCRIPT_CONTENT:
-        log.warning("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
+        log.info("Usuario (%s) [%s]: %s", session.session_key, trigger, user_text)
     else:
-        log.warning(
+        log.info(
             "Usuario (%s) [%s]: len=%d",
             session.session_key, trigger, len(user_text),
         )
@@ -1175,9 +1185,9 @@ async def handle_agent_reply(
 
     # Registro esencial: lo que dice el asistente (TTS)
     if LOG_TRANSCRIPT_CONTENT:
-        log.warning("Agente (%s): %s", session.session_key, reply)
+        log.info("Agente (%s): %s", session.session_key, reply)
     else:
-        log.warning(
+        log.info(
             "Agente (%s): len=%d",
             session.session_key, len(reply),
         )

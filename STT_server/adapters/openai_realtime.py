@@ -228,7 +228,9 @@ def _build_realtime_tools(session: CallSession) -> list[dict] | None:
                 "parameters", {"type": "object", "properties": {}}
             ),
         })
-    log.info(
+    # ponytail: 2026-10-02 — INFO→DEBUG. Tool count only changes when an
+    # operator edits the agent.
+    log.debug(
         "[TOOLS] Passing %d tools to Realtime for session %s",
         len(out), session.session_key,
     )
