@@ -90,6 +90,20 @@ def _resolve_model(session: CallSession, provider: str) -> str:
 
 # ─── OpenAI ────────────────────────────────────────────────────────
 
+# ponytail: gpt-5 / o-series reject `max_tokens` (400 unsupported_parameter)
+# and want `max_completion_tokens`. One helper so both OpenAI-SDK call
+# sites stay in sync — Anthropic/Gemini/MiniMax keep their own names.
+_COMPLETION_TOKENS_ONLY = ("gpt-5", "o1", "o3", "o4")
+
+
+def _token_budget_kwarg(model: str, session) -> dict:
+    n = getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS
+    m = (model or "").lower()
+    if any(m.startswith(p) for p in _COMPLETION_TOKENS_ONLY):
+        return {"max_completion_tokens": n}
+    return {"max_tokens": n}
+
+
 def _openai_client(session: CallSession) -> OpenAI:
     creds = resolve_for_session(session, "llm", "openai")
     key = creds.get("api_key")
@@ -613,7 +627,7 @@ async def call_llm(session: CallSession, user_text: str) -> str:
                 messages=messages,
                 temperature=getattr(session, "llm_temperature", None)
                     if getattr(session, "llm_temperature", None) is not None else 0.2,
-                max_tokens=getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
+                **_token_budget_kwarg(model, session),
             )
             content = response.choices[0].message.content
             return (content or "").strip()
@@ -693,7 +707,7 @@ def stream_llm_reply_sync(
             "messages": messages,
             "temperature": getattr(session, "llm_temperature", None)
                 if getattr(session, "llm_temperature", None) is not None else 0.2,
-            "max_tokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
+            **_token_budget_kwarg(model_id, session),
             "stream": True,
             # ponytail: 2026-10-02 — ask for usage in the final chunk so
             # we can log prompt/completion/cached tokens per turn. Without
