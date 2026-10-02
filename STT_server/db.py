@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 
 log = logging.getLogger("stt_server.db")
@@ -103,25 +104,47 @@ def _init_pool():
 
 
 @contextmanager
-def get_conn():
+def get_conn(max_attempts: int = 10):
     """Yield a psycopg2 connection from the pool.
 
     The connection is auto-committed on success and rolled back on
     exception. Caller should not call .commit()/.rollback() manually.
+
+    ponytail: 2026-10-02 — bounded immediate retry on pool exhaustion.
+    The pool is 10 slots and the server is bursty (live calls + API +
+    background tasks contend), so a single getconn() attempt 500s on
+    transient spikes that clear in milliseconds. Production saw exactly
+    that: [DB_POOL] exhausted, then the very next call seconds later
+    proceeded normally.
+
+    The retry is NON-BLOCKING (time.sleep(0) only yields the GIL) because
+    get_conn() is called from async handlers and a real sleep would stall
+    the event loop past the 20 ms voice frame budget. This handles the
+    race where a slot is about to be returned; if the pool is genuinely
+    saturated through all attempts, it still fails fast with PoolError so
+    callers keep their existing fallback behaviour.
     """
     pool = _init_pool()
     import psycopg2
-    try:
-        conn = pool.getconn()
-    except psycopg2.pool.PoolError:
-        # ponytail: never log the DSN — only safe counters. maxconn is
-        # a plain attribute on the pool; in-use is intentionally not
-        # read here (private internals are audit-only, see tests).
-        log.warning(
-            "[DB_POOL] exhausted max=10 (all slots checked out); "
-            "failing fast instead of queuing"
-        )
-        raise
+    conn = None
+    for attempt in range(max_attempts):
+        try:
+            conn = pool.getconn()
+            break
+        except psycopg2.pool.PoolError:
+            if attempt + 1 >= max_attempts:
+                # ponytail: never log the DSN — only safe counters.
+                log.warning(
+                    "[DB_POOL] exhausted max=10 after %d attempts; "
+                    "failing fast instead of queuing",
+                    max_attempts,
+                )
+                raise
+            # Yield the GIL so the thread returning a slot can run.
+            # No real sleep: this is called from async handlers and even
+            # 50 ms would blow the voice frame budget.
+            time.sleep(0)
+    assert conn is not None  # for type checkers; loop breaks or raises
     try:
         yield conn
         conn.commit()

@@ -739,6 +739,67 @@ def test_p14_failing_rollback_still_returns_slot(monkeypatch):
 
 
 
+def test_p15_transient_exhaustion_recovers_via_retry(pool):
+    """2026-10-02 production: [DB_POOL] exhausted, then the very next call
+    seconds later proceeded normally. A single getconn() attempt 500s on
+    that transient spike. get_conn() must retry (non-blocking) and succeed
+    once a slot frees, instead of failing on the first attempt.
+
+    Deterministic: free a slot when the retry loop is mid-flight (on the
+    3rd getconn call), modelling a concurrent thread returning its slot
+    while we wait. With single-attempt acquisition this raises; the retry
+    must absorb it.
+    """
+    held = [pool.getconn() for _ in range(10)]
+    assert pool.in_use() == 10
+
+    real_getconn = pool.getconn
+    calls = {"n": 0}
+
+    def freeing_getconn():
+        calls["n"] += 1
+        if calls["n"] == 3:
+            pool.putconn(held.pop())
+        return real_getconn()
+
+    import unittest.mock as mock
+    with mock.patch.object(pool, "getconn", side_effect=freeing_getconn):
+        with db_mod.get_conn():
+            pass
+    for c in held:
+        pool.putconn(c)
+    assert pool.available() == 10
+    assert pool.in_use() == 0
+    # Proves the retry actually ran instead of succeeding first try.
+    assert calls["n"] >= 3
+
+
+def test_p15b_sustained_exhaustion_still_raises(pool, caplog):
+    """The retry must not turn a genuinely saturated pool into a hang.
+
+    If no slot ever frees, get_conn() must still raise PoolError (so
+    callers keep their fallback behaviour) and log the safe warning.
+    This is the same assertion as P9, kept explicit so a future change to
+    the retry count cannot silently convert fail-fast into queue-forever.
+    """
+    import logging
+
+    held = [pool.getconn() for _ in range(10)]
+    try:
+        with caplog.at_level(logging.WARNING, logger="stt_server.db"):
+            with pytest.raises(PoolExhausted):
+                with db_mod.get_conn():
+                    pass
+        assert any(
+            "DB_POOL" in r.message and "exhausted" in r.message
+            for r in caplog.records
+        )
+    finally:
+        for c in held:
+            pool.putconn(c)
+    assert pool.available() == 10
+
+
 def test_p13b_no_nested_get_conn_remains_in_refresh_paths():
     """Static guard: the three production call sites must pass cur=, and
     no call to get_integration_by_id() may sit inside a `with get_conn()`
