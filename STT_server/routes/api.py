@@ -556,6 +556,12 @@ class AgentCreate(BaseModel):
     stt_latency_mode: Optional[str] = None
     tts_provider: Optional[str] = None
     tts_model: Optional[str] = None
+    # ponytail: 028_agent_tts_instructions.sql. Free-text voice steering
+    # (accent / tone / pace). Optional and provider-agnostic on purpose:
+    # the OpenAI adapter forwards it as `instructions` for
+    # gpt-4o-mini-tts and drops it for models that reject the field, so
+    # one column covers every provider instead of an OpenAI-only table.
+    tts_instructions: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     # ponytail: per-agent runtime overrides (006_agent_runtime_params.sql).
@@ -569,7 +575,7 @@ class AgentCreate(BaseModel):
     llm_temperature: Optional[float] = None
     llm_max_tokens: Optional[int] = None
     tts_speed: Optional[float] = None
-    # Idle / silence detection (008_agent_idle_settings.sql). All optional —
+    # Idle / silence detection (008_agent_idle_settings.sql). All optional —"
     # None on every field = fall back to the global IDLE_SILENCE_TIMEOUT_SEC.
     # When idle_enabled=True the monitor plays the prompt messages at the
     # configured intervals, then closes the websocket after idle_max_attempts
@@ -667,6 +673,11 @@ class AgentUpdate(BaseModel):
     stt_latency_mode: Optional[str] = None
     tts_provider: Optional[str] = None
     tts_model: Optional[str] = None
+    # ponytail: 028_agent_tts_instructions.sql. Same semantics as
+    # AgentCreate. Note the update route uses exclude_none, so omitting
+    # this leaves the stored value untouched and the modal must send an
+    # explicit value to change or clear it.
+    tts_instructions: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     # ponytail: per-agent runtime overrides (006_agent_runtime_params.sql).
@@ -1371,6 +1382,21 @@ def _agent_stt_model(agent_id: str, user_id: str) -> str:
     return (row.get("stt_model") or "").strip()
 
 
+def _agent_tts_field(agent_id: str, user_id: str, field: str) -> str:
+    """Stored tts_provider / tts_model / voice_id for a partial update.
+
+    A caller that switches tts_provider without re-sending the model and
+    voice leaves us validating against "absent", which would either skip
+    validation or 400 on a stale stored pair.
+    """
+    try:
+        from STT_server.db_agents import get_agent
+        row = get_agent(agent_id, user_id) or {}
+    except Exception:
+        return ""
+    return (row.get(field) or "").strip()
+
+
 def _validate_stt_latency(provider, model, latency_mode) -> Optional[str]:
     """Normalize and validate the STT latency dial before it hits disk.
 
@@ -1415,6 +1441,57 @@ def _validate_stt_latency(provider, model, latency_mode) -> Optional[str]:
     return latency_mode
 
 
+def _validate_tts_openai(payload: dict) -> None:
+    """Validate the OpenAI TTS triple server-side (spec §19).
+
+    The FE must not be able to point this agent at an arbitrary model,
+    voice or oversized instruction blob. Runs only when
+    tts_provider == "openai"; every other provider keeps its existing
+    free-form behaviour.
+
+    Mutates *payload* in place: tts_model / voice_id are normalised to
+    values the pipeline can actually run, and tts_instructions is
+    trimmed. Raising rather than coercing on an explicitly-sent invalid
+    model, because a silent fallback would show the operator "saved"
+    while the call runs a different voice than the one they picked.
+    """
+    from STT_server.services import openai_tts as _oai
+
+    if (payload.get("tts_provider") or "").strip().lower() != "openai":
+        return
+
+    model = (payload.get("tts_model") or "").strip()
+    if model and model not in _oai.OPENAI_TTS_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown OpenAI TTS model '{model}'. "
+                f"Valid: {sorted(_oai.OPENAI_TTS_MODELS)}"
+            ),
+        )
+    resolved_model = _oai.resolve_model(model)
+    payload["tts_model"] = resolved_model
+
+    voice = (payload.get("voice_id") or "").strip()
+    if voice and not _oai.is_valid_voice(resolved_model, voice):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Voice '{voice}' is not available for {resolved_model}. "
+                f"Valid: {_oai.voice_ids_for_model(resolved_model)}"
+            ),
+        )
+    if voice:
+        payload["voice_id"] = voice
+
+    # ponytail: instructions are optional. Absent/None/"" all mean "no
+    # instructions", which is a valid config -- so we only trim, never 400.
+    if payload.get("tts_instructions"):
+        payload["tts_instructions"] = _oai.sanitize_instructions(
+            payload["tts_instructions"], resolved_model,
+        ) or None
+
+
 @api_router.post("/agents")
 def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
     # ponytail: validate provider ids BEFORE the agent hits disk so a
@@ -1428,6 +1505,7 @@ def create_agent(data: AgentCreate, auth: dict = Depends(require_auth)):
         payload.get("stt_provider"), payload.get("stt_model"),
         data.stt_latency_mode,
     )
+    _validate_tts_openai(payload)
     # ponytail: handoff routing validation (fail-fast). On create no tools
     # can be assigned yet, so membership checks run against an empty set —
     # any transfer_tool reference 400s; post-create assigns append to chain.
@@ -1488,6 +1566,45 @@ def update_agent(agent_id: str, data: AgentUpdate, auth: dict = Depends(require_
             payload["stt_latency_mode"] = _resolved
         else:
             clear_fields.add("stt_latency_mode")
+    # ponytail: 028_agent_tts_instructions.sql — same treatment for the
+    # OpenAI TTS triple. Validation needs the STORED provider/model/voice
+    # too, because the operator can switch provider without re-sending the
+    # other two, and a stale tts-1 + marin pair would otherwise 400 on save
+    # for a change that has nothing to do with OpenAI.
+    _tts_touched = (
+        "tts_provider" in payload
+        or "tts_model" in payload
+        or "voice_id" in payload
+        or "tts_instructions" in payload
+    )
+    if _tts_touched:
+        from STT_server.services import openai_tts as _oai
+        _merged = dict(payload)
+        _merged["tts_provider"] = (
+            payload.get("tts_provider")
+            or _agent_tts_field(agent_id, auth["user_id"], "tts_provider")
+            or ""
+        )
+        if _merged["tts_provider"].strip().lower() == "openai":
+            _merged["tts_model"] = (
+                payload.get("tts_model")
+                or _agent_tts_field(agent_id, auth["user_id"], "tts_model")
+            )
+            _merged["voice_id"] = (
+                payload.get("voice_id")
+                or _agent_tts_field(agent_id, auth["user_id"], "voice_id")
+            )
+            _validate_tts_openai(_merged)
+            for _k in ("tts_model", "voice_id", "tts_instructions"):
+                if _k in _merged and _merged[_k] is not None:
+                    payload[_k] = _merged[_k]
+            # Switching OFF openai must clear the instructions: the column
+            # is provider-agnostic and db_update_agent treats None as
+            # "don't touch", so without this the old steering would
+            # resurrect the next time someone picks OpenAI again.
+            if "tts_instructions" in payload and not payload["tts_instructions"]:
+                payload.pop("tts_instructions")
+                clear_fields.add("tts_instructions")
     # ponytail: unified handoff validation. handoff_order (canonical) is
     # split into transfer_cascade + transfer_chain atomically; the halves
     # sent directly (legacy callers) get the same membership guarantees.
@@ -3462,11 +3579,16 @@ async def list_categorized_models(
 class TtsPreviewRequest(BaseModel):
     """Body for POST /tts/preview. The FE uses this to let the user
     preview a TTS voice/model before saving the agent config."""
-    provider: str  # "elevenlabs" | "rime"
+    provider: str  # "elevenlabs" | "rime" | "inworld" | "openai" | "deepgram"
     voice_id: str | None = None
     model_id: str | None = None
     text: str = "Hello, this is a preview of how I will sound on your calls."
     api_key: str | None = None
+    # ponytail: 028_agent_tts_instructions.sql. Voice steering to apply
+    # to the preview, so what the operator hears in the modal is what
+    # callers get. Optional: empty means "no instructions", which is a
+    # valid configuration and must still produce audio.
+    instructions: str | None = None
 
 
 @api_router.post("/tts/preview")
@@ -3485,6 +3607,16 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
     from STT_server.adapters.tts_preview import preview_tts
     import asyncio as _aio
     tts_log = logging.getLogger("stt_server.tts_preview")
+    # ponytail: preview text cap. A preview is 1-2 sentences; without a
+    # cap an authenticated caller could turn this endpoint into an
+    # unbounded billable TTS job on someone else's stored key.
+    _text = (body.text or "").strip()
+    if not _text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(_text) > 600:
+        raise HTTPException(
+            status_code=400, detail="preview text is limited to 600 characters",
+        )
     creds = resolve_provider(auth["user_id"], body.provider) if auth["user_id"] else {}
     user_key = (body.api_key or creds.get("api_key") or "").strip() or None
     if not user_key:
@@ -3496,10 +3628,11 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
         audio_bytes = await preview_tts(
             user_id=auth["user_id"],
             provider=body.provider,
-            text=body.text,
+            text=_text,
             voice_id=body.voice_id,
             model_id=body.model_id,
             api_key=body.api_key,
+            instructions=body.instructions,
         )
     except Exception as exc:
         tts_log.exception("tts_preview failed for provider=%s voice=%s: %s",

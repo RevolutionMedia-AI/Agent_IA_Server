@@ -32,6 +32,7 @@ async def preview_tts(
     voice_id: Optional[str] = None,
     model_id: Optional[str] = None,
     api_key: Optional[str] = None,
+    instructions: Optional[str] = None,
 ) -> bytes:
     """Run a single TTS call and return the raw mu-law 8 kHz audio bytes.
 
@@ -42,6 +43,10 @@ async def preview_tts(
     `api_key` (optional) lets the FE inline a fresh key for the test
     without going through the persisted credential. Same priority as
     the test endpoint: caller-supplied > stored > env.
+
+    `instructions` (optional) is the voice steering the agent would
+    actually call with, so the preview matches production. Empty is
+    valid and must still produce audio.
     """
     # Build a synthetic session with the user's resolved TTS config.
     # `stream_tts_segment` reads credentials via resolve_provider(user_id,
@@ -66,6 +71,13 @@ async def preview_tts(
         # consistent avoids future drift if the preview ever does
         # route through the dispatcher.
         session.tts_model = model_id
+    if instructions and instructions.strip():
+        # ponytail: 028_agent_tts_instructions.sql. Providers that do
+        # not accept `instructions` ignore this field; the OpenAI
+        # adapter drops it for tts-1/tts-1-hd. Storing it on the
+        # synthetic session is enough because the preview reuses the
+        # live adapter path.
+        session.tts_instructions = instructions.strip()
 
     chunks: list[bytes] = []
 

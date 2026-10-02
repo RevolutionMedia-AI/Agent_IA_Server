@@ -1731,6 +1731,17 @@ async def media_stream(ws: WebSocket) -> None:
                     # llm_max_tokens=200 was silently ignored).
                     session.llm_max_tokens = _safe_int(agent_cfg.get('llm_max_tokens'))
                     session.tts_speed = _safe_float(agent_cfg.get('tts_speed'))
+                    # ponytail: 028_agent_tts_instructions.sql. Free-text
+                    # voice steering forwarded to the provider's
+                    # `instructions` field. Empty/absent is valid — the
+                    # adapter omits the field and TTS works without it.
+                    # Only OpenAI gpt-4o-mini-tts honours it; the adapter
+                    # drops it for tts-1/tts-1-hd, so we store it
+                    # provider-agnostically here.
+                    _tts_instr = agent_cfg.get('tts_instructions')
+                    session.tts_instructions = (
+                        str(_tts_instr).strip() or None
+                    ) if _tts_instr else None
                     # ponytail: per-agent idle / silence detection
                     # (008_agent_idle_settings.sql). None on every field
                     # keeps the legacy global IDLE_SILENCE_TIMEOUT_SEC

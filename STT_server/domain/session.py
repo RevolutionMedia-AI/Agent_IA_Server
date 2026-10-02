@@ -100,6 +100,12 @@ class CallSession:
     llm_temperature: float | None = None
     llm_max_tokens: int | None = None
     tts_speed: float | None = None
+    # ponytail: 028_agent_tts_instructions.sql. Free-text voice steering
+    # (accent / tone / pace) forwarded to the provider's `instructions`
+    # field. Only OpenAI gpt-4o-mini-tts honours it; the adapter drops it
+    # for tts-1 / tts-1-hd. None or "" = no instructions, which is valid
+    # and must keep working.
+    tts_instructions: str | None = None
     # ponytail: idle / silence detection (008_agent_idle_settings.sql).
     # All None = fall back to the global IDLE_SILENCE_TIMEOUT_SEC (legacy
     # single-timeout-then-close behaviour). When idle_enabled=True the

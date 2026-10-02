@@ -33,6 +33,11 @@ Schema (001_schema.sql + 006_agent_runtime_params.sql):
     llm_temperature REAL,     -- 0.0..2.0 (NULL = adapter default 0.2)
     llm_max_tokens  INTEGER,  -- >0..4096  (NULL = config.MAX_RESPONSE_TOKENS)
     tts_speed      REAL,     -- 0.5..2.0  (NULL = provider default)
+    -- 028_agent_tts_instructions.sql. Free-text voice steering sent to the
+    -- provider's `instructions` field. Only honoured by models that
+    -- accept it (OpenAI gpt-4o-mini-tts); the adapter drops it for
+    -- tts-1 / tts-1-hd. NULL = no instructions, which is valid.
+    tts_instructions TEXT,   -- <=600 chars
 -- per-agent idle/silence detection (008_agent_idle_settings.sql).
     -- NULL on every column = fall back to the global IDLE_SILENCE_TIMEOUT_SEC
     -- (the legacy single-timeout-then-close behaviour).
@@ -92,7 +97,7 @@ _AGENT_COLS = (
     "stt_provider, stt_model, stt_latency_mode, "
     "tts_provider, tts_model, "
     "llm_provider, llm_model, "
-    "llm_temperature, llm_max_tokens, tts_speed, "
+    "llm_temperature, llm_max_tokens, tts_speed, tts_instructions, "
     "stt_use_own_key, llm_use_own_key, tts_use_own_key, "
     f"{_IDLE_COLS}, "
     "transfer_cascade, "
@@ -118,9 +123,11 @@ _UPDATABLE_COLS = frozenset({
     "name", "voice", "voice_id", "language", "campaign", "status",
     "description", "tone", "prompt", "welcome_message",
     "stt_provider", "stt_model", "stt_latency_mode",
-    "tts_provider", "tts_model",
+"tts_provider", "tts_model",
     "llm_provider", "llm_model",
     "llm_temperature", "llm_max_tokens", "tts_speed",
+    # 028_agent_tts_instructions.sql
+    "tts_instructions",
     "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
     "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
     "idle_subsequent_timeout_sec", "idle_final_message",
@@ -256,9 +263,9 @@ def create_agent(user_id: str, payload: dict) -> dict:
     cols = ["id", "user_id", "name", "calls", "perf", "voice", "voice_id", "language",
             "campaign", "status", "description", "tone", "prompt", "welcome_message",
             "stt_provider", "stt_model", "stt_latency_mode",
-            "tts_provider", "tts_model",
+"tts_provider", "tts_model",
             "llm_provider", "llm_model",
-            "llm_temperature", "llm_max_tokens", "tts_speed",
+            "llm_temperature", "llm_max_tokens", "tts_speed", "tts_instructions",
             "stt_use_own_key", "llm_use_own_key", "tts_use_own_key",
             "idle_enabled", "idle_first_timeout_sec", "idle_first_message",
             "idle_subsequent_timeout_sec", "idle_final_message",
@@ -286,6 +293,7 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("llm_provider"), payload.get("llm_model"),
               payload.get("llm_temperature"), payload.get("llm_max_tokens"),
               payload.get("tts_speed"),
+              payload.get("tts_instructions"),
               payload.get("stt_use_own_key"),
               payload.get("llm_use_own_key"),
               payload.get("tts_use_own_key"),

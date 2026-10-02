@@ -129,8 +129,38 @@ async def _stream_openai(
     emit_item,
     api_key: str,
 ) -> tuple[float | None, float]:
+    """Stream OpenAI /v1/audio/speech into the mu-law playback pipeline.
+
+    ponytail: 2026-10-02 — was a bare urllib.urlopen(timeout=45) with the
+    model defaulting to tts-1, no voice validation, no `instructions`, no
+    error classification and no cancellation of the HTTP stream on
+    barge-in. Changes:
+      * model / voice / instructions / input / speed are validated and
+        clamped by services.openai_tts.build_speech_request, so a bad
+        frontend value cannot 400 mid-call and an unknown stored model
+        still places calls (falls back to gpt-4o-mini-tts).
+      * http.client instead of urllib so connect/first-byte and mid-stream
+        reads get SEPARATE budgets and conn.close() actually releases the
+        socket when a barge-in cancels us mid-body.
+      * the read loop aborts as soon as `generation` stops being the active
+        generation, so a barge-in'd turn stops burning CPU and stops
+        holding an HTTP connection instead of draining the rest of the body
+        into the void.
+      * resample+encode time is measured (they happen inside one converter
+        call, so a single figure, not two).
+    """
     from STT_server.services._instrumentation import Stages  # ponytail: lazy per spec
+    from STT_server.services.openai_tts import (
+        OPENAI_TTS_CONNECT_TIMEOUT_SEC,
+        OPENAI_TTS_FIRST_BYTE_TIMEOUT_SEC,
+        OPENAI_TTS_READ_TIMEOUT_SEC,
+        OpenAITtsError,
+        build_speech_request,
+        classify_http_status,
+    )
+    import http.client
     import time
+
     started = time.perf_counter()
     if not api_key:
         # ponytail: P3 — defense-in-depth. _stream_openai should not be
@@ -140,69 +170,188 @@ async def _stream_openai(
                    "message": "openai TTS: API key not configured"})
         emit_item({"type": "segment_end", "generation": generation})
         return None, 0.0
+
     # ponytail: per-agent speed override (006_agent_runtime_params.sql).
-    # OpenAI TTS accepts 0.25..4.0; we clamp to the adapter's safe
-    # range so a typo doesn't trip an HTTP 400.
+    # OpenAI TTS accepts 0.25..4.0; build_speech_request clamps so a typo
+    # can't trip an HTTP 400.
     _speed = getattr(session, "tts_speed", None)
-    speed = max(0.25, min(4.0, _speed if _speed is not None else 1.0))
-    body = json.dumps({
-        "model": getattr(session, "tts_model", None) or "tts-1",
-        "input": text,
-        "voice": getattr(session, "voice_id", None) or "alloy",
-        "response_format": "pcm",  # raw PCM16 LE 24 kHz mono
-        "speed": speed,
-    }).encode("utf-8")
+    payload, src_rate = build_speech_request(
+        text,
+        model_id=getattr(session, "tts_model", None),
+        voice_id=getattr(session, "voice_id", None),
+        instructions=getattr(session, "tts_instructions", None),
+        speed=_speed,
+    )
+    body = json.dumps(payload).encode("utf-8")
+    # ponytail: the TTS request starts HERE, not when the first byte lands.
+    # playback_loop reads this to compute tts_first_audio_sent_ms, i.e. the
+    # true request -> caller-hears-it number instead of request -> provider.
+    session._tts_request_started_at = time.monotonic()
+
+    log.debug(
+        "[TTS_OPENAI] session=%s gen=%d model=%s voice=%s speed=%s "
+        "instructions=%s input_chars=%d",
+        session.session_key, generation, payload["model"], payload["voice"],
+        payload.get("speed"), bool(payload.get("instructions")),
+        len(payload["input"]),
+    )
 
     loop = asyncio.get_running_loop()
     ttfb_ms: float | None = None
+    total_ms = 0.0
+    cancelled = False
+    convert_ms = 0.0
+
+    metrics = getattr(session, "metrics", None)
+
+    def _observe(name: str, value: float) -> None:
+        if metrics is not None:
+            try:
+                metrics.observe_ms(name, value)
+            except Exception:
+                pass
 
     def _emit_frame(frame: bytes) -> None:
         nonlocal ttfb_ms
         if ttfb_ms is None:
             ttfb_ms = (time.perf_counter() - started) * 1000
+            _observe("tts_first_byte_ms", ttfb_ms)
             # ponytail: stamp TTS_FIRST_BYTE on the first 160-byte frame emitted.
-            session._stage_timer = session._stage_timer or StageTimer(
-                call_id=session.session_key,
-                turn_id=0,
-                generation=session.active_generation,
-            )
-            if Stages.TTS_FIRST_BYTE not in session._stage_timer._stages:
-                session._stage_timer.mark(Stages.TTS_FIRST_BYTE)
+            # getattr, not attribute access: _stage_timer is not a declared
+            # CallSession field, it is attached by session_runtime. The
+            # sibling adapters (inworld/rime/elevenlabs) all getattr it for
+            # that reason; reading it directly raised AttributeError on any
+            # path that reaches TTS before session_runtime has run.
+            _timer = getattr(session, "_stage_timer", None)
+            if _timer is None:
+                _timer = StageTimer(
+                    call_id=session.session_key,
+                    turn_id=0,
+                    generation=session.active_generation,
+                )
+                session._stage_timer = _timer
+            if Stages.TTS_FIRST_BYTE not in _timer._stages:
+                _timer.mark(Stages.TTS_FIRST_BYTE)
         loop.call_soon_threadsafe(
             emit_item, {"type": "audio", "generation": generation, "data": frame}
         )
 
     def _fetch() -> None:
+        nonlocal cancelled, convert_ms
         from STT_server.adapters.rime_tts import _pcm16_bytes_to_mulaw_8k
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/audio/speech",
-            data=body,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        # ponytail: AudioFrameProcessor owns 20ms framing; emit_silence_tail=False
+        # AudioFrameProcessor owns 20ms framing; emit_silence_tail=False
         # drops the partial trailing frame to avoid a <20ms packet boundary click.
         proc = AudioFrameProcessor(emit_silence_tail=False)
         pcm_remainder = b""
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        # NO Authorization header is ever logged (spec §15/§19): only the
+        # status and a truncated error body reach the logs.
+        conn = http.client.HTTPSConnection(
+            "api.openai.com", timeout=OPENAI_TTS_CONNECT_TIMEOUT_SEC,
+        )
+        try:
+            conn.request(
+                "POST", "/v1/audio/speech", body=body,
+                headers={
+                    # ponytail: key comes from resolve_for_session (stored
+                    # per-user credential or platform env). Never from the
+                    # frontend, never from a request body.
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=OPENAI_TTS_FIRST_BYTE_TIMEOUT_SEC,
+            )
+            if conn.sock is not None:
+                conn.sock.settimeout(OPENAI_TTS_FIRST_BYTE_TIMEOUT_SEC)
+            resp = conn.getresponse()
+            if resp.status != 200:
+                snippet = ""
+                try:
+                    snippet = resp.read(300).decode("utf-8", "replace")
+                except Exception:
+                    pass
+                classify_http_status(resp.status, snippet)
+            # ponytail: once bytes are flowing, bound each individual read
+            # separately. A stalled mid-stream socket must not hold the
+            # thread for the whole first-byte budget.
+            if conn.sock is not None:
+                conn.sock.settimeout(OPENAI_TTS_READ_TIMEOUT_SEC)
             while True:
-                # ponytail: cheap closed-check per chunk; thread stays sync.
                 if getattr(session, "closed", False):
+                    break
+                # ponytail: barge-in. When the user talks, active_generation
+                # moves on and cancelled_through advances; this turn's audio
+                # is dead. Stop consuming instead of decoding a body nobody
+                # will hear — playback_loop would drop every frame anyway.
+                if generation != getattr(session, "active_generation", generation):
+                    cancelled = True
                     break
                 chunk = resp.read(8192)
                 if not chunk:
                     break
-                mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(chunk, 24000, pcm_remainder)
+                c0 = time.perf_counter()
+                mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(
+                    chunk, src_rate, pcm_remainder, session,
+                )
+                convert_ms += (time.perf_counter() - c0) * 1000
                 if not mulaw_bytes:
                     continue
                 for frame in proc.feed(mulaw_bytes):
                     _emit_frame(frame)
-        for frame in proc.flush():
-            _emit_frame(frame)
+            for frame in proc.flush():
+                _emit_frame(frame)
+        finally:
+            # Always release the socket: barge-in, timeout, 5xx and normal
+            # end-of-stream all land here.
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    await _to_thread(_fetch)
+    try:
+        await _to_thread(_fetch)
+    except OpenAITtsError as exc:
+        # ponytail: structured failure. Emit the error marker + segment_end
+        # so playback_loop advances and the call does not sit in SPEAKING
+        # forever waiting on a mark that will never come.
+        log.warning(
+            "[TTS_OPENAI] %s status=%s stage=%s retryable=%s session=%s gen=%d",
+            exc, exc.status, exc.stage, exc.retryable, session.session_key, generation,
+        )
+        if metrics is not None:
+            try:
+                metrics.incr("tts_error_total", 1)
+                metrics.observe_ms("tts_error_ms", (time.perf_counter() - started) * 1000)
+            except Exception:
+                pass
+        emit_item({"type": "error", "generation": generation,
+                   "message": f"openai TTS: {exc}"})
+        emit_item({"type": "segment_end", "generation": generation})
+        return None, (time.perf_counter() - started) * 1000
+    except Exception as exc:
+        log.exception(
+            "[TTS_OPENAI] transport failure session=%s gen=%d", session.session_key, generation,
+        )
+        if metrics is not None:
+            try:
+                metrics.incr("tts_error_total", 1)
+            except Exception:
+                pass
+        emit_item({"type": "error", "generation": generation,
+                   "message": f"openai TTS: {type(exc).__name__}"})
+        emit_item({"type": "segment_end", "generation": generation})
+        return None, (time.perf_counter() - started) * 1000
+    finally:
+        total_ms = (time.perf_counter() - started) * 1000
+        if metrics is not None:
+            try:
+                metrics.incr("tts_cancelled_total", 1) if cancelled else metrics.incr("tts_completed_total", 1)
+            except Exception:
+                pass
+        _observe("tts_resample_encode_ms", convert_ms)
+        _observe("tts_generation_ms", total_ms)
+
     emit_item({"type": "segment_end", "generation": generation})
-    return ttfb_ms, (time.perf_counter() - started) * 1000
+    return ttfb_ms, total_ms
 
 
 async def _stream_deepgram(

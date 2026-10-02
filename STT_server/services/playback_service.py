@@ -411,6 +411,21 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         timer = getattr(session, "_stage_timer", None)
                         if timer is not None:
                             timer.mark(Stages.FIRST_160_FRAME_SENT)
+                        # ponytail: 2026-10-02 — the number an operator
+                        # actually wants: TTS request start -> this frame
+                        # going on the wire. Distinct from tts_first_byte_ms
+                        # (request -> provider's first chunk), which hides
+                        # everything that happens after the provider.
+                        _tts_started = getattr(session, "_tts_request_started_at", None)
+                        if _tts_started is not None:
+                            _sent_ms = (time.monotonic() - _tts_started) * 1000.0
+                            session._tts_first_audio_sent_ms = _sent_ms
+                            _m = getattr(session, "metrics", None)
+                            if _m is not None:
+                                try:
+                                    _m.observe_ms("tts_first_audio_sent_ms", _sent_ms)
+                                except Exception:
+                                    pass
                         first_frame_marked_gen = generation
 
                     send_start = time.perf_counter()

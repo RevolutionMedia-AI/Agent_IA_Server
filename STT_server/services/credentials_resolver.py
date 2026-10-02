@@ -2238,6 +2238,42 @@ def _build_categorized_models(
             buckets[k].sort()
         for k, ids in buckets.items():
             out["models"][k] = _to_entries([{"id": i} for i in ids])
+        # ponytail: 2026-10-02 — OpenAI TTS voices. /v1/models never
+        # returns voices (they are a property of the model, not the
+        # account), so the voice dropdown had nothing to show. Attach the
+        # per-model voice list to each tts entry, mirroring the metadata
+        # Inworld entries already carry, so the FE filters the voice
+        # dropdown off the selected model with no new endpoint.
+        #
+        # The curated catalog is authoritative for TTS: an id the
+        # pipeline cannot run (or that /v1/models stops returning) is
+        # dropped rather than offered and failing the first call.
+        try:
+            from STT_server.services import openai_tts as _oai_tts
+            _tts_ids = [m["id"] for m in out["models"]["tts"]
+                        if m["id"] in _oai_tts.OPENAI_TTS_MODELS]
+            if _tts_ids:
+                out["models"]["tts"] = [
+                    {
+                        "id": mid,
+                        "label": _oai_tts.OPENAI_TTS_MODELS[mid]["label"],
+                        "recommended": _oai_tts.OPENAI_TTS_MODELS[mid].get("recommended", False),
+                        "supportsInstructions": _oai_tts.OPENAI_TTS_MODELS[mid].get("supports_instructions", False),
+                        "supportsSpeed": _oai_tts.OPENAI_TTS_MODELS[mid].get("supports_speed", False),
+                        "description": _oai_tts.OPENAI_TTS_MODELS[mid].get("description", ""),
+                        "voices": [
+                            {"id": vid, "label": vmeta["label"],
+                             "preferred": vmeta.get("preferred", False),
+                             "hint": vmeta.get("style", "")}
+                            for vid, vmeta in _oai_tts.voices_for_model(mid).items()
+                        ],
+                    }
+                    for mid in _tts_ids
+                ]
+        except Exception:
+            # Catalog is a static table; if it cannot be imported the
+            # generic entries above still render a usable model list.
+            pass
         return out
 
     # ponytail: every other provider's catalog lives in the curated
