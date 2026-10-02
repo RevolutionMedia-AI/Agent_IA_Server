@@ -319,7 +319,11 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
     # dropped_tail_bytes. The audit says these need measurement
     # before sizing policy; we cannot size without observing.
     session._playback_frame_proc = frame_proc
-    first_frame_marked = False
+    # ponytail: 2026-10-02 — this was a one-shot flag for the whole call,
+    # so FIRST_160_FRAME_SENT was stamped only for generation 0 and every
+    # later turn inherited turn 0's timestamp (tts_first_byte=6167ms-type
+    # garbage). Track the generation instead so each turn stamps its own.
+    first_frame_marked_gen: object = object()
     try:
         while True:
             item = await session.playback_queue.get()
@@ -357,6 +361,11 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                 if not session.assistant_speaking:
                     session.assistant_started_at = time.perf_counter()
                     session.last_activity_at = time.monotonic()
+                    # ponytail: 2026-10-02 — new speaking stretch, so the
+                    # cumulative frame counter restarts. Without this the
+                    # expected-end deadline below inherited the previous
+                    # turn's frame count.
+                    session.assistant_frames_sent = 0
                 session.assistant_speaking = True
                 chunk = item["data"]
                 # ponytail: removed per-frame log.debug - one chunk can
@@ -396,13 +405,13 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         except Exception:
                             log.exception("Error escribiendo frame Twilio para %s", session.session_key)
 
-                    if not first_frame_marked:
+                    if generation != first_frame_marked_gen:
                         # ponytail: instrument — first 160-byte frame
                         # crossing the WS boundary is the playback TTFB.
                         timer = getattr(session, "_stage_timer", None)
                         if timer is not None:
                             timer.mark(Stages.FIRST_160_FRAME_SENT)
-                        first_frame_marked = True
+                        first_frame_marked_gen = generation
 
                     send_start = time.perf_counter()
                     # ponytail: 2026-08-28 — B capture moved INSIDE
@@ -443,11 +452,16 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                     # and a slow (not lost) mark. After the last frame this
                     # freezes, so a lost mark unsticks in audio_len + 3 s
                     # instead of a flat 30 s.
+                    # ponytail: sent_frames resets per chunk (it counts
+                    # THIS chunk for the tail log) — the deadline needs the
+                    # per-speaking-stretch total or it collapses to
+                    # started_at + margin on any multi-chunk reply.
+                    session.assistant_frames_sent += 1
                     _started = session.assistant_started_at
                     if _started is not None:
                         session.assistant_expected_end_at = (
                             _started
-                            + sent_frames * (FRAME_DURATION_MS / 1000.0)
+                            + session.assistant_frames_sent * (FRAME_DURATION_MS / 1000.0)
                             + PLAYBACK_MARK_MARGIN_SEC
                         )
                     # Pace outgoing frames proportionally to their duration.

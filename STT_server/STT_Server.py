@@ -2189,7 +2189,15 @@ async def media_stream(ws: WebSocket) -> None:
                     sent_at = pending.pop(mark, None)
                     if sent_at is not None:
                         rtt_ms = (time.monotonic() - sent_at) * 1000.0
-                        timer = getattr(session, "stage_timer", None)
+                        # ponytail: 2026-10-02 — session._stage_timer, not
+                        # session.stage_timer. audio_ingest rebinds the
+                        # underscore name to a fresh per-turn timer at every
+                        # VAD turn boundary; the bare name still points at the
+                        # session-lifetime timer, so the mark ack was landing
+                        # on a different object than tts_first_byte /
+                        # first_160_frame_sent and its delta was measured
+                        # from call start instead of from the turn.
+                        timer = getattr(session, "_stage_timer", None)
                         if timer is not None:
                             try:
                                 timer.mark(Stages.TWILIO_MARK_ACK)
