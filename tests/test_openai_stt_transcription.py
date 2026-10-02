@@ -131,7 +131,9 @@ async def test_turn_end_seq_from_vad_is_what_drives_commit(monkeypatch):
     session = CallSession(session_key="commit-probe")
     session.stt_audio_queue.put_nowait(b"\xff" * 160)
 
-    task = asyncio.create_task(mod._audio_sender(FakeWS(), session))
+    task = asyncio.create_task(
+        mod._audio_sender(FakeWS(), session, "gpt-live-transcribe")
+    )
     try:
         # real elapsed time, not sleep(0): the sender polls the turn-end
         # seq on a wait_for(timeout=...), so a zero-sleep spin would never

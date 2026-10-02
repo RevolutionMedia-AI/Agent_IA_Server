@@ -360,7 +360,7 @@ def build_session_update(
     }
 
 
-async def _audio_sender(ws, session: CallSession) -> None:
+async def _audio_sender(ws, session: CallSession, model_id: str) -> None:
     """Pump mu-law into the transcription session, committing turns.
 
     Commit is driven by ``session.stt_turn_end_seq`` rather than a local
@@ -400,7 +400,6 @@ async def _audio_sender(ws, session: CallSession) -> None:
                     "type": "input_audio_buffer.append",
                     "audio": base64.b64encode(pcm).decode("ascii"),
                 }))
-                sent_this_turn = True
 
         seq = session.stt_turn_end_seq
         if seq != last_committed_seq:
@@ -408,6 +407,16 @@ async def _audio_sender(ws, session: CallSession) -> None:
             # Commit even with no audio of our own this turn: the append
             # for the turn may already be on the wire and OpenAI needs the
             # commit to emit the final transcript.
+            # ponytail: 2026-10-01 — this send is now logged with its seq.
+            # "STT records nothing" used to be undebuggable because a
+            # missing commit and a model that ignored the commit looked
+            # identical in the logs. Now: a commit line with no transcript
+            # after it means the model side is silent; no commit line at
+            # all means our VAD never closed the turn.
+            log.info(
+                "[OPENAI_STT] commit sent for %s (turn_end_seq=%d model=%s)",
+                session.session_key, seq, model_id,
+            )
             try:
                 await ws.send(json.dumps({
                     "type": "input_audio_buffer.commit",
@@ -508,7 +517,9 @@ async def run_realtime_stt(
                 await ws.send(json.dumps(build_session_update(
                     model_id, language, latency_mode=latency_mode,
                 )))
-                sender_task = asyncio.create_task(_audio_sender(ws, session))
+                sender_task = asyncio.create_task(
+                    _audio_sender(ws, session, model_id)
+                )
                 # ponytail: 2026-10-01 — this says "sent", not "open".
                 # The previous wording logged the session as open
                 # immediately after ws.send(), before the server had
