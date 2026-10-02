@@ -39,6 +39,12 @@ TWILIO_CHANNELS = 1
 FRAME_DURATION_MS = 20
 TWILIO_OUTBOUND_CHUNK_BYTES = 160
 TWILIO_OUTBOUND_PACING_MS = float(os.getenv("TWILIO_OUTBOUND_PACING_MS", "20"))
+# ponytail: 2026-10-02 — slack added to the audio length when computing
+# when playback should be done (assistant_expected_end_at). Covers network
+# jitter between our send and Twilio's play, plus a slow mark ack. Too
+# small and a delayed (not lost) mark resets the flag while audio is still
+# playing; too large and a lost mark sticks the flag. 3 s is the middle.
+PLAYBACK_MARK_MARGIN_SEC = float(os.getenv("PLAYBACK_MARK_MARGIN_SEC", "3.0"))
 # ponytail: AUDIO-006 — per-event base64 payload cap. Twilio sends
 # ~160-800 byte PCMU payloads; 8192 decoded bytes leaves generous
 # headroom (2 frames at 8 kHz / 20 ms is 320 bytes; 8192 is 25x).

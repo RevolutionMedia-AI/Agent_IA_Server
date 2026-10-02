@@ -245,6 +245,13 @@ class CallSession:
     pending_playback_marks: int = 0
     assistant_speaking: bool = False
     assistant_started_at: float | None = None
+    # ponytail: 2026-10-02 — monotonic timestamp by which the audio sent
+    # so far should have finished playing (started_at + frames * 20 ms +
+    # margin). The watchdog compares against this instead of a flat
+    # timeout, so a lost mark ack on a 2 s reply unsticks in ~5 s while a
+    # lost mark on a 9 s greeting unsticks in ~12 s. Without it the flag
+    # stayed True for a fixed 30 s no matter how short the audio was.
+    assistant_expected_end_at: float | None = None
     current_transcript: str = ""
     reply_source_text: str = ""
     reply_task: asyncio.Task | None = None

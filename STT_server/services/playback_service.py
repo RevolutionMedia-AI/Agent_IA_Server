@@ -9,7 +9,9 @@ from fastapi import WebSocket
 from STT_server.adapters.tts_dispatcher import stream_tts_segment
 from STT_server.adapters.twilio_media import send_twilio_clear, send_twilio_mark, send_twilio_media
 from STT_server.config import (
+    FRAME_DURATION_MS,
     LOG_TWILIO_PLAYBACK,
+    PLAYBACK_MARK_MARGIN_SEC,
     TWILIO_OUTBOUND_CHUNK_BYTES,
     TWILIO_OUTBOUND_PACING_MS,
     SAVE_TWILIO_FRAMES,
@@ -435,6 +437,19 @@ async def playback_loop(ws: WebSocket, session: CallSession) -> None:
                         generation,
                     )
                     sent_frames += 1
+                    # ponytail: 2026-10-02 — keep the watchdog's expected
+                    # end current. started_at + frames * frame duration is
+                    # the audio length; the margin covers network jitter
+                    # and a slow (not lost) mark. After the last frame this
+                    # freezes, so a lost mark unsticks in audio_len + 3 s
+                    # instead of a flat 30 s.
+                    _started = session.assistant_started_at
+                    if _started is not None:
+                        session.assistant_expected_end_at = (
+                            _started
+                            + sent_frames * (FRAME_DURATION_MS / 1000.0)
+                            + PLAYBACK_MARK_MARGIN_SEC
+                        )
                     # Pace outgoing frames proportionally to their duration.
                     # A full frame (TWILIO_OUTBOUND_CHUNK_BYTES) represents
                     # TWILIO_OUTBOUND_PACING_MS milliseconds of audio.

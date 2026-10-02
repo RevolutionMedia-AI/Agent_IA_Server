@@ -1326,6 +1326,41 @@ async def voice_transfer_fallback(
         media_type="application/xml",
     )
 
+def _speaking_stuck_reason(session: CallSession, now: float) -> str | None:
+    """Why assistant_speaking should be force-cleared, or None to leave it.
+
+    Pure function of session state so it is unit-testable without running
+    the watchdog loop. Two reasons, checked in order:
+
+    1. "past-expected-end": playback counted N frames, so the audio should
+       have finished at started_at + N * 20 ms + margin. If we are past
+       that, the mark ack was lost. This unsticks a 2 s reply in ~5 s and
+       a 9 s greeting in ~12 s.
+    2. "over-absolute-cap": flat 30 s backstop for turns where no frames
+       were ever counted.
+
+    The expected_end > started_at guard makes this safe across turns: a
+    fresh turn that has not sent its first frame yet still carries the
+    previous turn's (past) expected_end, and without it we would kill the
+    new turn instantly.
+    """
+    if not session.assistant_speaking:
+        return None
+    started_at = session.assistant_started_at
+    if started_at is None:
+        return None
+    expected_end = session.assistant_expected_end_at
+    if (
+        expected_end is not None
+        and expected_end > started_at
+        and now > expected_end
+    ):
+        return "past-expected-end"
+    if now - started_at > 30:
+        return "over-absolute-cap"
+    return None
+
+
 async def _watchdog_assistant_speaking(session: CallSession) -> None:
     """H5 from the call-flow audit: force-reset assistant_speaking if
     it's been True too long without Twilio sending a mark event.
@@ -1335,10 +1370,10 @@ async def _watchdog_assistant_speaking(session: CallSession) -> None:
     user mute, anything that drops the event but keeps the WS open),
     assistant_speaking stays True forever and STT barge-in stops
     working because the VAD treats the stuck state as "agent is
-    talking, ignore user input". This watchdog catches that case
-    and resets the flag after MAX_SPEAKING_SEC.
+    talking, ignore user input". This watchdog catches that case.
+    The decision lives in _speaking_stuck_reason (audio-length deadline
+    first, flat 30 s backstop second) so it is unit-testable.
     """
-    MAX_SPEAKING_SEC = 30
     POLL_SEC = 5
     while not session.closed:
         try:
@@ -1347,19 +1382,28 @@ async def _watchdog_assistant_speaking(session: CallSession) -> None:
             await asyncio.sleep(POLL_SEC)
         except asyncio.CancelledError:
             return
-        if not session.assistant_speaking:
+        reason = _speaking_stuck_reason(session, time.perf_counter())
+        if reason is None:
             continue
-        if session.assistant_started_at is None:
-            continue
-        elapsed = time.perf_counter() - session.assistant_started_at
-        if elapsed > MAX_SPEAKING_SEC:
+        elapsed = time.perf_counter() - (session.assistant_started_at or 0)
+        # ponytail: 2026-10-02 — reason comes from _speaking_stuck_reason
+        # (audio-length deadline first, flat 30 s backstop second). See
+        # that function for why each exists.
+        if reason == "past-expected-end":
+            log.warning(
+                "[WATCHDOG] assistant_speaking past expected end in %s "
+                "(elapsed %.1fs), forcing False — mark ack likely lost",
+                session.session_key, elapsed,
+            )
+        else:
             log.warning(
                 "[WATCHDOG] assistant_speaking stuck for %.1fs in %s, forcing False",
                 elapsed, session.session_key,
             )
-            session.assistant_speaking = False
-            session.assistant_started_at = None
-            session.pending_marks.clear()
+        session.assistant_speaking = False
+        session.assistant_started_at = None
+        session.assistant_expected_end_at = None
+        session.pending_marks.clear()
 
 
 async def _pump_realtime_transcripts_to_central_queue(session: CallSession) -> None:
