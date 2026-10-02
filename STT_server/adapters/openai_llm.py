@@ -695,15 +695,28 @@ def stream_llm_reply_sync(
                 if getattr(session, "llm_temperature", None) is not None else 0.2,
             "max_tokens": getattr(session, "llm_max_tokens", None) or MAX_RESPONSE_TOKENS,
             "stream": True,
+            # ponytail: 2026-10-02 — ask for usage in the final chunk so
+            # we can log prompt/completion/cached tokens per turn. Without
+            # this, streaming responses carry no usage and we cannot tell
+            # whether the 28k system prompt is hitting OpenAI's prefix
+            # cache or being reprocessed every turn.
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = tools
 
         stream = client.chat.completions.create(**kwargs)
+        _usage = None
 
         for chunk in stream:
             if should_stop():
                 break
+            # ponytail: 2026-10-02 — with stream_options.include_usage the
+            # final chunk carries usage and NO choices, so it must be read
+            # before the choices guard below skips it.
+            _u = getattr(chunk, "usage", None)
+            if _u is not None:
+                _usage = _u
             if not getattr(chunk, "choices", None):
                 continue
 
@@ -739,6 +752,27 @@ def stream_llm_reply_sync(
             for segment in final_segments:
                 on_first_segment()
                 emit_segment(segment)
+
+        # ponytail: 2026-10-02 — usage per turn, the answer to "is the
+        # 28k system prompt cached?". Placed BEFORE the tool-call early
+        # return so tool turns are measured too. prompt_tokens should stay
+        # ~flat across turns (system + growing history); cached_tokens
+        # near the system size means the prefix cache is hitting and the
+        # prompt is NOT reprocessed. Near zero means every turn pays full
+        # price and the slowness is prompt reprocessing, not compute.
+        if _usage is not None:
+            try:
+                _pt = getattr(_usage, "prompt_tokens", None)
+                _ct = getattr(_usage, "completion_tokens", None)
+                _det = getattr(getattr(_usage, "prompt_tokens_details", None),
+                               "cached_tokens", None)
+                log.info(
+                    "[LLM] usage session=%s model=%s prompt=%s completion=%s cached=%s",
+                    getattr(session, "session_key", "?") if session else "?",
+                    model_id, _pt, _ct, _det,
+                )
+            except Exception:
+                pass
 
         # If we have tool calls, return them for processing
         if tool_calls and execute_tool_callback:
