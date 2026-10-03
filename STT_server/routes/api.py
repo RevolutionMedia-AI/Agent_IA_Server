@@ -5314,7 +5314,12 @@ def internal_get_integration_credentials(
     spec = get_integration_provider_spec(provider)
     is_oauth = bool(spec and getattr(spec, "auth_type", "static") == "oauth")
     from STT_server.db import is_postgres
-    if is_oauth and is_token_expiring(creds_plain.get("expires_at")) and is_postgres():
+    # ponytail: 2026-10-02 — should_attempt_refresh() is the single source
+    # of truth and also answers "does this provider support refresh at
+    # all?". Without it an Intercom integration (no refresh token, token
+    # never expires) was marked `failed` + 503'd on EVERY n8n call.
+    from STT_server.services.oauth_providers import should_attempt_refresh
+    if is_oauth and is_postgres() and should_attempt_refresh(provider, creds_plain):
         # ponyy: refresh-on-read runs in ONE connection and ONE
         # transaction. acquire lock → re-read inside the lock →
         # (optional) refresh → persist creds + status → commit.
@@ -5605,10 +5610,14 @@ def internal_execute_integration_action(
     # concurrent calls for the same integration serialize on the
     # advisory lock; the second one sees the freshly-persisted row.
     from STT_server.db import is_postgres as _is_pg
+    # ponytail: 2026-10-02 — same helper as the /credentials endpoint.
+    # Both copies of refresh-on-read now agree on when to refresh; they
+    # used to be independent copies of the same condition.
+    from STT_server.services.oauth_providers import should_attempt_refresh
     if (
         is_oauth
-        and _expiring(creds_plain.get("expires_at"))
         and _is_pg()
+        and should_attempt_refresh(provider, creds_plain)
     ):
         try:
             with _get_conn() as conn:

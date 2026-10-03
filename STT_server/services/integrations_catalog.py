@@ -705,15 +705,21 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
         name="NICE CXone",
         category="contact_center",
         description="NICE CXone — contact center routing and reporting.",
+        # ponytail: 2026-10-02 — migrated from a pasted api_token to OAuth
+        # Authorization Code, so the access_token field is gone; the token
+        # exchange supplies it. `tenant` stays because the ACTIONS need the
+        # POD name, not because the token exchange does. CXone's
+        # authorization server is per-REGION (oauth.nicecxone.com /
+        # oauth.nice.eu / oauth.nice.com.au), a deployment-time env value
+        # (NICECXONE_AUTH_BASE), so no per-account domain field is needed.
+        #
+        # BREAKING for existing rows: a nice_cxone integration created with
+        # a pasted api_token must be reconnected once.
         fields=(
             IntegrationFieldSpec(
                 name="tenant", label="Tenant / POD", type="text",
                 required=True, min_length=2, max_length=64,
                 placeholder="na1",
-            ),
-            IntegrationFieldSpec(
-                name="access_token", label="Access Token", type="password",
-                required=True, min_length=20,
             ),
         ),
         actions=(
@@ -721,6 +727,50 @@ INTEGRATION_PROVIDERS: tuple[IntegrationProviderSpec, ...] = (
             _a("get_skill_stats", "Get Skill Stats"),
         ),
         test_fn=None,
+        auth_type="oauth",
+        oauth_label="Connect NICE CXone",
+    ),
+    # ponytail: 2026-10-02 — new OAuth providers. No `actions` on purpose:
+    # the automation lives in n8n, which calls the internal credentials /
+    # exec endpoints. What the product needs from these is a connect +
+    # validate + keep-alive path, and that is exactly what auth_type=oauth
+    # plus the refresh-on-read path in routes/api.py provides.
+    IntegrationProviderSpec(
+        id="intercom",
+        name="Intercom",
+        category="crm",
+        description="Intercom — conversations and contacts.",
+        fields=(),
+        actions=(),
+        test_fn=None,
+        auth_type="oauth",
+        oauth_label="Connect Intercom",
+        # Intercom's OAuth grants a fixed per-app permission set and
+        # rejects an unrecognised scope, so we send none.
+        oauth_default_scopes=(),
+        capabilities=("support", "messaging"),
+    ),
+    IntegrationProviderSpec(
+        id="hubspot",
+        name="HubSpot CRM",
+        category="crm",
+        description="HubSpot CRM API v3 — contacts, companies, deals and tickets.",
+        fields=(),
+        actions=(),
+        test_fn=None,
+        auth_type="oauth",
+        oauth_label="Connect HubSpot",
+        oauth_default_scopes=(
+            "crm.objects.contacts.read",
+            "crm.objects.contacts.write",
+            "crm.objects.companies.read",
+            "crm.objects.deals.read",
+            "crm.objects.deals.write",
+            "crm.objects.tickets.read",
+            "crm.objects.tickets.write",
+            "oauth",
+        ),
+        capabilities=("crm", "contacts", "deals", "tickets"),
     ),
     # ponytail: generic_webhook IS the provider for "I just want to
     # call any URL". The n8n router resolves the URL from this row's

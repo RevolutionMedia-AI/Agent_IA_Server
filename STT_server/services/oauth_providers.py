@@ -73,6 +73,12 @@ class OAuthConfig:
     client_id: str = ""
     client_secret: str = ""
     redirect_uri: str = ""
+    # ponytail: 2026-10-02 — False for providers whose access token does
+    # NOT expire and which issue no refresh token (Intercom). Without
+    # this flag the refresh-on-read path sees expires_at=None, treats it
+    # as "expiring", finds no refresh_token, and marks the integration
+    # `failed` + 503s EVERY call. See should_attempt_refresh().
+    refresh_supported: bool = True
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,137 @@ class OAuthTokenResponse:
 
 
 # ── Registry ────────────────────────────────────────────────────────────────
+
+
+def _redirect_uri_for(provider_id: str, env_key: str) -> str:
+    """`<PROVIDER>_REDIRECT_URI`, falling back to PUBLIC_URL + the standard
+    callback path. Every OAuth provider in this product uses the same
+    callback route shape (`/integrations/<provider>/oauth/callback`), so
+    the fallback is derivable instead of per-provider boilerplate."""
+    explicit = os.environ.get(env_key, "").strip()
+    if explicit:
+        return explicit
+    public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        return f"{public_url}/integrations/{provider_id}/oauth/callback"
+    raise RuntimeError(
+        f"{env_key} is not set and PUBLIC_URL is not configured; cannot "
+        f"build the redirect target. Set {env_key}=https://<backend>"
+        f"/integrations/{provider_id}/oauth/callback"
+    )
+
+
+def _scopes_from_env(env_key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(env_key, "").strip()
+    return tuple(s for s in raw.replace(",", " ").split() if s) if raw else default
+
+
+def _build_intercom_config() -> OAuthConfig:
+    """Intercom — OAuth 2.0 Authorization Code.
+
+    ponytail: 2026-10-02. Intercom's access token does NOT expire and the
+    provider issues NO refresh token, so `refresh_supported=False`. That
+    flag is load-bearing: without it the refresh-on-read path treats the
+    absent `expires_in` as "expiring", finds no refresh_token and marks
+    the integration failed on every single n8n call.
+
+    The authorize/token URLs are env-overridable because Intercom regions
+    (EU / AU / US) differ and I could not verify the EU/AU variants from
+    the docs in this environment. Defaults are the US endpoints.
+    """
+    return OAuthConfig(
+        provider_id="intercom",
+        authorize_url=os.environ.get(
+            "INTERCOM_AUTHORIZE_URL", "https://app.intercom.com/oauth"
+        ).strip(),
+        token_url=os.environ.get(
+            "INTERCOM_TOKEN_URL", "https://api.intercom.com/auth/eagle/token"
+        ).strip(),
+        revoke_url="",
+        # No scopes: Intercom's OAuth grants a fixed permission set per
+        # app and rejects an unrecognised scope parameter.
+        default_scopes=_scopes_from_env("INTERCOM_SCOPES", ()),
+        client_id=os.environ["INTERCOM_CLIENT_ID"],
+        client_secret=os.environ["INTERCOM_CLIENT_SECRET"],
+        redirect_uri=_redirect_uri_for("intercom", "INTERCOM_REDIRECT_URI"),
+        refresh_supported=False,
+    )
+
+
+def _build_hubspot_config() -> OAuthConfig:
+    """HubSpot CRM API — OAuth 2.0 Authorization Code.
+
+    ponytail: 2026-10-02. HubSpot ROTATES the refresh token: every
+    successful refresh returns a new one and invalidates the old. The
+    refresh-on-read path already persists `new_tokens.refresh_token` when
+    the provider returns one (routes/api.py), which is what keeps this
+    integration alive. If you ever read the creds without going through
+    that path, the stored refresh_token may already be dead.
+    """
+    return OAuthConfig(
+        provider_id="hubspot",
+        authorize_url=os.environ.get(
+            "HUBSPOT_AUTHORIZE_URL", "https://app.hubspot.com/oauth/authorize"
+        ).strip(),
+        token_url=os.environ.get(
+            "HUBSPOT_TOKEN_URL", "https://api.hubapi.com/oauth/v1/token"
+        ).strip(),
+        # ponytail: no revoke_url. HubSpot's revoke endpoint is
+        # /oauth/v1/refresh-tokens/{token_id} and we deliberately do NOT
+        # store the token id, so there is nothing to call. Disconnecting
+        # is done by dropping the integration row.
+        revoke_url="",
+        default_scopes=_scopes_from_env(
+            "HUBSPOT_SCOPES",
+            (
+                "crm.objects.contacts.read",
+                "crm.objects.contacts.write",
+                "crm.objects.companies.read",
+                "crm.objects.deals.read",
+                "crm.objects.deals.write",
+                "crm.objects.tickets.read",
+                "crm.objects.tickets.write",
+                "oauth",
+            ),
+        ),
+        client_id=os.environ["HUBSPOT_CLIENT_ID"],
+        client_secret=os.environ["HUBSPOT_CLIENT_SECRET"],
+        redirect_uri=_redirect_uri_for("hubspot", "HUBSPOT_REDIRECT_URI"),
+        refresh_supported=True,
+    )
+
+
+def _build_nice_cxone_config() -> OAuthConfig:
+    """NICE CXone — OAuth 2.0 Authorization Code for CRM/voice.
+
+    ponytail: 2026-10-02. CXone's authorization server is per-REGION, not
+    per-tenant: oauth.nicecxone.com (NA) / oauth.nice.eu / oauth.nice.com.au.
+    The region is a deployment decision, so it lives in env — no per-account
+    domain field is needed, which is why this provider fits the static
+    OAuthConfig shape. The tenant/POD stays on the integration row as a
+    config field (used by the actions, not by the token exchange).
+    """
+    auth_base = os.environ.get(
+        "NICECXONE_AUTH_BASE", "https://oauth.nicecxone.com"
+    ).strip().rstrip("/")
+    return OAuthConfig(
+        provider_id="nice_cxone",
+        authorize_url=os.environ.get(
+            "NICECXONE_AUTHORIZE_URL", f"{auth_base}/oauth2/v1/authorize"
+        ).strip(),
+        token_url=os.environ.get(
+            "NICECXONE_TOKEN_URL", f"{auth_base}/oauth2/v1/token"
+        ).strip(),
+        revoke_url="",
+        default_scopes=_scopes_from_env(
+            "NICECXONE_SCOPES",
+            ("openid", "profile", "email", "offline_access"),
+        ),
+        client_id=os.environ["NICECXONE_CLIENT_ID"],
+        client_secret=os.environ["NICECXONE_CLIENT_SECRET"],
+        redirect_uri=_redirect_uri_for("nice_cxone", "NICECXONE_REDIRECT_URI"),
+        refresh_supported=True,
+    )
 
 
 _REQUIRED_ENV = ("SALESFORCE_CLIENT_ID", "SALESFORCE_CLIENT_SECRET", "SALESFORCE_REDIRECT_URI")
@@ -227,6 +364,12 @@ def _ensure_provider_built(provider_id: str) -> None:
         _OAUTH_PROVIDERS["google_calendar"] = _build_google_calendar_config()
     elif provider_id == "dynamics365":
         _OAUTH_PROVIDERS["dynamics365"] = _build_dynamics365_config()
+    elif provider_id == "intercom":
+        _OAUTH_PROVIDERS["intercom"] = _build_intercom_config()
+    elif provider_id == "hubspot":
+        _OAUTH_PROVIDERS["hubspot"] = _build_hubspot_config()
+    elif provider_id == "nice_cxone":
+        _OAUTH_PROVIDERS["nice_cxone"] = _build_nice_cxone_config()
     else:
         raise KeyError(f"Provider '{provider_id}' is not registered as OAuth")
 
@@ -237,7 +380,35 @@ def get_oauth_config(provider_id: str) -> OAuthConfig:
 
 
 def known_oauth_providers() -> list[str]:
-    return ["salesforce", "google_calendar", "dynamics365"]
+    return [
+        "salesforce", "google_calendar", "dynamics365",
+        "intercom", "hubspot", "nice_cxone",
+    ]
+
+
+def provider_refresh_supported(provider_id: str) -> bool:
+    """Can we exchange a refresh token for this provider?
+
+    Read from a static table rather than from the built OAuthConfig on
+    purpose: refresh support is a property of the PROVIDER, not of the
+    environment. Deriving it from get_oauth_config() meant a missing
+    INTERCOM_CLIENT_ID flipped the answer to True and reintroduced the
+    bug this flag exists to prevent.
+
+    Unknown providers default to True so a not-yet-registered provider
+    keeps the loud "no refresh token -> reconnect" behaviour instead of
+    silently skipping the refresh.
+    """
+    return provider_id not in _NO_REFRESH_SUPPORT
+
+
+_NO_REFRESH_SUPPORT = frozenset({
+    # Intercom: the access token does not expire and no refresh token is
+    # issued. Its token response has no expires_in at all, so an
+    # unguarded is_token_expiring(None) reads True and every call would
+    # mark the integration failed.
+    "intercom",
+})
 
 
 def _required_env_vars(provider_id: str) -> tuple[str, ...]:
@@ -258,6 +429,24 @@ def _required_env_vars(provider_id: str) -> tuple[str, ...]:
             "DYNAMICS365_CLIENT_ID",
             "DYNAMICS365_CLIENT_SECRET",
             "DYNAMICS365_REDIRECT_URI",
+        )
+    if provider_id == "intercom":
+        return (
+            "INTERCOM_CLIENT_ID",
+            "INTERCOM_CLIENT_SECRET",
+            "INTERCOM_REDIRECT_URI",
+        )
+    if provider_id == "hubspot":
+        return (
+            "HUBSPOT_CLIENT_ID",
+            "HUBSPOT_CLIENT_SECRET",
+            "HUBSPOT_REDIRECT_URI",
+        )
+    if provider_id == "nice_cxone":
+        return (
+            "NICECXONE_CLIENT_ID",
+            "NICECXONE_CLIENT_SECRET",
+            "NICECXONE_REDIRECT_URI",
         )
     return ()
 
@@ -568,3 +757,56 @@ def now_plus_seconds(seconds: int) -> str:
     from datetime import datetime, timezone, timedelta
     t = datetime.now(timezone.utc) + timedelta(seconds=seconds)
     return t.isoformat().replace("+00:00", "Z")
+
+
+# ── Refresh decision ────────────────────────────────────────────────────────
+
+
+def should_attempt_refresh(provider_id: str, creds: dict) -> bool:
+    """Should the refresh-on-read path try to renew *creds*?
+
+    Single source of truth for that decision. It used to be inlined in two
+    places (routes/api.py /internal/.../credentials and /internal/.../exec),
+    which is how the two copies drifted apart.
+
+    Returns False when:
+      - the provider does not support refresh at all (Intercom: the access
+        token does not expire and no refresh token is issued), or
+      - the token is not close to expiry.
+
+    A provider that does NOT support refresh is deliberately NOT treated
+    as an error. That is the Intercom case: its token response carries no
+    `expires_in`, so `expires_at` is absent, and an unguarded
+    `is_token_expiring(None)` returns True, finds no refresh_token and
+    marks the integration `failed` on every call — an integration that
+    works perfectly but reports itself as broken.
+
+    Everything else (including a refresh-capable provider whose refresh
+    token is genuinely missing) still returns True so the existing
+    "reconnect required" 503 path is unchanged.
+    """
+    if not provider_refresh_supported(provider_id):
+        return False
+    if not is_token_expiring((creds or {}).get("expires_at")):
+        return False
+    return True
+
+
+# ── Self-check ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Intercom: never refresh, never marked failed.
+    assert should_attempt_refresh("intercom", {"access_token": "x"}) is False
+    assert should_attempt_refresh("intercom", {"expires_at": None}) is False
+    # HubSpot: refresh when close to expiry, including when expires_at is
+    # missing (which is what a misconfigured exchange looks like).
+    assert should_attempt_refresh("hubspot", {"expires_at": None}) is True
+    future = now_plus_seconds(3600)
+    assert should_attempt_refresh("hubspot", {"expires_at": future}) is False
+    past = now_plus_seconds(-10)
+    assert should_attempt_refresh("hubspot", {"expires_at": past}) is True
+    # Unknown provider keeps the old, loud behaviour.
+    assert should_attempt_refresh("mystery", {"expires_at": None}) is True
+    # Static (non-OAuth) providers are never in this path, but be safe.
+    assert should_attempt_refresh("zendesk", {"expires_at": None}) is True
+
+    print("oauth_providers refresh decision: OK")
