@@ -56,7 +56,8 @@ _INTEGRATIONS_COLS_BASE = (
     "id, user_id, agent_id, provider, name, configuration, "
     "credentials_encrypted, credentials_cipher, connection_status, "
     "last_tested_at, last_test_message, oauth_scope, "
-    "oauth_state_hash, oauth_state_expires_at, assignments, created_at, updated_at"
+    "oauth_state_hash, oauth_state_expires_at, assignments, created_at, updated_at, "
+    "n8n_token_prefix"
 )
 # credentials_encrypted lands as BYTEA; we kept `cipher` as a separate
 # TEXT column so future migrations (rotating Fernet keys, switching to
@@ -136,6 +137,7 @@ def _ensure_integrations_table() -> None:
                             "  oauth_state_hash       TEXT,"
                             "  oauth_state_expires_at TIMESTAMPTZ,"
                             "  oauth_code_verifier_encrypted BYTEA,"
+                            "  n8n_token_prefix      TEXT,"
                             "  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
                             "  updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()"
                             ")"
@@ -178,7 +180,14 @@ def _ensure_integrations_table() -> None:
                     # Without this the /oauth/start UPDATE would 500
                     # with "column oauth_code_verifier_encrypted
                     # does not exist" forever.
-                    "oauth_code_verifier_encrypted": "BYTEA",
+"oauth_code_verifier_encrypted": "BYTEA",
+                    # ponytail: 029 — lookup half of the per-integration
+                    # n8n token. The token itself lives encrypted in
+                    # credentials_encrypted; this clear column holds a
+                    # hash prefix so the row is findable without
+                    # decrypting every integration on every n8n request.
+                    # NULL = use the platform INTEGRATIONS_N8N_TOKEN.
+                    "n8n_token_prefix": "TEXT",
                     "assignments": "JSONB NOT NULL DEFAULT '[]'::jsonb",
                     "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
                     "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
@@ -1387,6 +1396,147 @@ def mark_integration_status(
                     "WHERE id = %s AND user_id = %s",
                     (status, last_test_message, integration_id, user_id),
                 )
+
+
+# ── Per-integration n8n token (029) ─────────────────────────────────────────
+#
+# Why this exists: until now n8n authenticated to the internal endpoints
+# with ONE platform-wide INTEGRATIONS_N8N_TOKEN and the caller context
+# carried no user_id, so any n8n holding that token could fetch the
+# decrypted access token of any integration belonging to any user by
+# guessing the id. Each integration can now carry its own token; when n8n
+# presents one, the caller context is scoped to that integration's owner
+# and the lookup can be scoped too.
+#
+# Storage split:
+#   * the token  -> credentials_encrypted (Fernet, never in the clear)
+#   * a hash prefix -> n8n_token_prefix (clear column, indexed) so the row
+#     is FINDABLE without decrypting every integration on every request.
+#
+# NULL prefix = "use the platform token", which is the default and the
+# backwards-compatible path.
+
+
+N8N_TOKEN_PREFIX_LEN = 12
+N8N_TOKEN_ENTROPY_BYTES = 32
+
+
+def n8n_token_prefix(token: str) -> str:
+    """Indexed lookup prefix for *token*.
+
+    SHA-256 rather than the raw token: the column is cleartext, and a
+    leaked DB dump must not hand out working n8n tokens. 12 hex chars
+    (48 bits) is enough to be collision-free at realistic row counts while
+    keeping the candidate set the verify step has to check at ~1.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return digest[:N8N_TOKEN_PREFIX_LEN]
+
+
+def generate_n8n_token() -> str:
+    """Fresh URL-safe token for one integration."""
+    import secrets
+
+    return secrets.token_urlsafe(N8N_TOKEN_ENTROPY_BYTES)
+
+
+def find_integrations_by_n8n_prefix(prefix: str) -> list[dict]:
+    """Rows whose stored token hash starts with *prefix*.
+
+    Returns candidates, not a decision: the caller must still verify the
+    presented token against the decrypted value with a constant-time
+    compare. A prefix match alone is not authentication.
+    """
+    if not prefix:
+        return []
+    prefix = str(prefix).strip()
+    if not is_postgres():
+        out = []
+        for r in _read_integrations_file():
+            if isinstance(r, dict) and r.get("n8n_token_prefix") == prefix:
+                out.append(dict(r))
+        return out
+    from STT_server.db import get_conn
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {_integrations_cols()}, credentials_encrypted, "
+                "credentials_cipher FROM integrations "
+                "WHERE n8n_token_prefix = %s LIMIT 5",
+                (prefix,),
+            )
+            rows = cur.fetchall()
+    return [_row_to_dict(r, extra=("credentials_encrypted", "credentials_cipher")) for r in rows]
+
+
+def set_integration_n8n_token(
+    integration_id: str,
+    user_id: str,
+    token: str,
+    *,
+    cur=None,
+) -> bool:
+    """Persist *token* as the integration's n8n token and index its prefix.
+
+    Returns False when the integration does not exist or belongs to another
+    user, so a cross-tenant write is impossible rather than merely logged.
+    """
+    prefix = n8n_token_prefix(token)
+    if not is_postgres():
+        rows = _read_integrations_file()
+        changed = False
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["n8n_token_prefix"] = prefix
+                r["updated_at"] = _now_iso()
+                changed = True
+        if changed:
+            _write_integrations_file(rows)
+        return changed
+    from STT_server.db import get_conn
+
+    own_cur = cur is None
+    conn = get_conn() if own_cur else None
+    try:
+        active = conn.cursor() if own_cur else cur
+        active.execute(
+            "UPDATE integrations SET n8n_token_prefix = %s, updated_at = NOW() "
+            "WHERE id = %s AND user_id = %s RETURNING id",
+            (prefix, integration_id, user_id),
+        )
+        return active.fetchone() is not None
+    finally:
+        if own_cur and conn is not None:
+            conn.close()
+
+
+def clear_integration_n8n_token(integration_id: str, user_id: str) -> bool:
+    """Drop the per-integration token; the row falls back to the platform
+    INTEGRATIONS_N8N_TOKEN."""
+    if not is_postgres():
+        rows = _read_integrations_file()
+        changed = False
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == integration_id and r.get("user_id") == user_id:
+                r["n8n_token_prefix"] = None
+                r["updated_at"] = _now_iso()
+                changed = True
+        if changed:
+            _write_integrations_file(rows)
+        return changed
+    from STT_server.db import get_conn
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE integrations SET n8n_token_prefix = NULL, updated_at = NOW() "
+                "WHERE id = %s AND user_id = %s RETURNING id",
+                (integration_id, user_id),
+            )
+            return cur.fetchone() is not None
 
 
 def acquire_advisory_xact_lock(cur, lock_key: str) -> None:

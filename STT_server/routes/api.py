@@ -235,19 +235,48 @@ def _expected_service_token() -> str:
 
 
 def require_service_token(authorization: str = Header(None)) -> dict:
-    """Validate the shared bearer token used by n8n to call internal
-    endpoints. Returns a synthetic context dict (no user_id — the
-    caller is n8n, not a logged-in user)."""
+    """Validate the bearer token n8n uses to call the internal endpoints.
+
+    Two accepted forms, in this order:
+
+    1. A PER-INTEGRATION token (migration 029). Resolved to the owning
+       integration, and the returned context carries `user_id` so the
+       caller can scope its lookup to that tenant.
+    2. The platform-wide INTEGRATIONS_N8N_TOKEN. Returns `user_id: None`,
+       which means UNSCOPED — it is a platform-admin credential and can
+       reach any integration.
+
+    Why 1 exists: the caller context used to have no user_id at all and
+    the credentials endpoint used the unscoped lookup, so any n8n holding
+    the shared token could read any tenant's decrypted access token by
+    guessing the integration id. Per-integration tokens make that require
+    the caller to already hold that specific integration's secret.
+    """
     import hmac
+    presented = ""
+    if authorization and authorization.startswith("Bearer "):
+        presented = authorization[len("Bearer "):].strip()
+
+    if not presented:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # ── 1. per-integration token ─────────────────────────────────────
+    scoped = _resolve_integration_n8n_token(presented)
+    if scoped is not None:
+        return {
+            "caller": "n8n",
+            "user_id": scoped["user_id"],
+            "integration_id": scoped["integration_id"],
+            "scope": "integration",
+        }
+
+    # ── 2. platform token ───────────────────────────────────────────
     expected = _expected_service_token()
     if not expected:
         raise HTTPException(
             status_code=503,
             detail="INTEGRATIONS_N8N_TOKEN is not configured on the server",
         )
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    presented = authorization[len("Bearer "):].strip()
     # Constant-time compare. hmac.compare_digest returns False on
     # length mismatch without leaking length to a remote attacker
     # (Python's `==` short-circuits on the first non-equal byte).
@@ -258,7 +287,51 @@ def require_service_token(authorization: str = Header(None)) -> dict:
             "<unknown>",
         )
         raise HTTPException(status_code=401, detail="Invalid service token")
-    return {"caller": "n8n"}
+    return {"caller": "n8n", "user_id": None, "scope": "platform"}
+
+
+def _resolve_integration_n8n_token(presented: str) -> dict | None:
+    """Match *presented* against the per-integration n8n tokens.
+
+    Returns {"integration_id", "user_id"} on a verified match, else None
+    (which makes the caller fall through to the platform token).
+
+    The prefix narrows the candidate set; the constant-time compare against
+    the DECRYPTED token is what actually authenticates. A prefix match on
+    its own is never accepted.
+    """
+    from STT_server.db_integrations import (
+        find_integrations_by_n8n_prefix,
+        n8n_token_prefix,
+    )
+    from STT_server.security.credentials import decrypt_credentials
+
+    import hmac as _hmac
+
+    try:
+        candidates = find_integrations_by_n8n_prefix(n8n_token_prefix(presented))
+    except Exception as exc:
+        # A DB problem must not authenticate anyone.
+        log.warning("[internal] n8n token lookup failed: %s", exc)
+        return None
+
+    for row in candidates:
+        blob = row.get("credentials_encrypted")
+        if not blob:
+            continue
+        try:
+            creds = decrypt_credentials(blob) if (
+                row.get("credentials_cipher") or "fernet-v1"
+            ) == "fernet-v1" else {}
+        except Exception:
+            continue
+        stored = (creds or {}).get("n8n_token")
+        if stored and _hmac.compare_digest(str(stored), presented):
+            return {
+                "integration_id": row["id"],
+                "user_id": row.get("user_id"),
+            }
+    return None
 
 
 def resolve_bearer(authorization, *, raise_on_missing: bool = False):
@@ -3708,6 +3781,188 @@ class IntegrationUpdate(BaseModel):
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
+N8N_WEBHOOK_CONFIG_KEY = "n8n_webhook_url"
+
+
+def _mint_n8n_token_for(integration_id: str, user_id: str) -> str | None:
+    """Generate and persist this integration's n8n token.
+
+    Returns the plaintext for the caller to hand to the operator exactly
+    once. It lives encrypted in credentials_encrypted alongside every
+    other secret on the row, so a static provider's API key and the n8n
+    token share one encryption envelope — which is why this merges rather
+    than writing a second blob.
+
+    Returns None on failure rather than raising: failing to mint the
+    per-tenant token must not block creating the integration (the platform
+    token still works as the fallback), but it must be logged.
+    """
+    from STT_server.db_integrations import (
+        generate_n8n_token,
+        get_integration_by_id,
+        set_integration_n8n_token,
+    )
+    from STT_server.security.credentials import (
+        decrypt_credentials, encrypt_credentials,
+    )
+    from STT_server.db import get_conn
+
+    token = generate_n8n_token()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                row = get_integration_by_id(integration_id, cur=cur)
+                if not row or row.get("user_id") != user_id:
+                    log.warning(
+                        "[integrations] n8n token mint refused: integration_id=%s not owned",
+                        integration_id,
+                    )
+                    return None
+                creds = {}
+                blob = row.get("credentials_encrypted")
+                if blob and (row.get("credentials_cipher") or "fernet-v1") == "fernet-v1":
+                    try:
+                        creds = decrypt_credentials(blob) or {}
+                    except Exception:
+                        # Undecryptable blob: start a fresh envelope rather
+                        # than silently dropping the provider credential the
+                        # operator thinks is still stored.
+                        log.warning(
+                            "[integrations] n8n token mint on %s: existing "
+                            "credentials could not be decrypted, replacing",
+                            integration_id,
+                        )
+                        creds = {}
+                creds["n8n_token"] = token
+                from STT_server.db_integrations import (
+                    update_integration_credentials as db_update_creds,
+                )
+                db_update_creds(
+                    integration_id, user_id, encrypt_credentials(creds), cur=cur,
+                )
+                if not set_integration_n8n_token(integration_id, user_id, token, cur=cur):
+                    log.warning(
+                        "[integrations] n8n token prefix write failed for %s",
+                        integration_id,
+                    )
+                    return None
+        return token
+    except Exception as exc:
+        log.warning(
+            "[integrations] n8n token mint failed for %s: %s", integration_id, exc,
+        )
+        return None
+
+
+def _validate_oauth_config_only(provider: str, configuration: dict | None) -> tuple[dict, list[dict]]:
+    """Validate an OAuth integration's non-secret configuration.
+
+    OAuth providers get their credentials from the token exchange, so
+    nothing here may touch `credentials`. But the provider's own config
+    fields are the operator's input (NICE CXone's `tenant` POD, for one)
+    and dropping them — which this used to do by assigning `{}` — makes
+    the integration silently do the wrong thing on the first call.
+
+    `n8n_webhook_url` is accepted for EVERY provider: it is where this
+    tenant's n8n lives, which is per-tenant routing, not a provider
+    secret, and it is what makes an integration independent of the
+    platform-wide INTEGRATIONS_N8N_WEBHOOK.
+
+    Returns (cleaned_config, errors).
+    """
+    from STT_server.services.integrations_catalog import (
+        get_integration_provider_spec,
+        validate_integration_fields,
+    )
+
+    spec = get_integration_provider_spec(provider)
+    incoming = dict(configuration or {})
+
+    errors: list[dict] = []
+
+    # Per-tenant n8n URL: validated here rather than through the spec,
+    # because it applies to all providers and must survive OAuth creates.
+    own_n8n = (incoming.pop(N8N_WEBHOOK_CONFIG_KEY, "") or "").strip()
+    if own_n8n:
+        if not own_n8n.lower().startswith("https://"):
+            errors.append({
+                "field": f"config.{N8N_WEBHOOK_CONFIG_KEY}",
+                "message": "must be an https:// URL",
+            })
+        elif len(own_n8n) > 2000:
+            errors.append({
+                "field": f"config.{N8N_WEBHOOK_CONFIG_KEY}",
+                "message": "is too long (max 2000)",
+            })
+
+    # Anything the caller sent that is neither a spec config field nor
+    # n8n_webhook_url is dropped: OAuth rows must not smuggle credentials
+    # in through configuration.
+    allowed = {f.name for f in (spec.fields if spec else ())}
+    cleaned, _cleaned_creds, field_errors = validate_integration_fields(
+        provider, {k: v for k, v in incoming.items() if k in allowed}, {},
+    )
+    # validate_integration_fields drops keys it does not know, so `cleaned`
+    # is already limited to spec config fields. Credential slots stay
+    # untouched: we passed {} and OAuth rows never store credentials here.
+    errors.extend(field_errors)
+    if own_n8n and not any(
+        e.get("field") == f"config.{N8N_WEBHOOK_CONFIG_KEY}" for e in errors
+    ):
+        cleaned[N8N_WEBHOOK_CONFIG_KEY] = own_n8n
+    return cleaned, errors
+
+
+@api_router.post("/integrations/{integration_id}/n8n-token")
+def rotate_integration_n8n_token(
+    integration_id: str,
+    auth: dict = Depends(require_auth),
+    keep_platform: bool = False,
+):
+    """Mint a NEW n8n token for this integration and return it once.
+
+    Rotation path for a leaked token: the previous one stops working the
+    moment this returns, because the new write replaces both the encrypted
+    value and the lookup prefix. There is no "revoke without rotate" —
+    pass ``?keep=platform`` to fall back to the shared token instead.
+    """
+    from STT_server.db_integrations import (
+        clear_integration_n8n_token,
+        get_integration as db_get_integration,
+    )
+
+    # Ownership first: minting must not work for someone else's row.
+    row = db_get_integration(integration_id, auth["user_id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Integration not found")
+
+    if keep_platform:
+        clear_integration_n8n_token(integration_id, auth["user_id"])
+        return {
+            "integration_id": integration_id,
+            "n8n_token": None,
+            "scope": "platform",
+            "note": (
+                "This integration now authenticates with the shared "
+                "INTEGRATIONS_N8N_TOKEN again. Set it in your n8n node."
+            ),
+        }
+
+    token = _mint_n8n_token_for(integration_id, auth["user_id"])
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not mint an n8n token for this integration",
+        )
+    return {
+        "integration_id": integration_id,
+        "n8n_token": token,
+        "scope": "integration",
+        "credentials_path": f"/internal/integrations/{integration_id}/credentials",
+        "execute_path": f"/internal/integrations/{integration_id}/execute",
+    }
+
+
 def _strip_integration_for_wire(row: dict) -> dict:
     """Drop credential + OAuth-internal fields before returning to the FE.
 
@@ -3735,6 +3990,11 @@ def _strip_integration_for_wire(row: dict) -> dict:
     out.pop("credentials_cipher", None)
     out.pop("oauth_state_hash", None)
     out.pop("oauth_state_expires_at", None)
+    # ponytail: 2026-10-02 — the n8n token lookup prefix must never reach
+    # the browser. It is a cleartext column, and 12 hex chars of a SHA-256
+    # is not a secret, but publishing it hands an attacker the exact
+    # lookup key require_service_token searches on.
+    out.pop("n8n_token_prefix", None)
     # ponytail: `assigned_agents` mirrors `list_agents_for_integration`
     # so the FE reads ONE field for both kinds of integration. Private
     # rows expose their owner; shared rows expose the JSONB array.
@@ -3953,8 +4213,19 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
         # agent_id + an empty configuration. The OAuth callback
         # writes the actual config (instance_url) + encrypted
         # credentials + flips connection_status to 'connected'.
-        # No preflight (the OAuth redirect IS the verification).
-        cleaned_config = {}
+        # No preflight (the OAuth redirect IS the verification), but the
+        # provider's own NON-SECRET configuration fields must survive.
+        # ponytail: 2026-10-02 — this used to be `cleaned_config = {}`,
+        # which silently dropped every configuration field on an OAuth
+        # provider. That was invisible for Salesforce (instance_url is
+        # written by the callback) but breaks NICE CXone, whose `tenant`
+        # POD is what its actions read. Credential fields are still
+        # refused here: those come from the token exchange.
+        cleaned_config, cred_errors = _validate_oauth_config_only(
+            body.provider, body.configuration,
+        )
+        if cred_errors:
+            raise HTTPException(status_code=422, detail={"errors": cred_errors})
     else:
         cleaned_config, cleaned_creds, errors = validate_integration_fields(
             body.provider, body.configuration, body.credentials,
@@ -4022,6 +4293,18 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
             row["id"], auth["user_id"], {},
         ) or row
 
+    # ponytail: 2026-10-02 — mint this integration's own n8n token at
+    # create time. Doing it here (rather than making the operator call a
+    # separate endpoint) means no integration is ever left relying on the
+    # shared platform token by omission, which is the state that let any
+    # n8n read any tenant's credentials. Returned ONCE in this response
+    # and never again; the FE shows it as "copy this into your n8n".
+    #
+    # OAuth rows still have encrypted=None at this point (the token
+    # exchange writes those), so the n8n token is stored via a dedicated
+    # write rather than by rewriting credentials.
+    _issued_n8n_token = _mint_n8n_token_for(row["id"], auth["user_id"])
+
     # ponytail: auto-create Google Calendar tool for OAuth providers - one
     # click creates the integration + a default tool that points at the
     # catalog's `calendar_event` action. The operator then connects via
@@ -4062,7 +4345,18 @@ def create_integration_endpoint(body: IntegrationCreate, auth: dict = Depends(re
         except Exception as exc:
             log.warning("[integrations] auto-create google_calendar tool failed: %s", exc)
 
-    return _strip_integration_for_wire(row)
+    out = _strip_integration_for_wire(row)
+    if _issued_n8n_token:
+        # The ONLY time this is ever returned. Never stored in the clear,
+        # never re-readable through any endpoint.
+        out["n8n_token"] = _issued_n8n_token
+        out["n8n_credentials_path"] = (
+            f"/internal/integrations/{row['id']}/credentials"
+        )
+        out["n8n_execute_path"] = (
+            f"/internal/integrations/{row['id']}/execute"
+        )
+    return out
 
 
 @api_router.get("/integrations/{integration_id}")
@@ -5266,10 +5560,31 @@ def internal_get_integration_credentials(
         RefreshTokenRevoked, OAuthError,
     )
     from STT_server.db import get_conn
-    # ponytail: internal endpoint uses the unscoped lookup so n8n
-    # (which carries only the service token, not a user token) can
-    # resolve any integration by id. Cross-user access is intentional
-    # and scoped: the service token grants access to every row.
+    # ponytail: 2026-10-02 — scoped lookup.
+    #
+    # Before, this was `get_integration_by_id(integration_id)` unscoped,
+    # on the reasoning that "the service token grants access to every
+    # row". True, and that is exactly the problem: any n8n holding the
+    # platform token could read ANY tenant's decrypted access token by
+    # guessing the id.
+    #
+    # Now a per-integration token carries the integration it belongs to,
+    # so it may ONLY read that one row — a strict subset of the old
+    # behaviour and one the caller cannot widen. The platform token
+    # (user_id=None) stays unscoped because it IS the platform-admin
+    # credential. No extra query: the check is on values require_service_token
+    # already resolved.
+    _caller_integration_id = _service.get("integration_id")
+    if _caller_integration_id and _caller_integration_id != integration_id:
+        log.warning(
+            "[internal.creds] cross-tenant read rejected integration_id=%s "
+            "token_integration_id=%s ip=%s",
+            integration_id, _caller_integration_id,
+            request.client.host if request.client else "?",
+        )
+        # 404, not 403: confirming the row exists would leak tenant
+        # existence to a caller that is not entitled to know.
+        raise HTTPException(status_code=404, detail="Integration not found")
     row = get_integration_by_id(integration_id)
     if not row:
         log.warning(
@@ -5557,6 +5872,20 @@ def internal_execute_integration_action(
         OAuthError as _OauthError,
     )
     from STT_server.db import get_conn as _get_conn
+
+    # ponytail: 2026-10-02 — same tenant scoping as the /credentials
+    # endpoint: a per-integration token may only touch its own row.
+    # Both endpoints used to take the unscoped lookup, which meant the
+    # platform token could execute ANY tenant's integration actions.
+    _caller_integration_id = _service.get("integration_id")
+    if _caller_integration_id and _caller_integration_id != integration_id:
+        log.warning(
+            "[internal.exec] cross-tenant execute rejected integration_id=%s "
+            "token_integration_id=%s ip=%s",
+            integration_id, _caller_integration_id,
+            request.client.host if request.client else "?",
+        )
+        raise HTTPException(status_code=404, detail="Integration not found")
 
     row = _db_get_integration_by_id(integration_id)
     if not row:

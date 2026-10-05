@@ -30,15 +30,28 @@ def _resolve_integration_webhook(integration: dict) -> str:
     """Resolve the URL the executor will POST to for an integration-bound tool.
 
     Precedence:
-      1. INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__<PROVIDER> env var (uppercased)
-      2. INTEGRATIONS_N8N_WEBHOOK (single router, used for all official
+      1. integration.configuration["n8n_webhook_url"] — the tenant's own
+         n8n. ponytail 2026-10-02: this used to be reserved for
+         generic_webhook, which meant every official provider's automation
+         was welded to the single INTEGRATIONS_N8N_WEBHOOK instance and a
+         second customer could not bring their own n8n.
+      2. INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__<PROVIDER> env var (uppercased)
+      3. INTEGRATIONS_N8N_WEBHOOK (single router, used for all official
          providers — the user's n8n Switch node dispatches by `action`)
-      3. integration.configuration["webhook_url"] (only valid for
-         provider="generic_webhook" — official providers don't carry a URL)
+      4. integration.configuration["webhook_url"] for generic_webhook
+         (the legacy per-row URL; unchanged)
+      5. the server-managed Google Calendar route, which was previously
+         a hardcoded literal in this function. That is one operator's
+         personal n8n instance baked into the platform source; it is now
+         the last-resort default and overridable like everything else.
 
     Returns "" when no URL can be resolved; the caller raises
     ToolExecutionError on empty so the LLM gets a clear failure.
     """
+    config = integration.get("configuration") or {}
+    own = (config.get("n8n_webhook_url") or "").strip()
+    if own:
+        return own
     provider = (integration.get("provider") or "").strip().upper()
     override = os.environ.get(f"INTEGRATIONS_N8N_WEBHOOK_OVERRIDES__{provider}", "").strip()
     if override:
@@ -46,12 +59,17 @@ def _resolve_integration_webhook(integration: dict) -> str:
     base = os.environ.get("INTEGRATIONS_N8N_WEBHOOK", "").strip()
     if base:
         return base
-    # Fallback: only generic_webhook is allowed to surface its own URL.
+    # Legacy per-row URL; only generic_webhook is allowed to surface it.
     if integration.get("provider") == "generic_webhook":
-        return (integration.get("configuration") or {}).get("webhook_url", "") or ""
+        return (config.get("webhook_url") or "").strip()
     if integration.get("provider") == "google_calendar":
-        # ponytail: zero-config Google Calendar - URL is server-managed, not operator-configured
-        return "https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica"
+        # ponytail: zero-config Google Calendar - URL is server-managed,
+        # not operator-configured. Last resort so a tenant that sets
+        # n8n_webhook_url is never routed to someone else's instance.
+        return os.environ.get(
+            "GOOGLE_CALENDAR_N8N_WEBHOOK",
+            "https://revomedia.app.n8n.cloud/webhook/agendar-cita-dinamica",
+        ).strip()
     return ""
 
 
