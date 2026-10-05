@@ -234,6 +234,9 @@ def _expected_service_token() -> str:
     return os.environ.get("INTEGRATIONS_N8N_TOKEN", "").strip()
 
 
+from STT_server.security.rate_limit import enforce_internal_rate_limit
+
+
 def require_service_token(authorization: str = Header(None)) -> dict:
     """Validate the bearer token n8n uses to call the internal endpoints.
 
@@ -5519,6 +5522,7 @@ def internal_get_integration_credentials(
     integration_id: str,
     request: Request,
     _service: dict = Depends(require_service_token),
+    _rate: None = Depends(enforce_internal_rate_limit),
 ):
     """Ponytail: server-to-server endpoint used by n8n at call time.
 
@@ -5835,6 +5839,7 @@ def internal_execute_integration_action(
     body: _IntegrationExecuteRequest,
     request: Request,
     _service: dict = Depends(require_service_token),
+    _rate: None = Depends(enforce_internal_rate_limit),
 ):
     """Server-to-server action executor (called by n8n today; same
     shape works for any future Workflow provider).
