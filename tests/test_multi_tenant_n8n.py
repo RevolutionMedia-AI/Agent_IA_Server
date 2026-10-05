@@ -153,6 +153,104 @@ def test_credentials_are_still_never_returned():
     assert 'out.pop("credentials_cipher"' in src
 
 
+# ── The payload n8n receives must not carry the refresh token ────
+
+def _credentials_for_n8n():
+    """Lift the nested helper out of the request handler.
+
+    It is defined INSIDE internal_get_integration_credentials, so it cannot
+    be imported. exec'ing it standalone is still exercising the real source.
+    Returns (callable, source_segment) — inspect.getsource does not work on
+    an exec'd function, so the source comes from the AST.
+    """
+    source = ROUTES.read_text(encoding="utf-8-sig")
+    tree = ast.parse(source)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_credentials_for_n8n"
+    )
+    ns: dict = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "api.py", "exec"), ns)
+    return ns["_credentials_for_n8n"], (ast.get_source_segment(source, fn) or "")
+
+
+def test_oauth_providers_get_only_the_bearer():
+    """Regression: intercom / hubspot / nice_cxone were added to the
+    catalog but not to _credentials_for_n8n's whitelist, so they fell into
+    the `dict(credentials)` branch and n8n received access_token AND
+    refresh_token AND the n8n_token. The refresh token is what keeps the
+    integration alive — handing it out hands over the account."""
+    fn, _src = _credentials_for_n8n()
+    creds = {
+        "access_token": "pat-abc",
+        "refresh_token": "super-secret-refresh",
+        "expires_at": "2026-10-09T00:00:00Z",
+        "n8n_token": "our-own-token",
+    }
+    for provider in ("intercom", "hubspot", "nice_cxone",
+                     "salesforce", "google_calendar"):
+        out = fn(provider, creds)
+        assert out == {"access_token": "pat-abc"}, (provider, out)
+        assert "refresh_token" not in out, provider
+        assert "n8n_token" not in out, provider
+
+
+def test_static_providers_keep_their_config_but_never_the_n8n_token():
+    """Static providers legitimately need their full dict (API keys,
+    subdomain, tenant) — but the n8n_token is ours, not theirs."""
+    fn, _src = _credentials_for_n8n()
+    out = fn("zendesk", {
+        "api_token": "zd-secret",
+        "subdomain": "revolutionmedia",
+        "n8n_token": "our-own-token",
+    })
+    assert out.get("api_token") == "zd-secret"
+    assert out.get("subdomain") == "revolutionmedia"
+    assert "n8n_token" not in out, (
+        "the n8n_token must never be echoed back to n8n"
+    )
+
+
+def test_every_oauth_provider_is_whitelisted_or_blocked():
+    """The invariant: an OAuth provider must either be in the bearer
+    whitelist (so n8n gets only the access_token) or be explicitly 403'd
+    BEFORE the credentials are shaped. Anything else falls into
+    `dict(credentials)` and hands n8n the refresh token.
+
+    dynamics365 is deliberately in the second group: its Dataverse token
+    never leaves the backend at all, and the /execute endpoint is the only
+    way to use it.
+    """
+    from STT_server.services.integrations_catalog import INTEGRATION_PROVIDERS
+    from STT_server.services.oauth_providers import known_oauth_providers
+
+    _fn, whitelist_src = _credentials_for_n8n()
+    creds_src = ROUTES.read_text(encoding="utf-8-sig")
+
+    catalog_oauth = {
+        s.id for s in INTEGRATION_PROVIDERS
+        if getattr(s, "auth_type", "static") == "oauth"
+    }
+    blocked = {"dynamics365"}
+    assert blocked, "the blocked set should not be empty — then the rule below"
+
+    for provider in set(known_oauth_providers()) | catalog_oauth:
+        whitelisted = f'"{provider}"' in whitelist_src
+        explicitly_blocked = (
+            f'provider == "{provider}"' in creds_src
+            and "403" in creds_src
+        )
+        assert whitelisted or provider in blocked, (
+            f"{provider} is an OAuth provider that is neither whitelisted "
+            "nor blocked, so n8n would receive the refresh token"
+        )
+        if provider in blocked:
+            assert explicitly_blocked, (
+                f"{provider} is in the blocked set but has no explicit "
+                "403 guard in the credentials route"
+            )
+
+
 # ── Webhook resolution per tenant ─────────────────────────────────
 
 def test_own_n8n_url_wins_over_everything():
@@ -326,6 +424,9 @@ def _self_check():
         test_both_internal_endpoints_are_tenant_scoped,
         test_n8n_token_prefix_never_reaches_the_browser,
         test_credentials_are_still_never_returned,
+        test_oauth_providers_get_only_the_bearer,
+        test_static_providers_keep_their_config_but_never_the_n8n_token,
+        test_every_oauth_provider_is_whitelisted_or_blocked,
         test_own_n8n_url_wins_over_everything,
         test_fallback_chain_is_unchanged_without_an_own_url,
         test_google_calendar_hardcode_is_now_the_last_resort_and_overridable,

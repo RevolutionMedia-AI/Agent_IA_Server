@@ -5804,13 +5804,32 @@ def internal_get_integration_credentials(
         # route ships to production — otherwise n8n gets ``{}`` and
         # the workflow errors out (the same bug that affected Google
         # Calendar before 2026-09-04).
-        oauth_bearer_providers = {"salesforce", "google_calendar"}
+        oauth_bearer_providers = {
+            "salesforce", "google_calendar",
+            # ponytail: 2026-10-02 — intercom / hubspot / nice_cxone were
+            # added to the catalog without landing here, so they fell into
+            # the `dict(credentials)` branch below and n8n received the
+            # ENTIRE envelope: access_token, refresh_token, expires_at AND
+            # the n8n_token we store alongside them. Only the bearer is
+            # ever needed to call an OAuth provider's API; the refresh
+            # token must never leave the backend (it is what keeps the
+            # integration alive, so leaking it hands over the account).
+            "intercom", "hubspot", "nice_cxone",
+        }
         if provider in oauth_bearer_providers:
             return {"access_token": credentials.get("access_token")}
-        # Static / unrestricted providers — keep the full dict so the
+        # Static / unrestricted providers - keep the full dict so the
         # n8n workflow can read whatever the BE stored. This is the
         # previous behaviour for non-OAuth integrations.
-        return dict(credentials)
+        #
+        # ponytail: 2026-10-02 — belt and braces. Whatever a static
+        # provider's dict contains, the n8n_token is OUR credential for
+        # talking to this backend and has no business going back out, so
+        # it is stripped unconditionally rather than relying on every
+        # provider being classified correctly above.
+        out = dict(credentials)
+        out.pop("n8n_token", None)
+        return out
     return {
         "integration_id": row["id"],
         "provider": provider,
