@@ -61,10 +61,16 @@ _TOOL_COLS_BASE = (
 )
 # ponytail: integration_id + action columns added by 016_agent_tools_integration.sql.
 # ring_timeout_sec added by 023_transfer_chain.sql (per-transfer ring
-# budget). Same self-heal pattern as credentials (014): detected on
-# first call, ALTER'd inline if missing, then cached.
+# budget), require_confirmation by 030. Same self-heal pattern as
+# credentials (014): detected on first call, ALTER'd inline if missing,
+# then cached.
 _TOOL_COLS_BASE_V2 = _TOOL_COLS_BASE + ", integration_id, action"
-_TOOL_COLS_EXTRA: list[str] = []  # appended to _TOOL_COLS_BASE when present
+# ponytail: starts EMPTY on purpose and is filled by
+# _ensure_tool_columns() from what the target DB actually has. If the
+# self-heal raises we stay empty, so require_confirmation is never
+# SELECTed on a DB without it — and an unread column means every transfer
+# reads as "confirm", which is the safe way to fail.
+_TOOL_COLS_EXTRA: list[str] = []
 _columns_check_done: bool = False
 _columns_check_lock = threading.Lock()
 
@@ -100,7 +106,7 @@ def _ensure_tool_columns() -> None:
             return
         if not is_postgres():
             # JSON path: no schema to check, every field is supported.
-            _TOOL_COLS_EXTRA = ["credentials", "integration_id", "action", "ring_timeout_sec"]
+            _TOOL_COLS_EXTRA = ["credentials", "integration_id", "action", "ring_timeout_sec", "require_confirmation"]
             _columns_check_done = True
             return
         try:
@@ -109,7 +115,7 @@ def _ensure_tool_columns() -> None:
                     cur.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'agent_tools' "
-                        "AND column_name IN ('credentials', 'integration_id', 'action', 'ring_timeout_sec')"
+                        "AND column_name IN ('credentials', 'integration_id', 'action', 'ring_timeout_sec', 'require_confirmation')"
                     )
                     # ponytail: use fetchone in a loop so test stubs
                     # that only implement fetchone (not fetchall)
@@ -123,7 +129,7 @@ def _ensure_tool_columns() -> None:
                     # column_name key, (b) plain tuples with a single
                     # column name, or (c) test-stub composite rows
                     # that bundle multiple names — handle all three.
-                    expected = ("credentials", "integration_id", "action", "ring_timeout_sec")
+                    expected = ("credentials", "integration_id", "action", "ring_timeout_sec", "require_confirmation")
                     present: set = set()
                     bad_rows = 0
                     # ponytail: hard cap. The non-empty branch below
@@ -187,6 +193,20 @@ def _ensure_tool_columns() -> None:
                             "ALTER TABLE agent_tools "
                             "ADD COLUMN IF NOT EXISTS ring_timeout_sec INT NOT NULL DEFAULT 20"
                         )
+            if "require_confirmation" not in present:
+                # ponytail: 030. No DEFAULT on purpose: NULL is the
+                # "use the product default (confirm)" value, and adding
+                # one would make an explicit NULL indistinguishable from
+                # an explicit opt-out on rows that predate the gate.
+                log.warning(
+                    "[db_tools] agent_tools.require_confirmation missing - applying 030 inline"
+                )
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "ALTER TABLE agent_tools "
+                            "ADD COLUMN IF NOT EXISTS require_confirmation BOOLEAN"
+                        )
             # Confirm presence after the inline ALTERs. Cheap and
             # avoids a false positive if ALTER silently no-ops.
             with get_conn() as conn:
@@ -194,7 +214,7 @@ def _ensure_tool_columns() -> None:
                     cur.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'agent_tools' "
-                        "AND column_name IN ('credentials', 'integration_id', 'action', 'ring_timeout_sec')"
+                        "AND column_name IN ('credentials', 'integration_id', 'action', 'ring_timeout_sec', 'require_confirmation')"
                     )
                     present = set()
                     bad_rows = 0
@@ -223,7 +243,12 @@ def _ensure_tool_columns() -> None:
                             continue
                         if present.issuperset(expected):
                             break
-            _TOOL_COLS_EXTRA = [c for c in ("credentials", "integration_id", "action", "ring_timeout_sec") if c in present]
+            # ponytail: 030 — derive from `expected` instead of restating
+            # the tuple. The literal below silently dropped
+            # require_confirmation while the information_schema query and
+            # `expected` both knew about it, so the column would be
+            # ALTER'd in and then never SELECTed.
+            _TOOL_COLS_EXTRA = [c for c in expected if c in present]
             _columns_check_done = True
             log.info(
                 "[db_tools] self-heal complete: tool cols extra=%s",
@@ -327,6 +352,11 @@ def _row_to_tool(row: dict) -> dict:
         out["ring_timeout_sec"] = int(out.get("ring_timeout_sec") or 20)
     except (TypeError, ValueError):
         out["ring_timeout_sec"] = 20
+    # ponytail: 030 — require_confirmation is deliberately NOT coerced.
+    # None means "operator never set it" and the transfer gate treats it
+    # as ON; coercing to False here would silently disable the gate for
+    # every pre-030 row.
+    out["require_confirmation"] = out.get("require_confirmation")
     return out
 
 
@@ -605,6 +635,13 @@ def create_tool(
             extra_params.append(int(payload.get("ring_timeout_sec") or 20))
         except (TypeError, ValueError):
             extra_params.append(20)
+    if "require_confirmation" in _extra:
+        # ponytail: 030. Passed through as-is so None (unset) stays
+        # distinguishable from False (explicit opt-out).
+        _rc = payload.get("require_confirmation")
+        extra_cols_sql += ", require_confirmation"
+        extra_vals_sql += ", %s"
+        extra_params.append(None if _rc is None else bool(_rc))
     with get_conn() as conn:
         with conn.cursor() as cur:
             credentials_json = json.dumps(payload.get("credentials")) if payload.get("credentials") is not None else None
@@ -687,7 +724,20 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
     # caller didn't touch the integration binding and we shouldn't
     # blank it out by writing NULL.
     optional_text_keys = [k for k in ("integration_id", "action")
-                          if k in _extra_cols()]
+                      if k in _extra_cols()]
+    # ponytail: 030 — require_confirmation is BOOLEAN and, unlike the TEXT
+    # bindings above, None is a MEANINGFUL value here: it means "use the
+    # default", which is "ask the caller". So it must be written even when
+    # null, otherwise an operator could turn the gate off but never back
+    # on by resetting the field.
+    #
+    # Still column-guarded for the same reason as above: writing it on a
+    # DB where migration 030 never landed turns every PUT /tools/{id}
+    # into a 500.
+    optional_bool_keys = (
+        ["require_confirmation"]
+        if "require_confirmation" in _extra_cols() else []
+    )
     set_clauses = []
     values: list = []
     for k, v in payload.items():
@@ -703,6 +753,9 @@ def update_tool(tool_id: str, user_id: str, payload: dict) -> dict | None:
             # semantics: None = "remove the binding", string = set.
             set_clauses.append(f"{k} = %s")
             values.append(v)
+        elif k in optional_bool_keys:
+            set_clauses.append(f"{k} = %s")
+            values.append(None if v is None else bool(v))
         else:
             if v is None:
                 continue

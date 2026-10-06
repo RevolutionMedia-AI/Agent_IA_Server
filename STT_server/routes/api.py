@@ -1808,6 +1808,9 @@ def _build_tool_payload(agent_id: str, data: "ToolCreate", user_id: str | None =
         # getattr defaults to None so they don't crash.
         integration_id=getattr(data, "integration_id", None),
         action=getattr(data, "action", None),
+        # ponytail: 030 — confirmation gate opt-out. getattr default keeps
+        # hand-built Body stubs (tests, older callers) working.
+        require_confirmation=getattr(data, "require_confirmation", None),
     )
     errors = tool.validate()
     if errors:
@@ -2002,6 +2005,12 @@ class ToolCreate(BaseModel):
     # + shared/private matrix happens in _build_tool_payload.
     integration_id: Optional[str] = None
     action: Optional[str] = None
+    # ponytail: 030 — opt out of the caller-confirmation gate for this
+    # call_transfer. None/absent = ask the caller first (the default, and
+    # what every row written before this field existed gets). Only an
+    # explicit false restores the old dial-immediately behaviour, and the
+    # runtime ignores it for non-transfer tools.
+    require_confirmation: Optional[bool] = None
 
 
 @api_router.post("/agents/{agent_id}/tools")

@@ -672,6 +672,141 @@ async def _barge_in_watcher(ws, session: CallSession) -> None:
 
 # ── Event receiver ───────────────────────────────────────────────────
 
+async def _exec_transfer(
+    session, tool_def: dict | None, tool_name: str, tool_id: str | None,
+) -> tuple[str, bool, str | None]:
+    """Run a call_transfer. Returns (tool_output, ok, err).
+
+    ponytail: 2026-10-06 — extracted verbatim from the tool-call
+    dispatcher so the confirmed path and the unconfirmed path share ONE
+    implementation. Two copies of a <Dial> path is how the gate ends up
+    guarding one branch and not the other.
+    """
+    from STT_server.services.tool_executor import execute_call_transfer
+    from STT_server.services.transfer_cascade import (
+        build_transfer_chain, transfer_fallback_url,
+    )
+
+    destination = (tool_def or {}).get("destination")
+    account_sid = getattr(session, "twilio_account_sid", None)
+    auth_token = getattr(session, "twilio_auth_token", None)
+    call_sid = getattr(session, "call_sid", None)
+    tools_by_id = {
+        t.get("id"): t
+        for t in (getattr(session, "agent_tools", None) or [])
+        if isinstance(t, dict) and t.get("id")
+    }
+    chain_cfg: list = []
+    try:
+        from STT_server.db_agents import get_agent as _ga
+        arow = _ga(
+            getattr(session, "agent_id", None),
+            getattr(session, "user_id", None),
+        )
+        chain_cfg = (arow or {}).get("transfer_chain") or []
+    except Exception as exc:
+        log.warning(
+            "[OPENAI_REALTIME] transfer chain lookup failed: %s", exc,
+        )
+    chain = build_transfer_chain(tool_id, chain_cfg, tools_by_id)
+
+    # Ponytail: keep the transfer_enabled master switch from the central
+    # pipeline. If the agent row has the switch off, refuse the call so
+    # the LLM apologizes instead of dialing.
+    if getattr(session, "transfer_enabled", True) is False:
+        log.warning(
+            "[OPENAI_REALTIME] call_transfer '%s' refused: handoff disabled "
+            "session=%s", tool_name, session.session_key,
+        )
+        return (
+            f"Tool '{tool_name}' error: human handoff is disabled for this "
+            f"agent. Continue helping the caller yourself; do not try another "
+            f"transfer.",
+            False,
+            "transfer_enabled is False for this agent",
+        )
+
+    if not (account_sid and auth_token and call_sid and destination):
+        log.warning(
+            "[OPENAI_REALTIME] call_transfer '%s' skipped: missing creds "
+            "session=%s", tool_name, session.session_key,
+        )
+        return (
+            json.dumps({
+                "error": (
+                    "call_transfer not configured for this call "
+                    "(missing Twilio auth or destination): "
+                    f"account_sid={bool(account_sid)} "
+                    f"auth_token={bool(auth_token)} "
+                    f"call_sid={bool(call_sid)} "
+                    f"destination={bool(destination)}"
+                )
+            }),
+            False,
+            "call_transfer not configured",
+        )
+
+    if not chain:
+        log.warning(
+            "[OPENAI_REALTIME] call_transfer '%s' skipped: no chain", tool_name,
+        )
+        return (
+            json.dumps({"error": "call_transfer has no resolvable chain"}),
+            False,
+            "no chain",
+        )
+
+    first, rest = chain[0], chain[1:]
+    public_url = os.getenv("PUBLIC_URL")
+    action = None
+    if public_url:
+        action = transfer_fallback_url(
+            public_url,
+            getattr(session, "agent_id", None),
+            [s["id"] for s in rest],
+            tenant_id=getattr(session, "tenant_id", None),
+        )
+    log.info(
+        "[TRANSFER_EXEC] session=%s call_sid=%s tool_id=%s destination=%s "
+        "timeout=%s chain_len=%d",
+        session.session_key, call_sid, tool_id,
+        first["destination"], first["timeout_sec"], len(chain),
+    )
+    try:
+        await execute_call_transfer(
+            account_sid, auth_token, call_sid,
+            first["destination"], tool_name,
+            timeout_sec=first["timeout_sec"],
+            action_url=action,
+        )
+    except Exception as exc:
+        log.exception(
+            "[TRANSFER_TWILIO_ERROR] session=%s tool_id=%s exc=%s",
+            session.session_key, tool_id, type(exc).__name__,
+        )
+        err = str(exc)[:200]
+        return (
+            json.dumps({"error": f"call_transfer failed: {err}"}),
+            False,
+            err,
+        )
+    log.info(
+        "[TRANSFER_TWILIO_RESULT] session=%s tool_id=%s ok=True",
+        session.session_key, tool_id,
+    )
+    return (
+        json.dumps({
+            "ok": True,
+            "destination": first["destination"],
+            "tool_id": tool_id,
+            "chain_position": 1,
+            "chain_length": len(chain),
+        }),
+        True,
+        None,
+    )
+
+
 async def _event_receiver(ws, session: CallSession) -> None:
     """Process server events: transcription, response streaming, errors."""
     from STT_server.services.turn_manager import play_tts_from_text_queue
@@ -730,6 +865,66 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     session.history.append({"role": "user", "content": transcript})
                     if len(session.history) > MAX_HISTORY_MESSAGES:
                         session.history[:] = session.history[-MAX_HISTORY_MESSAGES:]
+
+                    # ponytail: 2026-10-06 — resolve a parked transfer
+                    # against this turn BEFORE the model sees the
+                    # transcript, and outside its hands entirely. The
+                    # model is the thing being guarded against, so a
+                    # second opinion from it is not a control.
+                    #
+                    # Confirmed -> dial now and end this turn. The model
+                    # already asked; letting it decide again invites a
+                    # second, contradictory call.
+                    from STT_server.services import (
+                        transfer_confirmation as _tc,
+                    )
+                    _verdict, _pending = _tc.resolve(session, transcript)
+                    if _verdict == "confirmed":
+                        _tool = next(
+                            (
+                                t for t in (
+                                    getattr(session, "agent_tools", None) or []
+                                )
+                                if t.get("id") == (_pending or {}).get("tool_id")
+                            ),
+                            None,
+                        ) or {}
+                        try:
+                            _out, _ok, _err = await _exec_transfer(
+                                session, _tool,
+                                _pending.get("tool_name") or "transfer",
+                                _pending.get("tool_id"),
+                            )
+                        except Exception as _exc:
+                            log.exception(
+                                "[TRANSFER_CONFIRM] confirmed transfer failed "
+                                "session=%s: %s", session.session_key, _exc,
+                            )
+                            _out, _ok, _err = (
+                                json.dumps({"error": "confirmed transfer failed"}),
+                                False,
+                                "confirmed transfer raised",
+                            )
+                        if _pending.get("tool_id"):
+                            try:
+                                from STT_server.services.tool_executor import (
+                                    record_tool_result as _rtr,
+                                )
+                                _rtr(
+                                    _pending["tool_id"], _ok, "invocation",
+                                    error=_err,
+                                )
+                            except Exception:
+                                log.exception("record_tool_result failed")
+                        # The call is leaving our WebSocket the moment the
+                        # <Dial> lands, so no response.create here:
+                        # anything the model says would race the teardown,
+                        # and a half-played goodbye is worse than silence.
+                        log.warning(
+                            "[TRANSFER_CONFIRM] CONFIRMED transfer executed "
+                            "ok=%s session=%s", _ok, session.session_key,
+                        )
+                        return
 
                     try:
                         structured = extract_structured_data(transcript)
@@ -949,15 +1144,11 @@ async def _event_receiver(ws, session: CallSession) -> None:
                     # results back. `record_tool_result` records
                     # observability for the per-tool panel.
                     from STT_server.services.tool_executor import (
-                        execute_tool, execute_tool_call,
-                        execute_call_transfer, record_tool_result,
+                        execute_tool, execute_tool_call, record_tool_result,
                     )
                     from STT_server.domain.tool import (
                         TOOL_KIND_CALL_TRANSFER as _KIND_CT,
                         TOOL_KIND_WEBHOOK as _KIND_WH,
-                    )
-                    from STT_server.services.transfer_cascade import (
-                        build_transfer_chain, transfer_fallback_url,
                     )
                     for call_id, tc in pending_tool_calls.items():
                         tool_name = tc["name"]
@@ -998,149 +1189,57 @@ async def _event_receiver(ws, session: CallSession) -> None:
                         # executor; integration-backed tools are out
                         # of scope here.
                         if tool_kind == _KIND_CT:
-                            # ponytail: mirror the central
-                            # turn_manager.py call_transfer branch.
-                            # Pull the same session credentials and
-                            # transfer chain the central pipeline uses
-                            # so the Realtime path and the central path
-                            # produce the same Twilio Dial.
-                            destination = (tool_def or {}).get("destination")
-                            timeout_sec = (tool_def or {}).get(
-                                "ring_timeout_sec"
-                            ) or 20
-                            account_sid = getattr(
-                                session, "twilio_account_sid", None
+                            # ponytail: 2026-10-06 — CONFIRMATION GATE.
+                            # A <Dial> takes the caller out of this
+                            # WebSocket with no way back, so it must not
+                            # ride on the model's judgement alone. A
+                            # production call had gpt-realtime emit this
+                            # tool call on its own and transfer a caller
+                            # to a recruiter's number without the caller
+                            # ever asking for one.
+                            #
+                            # When the tool requires confirmation we park
+                            # the request and hand the model a "did not
+                            # happen, now ask the caller" result.
+                            # services.transfer_confirmation resolves it on
+                            # the caller's next turn and performs the
+                            # transfer outside the model's hands.
+                            from STT_server.services import (
+                                transfer_confirmation as _tc,
                             )
-                            auth_token = getattr(
-                                session, "twilio_auth_token", None
-                            )
-                            call_sid_ws = getattr(session, "call_sid", None)
-                            tools_by_id = {
-                                t.get("id"): t
-                                for t in (getattr(session, "agent_tools", None) or [])
-                                if isinstance(t, dict) and t.get("id")
-                            }
-                            chain_cfg: list = []
-                            try:
-                                from STT_server.db_agents import get_agent as _ga
-                                _arow = _ga(
-                                    getattr(session, "agent_id", None),
-                                    getattr(session, "user_id", None),
-                                )
-                                chain_cfg = (_arow or {}).get("transfer_chain") or []
-                            except Exception as exc:
-                                log.warning(
-                                    "[OPENAI_REALTIME] transfer chain lookup failed: %s",
-                                    exc,
-                                )
-                            chain = build_transfer_chain(tool_id, chain_cfg, tools_by_id)
-                            # Ponytail: keep the transfer_enabled master
-                            # switch from the central pipeline. If the
-                            # agent row has the switch off, refuse the
-                            # call so the LLM apologizes instead of
-                            # dialing.
-                            transfer_enabled = getattr(
+                            if _tc.should_confirm(tool_def) and getattr(
                                 session, "transfer_enabled", True
-                            )
-                            if transfer_enabled is False:
-                                output_text = (
-                                    f"Tool '{tool_name}' error: human handoff "
-                                    f"is disabled for this agent. Continue helping "
-                                    f"the caller yourself; do not try another transfer."
+                            ) is not False:
+                                _pending = _tc.park(session, tool_def)
+                                _lang = (
+                                    getattr(session, "preferred_language", "es")
+                                    or "es"
+                                )
+                                # No TTS enqueue here, unlike the central
+                                # pipeline. The Realtime API speaks the
+                                # model's reply by itself after
+                                # function_call_output, so speaking the
+                                # question here too would stack two voices.
+                                # Let the model ask, with the exact wording
+                                # in the tool result; if it fails to ask,
+                                # the request just expires unanswered,
+                                # which is the safe way to be wrong.
+                                output_text = _tc.tool_result_for_model(
+                                    _pending, _lang,
                                 )
                                 ok = False
-                                err = "transfer_enabled is False for this agent"
+                                err = "awaiting caller confirmation"
                                 log.warning(
-                                    "[OPENAI_REALTIME] call_transfer '%s' refused: "
-                                    "handoff disabled session=%s",
-                                    tool_name, session.session_key,
-                                )
-                            elif not (account_sid and auth_token and call_sid_ws and destination):
-                                output_text = json.dumps({
-                                    "error": (
-                                        f"call_transfer not configured for this call "
-                                        f"(missing Twilio auth or destination): "
-                                        f"account_sid={bool(account_sid)} "
-                                        f"auth_token={bool(auth_token)} "
-                                        f"call_sid={bool(call_sid_ws)} "
-                                        f"destination={bool(destination)}"
-                                    )
-                                })
-                                ok = False
-                                err = "call_transfer not configured"
-                                log.warning(
-                                    "[OPENAI_REALTIME] call_transfer '%s' skipped: "
-                                    "missing creds session=%s",
-                                    tool_name, session.session_key,
-                                )
-                            elif not chain:
-                                output_text = json.dumps({
-                                    "error": "call_transfer has no resolvable chain"
-                                })
-                                ok = False
-                                err = "no chain"
-                                log.warning(
-                                    "[OPENAI_REALTIME] call_transfer '%s' skipped: no chain",
-                                    tool_name,
+                                    "[TRANSFER_CONFIRM] intercepted tool=%s "
+                                    "destination=%s — asking the caller, "
+                                    "NOT transferring session=%s",
+                                    tool_name, _pending.get("destination"),
+                                    session.session_key,
                                 )
                             else:
-                                first = chain[0]
-                                rest = chain[1:]
-                                public_url = os.getenv("PUBLIC_URL")
-                                action = None
-                                if public_url:
-                                    action = transfer_fallback_url(
-                                        public_url,
-                                        getattr(session, "agent_id", None),
-                                        [s["id"] for s in rest],
-                                        tenant_id=getattr(
-                                            session, "tenant_id", None
-                                        ),
-                                    )
-                                log.info(
-                                    "[TRANSFER_EXEC] session=%s call_sid=%s tool_id=%s "
-                                    "destination=%s timeout=%s chain_len=%d",
-                                    session.session_key, call_sid_ws, tool_id,
-                                    first["destination"], first["timeout_sec"],
-                                    len(chain),
+                                output_text, ok, err = await _exec_transfer(
+                                    session, tool_def, tool_name, tool_id,
                                 )
-                                try:
-                                    # Mask destination for the
-                                    # production log line: keep prefix
-                                    # + last 4 digits so the operator
-                                    # can correlate without leaking
-                                    # the full E.164 to logs.
-                                    transfer_result = await execute_call_transfer(
-                                        account_sid, auth_token, call_sid_ws,
-                                        first["destination"], tool_name,
-                                        timeout_sec=first["timeout_sec"],
-                                        action_url=action,
-                                    )
-                                    ok = True
-                                    err = None
-                                    output_text = json.dumps({
-                                        "ok": True,
-                                        "destination": first["destination"],
-                                        "tool_id": tool_id,
-                                        "chain_position": 1,
-                                        "chain_length": len(chain),
-                                    })
-                                    log.info(
-                                        "[TRANSFER_TWILIO_RESULT] session=%s "
-                                        "tool_id=%s ok=%s",
-                                        session.session_key, tool_id, ok,
-                                    )
-                                except Exception as exc:
-                                    log.exception(
-                                        "[TRANSFER_TWILIO_ERROR] session=%s "
-                                        "tool_id=%s exc=%s",
-                                        session.session_key, tool_id, type(exc).__name__,
-                                    )
-                                    ok = False
-                                    err = str(exc)[:200]
-                                    output_text = json.dumps({
-                                        "error": f"call_transfer failed: {err}"
-                                    })
                             if tool_id:
                                 try:
                                     record_tool_result(

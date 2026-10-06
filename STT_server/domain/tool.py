@@ -112,6 +112,12 @@ class AgentTool:
         # rings `destination` before the chain fallback fires. None
         # (legacy rows) means the default; validated to 5..60.
         ring_timeout_sec: Optional[int] = None,
+        # ponytail: 030 — opt out of the caller-confirmation gate for
+        # this transfer. None/True = ask the caller first (the product
+        # default, and what every pre-030 row gets). Only honoured for
+        # kind='call_transfer'; a <Dial> is the one irreversible action
+        # in the product, so the safe direction is the default.
+        require_confirmation: Optional[bool] = None,
     ):
         self.id = id or str(uuid.uuid4())
         self.agent_id = agent_id
@@ -174,6 +180,14 @@ class AgentTool:
         except (TypeError, ValueError):
             self.ring_timeout_sec = DEFAULT_STEP_TIMEOUT_SEC
 
+        # ponytail: 030. None is preserved rather than coerced to True so
+        # "operator never touched it" stays distinguishable from an
+        # explicit opt-out, which matters for a safety default.
+        if require_confirmation is not None:
+            self.require_confirmation = bool(require_confirmation)
+        else:
+            self.require_confirmation = None
+
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -193,6 +207,7 @@ class AgentTool:
             "kind": self.kind,
             "destination": self.destination,
             "ring_timeout_sec": self.ring_timeout_sec,
+            "require_confirmation": self.require_confirmation,
             "assignments": list(self.assignments),
             "function_name": self.function_name,
             "created_at": self.created_at,

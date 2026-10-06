@@ -258,6 +258,14 @@ class CallSession:
     # lost mark on a 9 s greeting unsticks in ~12 s. Without it the flag
     # stayed True for a fixed 30 s no matter how short the audio was.
     assistant_expected_end_at: float | None = None
+    # ponytail: 2026-10-06 — a call_transfer the model asked for that is
+    # WAITING on the caller's explicit yes. A transfer is the most
+    # irreversible thing we do (the <Dial> takes the caller out of this
+    # WebSocket), so it cannot ride on the model's judgement alone.
+    # Populated by services/transfer_confirmation.park() and consumed by
+    # resolve() on the caller's next turn. None = nothing pending.
+    # Holds no credentials, only what the transfer needs.
+    pending_transfer: dict | None = None
     # ponytail: 2026-10-02 — cumulative 160-byte frames sent in the CURRENT
     # assistant_speaking stretch. assistant_expected_end_at is derived from
     # it; playback_loop's local sent_frames resets per chunk, so using that

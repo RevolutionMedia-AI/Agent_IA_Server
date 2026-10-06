@@ -509,6 +509,70 @@ async def _stream_llm_with_tools(
                 except Exception:
                     log.warning("[Tools] Failed to play filler phrase for tool '%s'", tool_name)
             if tool_kind == TOOL_KIND_CALL_TRANSFER:
+                # ponytail: 2026-10-06 — CONFIRMATION GATE, same guard as
+                # adapters/openai_realtime.py. Both pipelines dispatch the
+                # same tools, so both need it; a gate on one path is no
+                # gate at all.
+                #
+                # Park the request, ask the caller, and tell the model the
+                # transfer did NOT happen. The transfer itself happens on
+                # the caller's next turn via the resolve hook in
+                # _resolve_pending_transfer_confirmation(), outside the
+                # model's hands.
+                from STT_server.services import (
+                    transfer_confirmation as _tc,
+                )
+                # NOTE the transfer_enabled guard: the gate must not
+                # park a request for an agent whose handoff switch is
+                # off, or the confirm path would dial it and bypass
+                # the master switch. Falling through here reaches the
+                # existing refusal a few lines down.
+                if _tc.should_confirm(tool_def) and getattr(
+                    session, "transfer_enabled", True
+                ) is not False:
+                    _pending = _tc.park(session, tool_def)
+                    _lang = (
+                        getattr(session, "preferred_language", "es") or "es"
+                    )
+                    session.history.append({
+                        "role": "tool",
+                        "content": _tc.tool_result_for_model(_pending, _lang),
+                    })
+                    if tool_def.get("id"):
+                        record_tool_result(
+                            tool_def["id"], False, "invocation",
+                            error="awaiting caller confirmation",
+                        )
+                    log.warning(
+                        "[TRANSFER_CONFIRM] intercepted tool=%s destination=%s "
+                        "— asking the caller, NOT transferring session=%s",
+                        tool_name, _pending.get("destination"),
+                        session.session_key,
+                    )
+                    # The question is the whole turn. The model's
+                    # own text for this turn is already streaming to
+                    # TTS and typically says "I'm transferring you",
+                    # so cut it off first — otherwise the caller hears
+                    # "one moment, transferring you" followed by "do
+                    # you want a transfer?". interrupting bumps
+                    # active_generation, so the TTS below must run
+                    # under the NEW generation or it gets dropped.
+                    try:
+                        await interrupt_current_turn(session)
+                        await run_tts_with_retries(
+                            session,
+                            _tc.confirmation_prompt(
+                                _pending.get("tool_name"), _lang,
+                            ),
+                            session.active_generation,
+                        )
+                    except Exception:
+                        log.warning(
+                            "[TRANSFER_CONFIRM] failed to ask for "
+                            "confirmation; the request stays parked and "
+                            "will expire unanswered",
+                        )
+                    continue
                 # ponytail: master handoff switch (024). The tools[]
                 # filter at call start normally hides these, but a
                 # session that began before the toggle (or a stale
@@ -895,6 +959,168 @@ def should_defer_final_transcript(text: str) -> bool:
     return word_count <= SHORT_FINAL_MAX_WORDS
 
 
+async def _dial_confirmed_transfer(session: CallSession, pending: dict) -> None:
+    """Ring the chain for a transfer the caller just agreed to.
+
+    ponytail: 2026-10-06. Mirrors the tool-dispatch branch above —
+    including the handoff budget guard, the routing-core decision and the
+    plan seal — because a confirmation must not become a cheaper path to
+    the same irreversible action. Kept as its own function rather than
+    reusing the inline block: that block is ~190 lines of working
+    transfer runtime and this runs once per call, so duplicating it beats
+    refactoring it untested. If you change routing behaviour here, change
+    it there too.
+
+    Swallows every failure: the caller has already said yes, so there is
+    no one left to apologise to and no turn left to fail.
+    """
+    from STT_server.config import PUBLIC_URL as _public_url
+    from STT_server.services.call_plan import (
+        seal_call_plan, routing_limits as _routing_limits,
+    )
+    from STT_server.services.transfer_cascade import (
+        build_transfer_chain, transfer_fallback_url,
+        PHASE_POST_AI, ACTION_DIAL, decide_routing, plan_from_steps,
+        advance_plan,
+    )
+
+    tool_id = pending.get("tool_id")
+    tool_name = pending.get("tool_name") or "transfer"
+    try:
+        tools_by_id = {
+            t.get("id"): t
+            for t in (getattr(session, "agent_tools", None) or [])
+            if isinstance(t, dict) and t.get("id")
+        }
+        from STT_server.db_agents import get_agent as _get_agent
+        arow = _get_agent(
+            getattr(session, "agent_id", None), getattr(session, "user_id", None),
+        ) or {}
+        chain = build_transfer_chain(tool_id, arow.get("transfer_chain") or [], tools_by_id)
+        account_sid = getattr(session, "twilio_account_sid", None)
+        auth_token = getattr(session, "twilio_auth_token", None)
+        call_sid = getattr(session, "call_sid", None)
+        if not (chain and account_sid and auth_token and call_sid):
+            raise RuntimeError(
+                f"chain={bool(chain)} sid={bool(account_sid)} "
+                f"token={bool(auth_token)} call_sid={bool(call_sid)}"
+            )
+
+        # Same REAL loop guard the tool path applies: a chain that came
+        # back to us already spent rounds, and an unbounded
+        # AI->humans->AI loop bills real Twilio minutes.
+        limits = _routing_limits()
+        prior = getattr(session, "call_plan", None)
+        rounds = prior.rounds_used if prior else 0
+        attempts = prior.dial_attempts if prior else 0
+        if (
+            getattr(session, "handoff_disabled", False)
+            or attempts >= limits.max_human_dial_attempts
+            or rounds >= limits.max_handoff_rounds
+        ):
+            session.handoff_disabled = True
+            log.warning(
+                "[TRANSFER_CONFIRM] REFUSED on confirmation: handoff budget "
+                "spent (round=%d/%d attempts=%d/%d) session=%s",
+                rounds, limits.max_handoff_rounds,
+                attempts, limits.max_human_dial_attempts, session.session_key,
+            )
+            return
+
+        fresh = plan_from_steps(PHASE_POST_AI, chain, call_sid)
+        decision = decide_routing(
+            PHASE_POST_AI, None, None, list(fresh.steps),
+            rounds_used=fresh.rounds_used,
+            dial_attempts=fresh.dial_attempts,
+            limits=limits,
+        )
+        if decision.action != ACTION_DIAL:
+            log.warning(
+                "[TRANSFER_CONFIRM] REFUSED by routing core: %s session=%s",
+                decision.reason, session.session_key,
+            )
+            return
+
+        advanced = advance_plan(fresh, decision)
+        rest_ids = [
+            s.get("id") for s in advanced.steps if isinstance(s, dict) and s.get("id")
+        ]
+        action = (
+            transfer_fallback_url(
+                _public_url,
+                getattr(session, "agent_id", None),
+                rest_ids,
+                tenant_id=getattr(session, "tenant_id", None),
+                plan=seal_call_plan(advanced),
+            )
+            if _public_url else None
+        )
+        session.call_plan = advanced
+        await execute_call_transfer(
+            account_sid, auth_token, call_sid,
+            decision.destination, tool_name,
+            timeout_sec=decision.timeout_sec,
+            action_url=action,
+        )
+        # Our WS dies with the <Dial>; if the whole chain goes unanswered
+        # the call re-attaches to this same call_sid. Without this the AI
+        # greets a caller who already gave their name as a stranger.
+        stash_handoff_history(call_sid, session.history)
+        if tool_id:
+            record_tool_result(tool_id, True, "invocation")
+        log.warning(
+            "[TRANSFER_CONFIRM] CONFIRMED transfer dialled -> %s session=%s",
+            decision.destination, session.session_key,
+        )
+    except Exception as exc:
+        log.exception(
+            "[TRANSFER_CONFIRM] confirmed transfer failed session=%s: %s",
+            session.session_key, exc,
+        )
+        if tool_id:
+            try:
+                record_tool_result(tool_id, False, "invocation", error=str(exc)[:200])
+            except Exception:
+                log.exception("record_tool_result failed")
+
+
+async def _resolve_pending_transfer_confirmation(
+    session: CallSession,
+    text: str,
+) -> bool:
+    """Answer a parked transfer from the caller's own words.
+
+    Returns True when the turn was consumed here and must NOT reach the
+    LLM.
+
+    ponytail: 2026-10-06. The transfer decision is made by the backend
+    from the transcript, never by the model — the model is the thing being
+    guarded against.
+    """
+    from STT_server.services import transfer_confirmation as _tc
+
+    if not getattr(session, "pending_transfer", None):
+        return False
+
+    verdict, pending = _tc.resolve(session, text)
+    if verdict == "unresolved":
+        # Mid-sentence or something else entirely. Keep waiting, but let
+        # the model keep talking to the caller — they asked a question.
+        return False
+
+    if verdict == "confirmed":
+        await _dial_confirmed_transfer(session, pending)
+    elif verdict in ("denied", "expired"):
+        # Say nothing: silence reads as "no" and the model should not be
+        # told what to think about a question the caller just answered.
+        log.info(
+            "[TRANSFER_CONFIRM] %s session=%s", verdict, session.session_key,
+        )
+
+    session.current_transcript = ""
+    return True
+
+
 async def process_final_transcript(
     session: CallSession,
     text: str,
@@ -905,6 +1131,18 @@ async def process_final_transcript(
     pending_partial = session.partial_reply_task
     if pending_partial and not pending_partial.done():
         pending_partial.cancel()
+
+    # ponytail: 2026-10-06 — the caller's answer to OUR confirmation
+    # question is resolved before the LLM pipeline runs, and this turn is
+    # consumed either way. The model asked to transfer and is already
+    # waiting on an answer; giving it this transcript would let it ask
+    # again, re-interpret a "no", or dial without one.
+    #
+    # Runs ahead of `should_generate_response` because a one-word "sí" is
+    # the exact shape that anti-echo filtering can discard.
+    handled = await _resolve_pending_transfer_confirmation(session, text)
+    if handled:
+        return
 
     prepared_reply = consume_prefetched_reply(session, text)
     await cancel_prefetch_task(session)
