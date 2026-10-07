@@ -45,6 +45,7 @@ from STT_server.domain.language import (
     get_filler_text,
     get_stt_failure_prompt,
     is_duplicate_collected_data,
+    is_farewell_closing,
     is_non_actionable_utterance,
     looks_like_digit_dictation,
     looks_like_incomplete_utterance,
@@ -1472,6 +1473,69 @@ async def handle_agent_reply(
         total_ms,
         llm_error or "none",
     )
+
+    # ponytail: cuelgue tras despedida. Sin esto la llamada solo muere
+    # por idle-timeout (45 s de aire muerto) o max-duration (30 min):
+    # el operador ve "nunca se cuelga". Solo la respuesta del AGENTE
+    # dispara el cuelgue (un "gracias" del usuario a mitad de llamada
+    # no es un cierre). El hangup es vía REST — Twilio envía `stop` y
+    # el media_stream hace cleanup; no necesitamos el ws aquí.
+    if reply and not llm_error and is_farewell_closing(reply):
+        log.info(
+            "[FAREWELL] closing detected in %s gen=%s — scheduling hangup after playback",
+            session.session_key, generation,
+        )
+        task = asyncio.create_task(_hangup_after_farewell(session, generation))
+        session.tasks.add(task)
+        task.add_done_callback(session.tasks.discard)
+
+
+async def _hangup_after_farewell(session: CallSession, generation: int) -> None:
+    """Cuelga la llamada vía REST una vez que la despedida terminó de sonar.
+
+    Aborta si el usuario volvió a hablar (last_activity posterior al fin
+    de playback) o si empezó un turno nuevo (active_generation cambió):
+    colgar a un cliente que dijo "espera, una cosa más" es peor que
+    tardar unos segundos extra.
+    """
+    try:
+        # Espera a que termine el playback de la despedida (mark acks).
+        for _ in range(240):  # ~120 s máximo
+            if session.closed or generation != session.active_generation:
+                return
+            if not session.assistant_speaking and not session.pending_playback_marks:
+                break
+            await asyncio.sleep(0.5)
+        if session.closed or generation != session.active_generation:
+            return
+        playback_done_at = time.monotonic()
+        await asyncio.sleep(1.5)  # margen para que el usuario interrumpa
+        if session.closed or generation != session.active_generation:
+            return
+        if session.last_activity_at > playback_done_at:
+            log.info(
+                "[FAREWELL] aborting hangup for %s (user spoke after farewell)",
+                session.session_key,
+            )
+            return
+        account_sid = getattr(session, "twilio_account_sid", None)
+        auth_token = getattr(session, "twilio_auth_token", None)
+        call_sid = getattr(session, "call_sid", None)
+        if not (account_sid and auth_token and call_sid):
+            log.warning(
+                "[FAREWELL] cannot hang up %s: missing Twilio creds/call_sid",
+                session.session_key,
+            )
+            return
+        from STT_server.adapters.twilio_api import hangup_call
+        log.info("[FAREWELL] hanging up %s (call_sid=%s)", session.session_key, call_sid)
+        result = await hangup_call(account_sid, auth_token, call_sid)
+        if not isinstance(result, dict) or not result.get("success"):
+            log.warning("[FAREWELL] hangup REST failed for %s: %s", session.session_key, result)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("[FAREWELL] hangup failed for %s", session.session_key)
 
 
 async def launch_reply_pipeline(

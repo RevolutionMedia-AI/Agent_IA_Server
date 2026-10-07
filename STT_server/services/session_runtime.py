@@ -87,15 +87,28 @@ async def _hangup_twilio_call(session: CallSession) -> None:
     account_sid = getattr(session, "twilio_account_sid", None)
     auth_token = getattr(session, "twilio_auth_token", None)
     call_sid = getattr(session, "call_sid", None)
-    if account_sid and auth_token and call_sid:
-        try:
-            from STT_server.adapters.twilio_api import hangup_call
-            await hangup_call(account_sid, auth_token, call_sid)
-        except Exception:
-            log.exception(
-                "[HANGUP] Twilio hangup failed for %s — falling back to WS close",
-                session.session_key,
-            )
+    if not (account_sid and auth_token and call_sid):
+        # ponytail: antes esto era un skip silencioso — el monitor
+        # cerraba el WS, Twilio nunca se enteraba y la llamada seguía
+        # facturando. Al menos que se vea en el log.
+        log.warning(
+            "[HANGUP] cannot hang up %s via REST (missing creds/call_sid) — WS close only",
+            session.session_key,
+        )
+        return
+    try:
+        from STT_server.adapters.twilio_api import hangup_call
+        result = await hangup_call(account_sid, auth_token, call_sid)
+        # ponytail: hangup_call devuelve {"success": False} en errores
+        # de Twilio SIN lanzar excepción. Ignorarlo dejaba la pata de
+        # Twilio viva aunque el monitor creía haber colgado.
+        if not isinstance(result, dict) or not result.get("success"):
+            log.warning("[HANGUP] Twilio hangup failed for %s: %s", session.session_key, result)
+    except Exception:
+        log.exception(
+            "[HANGUP] Twilio hangup failed for %s — falling back to WS close",
+            session.session_key,
+        )
 
 # ponytail: idle/duration monitor polling cadence. Landed here (instead of
 # config.py) so the constant is colocated with the only two functions that

@@ -416,6 +416,59 @@ def is_non_actionable_utterance(text: str) -> bool:
     return cleaned in NON_ACTIONABLE_PHRASES
 
 
+# Frases de cierre que indican que el agente está terminando la llamada.
+# Solo cierres explícitos: un "gracias" a secas NO cuelga (sigue en
+# NON_ACTIONABLE_PHRASES como filler a mitad de conversación).
+_FAREWELL_PATTERNS = (
+    r"adi[oó]s",
+    r"hasta luego",
+    r"hasta pronto",
+    r"hasta la pr[oó]xima",
+    r"nos vemos",
+    r"fue un placer",
+    r"fue un gusto",
+    r"gracias por (llamar|tu llamada|su llamada|contactarnos)",
+    r"que tengas un? (buen|excelente) d[ií]a",
+    r"que tenga un? (buen|excelente) d[ií]a",
+    r"que pases un? (buen|excelente) d[ií]a",
+    r"estamos en contacto",
+    r"quedo atento",
+    r"goodbye",
+    r"\bbye\b",
+    r"see you",
+    r"talk to you soon",
+    r"have a (good|great) day",
+    r"thanks for calling",
+)
+_FAREWELL_RE = re.compile(
+    r"(?:^|[\s¡!¿?,.])" r"(?:" + "|".join(_FAREWELL_PATTERNS) + r")"
+    r"(?:$|[\s!?.])",
+    re.IGNORECASE,
+)
+
+
+def _strip_accents(text: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def is_farewell_closing(text: str) -> bool:
+    """True cuando el texto es una despedida que cierra la llamada.
+
+    Solo se evalúa sobre la respuesta del AGENTE (el que termina la
+    conversación). Un "gracias" suelto del usuario no dispara el
+    cuelgue: el agente no se despediría y la llamada seguiría.
+    """
+    if not text or not text.strip():
+        return False
+    # ponytail: normalizar acentos una sola vez para que "adiós" y
+    # "adios" (STT sin tildes) matcheen el mismo patrón.
+    normalized = _strip_accents(text.strip().lower())
+    return bool(_FAREWELL_RE.search(normalized))
+
+
 def looks_like_incomplete_utterance(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
