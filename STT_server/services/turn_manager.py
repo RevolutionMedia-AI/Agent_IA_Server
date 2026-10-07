@@ -1440,6 +1440,15 @@ async def handle_agent_reply(
                 )
 
     if generation != session.active_generation or not reply:
+        # ponytail: un reply vacío (modelo mudo o tool-call puro) no
+        # encola audio jamás. Si este turno sigue vigente, soltar el
+        # flag aquí: si no, VAD + idle-monitor quedan congelados ~30 s
+        # hasta que el watchdog lo libera (el "la llamada nunca le
+        # llega a la IA" de los logs CAcaa3f7). Con relevo
+        # generacional el turno nuevo es dueño del flag y no se toca.
+        if generation == session.active_generation and not reply:
+            session.assistant_speaking = False
+            session.assistant_started_at = None
         return
 
     session.last_processed_user_text = user_text

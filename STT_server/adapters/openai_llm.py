@@ -668,9 +668,11 @@ def stream_llm_reply_sync(
     `tools` is a list of OpenAI-style function definitions that the LLM
     can call during the conversation.
 
-    `execute_tool_callback` is an async function that executes a tool and
-    returns the result. If provided and the LLM calls a tool, the third
-    return value will be the list of tool calls instead of None.
+    `execute_tool_callback` is accepted for backward compatibility but
+    is never invoked: when the LLM calls a tool, the third return value
+    is the list of tool calls and the CALLER (turn_manager) executes
+    them. It must NOT gate the return — gating it silently dropped
+    every tool call (incl. call_transfer) on the streaming path.
 
     `session` is optional but, when passed, lets the per-agent runtime
     knobs (llm_temperature, llm_max_tokens) reach the outbound request.
@@ -791,8 +793,15 @@ def stream_llm_reply_sync(
             except Exception:
                 pass
 
-        # If we have tool calls, return them for processing
-        if tool_calls and execute_tool_callback:
+        # If we have tool calls, return them for processing. The caller
+        # (turn_manager._stream_llm_with_tools) executes them — this
+        # function never does. NOTE: do NOT gate on
+        # execute_tool_callback (always None from the only caller):
+        # gating silently dropped every tool call, so the model said
+        # "te transfiero ahora mismo" and nothing ever dialed, and a
+        # text-less pure tool call came back as an empty reply that
+        # left assistant_speaking stuck ~30 s until the watchdog.
+        if tool_calls:
             parsed_calls = []
             for tc in tool_calls:
                 try:
