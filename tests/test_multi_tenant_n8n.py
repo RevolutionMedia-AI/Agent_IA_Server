@@ -116,12 +116,18 @@ def _internal_endpoints():
     return out
 
 
-def test_both_internal_endpoints_are_tenant_scoped():
-    """Both endpoints took the unscoped lookup before. Each must now reject
-    a token that belongs to a different integration."""
+def test_internal_endpoints_are_tenant_scoped():
+    """Every internal integrations endpoint must reject a service token
+    that belongs to a different integration.
+
+    Was `test_both_internal_endpoints_...`: /execute is gone, so there is
+    one endpoint left rather than two. The invariant is unchanged and now
+    reads as "all of them", which is the shape that survives the next
+    endpoint being added.
+    """
     source = ROUTES.read_text(encoding="utf-8-sig")
     eps = _internal_endpoints()
-    assert len(eps) >= 2, f"expected both internal endpoints, found {list(eps)}"
+    assert eps, "expected at least one internal integrations endpoint"
     scoped = 0
     for name, (route, fn) in eps.items():
         src = ast.get_source_segment(source, fn) or ""
@@ -195,61 +201,69 @@ def test_oauth_providers_get_only_the_bearer():
         assert "n8n_token" not in out, provider
 
 
-def test_static_providers_keep_their_config_but_never_the_n8n_token():
-    """Static providers legitimately need their full dict (API keys,
-    subdomain, tenant) — but the n8n_token is ours, not theirs."""
+def test_static_providers_keep_their_secret_but_never_the_n8n_token():
+    """A static provider needs its SECRET to call upstream -- Zendesk is
+    HTTP Basic, so api_token and email both have to reach n8n. The
+    n8n_token is ours, not theirs.
+
+    Changed from `..._keep_their_config_...`: non-secret fields (subdomain,
+    tenant, region) are NOT credentials. They live in integrations.configuration
+    and come back under the response's own "configuration" key, so asking
+    for them here asserted a leak that the shape no longer has.
+    """
     fn, _src = _credentials_for_n8n()
     out = fn("zendesk", {
         "api_token": "zd-secret",
+        "email": "admin@acme.com",
         "subdomain": "revolutionmedia",
         "n8n_token": "our-own-token",
     })
     assert out.get("api_token") == "zd-secret"
-    assert out.get("subdomain") == "revolutionmedia"
+    assert out.get("email") == "admin@acme.com", (
+        "email is a SECRET_FIELD_TYPE: it is the other half of HTTP Basic"
+    )
     assert "n8n_token" not in out, (
         "the n8n_token must never be echoed back to n8n"
     )
+    assert "subdomain" not in out, (
+        "non-secret config must not ride inside the credential blob"
+    )
 
 
-def test_every_oauth_provider_is_whitelisted_or_blocked():
-    """The invariant: an OAuth provider must either be in the bearer
-    whitelist (so n8n gets only the access_token) or be explicitly 403'd
-    BEFORE the credentials are shaped. Anything else falls into
-    `dict(credentials)` and hands n8n the refresh token.
+def test_every_oauth_provider_receives_only_the_bearer():
+    """The invariant, restated for the fail-closed credential shaping.
 
-    dynamics365 is deliberately in the second group: its Dataverse token
-    never leaves the backend at all, and the /execute endpoint is the only
-    way to use it.
+    This used to be "every OAuth provider is whitelisted or blocked": an
+    allowlist plus a catch-all, where a provider missing from the list
+    silently received the whole envelope including the refresh token.
+    dynamics365 was one of them. Shaping is now derived from the
+    provider's own catalog spec, so there is no list to forget an entry
+    in -- an OAuth provider is bearer-only by construction.
     """
     from STT_server.services.integrations_catalog import INTEGRATION_PROVIDERS
     from STT_server.services.oauth_providers import known_oauth_providers
 
-    _fn, whitelist_src = _credentials_for_n8n()
-    creds_src = ROUTES.read_text(encoding="utf-8-sig")
+    fn, _src = _credentials_for_n8n()
 
     catalog_oauth = {
         s.id for s in INTEGRATION_PROVIDERS
         if getattr(s, "auth_type", "static") == "oauth"
     }
-    blocked = {"dynamics365"}
-    assert blocked, "the blocked set should not be empty — then the rule below"
+    every = set(known_oauth_providers()) | catalog_oauth
+    assert catalog_oauth, "expected OAuth providers in the catalog"
 
-    for provider in set(known_oauth_providers()) | catalog_oauth:
-        whitelisted = f'"{provider}"' in whitelist_src
-        explicitly_blocked = (
-            f'provider == "{provider}"' in creds_src
-            and "403" in creds_src
+    envelope = {
+        "access_token": "AT", "refresh_token": "RT",
+        "expires_at": 1700000000, "n8n_token": "OURS",
+    }
+    for provider in every:
+        out = fn(provider, envelope)
+        assert out == {"access_token": "AT"}, (
+            f"{provider} is an OAuth provider but got {out!r} instead of"
+            " the bare bearer"
         )
-        assert whitelisted or provider in blocked, (
-            f"{provider} is an OAuth provider that is neither whitelisted "
-            "nor blocked, so n8n would receive the refresh token"
-        )
-        if provider in blocked:
-            assert explicitly_blocked, (
-                f"{provider} is in the blocked set but has no explicit "
-                "403 guard in the credentials route"
-            )
-
+        assert "refresh_token" not in out
+        assert "n8n_token" not in out
 
 # ── Webhook resolution per tenant ─────────────────────────────────
 

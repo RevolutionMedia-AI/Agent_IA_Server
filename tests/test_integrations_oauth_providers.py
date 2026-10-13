@@ -106,21 +106,22 @@ def test_static_providers_unaffected():
 
 # ── 2. Both refresh paths use the one predicate ────────────────────
 
-def test_both_refresh_paths_call_should_attempt_refresh():
-    """routes/api.py has two independent copies of refresh-on-read
-    (/internal/.../credentials and /internal/.../exec). They must both go
-    through should_attempt_refresh, or one of them keeps the old
-    unguarded is_token_expiring(None)."""
+def test_refresh_paths_call_should_attempt_refresh():
+    """Every refresh-on-read path must go through should_attempt_refresh.
+
+    Was `test_both_refresh_paths_...`: routes/api.py had two independent
+    copies (/internal/.../credentials and /internal/.../execute). Only one
+    remains, but the invariant is now written as "every path" rather than
+    "the two we happen to have", so the next refresh path added is covered
+    by construction instead of needing the count bumped.
+    """
     src = ROUTES.read_text(encoding="utf-8")
     tree = ast.parse(src)
     calls = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "should_attempt_refresh"
     ]
-    assert len(calls) == 2, (
-        f"expected both refresh-on-read copies to use the helper, found "
-        f"{len(calls)} call site(s)"
-    )
+    assert calls, "no refresh path uses should_attempt_refresh"
     # And no bare `is_token_expiring(<creds expires_at>)` guard survives as
     # the top-level refresh condition.
     tree2 = ast.parse(src)

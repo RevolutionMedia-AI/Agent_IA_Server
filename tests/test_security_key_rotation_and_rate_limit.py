@@ -331,16 +331,23 @@ def test_client_key_prefers_forwarded_for():
     assert RL._client_key(NoXff()) == "198.51.100.9"
 
 
-def test_both_internal_endpoints_are_throttled():
-    """Credentials AND execute must be limited; either one alone still
-    allows brute force."""
-    from STT_server.routes.api import (
-        internal_execute_integration_action,
-        internal_get_integration_credentials,
-    )
+def test_internal_endpoints_are_throttled():
+    """Credentials must be rate limited.
 
-    for fn in (internal_get_integration_credentials,
-               internal_execute_integration_action):
+    Was `test_both_internal_endpoints_are_throttled`: the /execute
+    endpoint is gone, so this covers the one internal endpoint that
+    remains. It discovers the endpoints by prefix rather than naming them,
+    so the next one added is covered by construction.
+    """
+    from STT_server.routes import api as api_mod
+
+    internal_fns = [
+        getattr(api_mod, name)
+        for name in dir(api_mod)
+        if name.startswith("internal_") and callable(getattr(api_mod, name))
+    ]
+    assert internal_fns, "expected at least one internal endpoint"
+    for fn in internal_fns:
         assert "enforce_internal_rate_limit" in inspect.getsource(fn), fn.__name__
 
 
@@ -369,8 +376,10 @@ def test_rate_limit_is_not_applied_to_the_public_api():
     """A shared quota in front of every user on one NAT'd IP would throttle
     paying tenants."""
     src = ROUTES.read_text(encoding="utf-8-sig")
-    assert src.count("enforce_internal_rate_limit") == 3, (
-        "import + exactly the two internal endpoints"
+    assert src.count("enforce_internal_rate_limit") == 2, (
+        "import + exactly the one internal endpoint. Was 3 while /execute "
+        "existed; asserting the count rather than the literal keeps this "
+        "honest when the next internal endpoint lands."
     )
     assert "/internal/integrations/" in src
 
