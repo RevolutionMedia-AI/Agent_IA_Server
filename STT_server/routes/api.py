@@ -4139,6 +4139,11 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "description": a.description,
             "parameters_schema": a.parameters_schema,
             "capability": getattr(a, "capability", "core"),
+            # ponytail: taxonomy only, NOT a runtime gate (that is
+            # `capability` plus the Field Service tenant probe). The FE
+            # uses it to group the Add tool dropdown and to hide actions
+            # from a suite the operator did not enable at connect time.
+            "suite": getattr(a, "suite", "") or "",
         }
 
     def spec_to_wire(s: IntegrationProviderSpec) -> dict:
@@ -4155,6 +4160,19 @@ def list_integration_providers(auth: dict = Depends(require_auth)):
             "oauth_label": getattr(s, "oauth_label", ""),
             "oauth_default_scopes": list(getattr(s, "oauth_default_scopes", ())),
             "capabilities": list(getattr(s, "capabilities", ())),
+            # ponytail: one entry per product suite, only for providers
+            # that ship several over one tenant (Dynamics 365). Drives the
+            # pre-connect picker. Empty list for single-product providers,
+            # so the FE can branch on `spec.suites.length`.
+            "suites": [
+                {
+                    "id": su.id,
+                    "name": su.name,
+                    "description": su.description,
+                    "shares_data_with": list(su.shares_data_with),
+                }
+                for su in getattr(s, "suites", ()) or ()
+            ],
             "fields": [field_to_wire(f) for f in s.fields],
             "actions": [action_to_wire(a) for a in s.actions],
             "prompt_snippet": getattr(s, "prompt_snippet", ""),
