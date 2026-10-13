@@ -41,6 +41,13 @@ def fake_test_fn(monkeypatch):
 
 
 async def _seed_zendesk(client, headers) -> str:
+    # ponytail: `email` is a SECRET field type (it is the other half of
+    # Zendesk's HTTP Basic), so it belongs in credentials -- see
+    # SECRET_FIELD_TYPES in integrations_catalog. An earlier edit here
+    # moved it to configuration on the assumption that only "password"
+    # counted; that broke this test and, more importantly, would have
+    # shipped an allowlist that silently dropped the account email from
+    # the payload n8n needs.
     resp = await client.post(
         "/integrations",
         headers=headers,
@@ -158,8 +165,14 @@ async def test_internal_endpoint_returns_decrypted_with_service_token(
     assert body["integration_id"] == iid
     assert body["provider"] == "zendesk"
     assert body["configuration"]["subdomain"] == "acme"
-    assert body["credentials"]["email"] == "admin@acme.com"
     assert body["credentials"]["api_token"] == "abcdef0123456789abcdef0123456789"
+    # ponytail: `email` IS a secret field type -- the other half of Zendesk
+    # HTTP Basic -- so it must still reach n8n. This assertion is the one
+    # that caught an allowlist written against "password" only, which
+    # would have dropped it silently.
+    assert body["credentials"]["email"] == "admin@acme.com"
+    # nothing beyond the catalog's SECRET_FIELD_TYPES rides along
+    assert set(body["credentials"]) == {"api_token", "email"}
 
 
 async def test_internal_endpoint_404_on_unknown_id(

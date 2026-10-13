@@ -32,6 +32,26 @@ from typing import Optional
 
 log = logging.getLogger("stt_server.services.integrations_catalog")
 
+# ponytail: the ONE definition of "this integration field is a secret".
+# A field whose type is in here is encrypted into
+# integrations.credentials_encrypted; everything else is plaintext in
+# integrations.configuration.
+#
+# `email` counts as a secret because it is the other half of HTTP Basic
+# auth (Zendesk, Genesys) -- it is not separable from the token it
+# accompanies, and it identifies the operator's account.
+#
+# Both the writer and the reader resolve this from here:
+#   writer: validate_integration_fields() routes a field to one bucket or
+#           the other
+#   reader: routes/api.py::_credentials_for_n8n decides what n8n may see
+#
+# They used to hardcode the tuple separately and drifted: the writer
+# treated email as a secret, the reader did not, so a Zendesk integration
+# silently lost the account email from the payload n8n needs to call the
+# API. One constant, imported by both.
+SECRET_FIELD_TYPES: tuple[str, ...] = ("password", "email")
+
 
 # ── Spec dataclasses ───────────────────────────────────────────────────────
 
@@ -39,10 +59,22 @@ log = logging.getLogger("stt_server.services.integrations_catalog")
 class IntegrationFieldSpec:
     """One form field the operator fills in to configure an integration.
 
-    `type` is "text" or "password". Password fields are encrypted at
-    rest in integrations.credentials_encrypted; text fields live
-    plaintext in integrations.configuration. Subdomain, email, etc.
-    are not secrets — only api_token-style values are.
+`type` is "text" | "password" | "url" | "email" | "select". Password and
+    email fields are treated as SECRETS and live encrypted in
+    integrations.credentials_encrypted. Everything else (text, url, select)
+    is not a secret and lives in plaintext in integrations.configuration.
+    Subdomain, instance_url and friends land in configuration; api tokens
+    and operator account emails land in credentials.
+
+    ponytail: `email` being a secret is not obvious -- it is an auth
+    half for HTTP Basic (Zendesk, Genesys), so it cannot be separated from
+    the token it accompanies. The authoritative list is
+    SECRET_FIELD_TYPES below; both the writer
+    (validate_integration_fields) and the reader
+    (_credentials_for_n8n in routes/api.py) resolve it from here so the
+    two cannot drift. They did once: the writer treated email as secret
+    and the reader did not, which silently dropped the Zendesk account
+    email from the payload n8n needs.
     """
     name: str
     label: str
@@ -188,7 +220,7 @@ def validate_integration_fields(
     if not isinstance(credentials, dict):
         credentials = {}
     for f in spec.fields:
-        is_secret = f.type in ("password", "email")
+        is_secret = f.type in SECRET_FIELD_TYPES
         raw = (credentials.get(f.name) if is_secret else configuration.get(f.name))
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             # Field absent or empty: only an error if it's required AND

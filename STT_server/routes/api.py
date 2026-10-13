@@ -5822,41 +5822,59 @@ def internal_get_integration_credentials(
     # stays minimal. Easy to extend for future providers (add another
     # `elif provider == "dynamics":` branch).
     def _credentials_for_n8n(provider: str, credentials: dict) -> dict:
-        # ponytail: provider whitelist. Each entry declares the
-        # narrowest shape n8n needs to call the upstream API — usually
-        # only the bearer. Static providers (zendesk, twilio, etc.) go
-        # through the explicit ``return credentials`` branch below so
-        # legacy integrations still receive the full dict they always
-        # have. New providers MUST land in this whitelist BEFORE the
-        # route ships to production — otherwise n8n gets ``{}`` and
-        # the workflow errors out (the same bug that affected Google
-        # Calendar before 2026-09-04).
-        oauth_bearer_providers = {
-            "salesforce", "google_calendar",
-            # ponytail: 2026-10-02 — intercom / hubspot / nice_cxone were
-            # added to the catalog without landing here, so they fell into
-            # the `dict(credentials)` branch below and n8n received the
-            # ENTIRE envelope: access_token, refresh_token, expires_at AND
-            # the n8n_token we store alongside them. Only the bearer is
-            # ever needed to call an OAuth provider's API; the refresh
-            # token must never leave the backend (it is what keeps the
-            # integration alive, so leaking it hands over the account).
-            "intercom", "hubspot", "nice_cxone",
-        }
-        if provider in oauth_bearer_providers:
-            return {"access_token": credentials.get("access_token")}
-        # Static / unrestricted providers - keep the full dict so the
-        # n8n workflow can read whatever the BE stored. This is the
-        # previous behaviour for non-OAuth integrations.
+        # ponytail: FAIL-CLOSED. This function is the only place where a
+        # decrypted credential crosses to a caller outside the backend, so
+        # it decides by ALLOWLIST and denies by default.
         #
-        # ponytail: 2026-10-02 — belt and braces. Whatever a static
-        # provider's dict contains, the n8n_token is OUR credential for
-        # talking to this backend and has no business going back out, so
-        # it is stripped unconditionally rather than relying on every
-        # provider being classified correctly above.
-        out = dict(credentials)
-        out.pop("n8n_token", None)
-        return out
+        # Two credentials must NEVER leave, for any provider:
+        #   refresh_token  - it is what keeps the connection alive. Handing
+        #                     it over hands over the whole account, and it
+        #                     would let n8n mint tokens the operator never
+        #                     approved.
+        #   n8n_token      - OUR service credential for calling THIS
+        #                     backend. Echoing it back is a pointless
+        #                     second copy of a secret that already lives
+        #                     here.
+        #
+        # The previous shape was an OAuth allowlist plus a catch-all that
+        # returned the whole dict minus n8n_token. That leaked the
+        # refresh_token of every provider missing from the list --
+        # dynamics365 was one, so n8n was holding its refresh token.
+        # A new provider that nobody remembered to add to the list was a
+        # silent data leak. An allowlist cannot leak by omission.
+        #
+        # What n8n is allowed to receive, per provider:
+        #   OAuth provider  -> the bearer, and nothing else.
+        #   static provider -> exactly the catalog fields the BE itself
+        #                      encrypted, i.e. SECRET_FIELD_TYPES
+        #                      (password + email). Those are the ones
+        #                      n8n needs to authenticate upstream.
+        #                      Text/URL/select fields are not secrets and
+        #                      are already returned separately under
+        #                      "configuration".
+        #
+        # Deriving the allowlist from the catalog spec rather than a
+        # hand-written dict means a provider cannot drift: add a secret
+        # field to the catalog and it is allowed out; do not, and n8n
+        # gets nothing. Test pins both directions.
+        from STT_server.services.integrations_catalog import (
+            SECRET_FIELD_TYPES,
+            get_integration_provider_spec as _get_spec,
+        )
+        spec = _get_spec(provider)
+        is_oauth = bool(spec and getattr(spec, "auth_type", "static") == "oauth")
+
+        if is_oauth:
+            return {"access_token": credentials.get("access_token")}
+
+        allowed = {
+            f.name for f in (spec.fields if spec else ())
+            if f.type in SECRET_FIELD_TYPES
+        }
+        return {
+            k: v for k, v in (credentials or {}).items()
+            if k in allowed
+        }
     return {
         "integration_id": row["id"],
         "provider": provider,
