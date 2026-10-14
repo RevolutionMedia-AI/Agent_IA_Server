@@ -1513,6 +1513,47 @@ def set_integration_n8n_token(
             conn.close()
 
 
+def get_integration_n8n_token(integration_id: str, user_id: str) -> str | None:
+    """This integration's n8n token in cleartext, or None.
+
+    Sibling of set_/clear_integration_n8n_token. The cleartext token
+    lives in the encrypted credentials blob; only the SHA-256 prefix is
+    indexed, so this is the ONE place that reads the secret back out.
+
+    ponytail: callers are the tool executor, which needs to hand n8n a
+    SCOPED token so the workflow stops using the platform-wide
+    INTEGRATIONS_N8N_TOKEN (that one reaches every tenant's credentials
+    by id). tool_executor cannot decrypt itself — importing the security
+    module there is circular — hence this helper.
+
+    Ownership-scoped by user_id so a caller cannot read another tenant's
+    token. Returns None when the row is missing, not fernet-v1, or
+    undecryptable: callers treat that as "no scoped token available",
+    never as a reason to fail the tool call.
+    """
+    from STT_server.security.credentials import decrypt_credentials
+
+    row = get_integration(integration_id, user_id)
+    if not row:
+        return None
+    if (row.get("credentials_cipher") or "fernet-v1") != "fernet-v1":
+        return None
+    blob = row.get("credentials_encrypted")
+    if not blob:
+        return None
+    try:
+        creds = decrypt_credentials(blob)
+    except Exception:
+        log.warning(
+            "[n8n] token read failed for integration_id=%s (cipher "
+            "undecryptable); caller falls back to platform token",
+            integration_id,
+        )
+        return None
+    token = (creds or {}).get("n8n_token")
+    return str(token) if token else None
+
+
 def clear_integration_n8n_token(integration_id: str, user_id: str) -> bool:
     """Drop the per-integration token; the row falls back to the platform
     INTEGRATIONS_N8N_TOKEN."""

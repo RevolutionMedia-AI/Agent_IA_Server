@@ -23,6 +23,11 @@ log = logging.getLogger(__name__)
 # webhook_url / credentials are server-injected from the DB.
 _FORBIDDEN_LLM_KEYS = frozenset({
     "action", "provider", "integration_id", "webhook_url", "credentials",
+    # server-injected authorization material. The LLM never authors these;
+    # they come from the encrypted row. Left unguarded the model could put
+    # a n8n_token INSIDE `arguments` and, in a workflow that reads the
+    # token off the wrong field, end up authenticating as someone else.
+    "n8n_token", "access_token", "refresh_token",
 })
 
 
@@ -485,6 +490,38 @@ async def execute_tool_call(
         body["provider"] = integration["provider"]
         if tool.get("action"):
             body["action"] = tool["action"]
+        # ponytail: hand n8n THIS integration's scoped token instead of
+        # making the workflow hold the platform-wide
+        # INTEGRATIONS_N8N_TOKEN. The platform token resolves to
+        # user_id=None = unscoped, so one shared n8n credential can read
+        # any tenant's decrypted provider token by editing the
+        # integration_id in the URL. The scoped token pins the call to
+        # the integration that owns it, and /internal/.../credentials
+        # enforces the match.
+        #
+        # Safe to put in the body: this POST is server-to-server, the
+        # LLM never sees it, and ToolExecutor logs only args_keys (the
+        # argument NAMES) plus the hostname — never the payload.
+        #
+        # Falls back to absent when the row has no per-integration token
+        # (never minted, or rotated away). The n8n workflow must then
+        # fall back to its platform-token credential; that keeps a
+        # not-yet-minted integration working instead of 401ing every
+        # tool call.
+        try:
+            from STT_server.db_integrations import get_integration_n8n_token
+            scoped_token = get_integration_n8n_token(
+                integration["id"], user_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "[ToolExecutor] scoped n8n token read failed "
+                "integration_id=%s: %s",
+                integration.get("id"), exc,
+            )
+            scoped_token = None
+        if scoped_token:
+            body["n8n_token"] = scoped_token
         # ponytail: Google Calendar OAuth credentials + per-integration
         # configuration flow downstream in the n8n workflow. The LLM
         # never sees these — they're server-injected from the encrypted
