@@ -5624,11 +5624,20 @@ def internal_get_integration_credentials(
         )
         raise HTTPException(status_code=404, detail="Integration not found")
     provider = row.get("provider")
-    if provider == "dynamics365":
-        raise HTTPException(
-            status_code=403,
-            detail="Dynamics 365 credentials never leave the backend; use the execute endpoint",
-        )
+    # ponytail: dynamics365 used to be 403'd here with "use the execute
+    # endpoint" -- a deliberate carve-out because its Dataverse token was
+    # tenant-scoped and only our dispatcher knew how to mint it. That
+    # dispatcher is gone: n8n calls Dataverse itself now, so refusing to
+    # hand over the bearer left n8n with no way to call Dynamics AT ALL.
+    # The token it receives is still the environment-scoped one produced
+    # by _replace_with_environment_token, which is what Dataverse expects
+    # as a bearer; only the refresh_token stays here.
+    #
+    # n8n also needs configuration.environment_url to build the API base
+    # itself -- prepare_oauth_connection writes it for a single-instance
+    # tenant, and the FE writes it when the operator picks one from a
+    # multi-environment discovery. Without it n8n has a token and nothing
+    # to call.
     cipher = row.get("credentials_cipher") or "fernet-v1"
     encrypted = row.get("credentials_encrypted")
     if not encrypted:

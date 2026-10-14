@@ -65,7 +65,9 @@ async def _seed_zendesk(client, headers) -> str:
     return resp.json()["id"]
 
 
-async def _seed_provider(client, headers, provider: str, credentials: dict) -> str:
+async def _seed_provider(
+    client, headers, provider: str, credentials: dict, configuration: dict | None = None,
+) -> str:
     """Seed an OAuth integration row through the SAME persistence path
     the OAuth callback uses (encrypt_credentials + _write_integrations_file).
     We patch decrypt_credentials to identity-return so the test only
@@ -84,6 +86,11 @@ async def _seed_provider(client, headers, provider: str, credentials: dict) -> s
         if provider == "google_calendar"
         else {"instance_url": "https://example.my.salesforce.com"}
     )
+    # caller-supplied configuration wins, so a test can seed e.g. the
+    # Dynamics environment_url without going through PUT (which triggers
+    # a real tenant token exchange)
+    if configuration:
+        config.update(configuration)
     encrypted_blob = encrypt_credentials(credentials)
     rows = _read_integrations_file()
     rows = [
@@ -173,6 +180,63 @@ async def test_internal_endpoint_returns_decrypted_with_service_token(
     assert body["credentials"]["email"] == "admin@acme.com"
     # nothing beyond the catalog's SECRET_FIELD_TYPES rides along
     assert set(body["credentials"]) == {"api_token", "email"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["dynamics365", "salesforce"])
+async def test_no_provider_is_refused_the_bearer_403(
+    client, auth_token, fake_test_fn, service_token, monkeypatch, provider,
+):
+    """Regression: /credentials used to 403 every dynamics365 call with
+    "use the execute endpoint", because its tenant-scoped Dataverse token
+    was only ever minted by our dispatcher. That dispatcher is gone, so the
+    carve-out left n8n with no way to call Dynamics at all -- a 403 on
+    every request.
+
+    Asserted at the route, not on the shaping helper: the 403 lived in the
+    route above the helper, so a helper-level test never saw it.
+    """
+    from STT_server.services import oauth_providers
+    monkeypatch.setattr(oauth_providers, "is_token_expiring", lambda *_a, **_kw: False)
+
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    integ_id = await _seed_provider(client, headers, provider, {"access_token": "BEARER"})
+    resp = await client.post(
+        f"/internal/integrations/{integ_id}/credentials",
+        headers={"Authorization": f"Bearer {service_token}"},
+    )
+    assert resp.status_code == 200, (
+        f"{provider} was refused: {resp.status_code} {resp.text}"
+    )
+    assert resp.json()["credentials"]["access_token"] == "BEARER"
+
+
+@pytest.mark.asyncio
+async def test_dynamics_credentials_carry_the_environment_url(
+    client, auth_token, fake_test_fn, service_token, monkeypatch,
+):
+    """The bearer is useless without the base URL. n8n builds the Dataverse
+    API endpoint itself now, so configuration.environment_url has to come
+    back with the token -- it is written by prepare_oauth_connection for a
+    single-instance tenant and by the FE when the operator picks one from a
+    multi-environment discovery."""
+    from STT_server.services import oauth_providers
+    monkeypatch.setattr(oauth_providers, "is_token_expiring", lambda *_a, **_kw: False)
+
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    integ_id = await _seed_provider(
+        client, headers, "dynamics365", {"access_token": "BEARER"},
+        configuration={"environment_url": "https://contoso.api.crm.dynamics.com"},
+    )
+    resp = await client.post(
+        f"/internal/integrations/{integ_id}/credentials",
+        headers={"Authorization": f"Bearer {service_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    cfg = resp.json()["configuration"]
+    assert cfg["environment_url"] == "https://contoso.api.crm.dynamics.com", (
+        "n8n cannot build a Dataverse URL without this"
+    )
 
 
 async def test_internal_endpoint_404_on_unknown_id(
