@@ -381,22 +381,43 @@ def integration_actions_for_prompt(
 ) -> list[dict]:
     """The action list to render in the prompt block for one integration.
 
-    Official providers take it straight from the catalog. A
-    `generic_webhook` has an EMPTY catalog on purpose — the operator
-    names the action per tool — so the real callable shape of that
-    connection is the set of tools bound to it. Each tool carries its own
-    `parameters` schema, which is exactly the JSON the model has to send.
+    For an OFFICIAL provider the catalog is the source of truth for the
+    bilingual copy — but only for the actions the operator actually
+    turned into tools. Rendering the whole catalog made the prompt
+    disagree with what the model can call: turn_manager builds the
+    OpenAI `tools[]` payload from session.agent_tools and NEVER reads
+    the catalog, so a 3-tool Dynamics integration shipped 47 action
+    blocks while the model could invoke 3. The other 44 were both
+    ~8.8k wasted tokens and an invitation to emit a tool call for a
+    function name that isn't in tools[] at all.
 
-    Without this fallback, assigning a webhook integration to an agent
-    wrote "This integration has no actions configured yet" into the
-    System Prompt while a tool with a complete schema sat bound to the
-    same row: the model was told there was nothing to call.
+    So: intersect the catalog with the bound tools' `action` values.
+    A bound tool whose action is not in the catalog renders from its own
+    row, which is also how a `generic_webhook` works — its catalog is
+    empty by design, so the bound tools ARE its action list.
 
     `bound_tools` is injectable so tests don't need a database.
     """
-    catalog_actions = [
-        {
-            "id": _spec_attr(a, "id"),
+    tools = bound_tools if bound_tools is not None else _bound_tools_for_integration(integration_row)
+    wanted = {
+        (t.get("action") or "").strip()
+        for t in tools
+        if isinstance(t, dict) and (t.get("action") or "").strip()
+    }
+
+    out: list[dict] = []
+    matched: set[str] = set()
+    for a in (getattr(spec, "actions", None) or _spec_attr(spec, "actions", None) or []):
+        act_id = _spec_attr(a, "id")
+        # No tools bound yet: keep the full catalog. Assigning an
+        # integration is a two-step flow (connect, then create tools),
+        # and an empty block on step 1 reads to the operator as a bug.
+        # Once tools exist the intersection below takes over.
+        if wanted and act_id not in wanted:
+            continue
+        matched.add(act_id)
+        out.append({
+            "id": act_id,
             "name": _spec_attr(a, "name"),
             "description": _spec_attr(a, "description"),
             # Catalog is the source of truth for the bilingual copy; the
@@ -407,18 +428,21 @@ def integration_actions_for_prompt(
                 a, "parameters_schema",
                 {"type": "object", "properties": {}, "required": []},
             ),
-        }
-        for a in (getattr(spec, "actions", None) or _spec_attr(spec, "actions", None) or [])
-    ]
-    if catalog_actions:
-        return catalog_actions
+        })
 
-    tools = bound_tools if bound_tools is not None else _bound_tools_for_integration(integration_row)
-    out: list[dict] = []
+    # ponytail: every bound tool must appear. A tool whose action is not
+    # in the catalog (a rename that beat the deploy, or generic_webhook
+    # where the catalog is empty by design) renders from its own row.
+    # Returning early on the first match would drop those and tell the
+    # model a tool it can really call does not exist.
     for t in tools:
+        if not isinstance(t, dict):
+            continue
+        act_id = (t.get("action") or "").strip()
+        if act_id and act_id in matched:
+            continue
         # A tool with neither an action nor a name would render as
         # "Action: action" — skip it rather than teach the model a blank.
-        act_id = (t.get("action") or t.get("id") or "").strip()
         act_name = (t.get("name") or "").strip()
         if not act_id and not act_name:
             continue
