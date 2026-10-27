@@ -53,13 +53,17 @@ def _reload_capture(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_capture_disabled_when_env_var_unset(tmp_path: Path, monkeypatch) -> None:
     """Without TTS_AUDIO_CAPTURE_DIR set, capture_a / capture_b are
     no-ops. Verify by calling them and asserting no files appear
-    in the (otherwise writable) tmp_path."""
+    in the (otherwise writable) tmp_path.
+
+    "data" is the per-test JSON store dir the conftest isolation
+    fixture creates; it is not a capture artifact."""
     monkeypatch.delenv("TTS_AUDIO_CAPTURE_DIR", raising=False)
     _reload_capture(monkeypatch)
     from STT_server.services import audio_capture as ac
     ac.capture_a("CA-disabled-A", 1, b"\xff" * 160)
     ac.capture_b("CA-disabled-B", 1, b"\x00" * 160)
-    assert list(tmp_path.glob("*")) == []
+    leftovers = [p for p in tmp_path.glob("*") if p.name != "data"]
+    assert leftovers == [], f"capture wrote files while disabled: {leftovers}"
     assert not (tmp_path / "CA-disabled-A").exists()
 
 

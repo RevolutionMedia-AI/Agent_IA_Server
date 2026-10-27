@@ -8,6 +8,8 @@ tmp dir so they never touch production data in STT_server/data/.
 """
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import os
 import secrets
@@ -235,28 +237,194 @@ def _build_test_app() -> FastAPI:
     return app
 
 
-@pytest.fixture
-def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect all JSON-file IO (tools + sessions + users) to a tmp dir."""
+# Every JSON store the backend falls back to when DATABASE_URL is unset.
+# Each entry is (module, attribute, filename): the attribute is the
+# module-level path constant, and every one of those modules reads it at
+# CALL time (not import time), so monkeypatching the module attribute
+# redirects the store.
+#
+# ponytail: the list is deliberately EXHAUSTIVE rather than "the ones the
+# current tests happen to touch". The previous fixture only redirected
+# agent_tools.json, sessions.json and users.json, so any test that
+# seeded an integration wrote to the REAL STT_server/data/integrations.json
+# and replaced the operator's store with test rows. A store that is
+# missing from this table is a store a test can silently overwrite.
+#
+# NOTE: api.py keeps its OWN copy of these paths (DATA_DIR / AGENTS_FILE
+# / ...) in addition to the db_* modules'. Both layers MUST be redirected
+# or the two disagree: the route writes to one file and the db layer
+# reads from another, which shows up as a bogus "Agent not found" instead
+# of the obvious "you forgot to patch a path".
+_JSON_STORES = (
+    ("STT_server.routes.api", "USERS_FILE", "users.json"),
+    ("STT_server.routes.api", "SESSIONS_FILE", "sessions.json"),
+    ("STT_server.routes.api", "AGENTS_FILE", "agents.json"),
+    ("STT_server.routes.api", "NUMBERS_FILE", "phone_numbers.json"),
+    ("STT_server.db_agents", "AGENTS_FILE", "agents.json"),
+    ("STT_server.db_call_sessions", "CALL_SESSIONS_FILE", "call_sessions.json"),
+    ("STT_server.db_call_usage", "LEGACY_CALLS_FILE", "calls.json"),
+    ("STT_server.db_integrations", "_INTEGRATIONS_FILE", "integrations.json"),
+    ("STT_server.db_phone_numbers", "NUMBERS_FILE", "phone_numbers.json"),
+    ("STT_server.db_tenants", "TENANTS_FILE", "tenants.json"),
+    ("STT_server.db_tools", "_AGENT_TOOLS_FILE", "agent_tools.json"),
+    ("STT_server.db_twilio_credentials", "CREDENTIALS_FILE", "twilio_credentials.json"),
+    ("STT_server.db_users", "USERS_FILE", "users.json"),
+    ("STT_server.db_users", "SESSIONS_FILE", "sessions.json"),
+)
+
+# Directory-shaped constants. None means "the data dir itself"; a name
+# means "a subdirectory of it".
+_JSON_STORE_DIRS = (
+    ("STT_server.routes.api", "DATA_DIR", None),
+    ("STT_server.routes.api", "SETTINGS_DIR", "settings"),
+    ("STT_server.db_agents", "DATA_DIR", None),
+    ("STT_server.db_call_sessions", "DATA_DIR", None),
+    ("STT_server.db_call_usage", "DATA_DIR", None),
+    ("STT_server.db_campaigns", "data_dir", None),
+    ("STT_server.db_integrations", "_DATA_DIR", None),
+    ("STT_server.db_phone_numbers", "DATA_DIR", None),
+    ("STT_server.db_settings", "DATA_DIR", None),
+    ("STT_server.db_settings", "SETTINGS_DIR", "settings"),
+    ("STT_server.db_tenants", "DATA_DIR", None),
+    ("STT_server.db_twilio_credentials", "DATA_DIR", None),
+    ("STT_server.db_users", "DATA_DIR", None),
+)
+
+
+def _same_type(current, value: Path):
+    """api.py stores its paths as str, the db_* modules as Path. Keep each
+    attribute's own type so nothing does an unexpected join."""
+    if isinstance(current, str):
+        return str(value)
+    return Path(value)
+
+
+# One Fernet key for the whole test session.
+#
+# ponytail: the suite used to INHERIT whatever CREDENTIAL_ENCRYPTION_KEY
+# the developer's shell happened to export — conftest used setdefault, so
+# a shell variable silently won — and other test files overwrote the
+# variable mid-session. Every mismatch surfaced as
+#
+#     ValueError: Could not decrypt with any configured key (tried 1: ...)
+#
+# which reads like a data problem but is really a non-reproducible
+# environment. The stores are isolated (see _isolate_json_stores), so the
+# VALUE does not matter; what matters is that it is the SAME everywhere.
+_SESSION_ENCRYPTION_KEY = "oahqImB7aGYfEFxfWIJLZzJs27YSYAgr5rHUyc3gIRU="
+
+
+@pytest.fixture(autouse=True)
+def _stable_encryption_key(monkeypatch: pytest.MonkeyPatch):
+    """Pin the encryption key for every test and rebuild the cache.
+
+    The credentials module caches its Fernet instance at first use, so
+    the cache is reset here as well — otherwise a previous test that
+    changed the key leaves the next one decrypting with the wrong key.
+    """
+    from STT_server.security import credentials as credentials_mod
+
+    monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY", _SESSION_ENCRYPTION_KEY)
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.delenv("CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS", raising=False)
+    credentials_mod._fernet_cache.update(
+        {"key": None, "instance": None, "ring": None, "fingerprints": None}
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_json_stores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point EVERY JSON store at a per-test tmp dir.
+
+    Autouse on purpose: a test must not be able to reach the operator's
+    real store by simply not requesting `data_dir`. The stores are
+    redirected to a fresh tmp_path per test, so tests stay isolated from
+    each other too.
+    """
     d = tmp_path / "data"
     d.mkdir()
+    (d / "settings").mkdir(exist_ok=True)
 
-    # Tools file paths used by the API endpoints and by
-    # _load_agent_tools in session_runtime.
-    tools_file = d / "agent_tools.json"
-    monkeypatch.setattr(api_mod, "DATA_DIR", str(d), raising=False)
-    monkeypatch.setattr(api_mod, "TOOLS_FILE", str(tools_file), raising=False)
-    monkeypatch.setattr(rt_mod, "_TOOLS_FILE", str(tools_file), raising=False)
+    for module_name, attr, filename in _JSON_STORES:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, attr):
+            # The constant does not exist in this module — do not invent
+            # it. A phantom attribute reads as "patched" in review but
+            # redirects nothing.
+            continue
+        current = getattr(module, attr)
+        monkeypatch.setattr(
+            module, attr, _same_type(current, d / filename), raising=True
+        )
 
-    # Sessions/users files used by the auth shim. require_auth
-    # re-imports load_sessions/save_sessions on every call, so we patch
-    # the underlying module attribute (which the `from X import Y`
-    # inside the function picks up fresh each invocation).
-    sessions_file = d / "sessions.json"
-    users_file = d / "users.json"
-    monkeypatch.setattr(db_users, "SESSIONS_FILE", sessions_file, raising=False)
-    monkeypatch.setattr(db_users, "USERS_FILE", users_file, raising=False)
+    for module_name, attr, subdir in _JSON_STORE_DIRS:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, attr):
+            continue
+        current = getattr(module, attr)
+        target = d if subdir is None else d / subdir
+        monkeypatch.setattr(
+            module, attr, _same_type(current, target), raising=True
+        )
+
     return d
+
+
+@pytest.fixture
+def data_dir(_isolate_json_stores: Path) -> Path:
+    """The per-test JSON store dir. Every store points here."""
+    return _isolate_json_stores
+
+
+@pytest.fixture(scope="session")
+def json_store_paths() -> tuple[tuple[str, str, str], ...]:
+    """The (module, attribute, filename) table of redirected stores.
+
+    Exposed as a fixture so the isolation test can assert the table is
+    complete without importing conftest as a module.
+    """
+    return _JSON_STORES
+
+
+def _snapshot_data_dir() -> dict[str, str]:
+    """Hash every file in the REAL data dir. Used by the guard below."""
+    real = Path(__file__).resolve().parent.parent / "STT_server" / "data"
+    out: dict[str, str] = {}
+    if not real.exists():
+        return out
+    for path in sorted(real.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            out[str(path.relative_to(real))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return out
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_data_dir():
+    """Fail the run if ANY test wrote to the operator's real data dir.
+
+    ponytail: the isolation above is the fix; this is the tripwire. The
+    operator lost a store of live integrations because the suite wrote to
+    STT_server/data/integrations.json. If a future test reaches a store
+    that is missing from _JSON_STORES, this catches it at the END of the
+    run instead of the operator discovering it in production.
+    """
+    before = _snapshot_data_dir()
+    yield
+    after = _snapshot_data_dir()
+    changed = sorted(
+        name for name in set(before) | set(after)
+        if before.get(name) != after.get(name)
+    )
+    assert not changed, (
+        "The test suite modified the operator's real data dir "
+        "(STT_server/data/): " + ", ".join(changed) + ". "
+        "Add the store to _JSON_STORES in tests/conftest.py so it is "
+        "redirected to a tmp dir."
+    )
 
 
 @pytest.fixture

@@ -1290,7 +1290,7 @@ def test_list_agents_bulk_tools_duplicate_assignment_counts_once(monkeypatch):
         {"id": "t1", "user_id": "user-1", "agent_id": "__shared__",
          "assignments": ["agent-a", "agent-a"], "destination": "+1"},
     ]
-    fake_file = _db_tools_mod.Path(_db_tools_mod.__file__).resolve().parent / "data" / "agent_tools.json"
+    fake_file = _db_tools_mod._AGENT_TOOLS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(tools_payload))
 
@@ -1323,7 +1323,7 @@ def test_list_agents_bulk_tools_multi_agent_duplicate_assignments(monkeypatch):
          "assignments": ["agent-a", "agent-a", "agent-b", "agent-b"],
          "destination": "+1"},
     ]
-    fake_file = _db_tools_mod.Path(_db_tools_mod.__file__).resolve().parent / "data" / "agent_tools.json"
+    fake_file = _db_tools_mod._AGENT_TOOLS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(tools_payload))
 
@@ -1355,7 +1355,7 @@ def test_list_agents_bulk_tools_multiple_distinct_rows(monkeypatch):
         {"id": "t2", "user_id": "user-1", "agent_id": "__shared__",
          "assignments": ["agent-a"], "webhook_url": "https://x"},
     ]
-    fake_file = _db_tools_mod.Path(_db_tools_mod.__file__).resolve().parent / "data" / "agent_tools.json"
+    fake_file = _db_tools_mod._AGENT_TOOLS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(tools_payload))
 
@@ -1390,7 +1390,7 @@ def test_list_agents_bulk_tools_private_row_with_assignments(monkeypatch):
         {"id": "t1", "user_id": "user-1", "agent_id": "agent-a",
          "assignments": ["agent-a", "agent-a"], "destination": "+1"},
     ]
-    fake_file = _db_tools_mod.Path(_db_tools_mod.__file__).resolve().parent / "data" / "agent_tools.json"
+    fake_file = _db_tools_mod._AGENT_TOOLS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(tools_payload))
 
@@ -1430,7 +1430,7 @@ def test_list_agents_bulk_integrations_shared_multi_assign(monkeypatch):
          "assignments": ["agent-a", "agent-b"],
          "connection_status": "connected"},
     ]
-    fake_file = _db_int_mod.Path(_db_int_mod.__file__).resolve().parent / "data" / "integrations.json"
+    fake_file = _db_int_mod._INTEGRATIONS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(integ_payload))
 
@@ -1469,7 +1469,7 @@ def test_list_agents_bulk_integrations_duplicate_assignment_counts_once(monkeypa
          "assignments": ["agent-a", "agent-a"],
          "connection_status": "connected"},
     ]
-    fake_file = _db_int_mod.Path(_db_int_mod.__file__).resolve().parent / "data" / "integrations.json"
+    fake_file = _db_int_mod._INTEGRATIONS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(integ_payload))
 
@@ -1498,7 +1498,7 @@ def test_list_agents_bulk_integrations_multi_agent_duplicate_assignments(monkeyp
          "assignments": ["agent-a", "agent-a", "agent-b", "agent-b"],
          "connection_status": "connected"},
     ]
-    fake_file = _db_int_mod.Path(_db_int_mod.__file__).resolve().parent / "data" / "integrations.json"
+    fake_file = _db_int_mod._INTEGRATIONS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(integ_payload))
 
@@ -1528,7 +1528,7 @@ def test_list_agents_bulk_integrations_multiple_distinct_rows(monkeypatch):
         {"id": "i2", "user_id": "user-1", "agent_id": "__shared__",
          "assignments": ["agent-a"], "connection_status": "connected"},
     ]
-    fake_file = _db_int_mod.Path(_db_int_mod.__file__).resolve().parent / "data" / "integrations.json"
+    fake_file = _db_int_mod._INTEGRATIONS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(integ_payload))
 
@@ -1556,7 +1556,7 @@ def test_list_agents_bulk_integrations_private_row_with_assignments(monkeypatch)
         {"id": "i1", "user_id": "user-1", "agent_id": "agent-a",
          "assignments": ["agent-a", "agent-a"], "connection_status": "connected"},
     ]
-    fake_file = _db_int_mod.Path(_db_int_mod.__file__).resolve().parent / "data" / "integrations.json"
+    fake_file = _db_int_mod._INTEGRATIONS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(integ_payload))
 
@@ -1867,7 +1867,7 @@ def test_list_agents_bulk_tools_count_matches_legacy_per_agent(
     monkeypatch.setattr("STT_server.db.is_postgres", lambda: False)
     monkeypatch.setattr(_db_tools_mod, "is_postgres", lambda: False)
 
-    fake_file = _db_tools_mod.Path(_db_tools_mod.__file__).resolve().parent / "data" / "agent_tools.json"
+    fake_file = _db_tools_mod._AGENT_TOOLS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(fixture_rows))
 
@@ -1998,7 +1998,7 @@ def test_list_agents_bulk_integrations_count_matches_legacy_per_agent(
     monkeypatch.setattr("STT_server.db.is_postgres", lambda: False)
     monkeypatch.setattr(_db_int_mod, "is_postgres", lambda: False)
 
-    fake_file = _db_int_mod.Path(_db_int_mod.__file__).resolve().parent / "data" / "integrations.json"
+    fake_file = _db_int_mod._INTEGRATIONS_FILE
     fake_file.parent.mkdir(parents=True, exist_ok=True)
     fake_file.write_text(_json.dumps(fixture_rows))
 
