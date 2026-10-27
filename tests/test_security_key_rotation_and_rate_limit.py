@@ -185,6 +185,31 @@ def test_a_malformed_previous_key_is_fatal_not_skipped():
         _restore(saved)
 
 
+def test_invalid_key_error_names_the_actual_mistake():
+    """"not a valid Fernet key" alone sends the operator back to the docs
+    without saying what is wrong with the value they pasted. The error must
+    name the shape of the mistake."""
+    truncated = _fresh_keys(1)[0][:30]
+    cases = [
+        ("your_fernet_key_here", "placeholder"),
+        ("a" * 64, "44 characters"),
+        (truncated, "44 characters"),
+        ("0123456789abcdef" * 4, "hex"),
+    ]
+    for bad_value, expected in cases:
+        try:
+            C._build_fernet(bad_value, "CREDENTIAL_ENCRYPTION_KEY")
+        except RuntimeError as exc:
+            msg = str(exc)
+            assert expected in msg, (
+                f"error for {bad_value[:20]!r} did not mention {expected!r}: {msg}"
+            )
+            # The key material must never leak into the message.
+            assert bad_value not in msg
+        else:
+            raise AssertionError(f"accepted {bad_value!r} as a Fernet key")
+
+
 def test_fingerprint_never_reveals_key_material():
     keys = _fresh_keys(2)
     for k in keys:

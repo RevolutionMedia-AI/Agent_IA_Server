@@ -119,13 +119,42 @@ def _get_fernet() -> Fernet:
     return ring[0][0]
 
 
+def _describe_bad_key(raw) -> str:
+    """Operator-facing diagnosis of WHY *raw* is not a Fernet key.
+
+    "not a valid Fernet key" on its own sends the operator back to the
+    docs without telling them what is actually wrong with the value they
+    pasted. This names the shape of the mistake instead: a truncated
+    key, a hex digest, or a placeholder copied straight out of the
+    deployment docs.
+
+    Only reports things that ACTUALLY break the key. Note that
+    ``base64.urlsafe_b64decode`` silently discards characters outside the
+    alphabet, so stray quotes or spaces do NOT break a key — mentioning
+    them here would send the operator chasing a non-problem.
+
+    Never echoes the key material itself.
+    """
+    text = raw.decode("ascii", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    hints: list[str] = []
+    if len(text) != 44:
+        hints.append(f"expected 44 characters, got {len(text)}")
+    if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
+        hints.append("this looks like a hex SHA-256 digest, not a Fernet key")
+    if text.strip().lower() in {
+        "your_fernet_key_here", "changeme", "change_me", "secret", "your_key_here",
+    }:
+        hints.append("this is a placeholder copied from the docs, not a generated key")
+    return "; ".join(hints) or "the value does not decode to 32 bytes"
+
+
 def _build_fernet(raw, env_name: str) -> Fernet:
     try:
         key_bytes = raw.encode("ascii") if isinstance(raw, str) else raw
         return Fernet(key_bytes)
     except (ValueError, TypeError) as exc:
         raise RuntimeError(
-            f"{env_name} is not a valid Fernet key. "
+            f"{env_name} is not a valid Fernet key ({_describe_bad_key(raw)}). "
             f"Generate one with:  python -c \"from cryptography.fernet import Fernet; "
             f"print(Fernet.generate_key().decode())\"  "
             f"Original error: {exc}"
