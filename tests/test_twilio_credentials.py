@@ -308,3 +308,68 @@ def test_platform_env_keys_dropped_twilio():
     fallback for Twilio credentials. The product brief requires this."""
     from STT_server.services.credentials_resolver import PLATFORM_ENV_KEYS
     assert "twilio" not in PLATFORM_ENV_KEYS
+
+
+def test_a_credential_on_a_retired_key_can_be_repaired(auth_token, stub_twilio):
+    """A row encrypted with a key that no longer exists must be
+    repairable by sending a fresh SID + auth token.
+
+    This is the production scenario, not a hypothetical: the operator
+    rotated CREDENTIAL_ENCRYPTION_KEY, the retired key was lost, and
+    every Twilio credential row became unreadable. The PUT handler used
+    to decrypt the STORED values eagerly — before looking at what the
+    caller sent — so even supplying fresh secrets 500'd on the
+    decryption of the very values being replaced. The operator was left
+    with a credential they could neither use, edit, nor replace.
+    """
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+
+    from STT_server import db_twilio_credentials as db_twcreds
+
+    client = TestClient(_build_app())
+    created = client.post(
+        "/twilio-credentials",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={"name": "Sales", "account_sid": VALID_SID, "auth_token": VALID_TOKEN},
+    )
+    assert created.status_code == 200, created.text
+    cred_id = created.json()["id"]
+
+    # Re-encrypt the row with a RETIRED key, exactly as a rotation
+    # would have left it.
+    retired = Fernet(Fernet.generate_key())
+    path = db_twcreds.CREDENTIALS_FILE
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    for row in rows:
+        if row.get("id") == cred_id:
+            row["account_sid_encrypted"] = retired.encrypt(
+                VALID_SID.encode()
+            ).decode("ascii")
+            row["auth_token_encrypted"] = retired.encrypt(
+                VALID_TOKEN.encode()
+            ).decode("ascii")
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+    # Reading it now fails — that is the production symptom.
+    with pytest.raises(Exception):
+        db_twcreds.get_credential(cred_id, "user-admin-001", include_secrets=True)
+
+    # The LIST endpoint must still work: it never decrypts.
+    listed = client.get(
+        "/twilio-credentials", headers={"Authorization": f"Bearer {auth_token}"}
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["credentials"][0]["id"] == cred_id
+
+    # Re-saving with the current key must work.
+    repaired = client.put(
+        f"/twilio-credentials/{cred_id}",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={"account_sid": VALID_SID, "auth_token": VALID_TOKEN},
+    )
+    assert repaired.status_code == 200, repaired.text
+
+    fixed = db_twcreds.get_credential(cred_id, "user-admin-001", include_secrets=True)
+    assert fixed["account_sid"] == VALID_SID
+    assert fixed["auth_token"] == VALID_TOKEN

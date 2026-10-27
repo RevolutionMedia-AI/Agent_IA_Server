@@ -3034,54 +3034,58 @@ async def update_twilio_credential(
     existing = db_twcreds.get_credential(credential_id, auth["user_id"])
     if not existing:
         raise HTTPException(status_code=404, detail="Credential not found")
-    if data.name is not None or data.account_sid is not None or data.auth_token is not None:
-        next_name = data.name if data.name is not None else existing["name"]
-        # Reveal secrets to validate. We only hit the DB once via
-        # get_credential(include_secrets=True) and then drop the
-        # plaintext — never log or return it.
+
+    touches_secret = data.account_sid is not None or data.auth_token is not None
+    if data.name is None and not touches_secret:
+        return existing
+
+    next_name = data.name if data.name is not None else existing["name"]
+
+    # ponytail: only reveal the CURRENT secrets when we actually need
+    # them. A credential encrypted under a retired key raises on
+    # decrypt, and this handler used to decrypt EAGERLY — before
+    # looking at what the caller sent. So a row encrypted with a key
+    # that no longer exists could not be repaired: supplying a fresh
+    # SID + auth token still 500'd on the decryption of the values we
+    # were about to overwrite. The operator was left with a credential
+    # they could neither use, edit, nor replace.
+    #
+    # Supplying both SID and token must be enough to recover the row.
+    need_current_sid = data.account_sid is None
+    need_current_token = data.auth_token is None
+    next_sid = data.account_sid.strip() if data.account_sid is not None else ""
+    next_token = data.auth_token.strip() if data.auth_token is not None else ""
+    if need_current_sid or need_current_token:
         full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
-        next_sid = (
-            data.account_sid.strip()
-            if data.account_sid is not None
-            else full.get("account_sid") or ""
-        )
-        next_token = (
-            data.auth_token.strip()
-            if data.auth_token is not None
-            else full.get("auth_token") or ""
-        )
+        if need_current_sid:
+            next_sid = full.get("account_sid") or ""
+        if need_current_token:
+            next_token = full.get("auth_token") or ""
+
+    # Validate only what we are about to store. A name-only edit must
+    # not fail because the stored secrets are unreadable — we are not
+    # touching them.
+    if not (next_name or "").strip():
+        raise HTTPException(status_code=400, detail="Name is required")
+    if len(next_name.strip()) > 80:
+        raise HTTPException(status_code=400, detail="Name is too long (max 80 chars)")
+    if touches_secret:
         err = _validate_twilio_credential_payload(
             name=next_name, account_sid=next_sid, auth_token=next_token
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
+
     kwargs: dict = {}
     if data.name is not None:
         kwargs["name"] = data.name
-    status_update = None
-    test_message_update = None
-    if data.account_sid is not None or data.auth_token is not None:
+    if touches_secret:
         from STT_server.adapters.twilio_api import validate_twilio_credentials
-        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
-        next_sid = (
-            data.account_sid.strip()
-            if data.account_sid is not None
-            else full.get("account_sid") or ""
-        )
-        next_token = (
-            data.auth_token.strip()
-            if data.auth_token is not None
-            else full.get("auth_token") or ""
-        )
         res = await validate_twilio_credentials(next_sid, next_token)
-        status_update = "connected" if res.get("valid") else "invalid"
-        test_message_update = res.get("message") or res.get("error") or ""
-        kwargs["status"] = status_update
-        kwargs["last_test_message"] = test_message_update
+        kwargs["status"] = "connected" if res.get("valid") else "invalid"
+        kwargs["last_test_message"] = res.get("message") or res.get("error") or ""
         kwargs["account_sid"] = next_sid
         kwargs["auth_token"] = next_token
-    if not kwargs:
-        return existing
     return db_twcreds.update_credential(credential_id, auth["user_id"], **kwargs)
 
 
