@@ -326,9 +326,8 @@ def _stable_encryption_key(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY", _SESSION_ENCRYPTION_KEY)
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.delenv("CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS", raising=False)
     credentials_mod._fernet_cache.update(
-        {"key": None, "instance": None, "ring": None, "fingerprints": None}
+        {"key": None, "instance": None}
     )
 
 

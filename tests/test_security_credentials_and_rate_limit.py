@@ -1,12 +1,17 @@
-"""Key rotation (P1) and internal rate limiting (P2).
+"""Credential encryption (single key) and internal rate limiting.
 
-No DB, no network, no API key. P1's crypto path runs for real (Fernet is
-local); the sweep's SQL is asserted at the source level because running
-it needs a live Postgres.
+No DB, no network, no API key. The crypto path runs for real (Fernet is
+local).
+
+There is ONE key: CREDENTIAL_ENCRYPTION_KEY. No key ring, no retired
+keys, no rotation script — see the module docstring in
+STT_server/security/credentials.py for why a ring could not help once
+the old key is gone. What these tests pin is the behaviour that follows
+from that: a value encrypted with a DIFFERENT key is refused (fail
+closed), and the error tells the operator what to actually do about it.
 """
 from __future__ import annotations
 
-import ast
 import inspect
 import os
 import pathlib
@@ -19,7 +24,6 @@ from cryptography.fernet import Fernet, InvalidToken  # noqa: E402
 from STT_server.security import credentials as C  # noqa: E402
 from STT_server.security import rate_limit as RL  # noqa: E402
 
-SWEEP = pathlib.Path("scripts/rotate_credential_key.py")
 ROUTES = pathlib.Path("STT_server/routes/api.py")
 
 
@@ -28,109 +32,42 @@ def _fresh_keys(n: int = 3) -> list[str]:
 
 
 def _reset_cache() -> None:
-    C._fernet_cache.update(
-        {"key": None, "instance": None, "ring": None, "fingerprints": None}
-    )
+    C._fernet_cache.update({"key": None, "instance": None})
 
 
-def _use(primary: str, previous: str | None = None):
-    """Point the module at a key ring for the duration of a test."""
-    saved = {
-        "CREDENTIAL_ENCRYPTION_KEY": os.environ.get("CREDENTIAL_ENCRYPTION_KEY"),
-        "CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS": os.environ.get(
-            "CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS"
-        ),
-    }
+def _use(key: str):
+    """Point the module at *key* for the duration of a test."""
+    saved = os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
     os.environ["ENVIRONMENT"] = "test"
-    os.environ["CREDENTIAL_ENCRYPTION_KEY"] = primary
-    if previous:
-        os.environ["CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS"] = previous
-    else:
-        os.environ.pop("CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS", None)
+    os.environ["CREDENTIAL_ENCRYPTION_KEY"] = key
     _reset_cache()
     return saved
 
 
-def _restore(saved: dict) -> None:
-    for k, v in saved.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
+def _restore(saved: str | None) -> None:
+    if saved is None:
+        os.environ.pop("CREDENTIAL_ENCRYPTION_KEY", None)
+    else:
+        os.environ["CREDENTIAL_ENCRYPTION_KEY"] = saved
     _reset_cache()
 
 
-# ── P1: the key ring ──────────────────────────────────────────────
+# ── The single key ───────────────────────────────────────────────
 
-def test_single_key_behaviour_is_unchanged():
-    """With no PREVIOUS set this must be byte-for-byte the old behaviour,
-    or every existing deployment breaks on deploy."""
+def test_encrypt_decrypt_round_trip():
+    """The everyday path: a value goes in, comes back out."""
     key = _fresh_keys(1)[0]
     saved = _use(key)
     try:
-        assert C.key_ring_fingerprints() == [C.key_fingerprint(key)]
         tok = C.encrypt_value("secreto")
         assert C.decrypt_value(tok) == "secreto"
-        plaintext, fp = C.decrypt_with_fingerprint(tok)
-        assert plaintext == "secreto"
-        assert fp == C.primary_key_fingerprint()
-    finally:
-        _restore(saved)
-
-
-def test_retired_key_still_decrypts():
-    old, new = _fresh_keys(2)
-    saved = _use(new, old)
-    try:
-        old_token = Fernet(old.encode()).encrypt(b"viejo").decode("ascii")
-        assert C.decrypt_value(old_token) == "viejo", (
-            "a row still on the retired key must keep decrypting"
-        )
-    finally:
-        _restore(saved)
-
-
-def test_new_writes_always_use_the_primary():
-    """The point of rotation: writes must land on the NEW key even when
-    the value being replaced was read off an old one."""
-    old, new = _fresh_keys(2)
-    saved = _use(new, old)
-    try:
-        old_token = Fernet(old.encode()).encrypt(b"viejo").decode("ascii")
-        rotated = C.encrypt_value(C.decrypt_value(old_token))
-        # Opens under the new key...
-        assert Fernet(new.encode()).decrypt(
-            rotated.encode("ascii")
-        ).decode() == "viejo"
-        # ...and NOT under the old one. If this ever passes, a "rotated"
-        # row is still silently on the retired key.
-        try:
-            Fernet(old.encode()).decrypt(rotated.encode("ascii"))
-        except InvalidToken:
-            pass
-        else:
-            raise AssertionError(
-                "re-encrypted value still opens under the retired key — "
-                "the sweep would not have moved it"
-            )
-    finally:
-        _restore(saved)
-
-
-def test_all_ring_keys_are_tried_in_order():
-    keys = _fresh_keys(3)
-    saved = _use(keys[0], ",".join(keys[1:]))
-    try:
-        assert C.key_ring_fingerprints() == [C.key_fingerprint(k) for k in keys]
-        for k in keys:
-            tok = Fernet(k.encode()).encrypt(b"x").decode("ascii")
-            assert C.decrypt_value(tok) == "x"
+        assert C.primary_key_fingerprint() == C.key_fingerprint(key)
     finally:
         _restore(saved)
 
 
 def test_unreadable_token_still_fails_closed():
-    """The ring must not become a way to accept garbage."""
+    """Garbage must never be accepted as a credential."""
     saved = _use(_fresh_keys(1)[0])
     try:
         for junk in ("not-a-token", "gAAAA", "x" * 200):
@@ -157,10 +94,21 @@ def test_empty_and_none_pass_through_unchanged():
         _restore(saved)
 
 
-def test_a_key_outside_the_ring_is_refused():
-    saved = _use(_fresh_keys(1)[0])
+def test_a_value_encrypted_with_another_key_is_refused():
+    """The production scenario: the key was changed, so the stored value
+    no longer opens. It must raise, never fall back to the raw value."""
+    key = _fresh_keys(1)[0]
+    saved = _use(key)
     try:
         stranger = Fernet(Fernet.generate_key()).encrypt(b"nope").decode("ascii")
+        # Fernet verifies the HMAC before touching the ciphertext, so a
+        # wrong key fails fast and leaks nothing about the payload.
+        try:
+            Fernet(key.encode()).decrypt(stranger.encode("ascii"))
+        except InvalidToken:
+            pass
+        else:
+            raise AssertionError("a token from an unknown key opened")
         try:
             C.decrypt_value(stranger)
         except Exception:
@@ -170,17 +118,29 @@ def test_a_key_outside_the_ring_is_refused():
         _restore(saved)
 
 
-def test_a_malformed_previous_key_is_fatal_not_skipped():
-    """Silently ignoring a retired key the operator thinks is present would
-    turn a rotation into silent data loss."""
-    saved = _use(_fresh_keys(1)[0], "not-a-fernet-key")
+def test_decrypt_failure_says_how_to_recover():
+    """The error must point at the only fix that exists.
+
+    There is no retired key to fall back to, so an error that tells the
+    operator to "add the retired key" sends them after something that
+    does not exist. It must say: replace the stored value.
+    """
+    key = _fresh_keys(1)[0]
+    saved = _use(key)
     try:
+        stranger = Fernet(Fernet.generate_key()).encrypt(b"nope").decode("ascii")
         try:
-            C.key_ring_fingerprints()
-        except RuntimeError as exc:
-            assert "CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS" in str(exc), exc
-            return
-        raise AssertionError("a malformed retired key was silently ignored")
+            C.decrypt_value(stranger)
+        except ValueError as exc:
+            msg = str(exc)
+            assert "CREDENTIAL_ENCRYPTION_KEY" in msg
+            assert "re-enter" in msg.lower(), msg
+            assert "retired" not in msg.lower(), (
+                "the error still points at a retired key, which no longer exists"
+            )
+            assert "PREVIOUS_KEYS" not in msg
+        else:
+            raise AssertionError("expected a ValueError")
     finally:
         _restore(saved)
 
@@ -221,11 +181,10 @@ def test_fingerprint_never_reveals_key_material():
 
 
 def test_production_still_refuses_to_start_without_a_key():
-    """SEC-014 must not be weakened by the rotation work."""
+    """SEC-014 must not be weakened."""
     saved_key = os.environ.pop("CREDENTIAL_ENCRYPTION_KEY", None)
     os.environ["ENVIRONMENT"] = "production"
     os.environ.pop("ALLOW_EPHEMERAL_ENCRYPTION_KEY", None)
-    os.environ.pop("CREDENTIAL_ENCRYPTION_PREVIOUS_KEYS", None)
     _reset_cache()
     try:
         try:
@@ -238,51 +197,6 @@ def test_production_still_refuses_to_start_without_a_key():
         if saved_key is not None:
             os.environ["CREDENTIAL_ENCRYPTION_KEY"] = saved_key
         _reset_cache()
-
-
-# ── P1: the sweep covers every store ──────────────────────────────
-
-def test_sweep_is_dry_run_by_default():
-    src = SWEEP.read_text(encoding="utf-8")
-    assert 'apply = "--apply" in argv' in src
-    assert "DRY-RUN (nothing will be written)" in src, (
-        "the default run must say it will not write"
-    )
-
-
-def test_sweep_covers_all_three_tables():
-    """A partial sweep leaves data on the retired key forever, which is
-    exactly what makes step 3 unsafe."""
-    src = SWEEP.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    funcs = {
-        n.name: ast.get_source_segment(src, n) or ""
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef)
-    }
-    assert "agent_tools" in funcs["sweep_agent_tools"]
-    assert "credentials_encrypted" in funcs["sweep_integrations"]
-    assert "oauth_code_verifier_encrypted" in funcs["sweep_integrations"]
-    assert "twilio_credentials" in funcs["sweep_twilio_credentials"]
-    assert "account_sid_encrypted" in funcs["sweep_twilio_credentials"]
-    assert "auth_token_encrypted" in funcs["sweep_twilio_credentials"]
-
-
-def test_sweep_never_prints_key_material():
-    src = SWEEP.read_text(encoding="utf-8")
-    assert "key_fingerprint" in src
-    # No bare printing of the env var contents.
-    for line in src.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("print(") and "CREDENTIAL_ENCRYPTION_KEY" in stripped:
-            raise AssertionError(f"sweep prints key material: {stripped}")
-
-
-def test_sweep_reports_unreadable_rather_than_overwriting():
-    src = SWEEP.read_text(encoding="utf-8")
-    assert "could not be opened by ANY" in src, (
-        "unreadable rows must be reported and skipped, never overwritten"
-    )
 
 
 # ── P2: the rate limiter ──────────────────────────────────────────
@@ -413,20 +327,14 @@ def test_rate_limit_is_not_applied_to_the_public_api():
 
 def _self_check():
     fns = [
-        test_single_key_behaviour_is_unchanged,
-        test_retired_key_still_decrypts,
-        test_new_writes_always_use_the_primary,
-        test_all_ring_keys_are_tried_in_order,
+        test_encrypt_decrypt_round_trip,
         test_unreadable_token_still_fails_closed,
         test_empty_and_none_pass_through_unchanged,
-        test_a_key_outside_the_ring_is_refused,
-        test_a_malformed_previous_key_is_fatal_not_skipped,
+        test_a_value_encrypted_with_another_key_is_refused,
+        test_decrypt_failure_says_how_to_recover,
+        test_invalid_key_error_names_the_actual_mistake,
         test_fingerprint_never_reveals_key_material,
         test_production_still_refuses_to_start_without_a_key,
-        test_sweep_is_dry_run_by_default,
-        test_sweep_covers_all_three_tables,
-        test_sweep_never_prints_key_material,
-        test_sweep_reports_unreadable_rather_than_overwriting,
         test_limit_is_100_per_minute,
         test_under_the_limit_is_allowed,
         test_over_the_limit_is_refused_with_retry_after,
@@ -434,13 +342,13 @@ def _self_check():
         test_refusals_do_not_grow_the_counter_forever,
         test_stale_clients_are_pruned,
         test_client_key_prefers_forwarded_for,
-        test_both_internal_endpoints_are_throttled,
+        test_internal_endpoints_are_throttled,
         test_limit_is_env_overridable,
         test_rate_limit_is_not_applied_to_the_public_api,
     ]
     for fn in fns:
         fn()
-    print(f"security_p1_p2: OK ({len(fns)} checks)")
+    print(f"security_credentials_and_rate_limit: OK ({len(fns)} checks)")
 
 
 if __name__ == "__main__":
