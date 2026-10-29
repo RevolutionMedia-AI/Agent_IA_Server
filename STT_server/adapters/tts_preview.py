@@ -33,6 +33,7 @@ async def preview_tts(
     model_id: Optional[str] = None,
     api_key: Optional[str] = None,
     instructions: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> bytes:
     """Run a single TTS call and return the raw mu-law 8 kHz audio bytes.
 
@@ -60,6 +61,7 @@ async def preview_tts(
     session = CallSession(session_key="preview")
     session.user_id = user_id
     session.tts_provider = provider
+    session.preferred_language = language
     if voice_id:
         session.voice_id = voice_id
     if model_id:

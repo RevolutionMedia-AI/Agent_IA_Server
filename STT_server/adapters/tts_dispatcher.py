@@ -5,7 +5,7 @@ Supports:
   - rime: Rime WebSocket TTS (PCM -> mu-law conversion)
   - openai: OpenAI /v1/audio/speech (PCM -> mu-law conversion)
   - deepgram: Deepgram /v1/speak with mulaw/8000/container=none
-  - assemblyai: AssemblyAI Streaming TTS HTTP API (mu-law 8 kHz)
+  - assemblyai: AssemblyAI Streaming TTS WebSocket API (requested mu-law 8 kHz)
 
 The provider is determined by:
   1. session.tts_provider (per-session override from frontend)

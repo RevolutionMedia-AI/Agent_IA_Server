@@ -1,4 +1,4 @@
-"""AssemblyAI streaming TTS in Twilio's native 8 kHz mu-law format."""
+"""AssemblyAI streaming TTS requested as Twilio-compatible 8 kHz mu-law."""
 from __future__ import annotations
 
 import asyncio
@@ -77,6 +77,30 @@ async def _get_session(session: CallSession, api_key: str, lock: asyncio.Lock):
     return tts_session
 
 
+async def prepare_session(session: CallSession) -> None:
+    """Open the call's TTS socket before the first reply is ready."""
+    if session.closed or getattr(session, "tts_provider", None) != "assemblyai":
+        return
+    creds = resolve_for_session(session, "tts", "assemblyai")
+    api_key = (creds.get("api_key") or "").strip()
+    if not api_key:
+        return
+
+    lock = getattr(session, "_assemblyai_tts_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        session._assemblyai_tts_lock = lock
+    try:
+        async with lock:
+            await _get_session(session, api_key, lock)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Connection setup is opportunistic. The first speak() retries so
+        # a transient startup failure does not mute the call permanently.
+        log.warning("[ASSEMBLYAI_TTS] early connect failed session=%s: %s", session.session_key, exc)
+
+
 async def close_session(session: CallSession) -> None:
     task = getattr(session, "_assemblyai_tts_keepalive", None)
     if task:
@@ -103,11 +127,12 @@ async def stream_tts_segment(
 
     started = time.perf_counter()
     ttfb_ms: float | None = None
-    frame_proc = AudioFrameProcessor(emit_silence_tail=False)
+    frame_proc = AudioFrameProcessor(emit_silence_tail=True)
     lock = getattr(session, "_assemblyai_tts_lock", None)
     if lock is None:
         lock = asyncio.Lock()
         session._assemblyai_tts_lock = lock
+    segment_completed = False
 
     def emit_audio(data: bytes) -> None:
         nonlocal ttfb_ms
@@ -130,6 +155,7 @@ async def stream_tts_segment(
             tts_session = await _get_session(session, api_key, lock)
             async for chunk in tts_session.speak(text):
                 emit_audio(chunk)
+            segment_completed = True
     except asyncio.CancelledError:
         tts_session = getattr(session, "_assemblyai_tts_session", None)
         if tts_session is not None:
@@ -143,6 +169,9 @@ async def stream_tts_segment(
         emit_item({"type": "error", "generation": generation, "message": f"AssemblyAI TTS error: {exc}"})
         await close_session(session)
     finally:
-        frame_proc.flush()
+        tail_frames = frame_proc.flush()
+        if segment_completed:
+            for frame in tail_frames:
+                emit_item({"type": "audio", "generation": generation, "data": frame})
         emit_item({"type": "segment_end", "generation": generation})
     return ttfb_ms, (time.perf_counter() - started) * 1000

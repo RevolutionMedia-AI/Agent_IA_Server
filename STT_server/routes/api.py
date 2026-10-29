@@ -3671,6 +3671,7 @@ class TtsPreviewRequest(BaseModel):
     provider: str  # "elevenlabs" | "rime" | "inworld" | "openai" | "deepgram"
     voice_id: str | None = None
     model_id: str | None = None
+    language: str | None = None
     text: str = "Hello, this is a preview of how I will sound on your calls."
     api_key: str | None = None
     # ponytail: 028_agent_tts_instructions.sql. Voice steering to apply
@@ -3720,6 +3721,7 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
             text=_text,
             voice_id=body.voice_id,
             model_id=body.model_id,
+            language=body.language,
             api_key=body.api_key,
             instructions=body.instructions,
         )

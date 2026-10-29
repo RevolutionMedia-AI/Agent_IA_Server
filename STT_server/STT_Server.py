@@ -2016,6 +2016,18 @@ async def media_stream(ws: WebSocket) -> None:
                             "message(s), greeting overridden, history seeded",
                             session.session_key, session.agent_id, len(_carried),
                         )
+                # AssemblyAI recommends opening the persistent TTS socket
+                # when the call starts, before the first reply is ready.
+                # This opens a session only (no generated warm-up audio);
+                # a failed preconnect is retried by the first TTS segment.
+                if session.tts_provider == "assemblyai":
+                    from STT_server.adapters.assemblyai_tts import prepare_session
+                    tts_prepare_task = asyncio.create_task(
+                        prepare_session(session),
+                        name=f"assemblyai-tts-connect-{session.session_key}",
+                    )
+                    session.tasks.append(tts_prepare_task)
+
                 # ponytail: helper that closes over `session` so the
                 # caller can `await _enqueue_transcript(item)` instead
                 # of `await lambda item: enqueue_transcript_event(session, item)`.
