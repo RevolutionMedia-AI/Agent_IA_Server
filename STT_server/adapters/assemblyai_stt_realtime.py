@@ -1,23 +1,9 @@
 """AssemblyAI realtime STT adapter.
 
-Streams the session's mu-law 8 kHz mono Twilio audio into AssemblyAI's
-WebSocket realtime endpoint. Zero transcoding: Twilio's native format
-matches AssemblyAI's preferred ``encoding=pcm_mulaw, sample_rate=8000``
-exactly, so chunks are forwarded as-is (base64-wrapped).
-
-Endpoint: wss://api.assemblyai.com/v2/realtime/ws
-Auth:     Authorization header = raw api_key (no Bearer prefix per
-          AssemblyAI docs; verified against /v2/models which uses the
-          same pattern in credentials_resolver._fetch_assemblyai_models)
-Send:     {"type": "data", "audio_data": "<base64>"}
-Recv:     {"type": "Begin"} | {"type": "Turn", "transcript", "end_of_turn", ...}
-        | {"type": "Termination"} | {"type": "Error", "error": ...}
-
-The `turn_is_formatted` flag is set on the server side (we open the
-socket with format_turns=true) so transcripts arrive already punctuated.
+Streams Twilio's mu-law 8 kHz mono audio to AssemblyAI Streaming v3 as
+binary WebSocket frames, then sends Terminate to flush the final turn.
 """
 import asyncio
-import base64
 import json
 import logging
 import urllib.parse
@@ -26,7 +12,6 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from STT_server.config import (
-    DEFAULT_CALL_LANGUAGE,
     STT_RECONNECT_BASE_DELAY_MS,
     STT_RECONNECT_MAX_ATTEMPTS,
     STT_RECONNECT_MAX_DELAY_MS,
@@ -39,46 +24,18 @@ from STT_server.services.credentials_resolver import resolve_for_session
 log = logging.getLogger("stt_server")
 
 
-ASSEMBLYAI_WS_URL = "wss://api.assemblyai.com/v2/realtime/ws"
-ASSEMBLYAI_DEFAULT_MODEL = "best"
-# ponytail: AssemblyAI's accepted language codes for the `language`
-# query param. Anything outside this list falls back to "auto" so the
-# server picks instead of the WS handshake 400-ing us.
-_ASSEMBLYAI_LANG_MAP = {
-    "en": "en_us",
-    "es": "es",
-    "fr": "fr",
-    "de": "de",
-    "it": "it",
-    "pt": "pt",
-    "nl": "nl",
-    "ja": "ja",
-    "zh": "zh",
-    "ko": "ko",
-    "ru": "ru",
-    "hi": "hi",
-    "pl": "pl",
-    "tr": "tr",
-    "uk": "uk",
-}
+ASSEMBLYAI_WS_URL = "wss://streaming.assemblyai.com/v3/ws"
+ASSEMBLYAI_DEFAULT_MODEL = "universal-3-6-pro"
 
 
 def _build_url(language_hint: str | None) -> str:
-    """Build the realtime WS URL with Twilio-matching audio params."""
+    """Build the v3 WS URL using Twilio's native audio format."""
     params = {
         "sample_rate": str(TWILIO_SR),
         "encoding": "pcm_mulaw",
+        "speech_model": ASSEMBLYAI_DEFAULT_MODEL,
         "format_turns": "true",
-        # ponytail: confidence below 0.7 means AssemblyAI is still
-        # waiting for more audio before closing the turn. 0.7 is the
-        # value they document for live captioning; tighter cuts lose
-        # mid-sentence hesitations.
-        "end_of_turn_confidence_threshold": "0.7",
     }
-    normalized = normalize_supported_language(language_hint)
-    code = _ASSEMBLYAI_LANG_MAP.get(normalized)
-    if code:
-        params["language"] = code
     qs = urllib.parse.urlencode(params)
     return f"{ASSEMBLYAI_WS_URL}?{qs}"
 
@@ -89,21 +46,20 @@ def _resolve_api_key(session: CallSession) -> str:
 
 
 def _resolve_model(session: CallSession) -> str:
-    # ponytail: model is currently a no-op for AssemblyAI (the realtime
-    # endpoint ignores model_id; only the model param on /v2/transcript
-    # matters, which we're not using). Keep it on the session so the
-    # UI doesn't lie when the user picks "Universal-3.5 Pro Realtime".
-    return getattr(session, "stt_model", None) or ASSEMBLYAI_DEFAULT_MODEL
+    # The realtime v3 endpoint accepts `speech_model`; old v2 model IDs
+    # are invalid here, so normalize any stale agent value to the current
+    # realtime model.
+    model = (getattr(session, "stt_model", None) or "").strip()
+    return model if model == ASSEMBLYAI_DEFAULT_MODEL else ASSEMBLYAI_DEFAULT_MODEL
 
 
 async def _assemblyai_audio_sender(ws, session: CallSession) -> None:
     """Forward Twilio's mu-law 8 kHz mono chunks verbatim.
 
-    No transcoding — AssemblyAI's WS accepts pcm_mulaw@8000 when
-    opened with the matching query params, and Twilio hands us exactly
-    that. Each chunk becomes a JSON {"type": "data", "audio_data":
-    "<b64>"} frame.
+    No transcoding — v3 accepts pcm_mulaw@8000 as binary. Twilio sends
+    20 ms packets, so combine them into 100 ms frames as required by v3.
     """
+    audio_buffer = bytearray()
     while True:
         try:
             chunk = await asyncio.wait_for(session.stt_audio_queue.get(), timeout=5.0)
@@ -115,22 +71,25 @@ async def _assemblyai_audio_sender(ws, session: CallSession) -> None:
             # next real chunk. Keepalive is implicit in the WS ping.
             continue
         if chunk is None:
-            # End-of-session sentinel from session_runtime. Close the
-            # upstream side cleanly so AssemblyAI flushes its final Turn.
+            # Flush audio before Terminate so AssemblyAI can emit the
+            # last finalized Turn before closing the socket.
             try:
-                await ws.close()
+                if audio_buffer:
+                    await ws.send(bytes(audio_buffer))
+                await ws.send(json.dumps({"type": "Terminate"}))
             except Exception:
                 pass
             return
         if not chunk:
             continue
-        try:
-            await ws.send(json.dumps({
-                "type": "data",
-                "audio_data": base64.b64encode(chunk).decode("ascii"),
-            }))
-        except Exception:
-            return
+        audio_buffer.extend(chunk)
+        while len(audio_buffer) >= 800:  # 100 ms at 8 kHz mu-law
+            frame = bytes(audio_buffer[:800])
+            del audio_buffer[:800]
+            try:
+                await ws.send(frame)
+            except Exception:
+                return
 
 
 async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> None:
@@ -139,10 +98,12 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
     """
     api_key = _resolve_api_key(session)
     if not api_key:
+        log.error("[ASSEMBLYAI_STT] API key not configured for session=%s", session.session_key)
+        await on_failure(session)
         return
 
-    url = _build_url(session.preferred_language)
     model_id = _resolve_model(session)
+    url = _build_url(session.preferred_language)
     connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
     language = normalize_supported_language(session.preferred_language)
 
@@ -225,7 +186,7 @@ async def run_realtime_stt(session: CallSession, on_transcript, on_failure) -> N
                             attempt = 0
                             await on_transcript({
                                 "text": text,
-                                "language": language,
+                                "language": msg.get("language_code") or language,
                                 "is_final": end_of_turn,
                                 # ponytail: AssemblyAI doesn't emit a
                                 # separate speech_final vs is_final

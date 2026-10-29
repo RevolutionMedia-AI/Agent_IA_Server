@@ -302,6 +302,12 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
     except Exception:
         pass
 
+    try:
+        from STT_server.adapters.assemblyai_tts import close_session as _close_assemblyai_tts
+        await _close_assemblyai_tts(session)
+    except Exception:
+        log.exception("AssemblyAI TTS session cleanup failed for %s", session.session_key)
+
     # ponytail: H2 from the call-flow audit. Mark the call closed
     # in Postgres so list_open_sessions() at startup can recover
     # any sessions that didn't close cleanly (server crash, deploy).

@@ -225,24 +225,13 @@ def build_transfer_chain(
 ) -> list[dict]:
     """Order the Dial chain for one transfer invocation.
 
-    Sequential routing (spec 1-2): the chain is the ordered list
-    after the AI. For an explicit named request the LLM invokes the
-    tool for that exact destination — route directly there instead of
-    forcing the caller through earlier entries. That is a suffix of
-    the configured chain starting at the invoked id. For the normal
-    sequential case the invoked id is the next expected (first in
-    chain), so the suffix is the whole chain. Tools missing a
+    Sequential routing: when a chain is configured, it is authoritative
+    and always starts at its first entry. The invoked tool only selects a
+    destination when there is no configured chain. Tools missing a
     destination are dropped. Returns rows in ring order.
     """
     chain = [c for c in (chain or []) if isinstance(c, str)]
-    if invoked_tool_id in chain:
-        # explicit or sequential — start at its position, not from 0
-        idx = chain.index(invoked_tool_id)
-        ordered_ids = chain[idx:]
-    else:
-        # invoked not in configured chain (per-agent tool or legacy)
-        # — dial it, then the configured chain as fallback
-        ordered_ids = [invoked_tool_id] + [c for c in chain if c != invoked_tool_id]
+    ordered_ids = chain or ([invoked_tool_id] if invoked_tool_id else [])
     out: list[dict] = []
     for tid in ordered_ids[:MAX_CHAIN_TOOLS]:
         tool = tools_by_id.get(tid)

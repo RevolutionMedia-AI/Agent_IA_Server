@@ -17,7 +17,7 @@ from STT_server.config import (
 )
 
 # Valid TTS providers and languages
-VALID_TTS_PROVIDERS = {"elevenlabs", "rime", "openai", "deepgram", "inworld"}
+VALID_TTS_PROVIDERS = {"elevenlabs", "rime", "openai", "deepgram", "inworld", "assemblyai"}
 VALID_LANGUAGES = {"en", "es"}
 
 

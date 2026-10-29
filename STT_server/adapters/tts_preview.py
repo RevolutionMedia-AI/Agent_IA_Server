@@ -184,6 +184,21 @@ async def preview_tts(
             raise
         if mulaw:
             chunks.append(bytes(mulaw))
+    elif provider == "assemblyai":
+        assemblyai_key = inline_key or (creds.get("api_key") or "").strip()
+        if not assemblyai_key:
+            raise RuntimeError("AssemblyAI API key not configured.")
+        from STT_server.adapters.assemblyai_tts import fetch_preview
+        audio = await _to_thread(
+            fetch_preview,
+            text,
+            assemblyai_key,
+            voice_id,
+            model_id,
+            getattr(session, "preferred_language", None),
+        )
+        if audio:
+            chunks.append(bytes(audio))
     else:
         # ponytail: validation-only path. Providers without a
         # streaming adapter (Inworld today, future ones) still need

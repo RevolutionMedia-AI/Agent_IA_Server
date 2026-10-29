@@ -299,7 +299,8 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         id="assemblyai",
         name="AssemblyAI",
         category="stt",
-        description="Speech-to-text provider via AssemblyAI's realtime WS. Universal model auto-detects language; per-user model selector overrides the default.",
+        categories=("stt", "tts"),
+        description="Streaming speech-to-text and text-to-speech for voice agents.",
         fields=(
             FieldSpec(
                 name="api_key", label="API Key", type="password",
@@ -760,14 +761,7 @@ _HARDCODED_STT_MODELS = {
         {"id": "base",         "name": "Base",       "description": "Original base model"},
     ],
     "assemblyai": [
-        {"id": "best",  "name": "Best",  "description": "Highest accuracy, multilingual"},
-        {"id": "nano",  "name": "Nano",  "description": "Lowest latency, lower accuracy"},
-        # ponytail: Universal-Streaming family. Listed so the FE can
-        # attach per-model pricing; these names also match what the
-        # AssemblyAI docs publish today.
-        {"id": "universal-streaming",                "name": "Universal-Streaming",                "description": "English streaming, balanced"},
-        {"id": "universal-streaming-multilingual",   "name": "Universal-Streaming Multilingual",   "description": "Multilingual streaming"},
-        {"id": "universal-3.5-pro-realtime",         "name": "Universal-3.5 Pro Realtime",         "description": "Highest accuracy, realtime"},
+        {"id": "universal-3-6-pro", "name": "Universal-3.6 Pro Realtime", "description": "Current realtime streaming model; multilingual auto-detection"},
     ],
     # ponytail: 2026-10-01 — REPLACED. This used to be the four
     # speech-to-speech Realtime ids (gpt-realtime-2.1-mini / -2.1 / -2 /
@@ -1172,34 +1166,6 @@ def _fetch_inworld_voices(api_key: str) -> list[dict]:
         return []
 
 
-def _fetch_assemblyai_models(api_key: str) -> list[dict]:
-    """GET /v2/models from AssemblyAI. The api_key IS the Authorization
-    header value (no "Bearer" prefix — AssemblyAI uses the raw key).
-    """
-    import urllib.error
-    import urllib.request
-    try:
-        req = urllib.request.Request(
-            "https://api.assemblyai.com/v2/models",
-            headers={"Authorization": api_key},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            payload = __import__("json").loads(resp.read().decode("utf-8"))
-        keep = []
-        for m in payload.get("models", []) or []:
-            mid = m.get("id", "")
-            if mid and m.get("available", True):
-                keep.append({
-                    "id": mid,
-                    "name": m.get("name", mid),
-                    "description": m.get("description", "AssemblyAI model"),
-                })
-        return keep
-    except Exception as exc:
-        log.info("[assemblyai-models] fetch failed: %s", _sanitize_error(str(exc))[:200])
-        return []
-
-
 def _fetch_gemini_models(api_key: str) -> list[dict]:
     """GET https://generativelanguage.googleapis.com/v1beta/models?key=..."""
     import urllib.error
@@ -1374,6 +1340,10 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                 return {"models": []}
 
         if service == "tts":
+            if provider_id == "assemblyai":
+                return {"models": [
+                    {"id": "assemblyai-tts-1", "name": "AssemblyAI TTS-1", "description": "Streaming TTS; supports English, Spanish, French, German, Italian and Portuguese"},
+                ]}
             # Live for OpenAI if key present, hardcoded catalog otherwise.
             if provider_id == "openai":
                 if creds:
@@ -1487,10 +1457,6 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                         pass
                 return {"models": _HARDCODED_STT_MODELS["deepgram"]}
             if provider_id == "assemblyai":
-                if creds:
-                    models = _fetch_assemblyai_models(creds)
-                    if models:
-                        return {"models": models}
                 return {"models": _HARDCODED_STT_MODELS["assemblyai"]}
             if provider_id == "openai":
                 # Realtime-compatible STT. The previous commit (561f6be)

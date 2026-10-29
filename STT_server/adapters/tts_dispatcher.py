@@ -5,6 +5,7 @@ Supports:
   - rime: Rime WebSocket TTS (PCM -> mu-law conversion)
   - openai: OpenAI /v1/audio/speech (PCM -> mu-law conversion)
   - deepgram: Deepgram /v1/speak with mulaw/8000/container=none
+  - assemblyai: AssemblyAI Streaming TTS HTTP API (mu-law 8 kHz)
 
 The provider is determined by:
   1. session.tts_provider (per-session override from frontend)
@@ -88,6 +89,10 @@ async def stream_tts_segment(
     if provider == "inworld":
         from STT_server.adapters.inworld_tts import stream_tts_segment as _inworld
         return await _inworld(session, text, generation, emit_item, seg_idx=seg_idx)
+
+    if provider == "assemblyai":
+        from STT_server.adapters.assemblyai_tts import stream_tts_segment as _assemblyai
+        return await _assemblyai(session, text, generation, emit_item, seg_idx=seg_idx)
 
     # ponytail: HTTP-only providers (no streaming adapter) get an inline
     # implementation here. They collect one response and emit it as a

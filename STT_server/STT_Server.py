@@ -1255,9 +1255,8 @@ async def voice_transfer_fallback(
     if agent_id:
         stream_params.append(f'<Parameter name="agent_id" value="{agent_id}" />')
 
-    # ponytail: explicit vs sequential. build_transfer_chain returns a
-    # suffix from the invoked position, so an explicit "Recruiting" skips
-    # earlier "Cafeteria" and remaining is suffix[1:] — never restart.
+    # A configured chain is authoritative: start at its first destination
+    # regardless of which transfer tool the model invoked.
     chain = build_transfer_chain(ids[0] if ids else "", ids, tools_by_id)
     # ponytail: Policy A. The sealed plan is AUTHORITATIVE — it is what
     # turn_manager froze for this call, so a tool delete/edit or a DB

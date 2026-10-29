@@ -251,7 +251,6 @@ ELEVENLABS_TTS_VOICE_ID = os.getenv("ELEVENLABS_TTS_VOICE_ID", "r8iaJkwUpytwsK5j
 
 # Rime TTS tunables.
 RIME_TTS_MODEL_ID = os.getenv("RIME_TTS_MODEL_ID", "mist-v2")
-RIME_TTS_SAMPLE_RATE = int(os.getenv("RIME_TTS_SAMPLE_RATE", "8000"))
 
 # Default TTS provider — operational default the runtime uses when
 # session.tts_provider is unset (debug calls, test paths).

@@ -11,7 +11,6 @@ import websockets
 
 from STT_server.config import (
     RIME_TTS_MODEL_ID,
-    RIME_TTS_SAMPLE_RATE,
     TTS_IDLE_TIMEOUT_SEC,
     TTS_TTFB_TIMEOUT_SEC,
 )
@@ -286,8 +285,8 @@ async def stream_tts_segment(
     )
     lang_code = "eng" if lang_norm == "en" else "spa"
 
-    # Request 8 kHz directly so we avoid downsampling most of the time.
-    sample_rate = RIME_TTS_SAMPLE_RATE
+    # Twilio Media Streams requires mono mu-law at 8 kHz.
+    sample_rate = TWILIO_SAMPLE_RATE
 
     log.debug(
         "[TTS] Rime WS TTS request: speaker=%s model=%s lang=%s rate=%d text_len=%d text=%.40r",
@@ -300,7 +299,7 @@ async def stream_tts_segment(
         "speaker": speaker,
         "modelId": model_id,
         "lang": lang_code,
-        "audioFormat": "pcm",
+        "audioFormat": "mulaw",
         "samplingRate": str(sample_rate),
     })
     ws_url = f"{RIME_WS_URL}?{qs}"
@@ -344,8 +343,6 @@ async def stream_tts_segment(
             await ws.send(ws_message)
             log.debug("[TTS] Rime WS message sent, waiting for audio... text=%.40r", text[:40])
 
-            pcm_remainder = b""  # carry odd trailing byte across chunks
-
             while True:
                 per_recv_timeout = TTS_TTFB_TIMEOUT_SEC if not emitted_audio else TTS_IDLE_TIMEOUT_SEC
                 try:
@@ -365,19 +362,16 @@ async def stream_tts_segment(
                     )
                     break
 
-                # Binary frame = raw audio data (shouldn't happen on /ws3, but handle it)
+                # Binary frame = raw audio bytes in the requested mu-law/8 kHz format.
                 if isinstance(raw_msg, bytes):
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] Rime WS TTFB (binary) ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
-                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(
-                        raw_msg, sample_rate, pcm_remainder, session=session,
-                    )
-                    if mulaw_bytes:
+                    if raw_msg:
                         _mark_first_byte()
                     if save_audio:
-                        audio_accum.extend(mulaw_bytes)
-                    for frame in frame_proc.feed(mulaw_bytes):
+                        audio_accum.extend(raw_msg)
+                    for frame in frame_proc.feed(raw_msg):
                         log.debug("[TTS] Emitting audio frame: session=%s gen=%s bytes=%d", getattr(session, 'session_key', '?'), generation, len(frame))
                         emit_item({"type": "audio", "generation": generation, "data": frame, "source": "tts"})
                         emitted_audio = True
@@ -408,15 +402,12 @@ async def stream_tts_segment(
                     audio_b64 = msg.get("data", "")
                     if not audio_b64:
                         continue
-                    pcm_bytes = base64.b64decode(audio_b64)
+                    mulaw_bytes = base64.b64decode(audio_b64)
 
                     if ttfb_ms is None:
                         ttfb_ms = (time.perf_counter() - started_at) * 1000
                         log.warning("[TTS] Rime WS TTFB ms=%.1f session=%s gen=%s", ttfb_ms, getattr(session, 'session_key', '?'), generation)
 
-                    mulaw_bytes, pcm_remainder = _pcm16_bytes_to_mulaw_8k(
-                        pcm_bytes, sample_rate, pcm_remainder, session=session,
-                    )
                     if mulaw_bytes:
                         _mark_first_byte()
                     if save_audio:
