@@ -24,7 +24,13 @@ _fn = next(
     n for n in _stt_tree.body
     if isinstance(n, ast.FunctionDef) and n.name == "_speaking_stuck_reason"
 )
-_ns: dict = {}
+_ns: dict = {"CallSession": CallSession}
+# ponytail: the exec'd function carries a `session: CallSession`
+# annotation, and annotations are evaluated at def time — the compiled
+# module inherits no `from __future__ import annotations`, so without
+# CallSession in the namespace the exec raises NameError and pytest
+# aborts the whole collection (0 tests run). Injecting the name is
+# enough: the function body never uses it.
 exec(compile(ast.Module(body=[_fn], type_ignores=[]), "STT_Server.py", "exec"), _ns)
 _speaking_stuck_reason = _ns["_speaking_stuck_reason"]
 

@@ -8,6 +8,8 @@ guidance (the "[breathe]" mention, the explicit "write digits
 in spoken form for IDs" rule, the "never [laugh]/[cough]"
 list, etc.).
 """
+import pytest
+
 from STT_server.domain.tts_hints import (
     INWORLD_STEERING_INSTRUCTIONS,
     TTS_PROVIDER_HINTS,

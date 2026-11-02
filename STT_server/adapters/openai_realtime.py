@@ -147,7 +147,10 @@ def _build_instructions(session: CallSession) -> str:
         # callable match — it answered with text only and the transfer
         # never happened. Pick the first ``call_transfer`` tool we know
         # is available to this session; if none, omit the directive.
-        from STT_server.domain.tool import TOOL_KIND_CALL_TRANSFER as _TCT_KIND
+        from STT_server.domain.tool import (
+            TOOL_KIND_CALL_TRANSFER as _TCT_KIND,
+            AgentTool as _AgentTool,
+        )
         transfer_tool_name = None
         for t in (getattr(session, "agent_tools", None) or []):
             if t.get("kind") == _TCT_KIND:

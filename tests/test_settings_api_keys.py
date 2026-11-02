@@ -471,7 +471,9 @@ def test_build_categorized_models_openai():
             if m["id"] == "gpt-realtime":
                 assert m["label"] == "GPT-Realtime"
             if m["id"] == "gpt-4o-mini-tts":
-                assert m["label"] == "GPT-4o Mini Tts"
+                # ponytail: the TTS catalog spells the acronym in caps
+                # ("TTS"), not title-cased ("Tts").
+                assert m["label"] == "GPT-4o Mini TTS"
     # Models that fit no bucket are in none of them. CHANGED: gpt-realtime
     # used to be here too; it is now the STT bucket, because it is the
     # model the runtime actually runs.

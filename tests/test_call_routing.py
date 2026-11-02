@@ -100,19 +100,31 @@ def test_scenario_F_exhaustion_no_restart():
     # Already attempted set would be handled by pos monotonic
 
 
-def test_scenario_G_explicit_jump():
-    """Reception → AI → Cafeteria → Recruiting, at AI explicit Recruiting → directly to Recruiting, skip Cafeteria"""
+def test_scenario_G_configured_chain_is_authoritative():
+    """Reception → AI → Cafeteria → Recruiting.
+
+    ponytail: the chain is AUTHORITATIVE. When the operator configures
+    an ordered chain, the call rings it from the FIRST entry — the tool
+    the model happened to invoke does NOT re-order it. That is the
+    documented contract of build_transfer_chain ("sequential routing").
+
+    The invoked tool only picks the destination when NO chain is
+    configured.
+    """
     tools = _tools(
         ("caf", "+15550001111", "Cafeteria"),
         ("rec", "+15550002222", "Recruiting"),
     )
     chain = ["caf", "rec"]
-    # Explicit Recruiting
+    # Explicit Recruiting with a configured chain → the chain order wins.
     explicit = build_transfer_chain("rec", chain, tools)
-    assert [c["id"] for c in explicit] == ["rec"]  # skips caf
-    # Normal sequential would be caf first
+    assert [c["id"] for c in explicit] == ["caf", "rec"]
+    # Sequential would be caf first
     sequential = build_transfer_chain("caf", chain, tools)
     assert [c["id"] for c in sequential] == ["caf", "rec"]
+    # No configured chain → the invoked tool selects the destination.
+    alone = build_transfer_chain("rec", [], tools)
+    assert [c["id"] for c in alone] == ["rec"]
 
 
 def test_scenario_H_new_call_resets():

@@ -392,7 +392,7 @@ def _self_check():
         test_existing_providers_unchanged,
         test_unknown_provider_keeps_the_loud_behaviour,
         test_static_providers_unaffected,
-        test_both_refresh_paths_call_should_attempt_refresh,
+        test_refresh_paths_call_should_attempt_refresh,
         test_new_providers_are_registered,
         test_new_providers_declare_their_env_vars,
         test_each_new_provider_builds_its_config,

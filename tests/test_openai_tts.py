@@ -933,12 +933,26 @@ def test_oai_25_full_pipeline_chunk1_chunk2_interrupt_chunk3_dropped():
         # separate asyncio.run() calls would break on the second.
         task = asyncio.create_task(ps.playback_loop(object(), session))
 
+        async def drain_frames():
+            """Wait until the playback loop has pushed frames.
+
+            ponytail: the fixed `sleep(0.05)` this replaced was a race —
+            under a loaded machine (the full suite) the loop had not
+            drained a single frame yet and the assertions below failed
+            on a green implementation. Poll for the condition instead.
+            """
+            for _ in range(200):  # up to ~2 s
+                if to_twilio:
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("playback loop produced no frames in 2 s")
+
         # ── Generation 1 ──────────────────────────────────────────────
         await tts_dispatcher._stream_openai(
             session, "Hola, esta es la respuesta.", 1,
             lambda item: emit_playback_item(session, item), "sk-test",
         )
-        await asyncio.sleep(0.05)
+        await drain_frames()
         gen_a_sent = list(to_twilio)
 
         # ── Generation 2 starts clean ─────────────────────────────────
@@ -952,7 +966,7 @@ def test_oai_25_full_pipeline_chunk1_chunk2_interrupt_chunk3_dropped():
             session, "Segunda respuesta.", 2,
             lambda item: emit_playback_item(session, item), "sk-test",
         )
-        await asyncio.sleep(0.05)
+        await drain_frames()
         gen_b_sent = list(to_twilio)
 
         task.cancel()

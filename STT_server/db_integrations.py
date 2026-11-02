@@ -1,4 +1,4 @@
-﻿"""Postgres-backed CRUD for the integrations table.
+"""Postgres-backed CRUD for the integrations table.
 
 Mirror of db_tools.py: the JSON file under STT_server/data/ is only
 used as a one-time backfill source on first boot (this file does NOT
@@ -1469,7 +1469,17 @@ def find_integrations_by_n8n_prefix(prefix: str) -> list[dict]:
                 (prefix,),
             )
             rows = cur.fetchall()
-    return [_row_to_dict(r, extra=("credentials_encrypted", "credentials_cipher")) for r in rows]
+    # ponytail: _row_to_integration is this module's row converter and
+    # keeps the two credential columns the caller needs to verify the
+    # presented token. (The previous call to a non-existent
+    # `_row_to_dict(r, extra=...)` raised NameError on every Postgres
+    # lookup, so the n8n token verification path always failed.)
+    out = []
+    for r in rows:
+        row = _row_to_integration(r)
+        if row:
+            out.append(row)
+    return out
 
 
 def set_integration_n8n_token(

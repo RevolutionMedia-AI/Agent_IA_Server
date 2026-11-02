@@ -113,15 +113,20 @@ async def test_mute_buffer_cursor_advances_per_turn():
 # ── 3. session.update payload — silence + no tools ───────────────────────
 
 
-def test_session_update_payload_has_no_tools_and_longer_silence():
-    """The session.update JSON must NOT include tools (central pipeline
-    owns them) and must request a 1500 ms silence window so the user
-    has time to think between phrases.
+def test_session_update_payload_registers_tools_and_longer_silence():
+    """The session.update JSON must register the agent's tools with
+    tool_choice="auto" and must request a 1500 ms silence window so the
+    user has time to think between phrases.
+
+    ponytail: the payload USED to omit tools ("the central pipeline
+    owns them"). That was wrong: process_transcripts runs with
+    trigger_llm=False for the Realtime source, so the central pipeline
+    never executes tool calls — the Realtime provider is the only path
+    that emits function_calls. Without tools the model could only speak
+    text when the caller asked for a transfer.
     """
     session = CallSession(session_key="session-update")
     session.custom_prompt = "Eres Eduardo, agente de soporte."
-    # Provide agent_tools so the helper WOULD return them; the
-    # builder must still drop them.
     session.agent_tools = [
         {"function_name": "find_customer", "name": "find_customer",
          "description": "x", "parameters": {"type": "object", "properties": {}}}
@@ -129,33 +134,61 @@ def test_session_update_payload_has_no_tools_and_longer_silence():
 
     payload = json.loads(ort._build_session_update_payload(session))
     audio = payload["session"]["audio"]["input"]
-    assert "tools" not in payload["session"]
-    assert "tool_choice" not in payload["session"]
+    assert payload["session"]["tools"], "the agent's tools must be registered"
+    assert payload["session"]["tool_choice"] == "auto"
     assert audio["turn_detection"]["silence_duration_ms"] == 1500
     assert audio["turn_detection"]["type"] == "server_vad"
+
+
+def test_session_update_payload_omits_tools_when_agent_has_none():
+    """No tools → the fields are omitted entirely (an empty list is
+    accepted by the API but carries the same meaning with more bytes)."""
+    session = CallSession(session_key="session-update-no-tools")
+    session.custom_prompt = "Eres Eduardo, agente de soporte."
+    session.agent_tools = []
+
+    payload = json.loads(ort._build_session_update_payload(session))
+    assert "tools" not in payload["session"]
+    assert "tool_choice" not in payload["session"]
 
 
 # ── 4. STT provider 'openai' must not double-consume transcripts ─────────
 
 
-def test_openai_stt_does_not_launch_central_consumer_directly(monkeypatch):
+def test_realtime_stt_does_not_launch_central_consumer_directly(monkeypatch):
     """Guards against accidentally re-introducing process_transcripts
-    on the openai stt branch (it'd race the relay pump and double-fire
-    TTS). The relevant block in STT_Server.py must contain the new
-    explanatory comment but must NOT call ``process_transcripts`` on
-    the openai branch.
+    on the REALTIME branch (it'd race the relay pump and double-fire
+    TTS).
+
+    The openai branch has two sub-cases and they need OPPOSITE
+    treatment:
+      * the speech-to-speech Realtime model — the relay pump forwards
+        its finals into the central queue, so no second consumer;
+      * the cascade transcription model (gpt-transcribe & friends) —
+        it feeds the queue directly and therefore DOES need its own
+        consumer.
+
+    The previous version sliced the whole openai branch (both
+    sub-cases) and asserted the absence of the call, so the cascade
+    case could never be added.
     """
     import inspect
     from STT_server import STT_Server
     src = inspect.getsource(STT_Server.media_stream)
-    openai_idx = src.find("session.stt_provider in ('openai_realtime', 'openai')")
+    cascade_idx = src.find("run_openai_transcription_stt")
+    pump_idx = src.find("_pump_realtime_transcripts_to_central_queue")
     inworld_idx = src.find("elif session.stt_provider == 'inworld'")
-    assert openai_idx != -1 and inworld_idx != -1, "branch order changed"
-    openai_block = src[openai_idx:inworld_idx]
-    # The original branch launched process_transcripts after the pump;
-    # we now rely on the pump alone.
-    assert "process_transcripts(session)" not in openai_block, (
-        "openai stt branch must not launch process_transcripts; the "
+    assert cascade_idx != -1 and pump_idx != -1 and inworld_idx != -1, "branch order changed"
+
+    cascade_block = src[cascade_idx:pump_idx]
+    assert "process_transcripts(session)" in cascade_block, (
+        "the cascade transcription branch feeds the queue directly and "
+        "must own the central consumer"
+    )
+
+    realtime_block = src[pump_idx:inworld_idx]
+    assert "process_transcripts(session)" not in realtime_block, (
+        "realtime stt branch must not launch process_transcripts; the "
         "pump already forwards realtime finals into the central queue."
     )
 

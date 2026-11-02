@@ -32,6 +32,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+# ponytail: the fallback URL the dispatcher hands to Twilio. The
+# previous lambda closed over a `public_url` name that only existed as
+# a parameter of _session_with_agent — calling it raised NameError.
+_PUBLIC_URL = "https://example.test"
+
 
 def _reload_realtime():
     if "STT_server.adapters.openai_realtime" in __import__("sys").modules:
@@ -106,7 +111,7 @@ async def test_e2e_realtime_reception_dispatch_full_path(monkeypatch):
     )
     monkeypatch.setattr(
         "STT_server.services.transfer_cascade.transfer_fallback_url",
-        lambda *a, **kw: f"{public_url}/voice/transfer-fallback" if public_url else None,
+        lambda *a, **kw: f"{_PUBLIC_URL}/voice/transfer-fallback" if _PUBLIC_URL else None,
     )
 
     # build_messages path: skip DB lookup for transfer_chain by

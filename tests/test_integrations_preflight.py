@@ -108,14 +108,19 @@ async def test_preflight_unknown_provider(client, auth_token, stub_runner):
 
 
 async def test_preflight_provider_without_test_fn(client, auth_token, stub_runner):
-    # Salesforce has test_fn=None → returns "Test not yet implemented"
+    """A provider whose spec has test_fn=None cannot be probed yet.
+
+    ponytail: this used to be asserted against Salesforce, which had no
+    test_fn back then. Salesforce ships one now, so the example moved
+    to hubspot — any provider without a test_fn takes this path.
+    """
     resp = await client.post(
         "/integrations/preflight",
         headers={"Authorization": f"Bearer {auth_token}"},
         json={
-            "provider": "salesforce",
-            "configuration": {"instance_url": "https://acme.my.salesforce.com"},
-            "credentials": {"access_token": "a" * 25},
+            "provider": "hubspot",
+            "configuration": {},
+            "credentials": {},
         },
     )
     body = resp.json()
@@ -123,6 +128,28 @@ async def test_preflight_provider_without_test_fn(client, auth_token, stub_runne
     assert "not yet implemented" in body["message"]
     # stub never ran (test_fn was None)
     assert stub_runner["calls"] == []
+
+
+async def test_preflight_provider_with_test_fn_runs_it(client, auth_token, stub_runner):
+    """The other half of the contract: a provider that DOES ship a
+    test_fn has it executed against the supplied credentials.
+
+    ponytail: Salesforce used to be the "no test_fn" example; it now
+    ships one, so the probe reaches the provider instead of short-
+    circuiting.
+    """
+    resp = await client.post(
+        "/integrations/preflight",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={
+            "provider": "zendesk",
+            "configuration": {"subdomain": "acme"},
+            "credentials": {"email": "admin@acme.com", "api_token": "a" * 25},
+        },
+    )
+    body = resp.json()
+    assert body["valid"] is True
+    assert len(stub_runner["calls"]) == 1
 
 
 async def test_create_integration_blocked_by_preflight_failure(client, auth_token, stub_runner):
