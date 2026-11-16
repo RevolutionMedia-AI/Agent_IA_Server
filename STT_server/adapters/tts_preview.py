@@ -57,7 +57,10 @@ async def preview_tts(
     if inline_key:
         creds = {"api_key": inline_key}
     else:
-        creds = resolve_provider(user_id, provider) if user_id else {}
+        from STT_server.services.db_async import db_call
+        creds = (
+            await db_call(resolve_provider, user_id, provider) if user_id else {}
+        )
     session = CallSession(session_key="preview")
     session.user_id = user_id
     session.tts_provider = provider

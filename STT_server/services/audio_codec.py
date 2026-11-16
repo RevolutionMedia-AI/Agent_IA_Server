@@ -1,12 +1,22 @@
-"""G.711 mu-law codec — pure-Python drop-in for the deprecated ``audioop`` stdlib module.
+"""G.711 mu-law codec — drop-in for the deprecated ``audioop`` stdlib module.
 
 Only ``width=2`` (16-bit signed PCM LE) is supported, matching the only callsite
 used by the Agent_IA voice pipeline. The decode table is byte-for-byte identical
 to CPython ``audioop.ulaw2lin`` so the two implementations can be swapped without
 behavioural drift.
+
+``ulaw2lin`` and ``rms`` are vectorised with numpy because they sit on the
+per-frame hot path: every incoming media chunk decodes μ-law to PCM and every
+frame is RMS-measured for the VAD. The pure-Python loop cost ~80 µs and ~21 µs
+per 160-byte frame; the vectorised versions cost ~3 µs each. Output is
+bit-identical (see tests/test_audio_codec.py, which fuzzes both against the
+original pure-Python reference). ``lin2ulaw`` stays pure Python — it has no
+production caller.
 """
 import math
 import struct
+
+import numpy as np
 
 
 # ── lookup tables ────────────────────────────────────────────────────────
@@ -48,18 +58,25 @@ _MULAW_TO_LINEAR = b''.join(struct.pack('<h', x) for x in (
 
 _SEG_UEND = (0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF)
 
+# ponytail: the numpy view of the SAME table — derived, never a second
+# literal, so the two can never drift. "<i2" is explicit little-endian:
+# numpy's native int16 would emit big-endian bytes on a BE host and break
+# the "signed PCM LE" contract. .tobytes() then always writes LE.
+_MULAW_TABLE = np.frombuffer(_MULAW_TO_LINEAR, dtype="<i2")
+
 
 # ── public API ───────────────────────────────────────────────────────────
 def ulaw2lin(audio: bytes, width: int) -> bytes:
-    """Decode mu-law bytes to signed PCM LE. Only ``width=2`` supported."""
+    """Decode mu-law bytes to signed PCM LE. Only ``width=2`` supported.
+
+    ponytail: was a per-byte Python loop (80.7 µs per 160-byte frame,
+    measured). Now a numpy fancy-index into the decode table (3.2 µs) —
+    the hot path decodes every incoming media chunk. Output is
+    bit-identical to the old loop; tests/test_audio_codec.py fuzzes both.
+    """
     if width != 2:
         raise ValueError(f"width must be 2, got {width}")
-    n = len(audio)
-    out = bytearray(n * 2)
-    tab = _MULAW_TO_LINEAR
-    for i, b in enumerate(audio):
-        out[i * 2:i * 2 + 2] = tab[b * 2:b * 2 + 2]
-    return bytes(out)
+    return _MULAW_TABLE[np.frombuffer(audio, dtype=np.uint8)].tobytes()
 
 
 def lin2ulaw(audio: bytes, width: int) -> bytes:
@@ -77,18 +94,33 @@ def lin2ulaw(audio: bytes, width: int) -> bytes:
 
 
 def rms(audio: bytes, width: int) -> int:
-    """Root-mean-square of signed PCM samples. Only ``width=2`` supported."""
+    """Root-mean-square of signed PCM samples. Only ``width=2`` supported.
+
+    ponytail: was a per-sample Python loop (20.9 µs per frame) and sat
+    right next to the VAD decision, so it was the second-hottest
+    function in the whole audio path. Now vectorised.
+
+    The sum of squares is accumulated in int64, not float64: the old
+    float accumulation was exact only while the running total stayed
+    under 2**53, and an exact int64 sum is what makes the vectorised
+    result bit-identical to it. int64 overflows past 9.2e18, i.e. a
+    buffer of ~2.6M int16 samples, so it cannot happen in practice.
+    """
     if width != 2:
         raise ValueError(f"width must be 2, got {width}")
     if len(audio) == 0:
         return 0
+    if len(audio) % width:
+        # The old loop raised struct.error here (struct.unpack_from on a
+        # trailing half-sample). numpy raises ValueError instead, so
+        # raise the original type explicitly to keep except clauses
+        # matching.
+        raise struct.error("audio length not a multiple of width")
     n = len(audio) // width
     if n == 0:
         return 0
-    total = 0.0
-    for i in range(0, len(audio), width):
-        s = struct.unpack_from('<h', audio, i)[0]
-        total += s * s
+    samples = np.frombuffer(audio, dtype="<i2").astype(np.int64)
+    total = int(np.dot(samples, samples))
     return int(math.sqrt(total / n))
 
 

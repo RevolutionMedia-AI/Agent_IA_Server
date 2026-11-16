@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 import asyncio
 import time
 
@@ -153,6 +154,13 @@ class CallSession:
     stt_use_own_key: bool = False
     llm_use_own_key: bool = False
     tts_use_own_key: bool = False
+    # ponytail: per-call snapshot of the user's decrypted provider
+    # credentials, loaded ONCE at WS start. Without it every adapter
+    # lookup (once per TTS segment, per LLM turn, per STT session) hit
+    # Postgres and re-ran Fernet decrypt. None means "no snapshot --
+    # the resolver falls back to reading the DB", which is what
+    # non-session callers (admin routes, previews) want.
+    cred_snapshot: Any = None
     vad_buffer: bytearray = field(default_factory=bytearray)
     pre_speech_frames: deque[bytes] = field(default_factory=lambda: deque(maxlen=PRE_SPEECH_FRAMES))
     # AUDIO-005: deque(maxlen=...) bounds the per-utterance PCM buffer at

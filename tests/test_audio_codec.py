@@ -5,15 +5,47 @@ Covers the public G.711 mu-law codec surface (``ulaw2lin``, ``lin2ulaw``, ``rms`
   - all-256-code round-trip stability (the core correctness property),
   - width and length guards,
   - rms behaviour on zero, DC, and alternating-sign inputs,
-  - random-fuzz round-trip stays within G.711 quantisation buckets (±4).
+  - random-fuzz round-trip stays within G.711 quantisation buckets (±4),
+  - the numpy-vectorised ``ulaw2lin``/``rms`` are bit-identical to the
+    pure-Python reference they replaced.
 """
 from __future__ import annotations
 
+import math
 import random
+import struct
 
 import pytest
 
+from STT_server.services import audio_codec
 from STT_server.services.audio_codec import lin2ulaw, rms, ulaw2lin
+
+
+# ── pure-Python reference implementations ────────────────────────────────
+# These are the originals, kept here (not in the package) so the
+# vectorised versions can be proven bit-identical. If someone changes
+# audio_codec, these stay frozen and the comparison still means something.
+
+
+def _ref_ulaw2lin(audio: bytes, width: int) -> bytes:
+    tab = audio_codec._MULAW_TO_LINEAR
+    out = bytearray(len(audio) * 2)
+    for i, b in enumerate(audio):
+        out[i * 2:i * 2 + 2] = tab[b * 2:b * 2 + 2]
+    return bytes(out)
+
+
+def _ref_rms(audio: bytes, width: int) -> int:
+    if len(audio) == 0:
+        return 0
+    n = len(audio) // width
+    if n == 0:
+        return 0
+    total = 0.0
+    for i in range(0, len(audio), width):
+        s = struct.unpack_from('<h', audio, i)[0]
+        total += s * s
+    return int(math.sqrt(total / n))
 
 
 # ── ulaw2lin ─────────────────────────────────────────────────────────────
@@ -146,3 +178,64 @@ def test_random_fuzz_roundtrip_within_quantisation_tolerance() -> None:
         f"worst round-trip delta {worst_delta} exceeds 1024 LSB "
         "(segment-7 step for audioop-compatible G.711)"
     )
+
+
+# ── vectorised implementation == pure-Python reference ───────────────────
+
+
+def test_ulaw2lin_vectorised_matches_reference() -> None:
+    """The numpy table lookup must be byte-identical to the old Python loop.
+
+    ``ulaw2lin`` decodes every incoming media chunk, so a one-bit change
+    here is audible on every call. Exhaustive over all 256 codes and every
+    buffer length up to 600 bytes, plus random buffers up to 4 kB.
+    """
+    rng = random.Random(1234)
+    for n in range(0, 601):
+        buf = bytes(rng.randint(0, 255) for _ in range(n))
+        assert ulaw2lin(buf, 2) == _ref_ulaw2lin(buf, 2), f"mismatch at len={n}"
+    for _ in range(500):
+        buf = bytes(rng.randint(0, 255) for _ in range(rng.randint(0, 4000)))
+        assert ulaw2lin(buf, 2) == _ref_ulaw2lin(buf, 2)
+
+
+def test_ulaw2lin_vectorised_all_256_codes() -> None:
+    """Every mu-law code decodes to the exact table entry."""
+    for b in range(256):
+        assert ulaw2lin(bytes([b]), 2) == _ref_ulaw2lin(bytes([b]), 2)
+
+
+def test_rms_vectorised_matches_reference() -> None:
+    """The vectorised RMS must return the exact same integer.
+
+    ``rms`` feeds the VAD voice threshold, so a 1-off drift can flip a
+    speech/silence decision and change barge-in behaviour.
+    """
+    rng = random.Random(4321)
+    for _ in range(2000):
+        n = rng.randint(1, 400)
+        samples = [
+            rng.choice([-32768, -1, 0, 1, 32767, rng.randint(-32768, 32767)])
+            for _ in range(n)
+        ]
+        buf = b"".join(struct.pack('<h', s) for s in samples)
+        assert rms(buf, 2) == _ref_rms(buf, 2), f"mismatch at n={n}"
+
+
+def test_rms_vectorised_exhaustive_single_sample() -> None:
+    """Every int16 value, on its own, gives the same RMS as the reference."""
+    for s in range(-32768, 32768):
+        buf = struct.pack('<h', s)
+        assert rms(buf, 2) == _ref_rms(buf, 2), f"mismatch for sample {s}"
+
+
+def test_rms_odd_length_raises_struct_error() -> None:
+    """Odd-length PCM keeps raising ``struct.error`` (not ValueError).
+
+    The pure-Python loop raised ``struct.error`` on a trailing half
+    sample; the numpy path would raise ValueError. Callers' except
+    clauses must keep matching, so the type is pinned here.
+    """
+    with pytest.raises(struct.error):
+        rms(b"\x01\x00\x02", 2)
+

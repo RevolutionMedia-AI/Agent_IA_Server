@@ -462,7 +462,8 @@ async def execute_tool_call(
     integration = None
     if tool.get("integration_id"):
         from STT_server.db_integrations import get_integration as db_get_integration
-        integration = db_get_integration(tool["integration_id"], user_id)
+        from STT_server.services.db_async import db_call
+        integration = await db_call(db_get_integration, tool["integration_id"], user_id)
         if not integration:
             raise ToolExecutionError(
                 f"Integration '{tool['integration_id']}' missing or revoked"
@@ -510,7 +511,9 @@ async def execute_tool_call(
         # tool call.
         try:
             from STT_server.db_integrations import get_integration_n8n_token
-            scoped_token = get_integration_n8n_token(
+            from STT_server.services.db_async import db_call
+            scoped_token = await db_call(
+                get_integration_n8n_token,
                 integration["id"], user_id,
             )
         except Exception as exc:

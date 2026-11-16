@@ -702,7 +702,9 @@ async def _exec_transfer(
     chain_cfg: list = []
     try:
         from STT_server.db_agents import get_agent as _ga
-        arow = _ga(
+        from STT_server.services.db_async import db_call
+        arow = await db_call(
+            _ga,
             getattr(session, "agent_id", None),
             getattr(session, "user_id", None),
         )

@@ -54,6 +54,7 @@ from STT_server import db_tenants
 from STT_server.db import is_postgres
 from STT_server.services.audio_ingest import handle_incoming_media
 from STT_server.services.common import require_debug_endpoints
+from STT_server.services.db_async import db_call
 from STT_server.services._instrumentation import Stages
 from STT_server.services.reconnect import BackoffPolicy, with_backoff
 from STT_server.services.playback_service import playback_loop
@@ -147,7 +148,7 @@ def _safe_int(v) -> int | None:
         return None
 
 
-def _resolve_twilio_credential(called_to, account_sid=None):
+async def _resolve_twilio_credential(called_to, account_sid=None):
     """Resolve the Twilio auth token that can verify a webhook for `called_to`.
 
     Returns (token, account_sid, source, row_id). Settings is the source of
@@ -161,6 +162,10 @@ def _resolve_twilio_credential(called_to, account_sid=None):
     only read the inline column — so any number whose credential lives in
     Settings authenticated on the inbound leg and then failed closed with
     503 on every cascade/chain callback. See commit 592f552's follow-up.
+
+    ponytail: async because it reads the DB, and it runs inside the
+    /voice webhook — the event loop that also serves live calls. The
+    reads go to the DB thread pool instead of blocking the loop.
     """
     token = sid = None
     source = "per-number"
@@ -169,7 +174,7 @@ def _resolve_twilio_credential(called_to, account_sid=None):
         return None, None, source, None
     try:
         from STT_server.db_phone_numbers import find_by_number
-        row = find_by_number(called_to)
+        row = await db_call(find_by_number, called_to)
     except Exception as exc:
         log.warning("[TWILIO] could not look up phone row for To=%s: %s", called_to, exc)
         return None, None, source, None
@@ -188,11 +193,11 @@ def _resolve_twilio_credential(called_to, account_sid=None):
         cred = None
         cred_id = row.get("twilio_credential_id")
         if cred_id:
-            cred = _twcreds.find_for_phone_number(cred_id, user_id)
+            cred = await db_call(_twcreds.find_for_phone_number, cred_id, user_id)
             if cred and cred.get("auth_token"):
                 source = f"settings:{cred_id}"
         if not (cred and cred.get("auth_token")):
-            cred = _twcreds.resolve_for_user(user_id, account_sid)
+            cred = await db_call(_twcreds.resolve_for_user, user_id, account_sid)
             if cred and cred.get("auth_token"):
                 source = f"settings:{cred.get('id')}"
         if cred and cred.get("auth_token"):
@@ -274,7 +279,10 @@ def _resume_copy(language, custom=None):
 # of "we have crash recovery" when we don't.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db_tenants.backfill_from_json()
+    # ponytail: the backfill writes to Postgres, so it runs on the DB
+    # thread pool — the event loop is already serving traffic by the
+    # time a lifespan hook runs on a reload.
+    await db_call(db_tenants.backfill_from_json)
     # ponytail: the `nullify_stale_tool_integration_pointers()` boot
     # backfill is GONE. It ran
     #   UPDATE agent_tools SET integration_id = NULL WHERE integration_id IS NOT NULL
@@ -618,7 +626,7 @@ async def voice(
     # number that's calling. The user enters that token via
     # ModalConnectNumber; if missing, REJECT the call — there's no
     # fallback to a global credential (removed per the spec).
-    per_number_token, per_number_sid, token_source, per_number_row_id = _resolve_twilio_credential(
+    per_number_token, per_number_sid, token_source, per_number_row_id = await _resolve_twilio_credential(
         form_dict.get("To") or form_dict.get("to"),
         form_dict.get("AccountSid") or form_dict.get("accountsid"),
     )
@@ -705,7 +713,7 @@ async def voice(
         if called_to:
             e164 = str(called_to).strip()
             from STT_server.db_phone_numbers import find_by_number as find_num
-            num_row = find_num(e164)
+            num_row = await db_call(find_num, e164)
             if num_row:
                 agent_id = num_row.get("agent") or None
                 # ponytail: log at WARNING so it shows up in the same
@@ -807,7 +815,7 @@ async def voice(
     if agent_id:
         try:
             from STT_server.db_agents import get_agent as _get_agent
-            _agent_row = _get_agent(agent_id)
+            _agent_row = await db_call(_get_agent, agent_id)
             _raw_cascade = (_agent_row or {}).get("transfer_cascade")
             # ponytail: timeout atomicity (runtime half). Tool-linked
             # entries resolve destination + timeout from the live tool
@@ -823,7 +831,10 @@ async def voice(
             try:
                 if _agent_row and _agent_row.get("user_id"):
                     from STT_server.db_tools import list_tools as _list_tools
-                    for _t in _list_tools(_agent_row["user_id"], agent_id=agent_id) or []:
+                    _tool_rows = await db_call(
+                        _list_tools, _agent_row["user_id"], agent_id=agent_id
+                    )
+                    for _t in _tool_rows or []:
                         if isinstance(_t, dict) and _t.get("id"):
                             _tools_by_id[_t["id"]] = _t
             except Exception as _txc:
@@ -855,7 +866,8 @@ async def voice(
                 _tz_name = None
                 if _agent_row.get("user_id"):
                     from STT_server.db_settings import get_settings as _get_settings
-                    _tz_name = (_get_settings(_agent_row["user_id"]) or {}).get("timezone")
+                    _settings = await db_call(_get_settings, _agent_row["user_id"])
+                    _tz_name = (_settings or {}).get("timezone")
                 _ai_first = agent_answers_ai_first(_agent_row, _tz_name)
             except Exception as exc:
                 # A holiday lookup must never cost us the call: degrade to
@@ -950,7 +962,7 @@ async def voice_cascade(
 
     from STT_server.adapters.twilio_api import validate_twilio_signature
     called_to = form_dict.get("To") or form_dict.get("to")
-    token_to_check, _cascade_sid, _cascade_src, _cascade_row = _resolve_twilio_credential(
+    token_to_check, _cascade_sid, _cascade_src, _cascade_row = await _resolve_twilio_credential(
         called_to, form_dict.get("AccountSid") or form_dict.get("accountsid"),
     )
     if not token_to_check:
@@ -1006,7 +1018,7 @@ async def voice_cascade(
     )
     from STT_server.db_agents import get_agent as _get_agent
     try:
-        agent_row = _get_agent(agent_id) if agent_id else None
+        agent_row = await db_call(_get_agent, agent_id) if agent_id else None
     except Exception:
         agent_row = None
     # ponytail: same canonical resolution as /voice (see above) — every
@@ -1018,7 +1030,10 @@ async def voice_cascade(
         _cascade_tools_by_id: dict | None = {}
         if agent_row and agent_row.get("user_id"):
             from STT_server.db_tools import list_tools as _list_tools
-            for _t in _list_tools(agent_row["user_id"], agent_id=agent_id) or []:
+            _cascade_rows = await db_call(
+                _list_tools, agent_row["user_id"], agent_id=agent_id
+            )
+            for _t in _cascade_rows or []:
                 if isinstance(_t, dict) and _t.get("id"):
                     _cascade_tools_by_id[_t["id"]] = _t
     except Exception as exc:
@@ -1180,7 +1195,7 @@ async def voice_transfer_fallback(
 
     from STT_server.adapters.twilio_api import validate_twilio_signature
     called_to2 = form_dict.get("To") or form_dict.get("to")
-    token_to_check, _fb_sid, _fb_src, _fb_row = _resolve_twilio_credential(
+    token_to_check, _fb_sid, _fb_src, _fb_row = await _resolve_twilio_credential(
         called_to2, form_dict.get("AccountSid") or form_dict.get("accountsid"),
     )
     if not token_to_check:
@@ -1229,14 +1244,17 @@ async def voice_transfer_fallback(
     from STT_server.db_agents import get_agent as _get_agent
     from STT_server.db_tools import list_tools as _list_tools
     try:
-        agent_row = _get_agent(agent_id) if agent_id else None
+        agent_row = await db_call(_get_agent, agent_id) if agent_id else None
     except Exception:
         agent_row = None
     ids = [x.strip() for x in (remaining or "").split(",") if x.strip()]
     tools_by_id: dict = {}
     try:
         if agent_row and agent_row.get("user_id"):
-            for t in _list_tools(agent_row["user_id"], agent_id=agent_id) or []:
+            _fallback_rows = await db_call(
+                _list_tools, agent_row["user_id"], agent_id=agent_id
+            )
+            for t in _fallback_rows or []:
                 if isinstance(t, dict) and t.get("id"):
                     tools_by_id[t["id"]] = t
     except Exception as exc:
@@ -1453,6 +1471,27 @@ async def _pump_realtime_transcripts_to_central_queue(session: CallSession) -> N
                         session.session_key)
 
 
+async def _ensure_cred_snapshot(session: CallSession) -> None:
+    """Load this call's credential snapshot, once.
+
+    ponytail: PERF-002. The user's provider credentials are read from
+    Postgres and decrypted ONCE per call and then kept on the session.
+    Without this, every provider lookup during the call re-read the
+    user's whole integration set and re-ran the Fernet decrypt — once
+    per TTS segment, per LLM turn, per STT session.
+
+    Safe to call more than once: the second call is a no-op. The DB
+    read runs on the DB thread pool so it never blocks the event loop
+    that is serving the call's audio frames.
+    """
+    if getattr(session, "cred_snapshot", None) is not None:
+        return
+    from STT_server.services.credentials_resolver import load_credential_snapshot
+    session.cred_snapshot = await db_call(
+        load_credential_snapshot, getattr(session, "user_id", None)
+    )
+
+
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket) -> None:
     # TODO reconnect: wrap call accept with with_backoff when transient failures appear in prod logs
@@ -1559,7 +1598,7 @@ async def media_stream(ws: WebSocket) -> None:
                 custom_params = start.get("customParameters") or {}
                 tenant_id = custom_params.get("tenant_id") if isinstance(custom_params, dict) else None
                 if tenant_id:
-                    tenant = tenant_store.get(tenant_id)
+                    tenant = await db_call(tenant_store.get, tenant_id)
                     if tenant:
                         session.custom_prompt = tenant.custom_prompt
                         session.tts_provider = tenant.tts_provider
@@ -1600,7 +1639,7 @@ async def media_stream(ws: WebSocket) -> None:
                     # the fields below don't need to change.
                     try:
                         from STT_server.db_agents import get_agent as _get_agent_db
-                        agent_cfg = _get_agent_db(agent_id_from_params)
+                        agent_cfg = await db_call(_get_agent_db, agent_id_from_params)
                     except Exception as exc:
                         log.warning("[AGENT] db lookup failed for %s: %s", agent_id_from_params, exc)
                 else:
@@ -1620,7 +1659,7 @@ async def media_stream(ws: WebSocket) -> None:
                     # the fields below don't need to change.
                     try:
                         from STT_server.db_agents import get_agent as _get_agent_db
-                        agent_cfg = _get_agent_db(agent_id_from_params)
+                        agent_cfg = await db_call(_get_agent_db, agent_id_from_params)
                     except Exception as exc:
                         log.warning("[AGENT] db lookup failed for %s: %s", agent_id_from_params, exc)
 
@@ -1674,6 +1713,18 @@ async def media_stream(ws: WebSocket) -> None:
                     # Used downstream by resolve_provider() to pick the
                     # right per-user credential.
                     session.user_id = agent_cfg.get('user_id') or session.user_id
+                    # ponytail: PERF-002 — load the user's credentials ONCE
+                    # per call, here, and keep them on the session. Before
+                    # this, every provider lookup (three auto-detect scans
+                    # right below, then one per TTS segment, per LLM turn
+                    # and per STT session) re-read the user's whole
+                    # integration set from Postgres and re-ran the Fernet
+                    # decrypt. One read now, dict hits for the rest of the
+                    # call. Loaded AFTER session.user_id is final.
+                    from STT_server.services.credentials_resolver import (
+                        find_first_configured_provider,
+                    )
+                    await _ensure_cred_snapshot(session)
                     # ponytail: provider resolution is per-agent > per-user
                     # auto-detect. The user explicitly asked for "no model
                     # or provider por defecto" — if the agent row has a
@@ -1682,13 +1733,12 @@ async def media_stream(ws: WebSocket) -> None:
                     # available one for the category. If neither, we
                     # fail loud (no env-var fallback) — the call adapter
                     # surfaces a clear error and the operator sees it.
-                    from STT_server.services.credentials_resolver import find_first_configured_provider
                     _cfg_stt = (agent_cfg.get('stt_provider') or '').strip().lower() or None
                     _cfg_tts = (agent_cfg.get('tts_provider') or '').strip().lower() or None
                     _cfg_llm = (agent_cfg.get('llm_provider') or '').strip().lower() or None
-                    session.stt_provider = _cfg_stt or find_first_configured_provider(session.user_id, 'stt') or ''
-                    session.tts_provider = _cfg_tts or find_first_configured_provider(session.user_id, 'tts') or ''
-                    session.llm_provider = _cfg_llm or find_first_configured_provider(session.user_id, 'llm') or 'openai'
+                    session.stt_provider = _cfg_stt or find_first_configured_provider(session.user_id, 'stt', snapshot=session.cred_snapshot) or ''
+                    session.tts_provider = _cfg_tts or find_first_configured_provider(session.user_id, 'tts', snapshot=session.cred_snapshot) or ''
+                    session.llm_provider = _cfg_llm or find_first_configured_provider(session.user_id, 'llm', snapshot=session.cred_snapshot) or 'openai'
                     session.stt_model = (agent_cfg.get('stt_model') or None)
                     # ponytail: 027 — the STT latency/accuracy dial. Kept
                     # as the RAW stored value here; the transcription
@@ -1765,7 +1815,9 @@ async def media_stream(ws: WebSocket) -> None:
                     if session.user_id and session.agent_id:
                         try:
                             from STT_server.db_phone_numbers import find_for_agent as _find_num_for_agent
-                            num_row = _find_num_for_agent(session.user_id, session.agent_id)
+                            num_row = await db_call(
+                                _find_num_for_agent, session.user_id, session.agent_id
+                            )
                             if num_row:
                                 session.twilio_account_sid = num_row.get("twilio_account_sid") or None
                                 session.twilio_auth_token = num_row.get("twilio_auth_token") or None
@@ -1776,9 +1828,13 @@ async def media_stream(ws: WebSocket) -> None:
                                         _cred = None
                                         _cid = num_row.get("twilio_credential_id")
                                         if _cid:
-                                            _cred = _twcreds.find_for_phone_number(_cid, session.user_id)
+                                            _cred = await db_call(
+                                                _twcreds.find_for_phone_number, _cid, session.user_id
+                                            )
                                         if not (_cred and _cred.get("auth_token")):
-                                            _cred = _twcreds.resolve_for_user(session.user_id)
+                                            _cred = await db_call(
+                                                _twcreds.resolve_for_user, session.user_id
+                                            )
                                         if _cred and _cred.get("auth_token"):
                                             session.twilio_account_sid = session.twilio_account_sid or _cred.get("account_sid")
                                             session.twilio_auth_token = _cred.get("auth_token")
@@ -1884,7 +1940,9 @@ async def media_stream(ws: WebSocket) -> None:
                     # this user are also loaded (the marketplace
                     # pattern: shared tools live with agent_id=
                     # "__shared__" in the same JSON file).
-                    session.agent_tools = _load_agent_tools(session.agent_id, session.user_id)
+                    session.agent_tools = await db_call(
+                        _load_agent_tools, session.agent_id, session.user_id
+                    )
                     if session.agent_tools:
                         # ponytail: 2026-10-02 — INFO→DEBUG. Tool count
                         # only changes when an operator edits the agent.
@@ -2016,6 +2074,12 @@ async def media_stream(ws: WebSocket) -> None:
                             "message(s), greeting overridden, history seeded",
                             session.session_key, session.agent_id, len(_carried),
                         )
+                # ponytail: calls with no agent row never reached the
+                # snapshot load inside the agent block above. Load it here
+                # too (idempotent) so a tenant-scoped call without an
+                # agent still resolves its per-user keys from memory
+                # instead of one DB read per TTS segment.
+                await _ensure_cred_snapshot(session)
                 # AssemblyAI recommends opening the persistent TTS socket
                 # when the call starts, before the first reply is ready.
                 # This opens a session only (no generated warm-up audio);
@@ -2564,7 +2628,7 @@ async def list_tenants(request: Request) -> dict:
     user = getattr(request.state, "user", None) or {}
     caller_id = user.get("user_id")
     caller_role = (user.get("role") or "").strip().lower()
-    tenants = tenant_store.list_all()
+    tenants = await db_call(tenant_store.list_all)
     visible = []
     for t in tenants:
         owner = getattr(t, "user_id", None)
@@ -2624,7 +2688,7 @@ async def create_tenant(request: Request, body: TenantCreateRequest) -> dict:
         deepgram_api_key=body.deepgram_api_key,
     )
 
-    tenant_store.upsert(tenant)
+    await db_call(tenant_store.upsert, tenant)
     log.info("[TENANT] Created tenant %s (%s) owner=%s", tenant_id, body.name, caller_id or "(none)")
 
     return {
@@ -2636,7 +2700,7 @@ async def create_tenant(request: Request, body: TenantCreateRequest) -> dict:
 @app.get("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
 async def get_tenant(tenant_id: str, request: Request) -> dict:
     """Get a tenant's configuration (secrets are masked). 404 on owner mismatch."""
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     forbidden = _require_tenant_owner(request, tenant)
@@ -2653,7 +2717,7 @@ async def update_tenant(tenant_id: str, body: TenantCreateRequest, request: Requ
     returns 404 (same shape as not-found) so we don't leak the existence
     of tenants belonging to other users.
     """
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     forbidden = _require_tenant_owner(request, tenant)
@@ -2704,7 +2768,7 @@ async def update_tenant(tenant_id: str, body: TenantCreateRequest, request: Requ
         updated["deepgram_api_key"] = "updated"
 
     tenant.updated_at = time.time()
-    tenant_store.upsert(tenant)
+    await db_call(tenant_store.upsert, tenant)
     log.info("[TENANT] Updated tenant %s: %s", tenant_id, list(updated.keys()))
 
     return {
@@ -2717,12 +2781,12 @@ async def update_tenant(tenant_id: str, body: TenantCreateRequest, request: Requ
 @app.delete("/tenants/{tenant_id}", dependencies=[Depends(require_auth)])
 async def delete_tenant(tenant_id: str, request: Request) -> dict:
     """Delete a tenant configuration. 404 on owner mismatch."""
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if tenant is not None:
         forbidden = _require_tenant_owner(request, tenant)
         if forbidden is not None:
             return forbidden
-    deleted = tenant_store.delete(tenant_id)
+    deleted = await db_call(tenant_store.delete, tenant_id)
     if not deleted:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     log.info("[TENANT] Deleted tenant %s", tenant_id)
@@ -2733,7 +2797,7 @@ async def delete_tenant(tenant_id: str, request: Request) -> dict:
 async def validate_tenant_twilio(tenant_id: str, request: Request) -> dict:
     """Validate a tenant's Twilio credentials. 404 on owner mismatch."""
     from STT_server.adapters.twilio_api import validate_twilio_credentials
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     forbidden = _require_tenant_owner(request, tenant)
@@ -2755,7 +2819,7 @@ async def configure_tenant_webhook(tenant_id: str) -> dict:
     configure anything in the Twilio console.
     """
     from STT_server.adapters.twilio_api import configure_voice_webhook
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     if not tenant.has_twilio_credentials:
@@ -2773,7 +2837,7 @@ async def configure_tenant_webhook(tenant_id: str) -> dict:
         tenant.webhook_configured = True
         import time
         tenant.updated_at = time.time()
-        tenant_store.upsert(tenant)
+        await db_call(tenant_store.upsert, tenant)
         log.info("[TENANT] Webhook configured for %s -> %s", tenant_id, webhook_url)
 
     return result
@@ -2783,7 +2847,7 @@ async def configure_tenant_webhook(tenant_id: str) -> dict:
 async def list_tenant_numbers(tenant_id: str) -> dict:
     """List all phone numbers in the tenant's Twilio account."""
     from STT_server.adapters.twilio_api import list_phone_numbers
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     if not tenant.twilio_account_sid or not tenant.twilio_auth_token:
@@ -2796,7 +2860,7 @@ async def list_tenant_numbers(tenant_id: str) -> dict:
 async def make_call(tenant_id: str, body: OutboundCallRequest) -> dict:
     """Initiate an outbound call from the tenant's phone number."""
     from STT_server.adapters.twilio_api import make_outbound_call
-    tenant = tenant_store.get(tenant_id)
+    tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
     if not tenant.has_twilio_credentials:

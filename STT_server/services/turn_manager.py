@@ -625,7 +625,9 @@ async def _stream_llm_with_tools(
                 chain_cfg: list = []
                 try:
                     from STT_server.db_agents import get_agent as _get_agent
-                    _arow = _get_agent(
+                    from STT_server.services.db_async import db_call
+                    _arow = await db_call(
+                        _get_agent,
                         getattr(session, "agent_id", None),
                         getattr(session, "user_id", None),
                     )
@@ -994,7 +996,9 @@ async def _dial_confirmed_transfer(session: CallSession, pending: dict) -> None:
             if isinstance(t, dict) and t.get("id")
         }
         from STT_server.db_agents import get_agent as _get_agent
-        arow = _get_agent(
+        from STT_server.services.db_async import db_call
+        arow = await db_call(
+            _get_agent,
             getattr(session, "agent_id", None), getattr(session, "user_id", None),
         ) or {}
         chain = build_transfer_chain(tool_id, arow.get("transfer_chain") or [], tools_by_id)

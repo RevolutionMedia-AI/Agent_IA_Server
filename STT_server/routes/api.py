@@ -70,6 +70,7 @@ from STT_server.db_settings import (
     upsert_settings as db_upsert_settings,
 )
 from STT_server.db_campaigns import list_campaigns as db_list_campaigns
+from STT_server.services.db_async import db_call
 
 VALID_MODEL_SERVICES = {"stt", "tts", "llm"}
 
@@ -422,7 +423,7 @@ async def call_status(request: Request) -> dict:
         try:
             from STT_server.adapters.twilio_api import validate_twilio_signature
             from STT_server.db_phone_numbers import find_by_number as _find_num_for_sig
-            row = _find_num_for_sig(called_to) or {}
+            row = await db_call(_find_num_for_sig, called_to) or {}
             per_number_token = row.get("twilio_auth_token") or None
         except Exception as exc:
             log.warning("[call-status] per-number token lookup failed: %s", exc)
@@ -2610,7 +2611,7 @@ def unassign_shared_integration(agent_id: str, integration_id: str, auth: dict =
 @api_router.post("/agents/{agent_id}/tools/{tool_id}/test")
 async def test_agent_tool(agent_id: str, tool_id: str, auth: dict = Depends(require_auth)):
     """Test a tool by executing its webhook with sample data."""
-    tool = db_get_tool(tool_id, auth["user_id"])
+    tool = await db_call(db_get_tool, tool_id, auth["user_id"])
     if not tool or tool.get("agent_id") != agent_id:
         raise HTTPException(status_code=404, detail="Tool not found")
     return await _test_tool_row(tool, auth["user_id"])
@@ -2740,7 +2741,7 @@ def delete_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
 @api_router.post("/tools/{tool_id}/test")
 async def test_shared_tool(tool_id: str, auth: dict = Depends(require_auth)):
     """Smoke-test a shared n8n tool by hitting its webhook with sample args."""
-    tool = db_get_tool(tool_id, auth["user_id"])
+    tool = await db_call(db_get_tool, tool_id, auth["user_id"])
     if not tool or tool.get("agent_id") != SHARED_TOOL_AGENT_ID:
         raise HTTPException(status_code=404, detail="Tool not found")
     return await _test_tool_row(tool, auth["user_id"])
@@ -2839,7 +2840,7 @@ async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(requ
                     status_code=400,
                     detail="Twilio Auth Token must be 32-64 characters",
                 )
-    new_number = db_create_number(auth["user_id"], data.dict())
+    new_number = await db_call(db_create_number, auth["user_id"], data.dict())
 
     # ponytail: configure the Twilio webhook so calls actually route
     # to us. Without this the number lives in our DB but Twilio has no
@@ -2859,7 +2860,9 @@ async def create_phone_number(data: PhoneNumberCreate, auth: dict = Depends(requ
     if data.provider == "twilio" and not (_wh_sid and _wh_tok) and data.twilio_credential_id:
         try:
             from STT_server import db_twilio_credentials as _twcreds
-            _cred = _twcreds.find_for_phone_number(data.twilio_credential_id, auth["user_id"])
+            _cred = await db_call(
+                _twcreds.find_for_phone_number, data.twilio_credential_id, auth["user_id"]
+            )
             if _cred and _cred.get("account_sid") and _cred.get("auth_token"):
                 _wh_sid, _wh_tok = _cred["account_sid"], _cred["auth_token"]
         except Exception as exc:
@@ -3013,7 +3016,8 @@ async def create_twilio_credential(
             status_code=400,
             detail=f"Twilio rejected the credentials: {res.get('error') or res.get('message') or 'unknown error'}",
         )
-    saved = db_twcreds.create_credential(
+    saved = await db_call(
+        db_twcreds.create_credential,
         auth["user_id"],
         name=data.name,
         account_sid=data.account_sid.strip(),
@@ -3031,7 +3035,7 @@ async def update_twilio_credential(
     auth: dict = Depends(require_auth),
 ):
     from STT_server import db_twilio_credentials as db_twcreds
-    existing = db_twcreds.get_credential(credential_id, auth["user_id"])
+    existing = await db_call(db_twcreds.get_credential, credential_id, auth["user_id"])
     if not existing:
         raise HTTPException(status_code=404, detail="Credential not found")
 
@@ -3056,7 +3060,9 @@ async def update_twilio_credential(
     next_sid = data.account_sid.strip() if data.account_sid is not None else ""
     next_token = data.auth_token.strip() if data.auth_token is not None else ""
     if need_current_sid or need_current_token:
-        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+        full = await db_call(
+            db_twcreds.get_credential, credential_id, auth["user_id"], include_secrets=True
+        )
         if need_current_sid:
             next_sid = full.get("account_sid") or ""
         if need_current_token:
@@ -3086,7 +3092,9 @@ async def update_twilio_credential(
         kwargs["last_test_message"] = res.get("message") or res.get("error") or ""
         kwargs["account_sid"] = next_sid
         kwargs["auth_token"] = next_token
-    return db_twcreds.update_credential(credential_id, auth["user_id"], **kwargs)
+    return await db_call(
+        db_twcreds.update_credential, credential_id, auth["user_id"], **kwargs
+    )
 
 
 @api_router.delete("/twilio-credentials/{credential_id}")
@@ -3107,7 +3115,9 @@ async def test_twilio_credential(
     re-save."""
     from STT_server import db_twilio_credentials as db_twcreds
     try:
-        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+        full = await db_call(
+            db_twcreds.get_credential, credential_id, auth["user_id"], include_secrets=True
+        )
     except Exception as exc:
         # ponytail: a row encrypted with a rotated/lost
         # CREDENTIAL_ENCRYPTION_KEY raises InvalidToken from Fernet.
@@ -3130,7 +3140,8 @@ async def test_twilio_credential(
     res = await validate_twilio_credentials(sid, token)
     status = "connected" if res.get("valid") else "invalid"
     message = res.get("message") or res.get("error") or ""
-    updated = db_twcreds.update_credential(
+    updated = await db_call(
+        db_twcreds.update_credential,
         credential_id,
         auth["user_id"],
         status=status,
@@ -3152,7 +3163,9 @@ async def validate_twilio_number(
     """
     from STT_server import db_twilio_credentials as db_twcreds
     try:
-        full = db_twcreds.get_credential(credential_id, auth["user_id"], include_secrets=True)
+        full = await db_call(
+            db_twcreds.get_credential, credential_id, auth["user_id"], include_secrets=True
+        )
     except Exception as exc:
         if exc.__class__.__name__ == "InvalidToken":
             raise HTTPException(
@@ -3707,7 +3720,10 @@ async def tts_preview(body: TtsPreviewRequest, auth: dict = Depends(require_auth
         raise HTTPException(
             status_code=400, detail="preview text is limited to 600 characters",
         )
-    creds = resolve_provider(auth["user_id"], body.provider) if auth["user_id"] else {}
+    creds = (
+        await db_call(resolve_provider, auth["user_id"], body.provider)
+        if auth["user_id"] else {}
+    )
     user_key = (body.api_key or creds.get("api_key") or "").strip() or None
     if not user_key:
         raise HTTPException(

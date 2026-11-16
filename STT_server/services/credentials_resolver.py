@@ -444,6 +444,15 @@ def _read_platform(provider_id: str) -> dict[str, str]:
     return out
 
 
+def _merge_credentials(platform: dict[str, str], per_user: dict[str, str]) -> dict[str, str]:
+    """Combine the two credential layers. Per-user wins; empty values are ignored."""
+    out = dict(platform)
+    for k, v in per_user.items():
+        if v:
+            out[k] = v
+    return out
+
+
 def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     """Read per-user encrypted credentials and decrypt them. Returns
     empty dict when the user has nothing stored or decryption fails.
@@ -501,6 +510,100 @@ def _read_per_user(user_id: str | None, provider_id: str) -> dict[str, str]:
     return {k: v for k, v in decrypted.items() if isinstance(v, str) and v}
 
 
+# ── session-scoped credential snapshot ─────────────────────────────────────
+# ponytail: PERF-002. Every adapter asked this module for its key, and
+# every ask re-read the user's whole integration set from Postgres and
+# re-ran Fernet decrypt over it -- once per TTS segment, once per LLM
+# turn, once per STT session, plus three times over at call start just
+# to auto-detect a provider. On Postgres that is a query + decrypt in
+# the middle of the voice path, every turn.
+#
+# The snapshot reads the rows ONCE per call and keeps the decrypted
+# result on the session. Lookups become dict hits. It is scoped to the
+# session, so a key the operator re-saves mid-call takes effect on the
+# NEXT call, not halfway through this one -- a call never changes
+# provider or key underneath the person on the line.
+class CredentialSnapshot:
+    """Decrypted per-user credentials for every provider, read once."""
+
+    __slots__ = ("_by_provider",)
+
+    def __init__(self, by_provider: dict[str, dict[str, str]] | None = None) -> None:
+        self._by_provider = by_provider or {}
+
+    def get(self, provider_id: str) -> dict[str, str]:
+        """Per-user credentials for one provider. Empty dict when absent."""
+        return self._by_provider.get(provider_id, {})
+
+
+def load_credential_snapshot(user_id: str | None) -> CredentialSnapshot:
+    """Read and decrypt every per-user credential in ONE DB round-trip.
+
+    Never raises: a failed read yields an empty snapshot, which makes
+    resolution fall back to the platform env vars exactly like the old
+    per-provider read did.
+    """
+    if not user_id:
+        return CredentialSnapshot()
+    try:
+        from STT_server.db_tools import list_tools as db_list_tools
+        rows = db_list_tools(user_id)
+    except Exception as exc:
+        log.warning(
+            "[credentials] load_credential_snapshot(%r) list_tools failed: %s "
+            "(treating as no per-user keys; falling back to env vars)",
+            user_id, exc,
+        )
+        return CredentialSnapshot()
+
+    by_provider: dict[str, dict[str, str]] = {}
+    # Rows arrive ordered by created_at DESC. The old per-provider read
+    # took the FIRST row matching the provider id, so a provider saved
+    # per-agent AND as a shared row resolves to the most recent one.
+    # Keep that rule: the first row claiming a provider wins, and later
+    # rows for the same provider are ignored.
+    for row in rows:
+        provider_id = row.get("id")
+        if not provider_id or not row.get("credentials"):
+            continue
+        if provider_id in by_provider:
+            continue
+        try:
+            decrypted = decrypt_credentials(row["credentials"]) or {}
+        except Exception as exc:
+            # Same cause as before: CREDENTIAL_ENCRYPTION_KEY was rotated
+            # or is missing. The row is still on disk; the operator just
+            # has to re-save the key in Settings -> API.
+            log.warning(
+                "[credentials] snapshot decrypt failed for provider %r "
+                "(stale ciphertext -- re-save the key in Settings -> API "
+                "to encrypt it with the current CREDENTIAL_ENCRYPTION_KEY): %s",
+                provider_id, exc,
+            )
+            decrypted = {}
+        by_provider[provider_id] = {k: v for k, v in decrypted.items() if isinstance(v, str) and v}
+    return CredentialSnapshot(by_provider)
+
+
+def resolve_from_snapshot(
+    snapshot: CredentialSnapshot,
+    provider_id: str,
+    use_own_key: bool = True,
+) -> dict[str, str]:
+    """Resolve a provider's credentials from an already-loaded snapshot.
+
+    Same merge rules as :func:`resolve_provider`, but the per-user layer
+    comes from the snapshot instead of a fresh DB read.
+    """
+    spec = get_provider_spec(provider_id)
+    if spec is None:
+        return {}
+    platform = _read_platform(provider_id)
+    if not use_own_key:
+        return platform
+    return _merge_credentials(platform, snapshot.get(provider_id))
+
+
 def resolve_provider(
     user_id: str | None,
     provider_id: str,
@@ -538,22 +641,15 @@ def resolve_provider(
     if spec is None:
         return {}
 
-    out: dict[str, str] = {}
     platform = _read_platform(provider_id)
 
     if use_own_key:
         per_user = _read_per_user(user_id, provider_id)
         # per_user wins where set, platform fills the rest
-        for k, v in platform.items():
-            out[k] = v
-        for k, v in per_user.items():
-            if v:
-                out[k] = v
-    else:
-        # Toggle off: platform env only
-        out.update(platform)
+        return _merge_credentials(platform, per_user)
 
-    return out
+    # Toggle off: platform env only
+    return platform
 
 
 def resolve_for_session(
@@ -572,6 +668,15 @@ def resolve_for_session(
     Falls back to use_own_key=True when the session attribute is
     missing (legacy sessions predating the migration), so existing
     per-user setups keep working.
+
+    ponytail: when the session carries a CredentialSnapshot (loaded
+    once at WS start), the per-user layer is read from it instead of
+    the DB. That turns the per-segment TTS lookup into a dict hit.
+
+    ponytail: the snapshot is only used when the session still has a
+    user_id. A session with user_id=None resolves to the platform env
+    vars only — same as before the snapshot existed — so the two paths
+    can never disagree about WHICH key a call uses.
     """
     flag_attr = {
         "stt": "stt_use_own_key",
@@ -582,6 +687,9 @@ def resolve_for_session(
     if flag_attr is not None:
         use_own = bool(getattr(session, flag_attr, True))
     user_id = getattr(session, "user_id", None)
+    snapshot = getattr(session, "cred_snapshot", None)
+    if snapshot is not None and user_id:
+        return resolve_from_snapshot(snapshot, provider_id, use_own_key=use_own)
     return resolve_provider(user_id, provider_id, use_own_key=use_own)
 
 
@@ -590,7 +698,11 @@ def is_provider_configured(user_id: str | None, provider_id: str) -> bool:
     return bool(resolve_provider(user_id, provider_id))
 
 
-def find_first_configured_provider(user_id: str | None, category: str) -> str | None:
+def find_first_configured_provider(
+    user_id: str | None,
+    category: str,
+    snapshot: CredentialSnapshot | None = None,
+) -> str | None:
     """Auto-detect a provider for a service category by scanning the
     per-user credentials the user has actually uploaded.
 
@@ -604,6 +716,10 @@ def find_first_configured_provider(user_id: str | None, category: str) -> str | 
     The match checks `spec.categories` if non-empty, falling back to
     `(spec.category,)`. The single-category table column on the DB
     row doesn't matter here — only the catalog view does.
+
+    ponytail: pass a `snapshot` to scan without touching the DB. At
+    call start this used to run three full credential reads (one per
+    category) on the event loop.
     """
     for spec in PROVIDER_CATALOG:
         all_categories = spec.categories if spec.categories else (spec.category,)
@@ -611,7 +727,11 @@ def find_first_configured_provider(user_id: str | None, category: str) -> str | 
             continue
         if spec.id == "twilio":  # telephony, not a runtime service
             continue
-        if is_provider_configured(user_id, spec.id):
+        if snapshot is not None:
+            configured = bool(resolve_from_snapshot(snapshot, spec.id))
+        else:
+            configured = is_provider_configured(user_id, spec.id)
+        if configured:
             return spec.id
     return None
 

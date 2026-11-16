@@ -12,6 +12,7 @@ from STT_server.config import IDLE_SILENCE_TIMEOUT_SEC, MAX_CALL_DURATION_SEC
 from STT_server.db_tools import list_tools as db_list_tools
 from STT_server.domain.session import CallSession
 from STT_server.services.common import enqueue_with_drop
+from STT_server.services.db_async import db_call
 from STT_server.services.usage_store import has_user_stored_key, record_call
 
 
@@ -216,10 +217,13 @@ async def register_session(session: CallSession) -> None:
     # is sync) returning a dict on success / None on skip. We
     # previously `await`-ed it, which raised
     # `object dict can't be used in 'await' expression` and broke
-    # every call. Just call it.
+    # every call. It now runs on the DB thread pool instead, so the
+    # event loop that is serving this call's audio frames is not
+    # blocked by the write.
     try:
         from STT_server import db_call_sessions
-        db_call_sessions.register_session(
+        await db_call(
+            db_call_sessions.register_session,
             session.session_key,
             tenant_id=session.tenant_id,
             call_sid=session.call_sid,
@@ -261,9 +265,9 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
     # ponytail: write the per-call usage record BEFORE we lose the
     # session data. The aggregation in /api/usage reads from this
     # ledger, so dropping the write means the call is invisible to
-    # billing.
+    # billing. Runs on the DB thread pool (it reads + writes Postgres).
     try:
-        _record_usage_for(session)
+        await db_call(_record_usage_for, session)
     except Exception as exc:  # noqa: BLE001 — never crash cleanup on billing
         log.warning("[usage] record failed for %s: %s", session.session_key, exc)
 
@@ -315,11 +319,12 @@ async def cleanup_session(session: CallSession, ws: WebSocket) -> None:
     # ran and the call is fully torn down. The row will be recovered
     # by a future startup sweep.
     #
-    # db_call_sessions.close_session is sync (psycopg2 is sync);
-    # don't await it.
+    # db_call_sessions.close_session is sync (psycopg2 is sync); it
+    # runs on the DB thread pool so the event loop is not blocked by
+    # the write.
     try:
         from STT_server import db_call_sessions
-        db_call_sessions.close_session(session.session_key)
+        await db_call(db_call_sessions.close_session, session.session_key)
     except Exception as exc:  # noqa: BLE001 — DB write must never block cleanup
         log.warning("[runtime] DB close_session failed for %s: %s",
                     session.session_key, exc)
