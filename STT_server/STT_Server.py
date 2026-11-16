@@ -887,8 +887,16 @@ async def voice(
             # re-assignment or a DB outage cannot move this call. The
             # next call reads the new config. Sealed (Fernet) so the
             # E.164s never land in an access log or a trace.
+            #
+            # ponytail: the plan holds the PENDING steps. The first
+            # destination is dialed right now, so by the time the
+            # callback arrives it is already gone. Sealing the WHOLE
+            # list made the callback ring it a second time: the human
+            # answered (or waited) twice, and the call burned another
+            # ring budget. The callback reads the plan's steps as the
+            # pending ones, so the first step must not be in it.
             _plan = plan_from_steps(
-                PHASE_PRE_AI, _steps,
+                PHASE_PRE_AI, _steps[1:],
                 (form_dict.get("CallSid") or form_dict.get("callSid") or "").strip(),
             )
             _sealed = seal_call_plan(_plan)

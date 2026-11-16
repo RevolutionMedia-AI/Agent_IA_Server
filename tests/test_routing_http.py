@@ -78,6 +78,16 @@ BASE = "http://localhost:8080"
 CASCADE_PATH = "/voice/cascade"
 FALLBACK_PATH = "/voice/transfer-fallback"
 
+# A plan the GO backend sealed with the same Fernet key. The two
+# services must read each other's plans: that is what lets a call
+# start in one and continue in the other.
+GO_SEALED_PLAN = (
+    "gAAAAABq-4Z9SFbrmpqlZ2fBTGLGJith4Olyb2WbsK2JXOtRr8D8m4MmTIxvB6t7WNDOU_NNb7KPR0"
+    "nu4CIN4b9vY9CmdFEV2jJm0rBZbLvHV3eZfe6jgvrioMw8jsNgcC-BLw4kBGt9Tm2IJkb6g0N6Hf"
+    "ssaps4dGDYFYYK7d_20SQzdHiOJUq-x53Rpa77Wjes5sulkHRmg3COCRBotiSzfqx1-AQTZ-H1w"
+    "zeFKh_nQUFNlrTMBYUto4zUJIxG7VFJjQaCHj9hyjePEvatrPKYrv69UtWiOg=="
+)
+
 
 # ── signing + request helpers ────────────────────────────────────────────
 
@@ -494,6 +504,57 @@ async def test_action_url_points_back_at_the_right_callback(client, routing_env)
 # ═══════════════════════════════════════════════════════════════════════
 # 6. Sealed plan: valid, and a real hop that re-seals
 # ═════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_voice_seals_the_pending_steps(client, routing_env):
+    """The plan /voice seals holds the PENDING steps.
+
+    The first destination is dialed right now, so by the time the
+    callback arrives it is already gone. A plan that still carried it
+    made the callback ring that human a SECOND time: the customer
+    waited another ring budget for the same person, and the call
+    burned one dial attempt for nothing.
+    """
+    routing_env.setattr(db_phone_numbers, "find_by_number", lambda *a, **k: {
+        "id": "pn-1", "twilio_auth_token": TOKEN,
+        "twilio_account_sid": ACCOUNT_SID, "user_id": "u1",
+        "agent": "agent-1",
+    })
+    set_cascade(routing_env, [H1, H2])
+    r = await post(client, "/voice", {}, twilio_form())
+    assert r.status_code == 200
+    xml = twiml_of(r)
+    assert dial_destinations(xml) == [H1], "/voice dials the first human"
+
+    qs = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(action_url(xml)).query))
+    token = qs.get("plan")
+    assert token, "/voice must seal the plan"
+    plan = open_call_plan(token, "CA" + "0" * 32)
+    assert plan is not None, "the sealed plan must open"
+    assert [s.destination for s in plan.steps] == [H2], (
+        "the plan must hold only the pending steps"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_sealed_by_the_go_backend_opens_here(client, routing_env):
+    """The Go backend seals a plan the Python backend can open.
+
+    The two services share the database AND the encryption key, so a
+    call that starts in one is continued by the other: the plan travels
+    in the action URL, sealed. If this breaks, the strangler stops
+    being one system.
+
+    The token below was produced by the Go backend
+    (internal/cascade, PlanFromSteps + Seal) for a plan with ONE
+    pending step, +15552222222, and this call's CallSid.
+    """
+    plan = open_call_plan(GO_SEALED_PLAN, "CA" + "0" * 32)
+    assert plan is not None, "the Go backend's plan must open here"
+    assert plan.phase == PHASE_PRE_AI
+    assert [s.destination for s in plan.steps] == ["+15552222222"]
+    assert plan.call_sid == "CA" + "0" * 32
+
 
 @pytest.mark.asyncio
 async def test_valid_sealed_plan_is_honoured_and_advances(client, routing_env):
