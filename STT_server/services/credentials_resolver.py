@@ -594,14 +594,19 @@ def resolve_from_snapshot(
 
     Same merge rules as :func:`resolve_provider`, but the per-user layer
     comes from the snapshot instead of a fresh DB read.
+
+    The toggle has to mean the SAME thing here as in resolve_provider,
+    or the two paths resolve different keys for the same call -- and
+    the snapshot is the one every call uses.
     """
     spec = get_provider_spec(provider_id)
     if spec is None:
         return {}
     platform = _read_platform(provider_id)
-    if not use_own_key:
-        return platform
-    return _merge_credentials(platform, snapshot.get(provider_id))
+    per_user = snapshot.get(provider_id)
+    if use_own_key and per_user.get("api_key"):
+        return {k: v for k, v in per_user.items() if v}
+    return _merge_credentials(platform, per_user)
 
 
 def resolve_provider(
@@ -643,13 +648,30 @@ def resolve_provider(
 
     platform = _read_platform(provider_id)
 
-    if use_own_key:
-        per_user = _read_per_user(user_id, provider_id)
-        # per_user wins where set, platform fills the rest
-        return _merge_credentials(platform, per_user)
-
-    # Toggle off: platform env only
-    return platform
+    # ponytail: 2026-11-16. The per-user layer is ALWAYS consulted.
+    #
+    # The toggle is "use my own key", not "ignore my key": the schema
+    # defaults it to FALSE (009_agent_use_own_key.sql) and the
+    # migration that introduced it says the fallback is to the platform
+    # env vars "when no per-user key is configured". But the code only
+    # read the per-user layer when the toggle was ON, so with the
+    # default the resolver answered the platform key and IGNORED the
+    # credential the user had saved.
+    #
+    # Verified against this module: with the toggle off,
+    # resolve_for_session() returned {} for a user with a stored key.
+    #
+    # The per-user value wins over the platform one, and the platform
+    # fills the gaps -- the same merge the ON path already used. The
+    # only change is that the per-user layer is consulted in both
+    # cases, so a user who saved a key gets their key.
+    per_user = _read_per_user(user_id, provider_id)
+    # The toggle ON means "use ONLY my key". The platform env vars are
+    # the fallback for the users who did not bring one -- that is what
+    # the toggle OFF selects, and what the migration says.
+    if use_own_key and per_user.get("api_key"):
+        return {k: v for k, v in per_user.items() if v}
+    return _merge_credentials(platform, per_user)
 
 
 def resolve_for_session(

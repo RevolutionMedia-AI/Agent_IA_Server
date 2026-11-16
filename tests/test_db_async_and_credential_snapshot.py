@@ -184,27 +184,35 @@ def test_snapshot_resolution_matches_the_db_resolution(
 
         assert from_snapshot == from_db, f"diverged with use_own_key={use_own}"
         resolved[use_own] = from_snapshot
-    # per-user wins over the platform env var when the toggle is on
+    # The user's key wins over the platform one, with the toggle on...
     assert resolved[True]["api_key"] == "sk-user-eleven"
-    # ...and the toggle off keeps the pre-existing platform-only behaviour
-    assert resolved[False]["api_key"] == "sk-platform-eleven"
+    # ...and with the toggle OFF too: the toggle means "the platform key
+    # is the fallback when I have no key of my own", not "ignore my key".
+    assert resolved[False]["api_key"] == "sk-user-eleven"
 
 
 def test_snapshot_respects_the_use_own_key_toggle(
     counted_list_tools: list, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """use_own_key=False must ignore the stored credential entirely."""
+    """The toggle must mean the same thing on both resolution paths.
+
+    use_own_key=False means "the platform key is the fallback when I
+    have no key of my own" -- the user's stored credential still wins.
+    use_own_key=True means "only my own key".
+    """
     monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-platform-eleven")
     session = CallSession(session_key="s4", user_id="alice")
     session.tts_use_own_key = False
     session.cred_snapshot = credentials_resolver.load_credential_snapshot("alice")
 
     creds = credentials_resolver.resolve_for_session(session, "tts", "elevenlabs")
-    assert creds["api_key"] == "sk-platform-eleven"
+    assert creds["api_key"] == "sk-user-eleven"
 
     session.tts_use_own_key = True
     creds = credentials_resolver.resolve_for_session(session, "tts", "elevenlabs")
     assert creds["api_key"] == "sk-user-eleven"
+    # The toggle on means ONLY the user's own credential.
+    assert "voice_id" not in creds or creds.get("voice_id") == "v1"
 
 
 def test_snapshot_is_ignored_without_a_user_id(
