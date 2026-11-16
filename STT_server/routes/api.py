@@ -3525,7 +3525,7 @@ def upsert_api_key(service_id: str, body: ApiKeyUpdate, auth: dict = Depends(req
 @api_router.delete("/settings/api-keys/{service_id}")
 def delete_api_key(service_id: str, auth: dict = Depends(require_auth)):
     """Disconnects a service for the user (falls back to env var default)."""
-    if not db_delete_tool(auth["user_id"], service_id):
+    if not db_delete_tool(service_id, auth["user_id"]):
         raise HTTPException(status_code=404, detail="Key not configured")
     return {"success": True}
 
@@ -3544,8 +3544,13 @@ def reveal_api_key(service_id: str, auth: dict = Depends(require_auth)):
     # ponytail: read directly from per-user Postgres storage (NOT the
     # resolver — we don't want to leak system env-var values through
     # the reveal endpoint).
-    row = db_get_tool(auth["user_id"], service_id)
-    if not row or not row.get("connected") or not row.get("credentials"):
+    row = db_get_tool(service_id, auth["user_id"])
+    # ponytail: only the credentials column is checked. The row has no
+    # "connected" column: migration 014 kept it OFF the table shape on
+    # purpose ("it is the inverse of credentials is null"), so testing
+    # row.get("connected") here always failed and the endpoint answered
+    # 404 for every user, key included. The FE's "show" toggle was dead.
+    if not row or not row.get("credentials"):
         raise HTTPException(status_code=404, detail="Key not configured")
     creds = decrypt_credentials(row["credentials"])
     return {"service": service_id, "credentials": creds}
