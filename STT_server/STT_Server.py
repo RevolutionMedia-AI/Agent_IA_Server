@@ -2811,17 +2811,26 @@ async def validate_tenant_twilio(tenant_id: str, request: Request) -> dict:
 
 
 @app.post("/tenants/{tenant_id}/configure-webhook", dependencies=[Depends(require_auth)])
-async def configure_tenant_webhook(tenant_id: str) -> dict:
+async def configure_tenant_webhook(tenant_id: str, request: Request) -> dict:
     """Automatically configure the Twilio webhook on the tenant's phone number.
 
     This sets the voice URL to point to our /voice endpoint, so incoming
     calls are routed to this server. The client does NOT need to manually
     configure anything in the Twilio console.
+
+    ponytail: ownership check added. This endpoint mutates the tenant's
+    Twilio account (it rewrites the voice webhook on their number), so
+    without the check any authenticated caller could reconfigure a
+    tenant they do not own. 404 on owner mismatch, same as the other
+    tenant endpoints.
     """
     from STT_server.adapters.twilio_api import configure_voice_webhook
     tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    forbidden = _require_tenant_owner(request, tenant)
+    if forbidden is not None:
+        return forbidden
     if not tenant.has_twilio_credentials:
         return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
 
@@ -2844,12 +2853,21 @@ async def configure_tenant_webhook(tenant_id: str) -> dict:
 
 
 @app.post("/tenants/{tenant_id}/list-numbers", dependencies=[Depends(require_auth)])
-async def list_tenant_numbers(tenant_id: str) -> dict:
-    """List all phone numbers in the tenant's Twilio account."""
+async def list_tenant_numbers(tenant_id: str, request: Request) -> dict:
+    """List all phone numbers in the tenant's Twilio account.
+
+    ponytail: ownership check added. This reads the tenant's Twilio
+    subaccount and returns its phone numbers, so without the check any
+    authenticated caller could enumerate another tenant's numbers.
+    404 on owner mismatch, same as the other tenant endpoints.
+    """
     from STT_server.adapters.twilio_api import list_phone_numbers
     tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    forbidden = _require_tenant_owner(request, tenant)
+    if forbidden is not None:
+        return forbidden
     if not tenant.twilio_account_sid or not tenant.twilio_auth_token:
         return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
 
@@ -2857,12 +2875,22 @@ async def list_tenant_numbers(tenant_id: str) -> dict:
 
 
 @app.post("/tenants/{tenant_id}/call", dependencies=[Depends(require_auth)])
-async def make_call(tenant_id: str, body: OutboundCallRequest) -> dict:
-    """Initiate an outbound call from the tenant's phone number."""
+async def make_call(tenant_id: str, body: OutboundCallRequest, request: Request) -> dict:
+    """Initiate an outbound call from the tenant's phone number.
+
+    ponytail: ownership check added, and this one matters most. The
+    call is placed with the TENANT's Twilio credentials and billed to
+    their account, so without the check any authenticated caller could
+    place calls through a tenant they do not own. 404 on owner
+    mismatch, same as the other tenant endpoints.
+    """
     from STT_server.adapters.twilio_api import make_outbound_call
     tenant = await db_call(tenant_store.get, tenant_id)
     if not tenant:
         return JSONResponse(status_code=404, content={"error": f"Tenant '{tenant_id}' not found"})
+    forbidden = _require_tenant_owner(request, tenant)
+    if forbidden is not None:
+        return forbidden
     if not tenant.has_twilio_credentials:
         return JSONResponse(status_code=400, content={"error": "Tenant does not have Twilio credentials configured"})
 
