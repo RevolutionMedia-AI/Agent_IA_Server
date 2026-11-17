@@ -2930,8 +2930,16 @@ def list_numbers_alias(auth: dict = Depends(require_auth)):
 
 
 @api_router.post("/numbers")
-def create_number_alias(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
-    return create_phone_number(data, auth)
+async def create_number_alias(data: PhoneNumberCreate, auth: dict = Depends(require_auth)):
+    """Alias of POST /phone-numbers.
+
+    ponytail: it has to be async AND await the call. The previous
+    version was a sync def that returned the coroutine of the async
+    route without awaiting it, so FastAPI got a coroutine where it
+    expected a response and the endpoint answered 500 with
+    "coroutine object is not iterable".
+    """
+    return await create_phone_number(data, auth)
 
 
 # ---------- /twilio-credentials CRUD ----------
