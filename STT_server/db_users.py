@@ -245,6 +245,29 @@ def update_user_name(user_id: str, name: str) -> None:
             )
 
 
+def delete_sessions_for_user(user_id: str) -> None:
+    """Drop every session of one user.
+
+    It is what a password change does: the sessions that were opened
+    with the old password must not keep working.
+    """
+    if not user_id:
+        return
+    if not is_postgres():
+        sessions = load_sessions()
+        for tok, entry in list(sessions.items()):
+            if entry.get("user_id") == user_id:
+                sessions.pop(tok, None)
+        save_sessions(sessions)
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM auth_sessions WHERE user_id = %s",
+                (user_id,),
+            )
+
+
 # ── Public API: pick the right backend at import time ────────────────
 
 # The two globals below are read by routes/auth.py. They are

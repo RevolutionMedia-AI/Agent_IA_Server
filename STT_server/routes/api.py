@@ -3281,22 +3281,42 @@ def update_settings(data: SettingsUpdate, auth: dict = Depends(require_auth)):
 
 @api_router.put("/settings/password")
 def change_password(data: PasswordChange, auth: dict = Depends(require_auth)):
-    with _data_lock():
-        users = _load(USERS_FILE, [])
-        user = _get_user(auth["user_id"])
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        if _hash_password(data.current_password) != user["password"]:
-            raise HTTPException(status_code=401, detail="Current password incorrect")
-        if len(data.new_password) < 8:
-            raise HTTPException(status_code=400, detail="New password too short")
-        user["password"] = _hash_password(data.new_password)
-        user["updated_at"] = _now_iso()
-        _save(USERS_FILE, users)
-        # Invalidate all sessions for this user (file + cache)
-        sessions = _load(SESSIONS_FILE, {})
-        sessions = {k: v for k, v in sessions.items() if v.get("user_id") != auth["user_id"]}
-        _save(SESSIONS_FILE, sessions)
+    """Change the caller's password.
+
+    ponytail: the check VERIFIES the password, it does not compare
+    hashes. The stored hash is PBKDF2 with a RANDOM salt, so two
+    hashes of the same password are never equal: comparing them made
+    this endpoint answer 401 for EVERY user, forever.
+
+    ponytail: the read and the write go through the db_users shim, so
+    Postgres is the store. The previous version read and wrote the
+    JSON file directly, which in Postgres mode left the real row
+    untouched: the password "changed" in a file nobody reads.
+    """
+    from STT_server.db_users import (
+        load_users,
+        save_users,
+        delete_sessions_for_user,
+    )
+    from STT_server.routes.auth import hash_password, verify_password
+
+    users = load_users()
+    found = None
+    for u in users:
+        if u.get("id") == auth["user_id"]:
+            found = u
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not verify_password(data.current_password, found.get("password") or ""):
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password too short")
+    found["password"] = hash_password(data.new_password)
+    found["updated_at"] = _now_iso()
+    save_users(users)
+    # Every session opened with the old password dies with it.
+    delete_sessions_for_user(auth["user_id"])
     invalidate_user_sessions(auth["user_id"])
     return {"success": True, "message": "Password updated. Please log in again."}
 
