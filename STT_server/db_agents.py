@@ -294,9 +294,15 @@ def create_agent(user_id: str, payload: dict) -> dict:
               payload.get("llm_temperature"), payload.get("llm_max_tokens"),
               payload.get("tts_speed"),
               payload.get("tts_instructions"),
-              payload.get("stt_use_own_key"),
-              payload.get("llm_use_own_key"),
-              payload.get("tts_use_own_key"),
+              # ponytail: these three are NOT NULL DEFAULT false. The
+              # payload carries them as None when the frontend did not
+              # send them, and writing NULL broke the INSERT: creating
+              # an agent answered 500 "null value in column
+              # stt_use_own_key violates not-null constraint".
+              # An explicit false is still false.
+              bool(payload.get("stt_use_own_key")),
+              bool(payload.get("llm_use_own_key")),
+              bool(payload.get("tts_use_own_key")),
               payload.get("idle_enabled"),
               payload.get("idle_first_timeout_sec"),
               payload.get("idle_first_message"),
