@@ -1425,7 +1425,17 @@ def list_provider_models(service: str, provider_id: str, api_key: str | None = N
                             "gpt-4o", "gpt-4.1", "gpt-5",
                             "o1", "o3", "o4", "o5",
                         )
-                        _DATED_SNAPSHOT = re.compile(r"-\d{4}(-\d{2})?(-preview)?(-light)?$")
+                        # ponytail: 2026-11-20 — the pattern used to be
+                        # `-\d{4}(-\d{2})?`, which matched -YYYY and
+                        # -YYYY-MM but NOT the full -YYYY-MM-DD form
+                        # ("gpt-4o-2024-05-13"). The comment above says
+                        # "any name with a -YYYY or -YYYY-MM suffix",
+                        # but the dated snapshots the operator actually
+                        # saw in the dropdown were the full-date ones.
+                        # The `{0,2}` closes the gap, and the Go port
+                        # carries the same pattern so the two services
+                        # answer the same dropdown.
+                        _DATED_SNAPSHOT = re.compile(r"-\d{4}(-\d{2}){0,2}(-preview)?(-light)?$")
                         llm = []
                         for m in models:
                             mid = m["id"]
