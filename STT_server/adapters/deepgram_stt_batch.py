@@ -75,12 +75,14 @@ def transcribe_sync(
     pcm16_audio: bytes,
     language_hint: str | None = None,
     user_id: str | None = None,
+    api_key: str | None = None,
 ) -> tuple[list[str], str]:
     # Per-user Deepgram key. No env fallback — the user must upload
     # their key via Settings → API or ModalAgents inline.
     # when no user_id is provided (test endpoints, admin tools).
     creds = resolve_provider(user_id, "deepgram")
-    api_key = creds.get("api_key")
+    # ponytail: 2026-11-20 - the inline key wins over the stored one.
+    api_key = (api_key or "").strip() or creds.get("api_key")
     if not api_key:
         raise RuntimeError("Deepgram no configurado. Sube tu key en Settings → API o en el campo inline de ModalAgents.")
 
@@ -151,5 +153,11 @@ async def transcribe_block(
     pcm16_audio: bytes,
     language_hint: str | None = None,
     user_id: str | None = None,
+    api_key: str | None = None,
 ) -> tuple[list[str], str]:
-    return await _to_thread(transcribe_sync, pcm16_audio, language_hint, user_id)
+    # ponytail: 2026-11-20 - `api_key` is the inline key the caller
+    # just typed (the debug endpoint takes it in the query string). It
+    # overrides the stored one. Without the parameter the /test-stt
+    # endpoint raised a TypeError and answered 500 for every caller
+    # that supplied a key.
+    return await _to_thread(transcribe_sync, pcm16_audio, language_hint, user_id, api_key)
